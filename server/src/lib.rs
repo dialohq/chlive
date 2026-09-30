@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use cache_engine::{CacheEngine, ClickHouseCache};
+use cache_engine::{CacheEngine, ChdbCache};
 use ch_http::{ChHttp, Params};
 use config::Config;
 use rewriter::{Catalog, FunctionCatalog};
@@ -27,6 +27,7 @@ use tail::TableRuntime;
 /// A running server.
 pub struct Server {
     pub addr: SocketAddr,
+    pub cache: Arc<dyn CacheEngine>,
     pub manager: Arc<Manager>,
     pub tables: HashMap<String, Arc<TableRuntime>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -75,6 +76,72 @@ async fn load_functions(main: &ChHttp) -> Result<FunctionCatalog> {
     ))
 }
 
+/// SQL string literal for trusted, operator-supplied config values.
+fn sql_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Make the (process-wide) chDB cache ready for a fresh server: define the `main_ro` named
+/// collection used by `remote()`, and drop tables left behind by an earlier server in this
+/// process (tests start several).
+async fn prepare_cache(cache: &ChdbCache, main: &ChHttp, cfg: &Config) -> Result<()> {
+    // chDB defaults to the host's local timezone; DateTime values must be parsed and
+    // printed exactly as main does, or tail rows and results shift by the UTC offset.
+    let tz = main
+        .query("SELECT timezone() AS tz", &Params::new())
+        .await
+        .context("reading main's timezone")?;
+    let tz = tz
+        .data
+        .first()
+        .and_then(|r| r["tz"].as_str())
+        .unwrap_or("UTC")
+        .to_string();
+    cache
+        .exec_on_all(&format!("SET session_timezone = {}", sql_literal(&tz)))
+        .await?;
+    let (host, port) = cfg
+        .main
+        .native_address
+        .rsplit_once(':')
+        .context("main.native_address must be host:port")?;
+    let port: u16 = port.parse().context("main.native_address port")?;
+    cache
+        .exec("DROP NAMED COLLECTION IF EXISTS main_ro", &Params::new())
+        .await?;
+    cache
+        .exec(
+            &format!(
+                "CREATE NAMED COLLECTION main_ro AS host = {}, port = {port}, user = {}, password = {}, database = {}",
+                sql_literal(host),
+                sql_literal(&cfg.main.user),
+                sql_literal(&cfg.main.password),
+                sql_literal(&cfg.main.database),
+            ),
+            &Params::new(),
+        )
+        .await
+        .context("creating named collection main_ro in chDB")?;
+    let leftovers = cache
+        .query(
+            "SELECT name FROM system.tables WHERE database = currentDatabase() \
+             AND (name LIKE 'tail\\_%' OR name LIKE 'sub\\_%')",
+            &Params::new(),
+        )
+        .await?;
+    for row in &leftovers.data {
+        if let Some(name) = row["name"].as_str() {
+            cache
+                .exec(
+                    &format!("DROP TABLE IF EXISTS {} SYNC", rewriter::quote_ident(name)),
+                    &Params::new(),
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Prepare the cache, start tail consumers and serve HTTP/WebSocket on `cfg.listen`.
 pub async fn start(cfg: Config) -> Result<Server> {
     let main = ChHttp::new(
@@ -83,24 +150,9 @@ pub async fn start(cfg: Config) -> Result<Server> {
         &cfg.main.password,
         &cfg.main.database,
     );
-    let cache_root = ChHttp::new(
-        &cfg.cache.url,
-        &cfg.cache.user,
-        &cfg.cache.password,
-        "default",
-    );
-    // The cache holds no durable state: start from an empty database every time.
-    let db = &cfg.cache.database;
-    cache_root
-        .exec(
-            &format!("DROP DATABASE IF EXISTS {db} SYNC"),
-            &Params::new(),
-        )
-        .await?;
-    cache_root
-        .exec(&format!("CREATE DATABASE {db}"), &Params::new())
-        .await?;
-    let cache: Arc<dyn CacheEngine> = Arc::new(ClickHouseCache(cache_root.with_database(db)));
+    let chdb = ChdbCache::shared(cfg.cache.pool_size)?;
+    prepare_cache(&chdb, &main, &cfg).await?;
+    let cache: Arc<dyn CacheEngine> = Arc::new(chdb);
 
     let functions = match load_functions(&main).await {
         Ok(f) => f,
@@ -143,6 +195,7 @@ pub async fn start(cfg: Config) -> Result<Server> {
         rows_limit_cap: cfg.rows_limit_cap,
         source_template: cfg.cache.remote_source.clone(),
     });
+    let cache_handle = cache.clone();
     let manager = Manager::new(
         catalog,
         tables.clone(),
@@ -168,6 +221,7 @@ pub async fn start(cfg: Config) -> Result<Server> {
     info!(%addr, "chlive listening");
     Ok(Server {
         addr,
+        cache: cache_handle,
         manager,
         tables,
         tasks,

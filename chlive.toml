@@ -9,13 +9,13 @@ url = "http://localhost:8123"
 user = "chlive_ro"
 password = "chlive_ro"
 database = "default"
+# native protocol port exposed by docker-compose.yml, for remote() from the embedded chDB cache
+native_address = "localhost:19000"
 
 [cache]
-url = "http://localhost:8124"
-user = "default"
-password = "default"
-database = "chlive"
-# named collection defined in infra/cache-config.xml
+# embedded chDB (in-process, in-memory); each connection runs one statement at a time
+pool_size = 4
+# `main_ro` is a named collection the server creates in chDB at startup from [main]
 remote_source = "remote(main_ro, database = '{database}', table = '{table}')"
 
 [kafka]

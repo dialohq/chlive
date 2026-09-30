@@ -4,7 +4,7 @@ A minimal **query-driven live sync layer** for a Kafka (Redpanda) → ClickHouse
 
 ## Quickstart
 
-Everything except Docker comes from the nix flake (cargo, node, librdkafka, …):
+Everything except Docker comes from the nix flake: cargo, node, librdkafka, and **libchdb** (packaged in `flake.nix`, since chDB is not in nixpkgs). If you use direnv, run `direnv reload` after flake changes, because this repo uses `nix_direnv_manual_reload`.
 
 ```sh
 nix develop -c ./scripts/dev.sh      # or `direnv allow` once, then ./scripts/dev.sh
@@ -15,7 +15,7 @@ The script runs `docker compose up`, builds the server and generator, and seeds 
 Individual pieces:
 
 ```sh
-docker compose up -d                                     # redpanda, clickhouse-main, clickhouse-cache
+docker compose up -d                                     # redpanda, clickhouse-main
 cargo run -p chlive-generator -- seed --count 1000000    # history, via Kafka
 cargo run -p chlive-server                               # reads chlive.toml
 cargo run -p chlive-generator -- stream --rate 200       # live events
@@ -42,7 +42,7 @@ agg(all rows) == aggMerge( aggState(history rows) ∪ aggState(tail rows) )
 
 For each distinct subscription `(sql, params)`, the server does the following:
 
-1. **Snapshot, once.** It takes a per-partition Kafka offset watermark `W` from main (`max(_offset)` per `_partition`). The cache ClickHouse then materializes the states of every row with `_offset <= W[_partition]` by reading main through `remote()`. The result goes into `sub_<id>_hist`, an in-memory table.
+1. **Snapshot, once.** It takes a per-partition Kafka offset watermark `W` from main (`max(_offset)` per `_partition`). The cache (embedded **chDB**, i.e. ClickHouse running inside the server process) then materializes the states of every row with `_offset <= W[_partition]` by reading main through `remote()`. The result goes into `sub_<id>_hist`, an in-memory table.
 2. **Tail.** The server consumes Kafka itself, using `assign()` with explicit offsets starting after the startup watermark. It appends the raw rows to `tail_<table>` in the cache.
 3. **Merge.** The live result is `merge(history states, states over tail rows with _offset > W[_partition])`. After each tail insert, affected subscriptions re-run this cheap merge right away, throttled to at most one merge per 100 ms under load. The server diffs the result by key and pushes a `patch`.
 
@@ -54,7 +54,7 @@ The rewriter (`server/src/rewriter/`) turns the client's SQL into the history, t
 Redpanda ──▶ ClickHouse main (Kafka engine + MV adds _partition/_offset)
    │                ▲ remote(): history states, once per subscription
    ▼                │
- chlive-server ── ClickHouse cache (tail_events, sub_<id>_hist) ── WebSocket ──▶ @chlive/client
+ chlive-server [chDB in-process: tail_events, sub_<id>_hist] ── WebSocket ──▶ @chlive/client
 ```
 
 ## Layout
@@ -62,7 +62,7 @@ Redpanda ──▶ ClickHouse main (Kafka engine + MV adds _partition/_offset)
 | path | what |
 |---|---|
 | `flake.nix` | dev shell: rust toolchain, librdkafka, node |
-| `docker-compose.yml`, `infra/` | Redpanda (topic `events`, 3 partitions), main and cache ClickHouse, schema, readonly user, `remote()` named collection |
+| `docker-compose.yml`, `infra/` | Redpanda (topics `events`, `customers`, `orders`; 3 partitions each) and main ClickHouse 26.7.2 (schema, readonly user, native port 19000 for `remote()`) |
 | `server/` | `chlive-server` (Rust): rewriter, watermark, tail consumer, subscription manager, diff, WebSocket |
 | `generator/` | `chlive-generator`: seeds history and streams live events through Kafka |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |

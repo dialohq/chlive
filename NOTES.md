@@ -1,6 +1,6 @@
 # chlive: notes, decisions, verified behaviors
 
-All behaviors below were checked against `clickhouse/clickhouse-server:25.8` (25.8.33.6), Redpanda v25.2.1 and `sqlparser` 0.63.
+The behaviors below were first verified against `clickhouse/clickhouse-server:25.8` with a separate cache ClickHouse server. Since the move to chDB (see *Embedded chDB cache* below), main runs **26.7.2** and the cache is chDB 26.7.3 (ClickHouse 26.7.2.1). The e2e suite passes on that setup. Redpanda v25.2.1, `sqlparser` 0.63.
 
 ## Data assumptions (enforced by the demo setup)
 
@@ -18,9 +18,7 @@ All behaviors below were checked against `clickhouse/clickhouse-server:25.8` (25
 
 Setup gotchas that were verified along the way:
 
-- The cache reaches main through a **named collection** `main_ro` (`infra/cache-config.xml`), so no credentials appear in SQL text or query logs.
-- Using a named collection needs the `NAMED COLLECTION` grant. That is `named_collection_control` on the user (`infra/cache-users.xml`).
-- The users.d override must sort *after* the image's `default-user.xml`, because that file does `remove="remove"` on `default`. Hence the name `zz-chlive.xml`.
+- The cache reaches main through a **named collection** `main_ro`, so no credentials appear in per-query SQL or query logs. With chDB it is created in SQL at startup (`CREATE NAMED COLLECTION`, from `[main]` in `chlive.toml`). The earlier cache server needed an XML config, the `named_collection_control` grant, and a users.d file sorted after the image's `default-user.xml`; none of that exists any more.
 - The main user `chlive_ro` is `readonly=2`, with `max_execution_time=60` and `max_memory_usage=4GB`. `readonly=1` would reject the settings that `remote()` and the HTTP interface send, such as `output_format_json_quote_64bit_integers`.
 
 ### (b) `fState`/`fMerge` naming for every allowlisted function: works
@@ -87,11 +85,43 @@ Partitions at `-1` or missing from `W` are omitted, so they fall through to the 
 | Merge → client | 0.5 ms | 0.5 ms |
 | **End to end (median of 20)** | **281 ms** | **24 ms** |
 
-The merge query now dominates. It is mostly fixed ClickHouse per-query overhead (HTTP, parsing, planning) plus Docker Desktop networking on macOS, not data volume. Embedded chDB behind `CacheEngine` would remove the HTTP hop.
+The merge query now dominates. With the HTTP cache it was mostly per-query overhead plus Docker networking on macOS; the chDB cache (below) removed about 4 ms of that.
 - **Tail consumer:** `assign()` with explicit offsets `W0[p] + 1`, `enable.auto.commit=false`, and a throwaway group id that rdkafka requires. It batches 1000 rows or 50 ms, and failed inserts are retried with backoff indefinitely. An undecodable message is logged and skipped. Main's Kafka engine would stall on the same message (`kafka_skip_broken_messages = 0`), so the upstream contract is that such messages don't exist.
-- **The cache holds no durable state:** the `chlive` database in the cache is dropped and recreated on startup. The e2e tests use their own cache databases.
+- **The cache holds no durable state:** chDB runs in-memory, and a server start drops any `tail_*` / `sub_*` tables left over from an earlier server in the same process (the e2e tests start several).
 - The live result is always correct up to the tail's progress. If the tail has not yet reached `W`, the rows it is missing are all `> W`, and those only show up later.
 - The demo rounds `since` down to the minute, so tabs opened in the same minute share the per-minute subscription.
+
+## Embedded chDB cache
+
+The cache is chDB (`chdb-rust` 2.0 over libchdb, chdb-core v26.7.3) inside `chlive-server`. It implements `CacheEngine` in `server/src/cache_engine.rs`; nothing else changed.
+
+- **Version lock:** libchdb is ClickHouse 26.7.2.1, and main is pinned to `clickhouse/clickhouse-server:26.7.2`. AggregateFunction states cross between them in binary form, so **upgrade both together**: bump `libchdbVersion` and the hashes in `flake.nix`, and `x-clickhouse-image` in `docker-compose.yml`. The chdb-rust version pins the engine it expects, and 2.0 requires chdb-core ≥ 26.7.3.
+- **Moving main from 25.8 to 26.7:** the upgrade recreated main with empty tables. Main's Kafka consumer-group offsets live in Redpanda, so they were deleted (`rpk group delete ch-main ch-main-customers ch-main-orders`) so that main re-ingested every topic from offset 0. Offsets and watermarks stay consistent this way.
+- **Nix packaging:** `flake.nix` fetches the release tarball (hashes from its `SHA256SUMS`). It contains `libchdb.so` (also on macOS) and `chdb.h`. The dev shell sets `CHDB_LIB_DIR` / `CHDB_INCLUDE_DIR`, so chdb-rust's `build.rs` links the store copy and never downloads; bindgen gets `LIBCLANG_PATH`. The library's install name is `@rpath/libchdb.so`, so `server/build.rs` and `tests/build.rs` add an rpath to the store path, and binaries run outside cargo. Caveat: a build with a stale environment, such as an editor still holding the pre-chDB direnv shell, has no `CHDB_LIB_DIR`, and chdb-rust then silently downloads an engine into `~/Library/Caches/chdb-rust`. That happened once here. Reload direnv after flake changes.
+- **Verified in a spike** (26.7.2 main, chDB 26.7.3):
+  - `remote('localhost:19000', …)` works. Main's native port is exposed as 19000.
+  - SQL-defined named collections work.
+  - `CREATE TABLE … ENGINE = Memory AS SELECT …State() FROM remote(…)` round-trips states.
+  - Typed `{name:Type}` params via `chdb_query_with_params` work, including params inside queries forwarded through `remote()`.
+  - Streaming JSONEachRow inserts work.
+  - Several in-memory connections share one engine and its tables, and run queries concurrently: two `sleep(1)` on two connections took 1.01 s.
+- **Pool:** a single process-wide pool (`OnceLock`) of `pool_size` connections (default 4), opened once and never closed. chDB allows one engine per process, and closing and reopening repeatedly is known to corrupt the allocator on macOS. Each connection runs one statement at a time; calls run in `spawn_blocking` on a free connection.
+- **Session settings, applied to every connection:**
+  - `output_format_json_quote_64bit_integers = 0` and `output_format_json_quote_denormals = 1`, the same as the HTTP client used.
+  - **`session_timezone` = main's `timezone()`.** chDB defaults to the host's local zone, which shifted every `DateTime` by the UTC offset (UTC+2 here). The e2e suite caught this.
+- **Signal handlers:** chDB's are disabled at startup (`runtime::signal_handlers(false)`), so tokio keeps SIGINT/SIGTERM.
+- **Footprint:** libchdb is 342 MB on disk, and the server's RSS was 132 MB with the demo subscriptions live. The separate cache container is gone.
+- **Latency, measured on the simple-demo path with 20 single events:**
+
+  | Stage | ClickHouse cache over HTTP | chDB in-process |
+  |---|---|---|
+  | Produce through the HTTP proxy until acknowledged | 3.3 ms | 5.0 ms |
+  | Write → tail insert done | 9.3 ms | 13.2 ms |
+  | Merge query | 13.4 ms | **9.0 ms** |
+  | Merge → client | 0.5 ms | 0.3 ms |
+  | **End to end (median)** | **23.6 ms** | **22.9 ms** |
+
+  The merge got ~4 ms faster: no HTTP, JSON over the wire, or Docker network hop. The remaining ~9 ms is ClickHouse's own parsing, planning and execution, which chDB doesn't remove. End to end is about the same within noise, so the win is operational (one service fewer, no cache container config) rather than latency.
 
 ## Known limitations
 
@@ -118,5 +148,4 @@ Periodically, per subscription, and later per table:
 
 - **Sliding windows:** time-bucketed states (for example per minute) with windows assembled from buckets at merge time, and expiry driven by a server-side clock rather than `now()` in SQL.
 - **Dedup:** track `(partition, offset)` in history too, or require an idempotent upstream key.
-- **chDB:** implement `CacheEngine` over embedded chDB. The trait already isolates `exec`/`query`/`insert_json_each_row`. `remote()` works the same way from chDB.
 - Share tail state queries between subscriptions that have the same WHERE and GROUP BY, and send incremental `order` diffs.

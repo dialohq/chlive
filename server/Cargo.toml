@@ -29,6 +29,7 @@ toml = "0.9"
 sha2 = "0.10"
 async-trait = "0.1"
 indexmap = { version = "2", features = ["serde"] }
+chdb-rust = "2.0"
 
 [dev-dependencies]
 rand.workspace = true

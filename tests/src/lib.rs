@@ -46,17 +46,18 @@ pub fn init_tracing() {
         .try_init();
 }
 
-pub fn config(cache_db: &str) -> Result<Config> {
+pub fn config() -> Result<Config> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../chlive.toml");
     let mut cfg = Config::load(&path)?;
     cfg.listen = "127.0.0.1:0".into();
-    cfg.cache.database = cache_db.into();
     cfg.debounce_ms = 50;
     Ok(cfg)
 }
 
-pub async fn start_server(cache_db: &str) -> Result<(Server, Config)> {
-    let cfg = config(cache_db)?;
+/// Start a server. All servers in this test process share the one embedded chDB engine
+/// (chDB allows a single engine per process); each start drops the previous tables.
+pub async fn start_server() -> Result<(Server, Config)> {
+    let cfg = config()?;
     let server = chlive_server::start(cfg.clone()).await?;
     Ok((server, cfg))
 }
@@ -67,15 +68,6 @@ pub fn main_client(cfg: &Config) -> ChHttp {
         &cfg.main.user,
         &cfg.main.password,
         &cfg.main.database,
-    )
-}
-
-pub fn cache_client(cfg: &Config) -> ChHttp {
-    ChHttp::new(
-        &cfg.cache.url,
-        &cfg.cache.user,
-        &cfg.cache.password,
-        &cfg.cache.database,
     )
 }
 

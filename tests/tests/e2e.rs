@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use chlive_e2e::*;
 use chlive_generator::TsMode;
+use chlive_server::cache_engine::CacheEngine;
 use chlive_server::ch_http::Params;
 use chlive_server::rewriter::{self, Options};
 use serde_json::{json, Value};
@@ -207,7 +208,7 @@ async fn live_results_match_direct_queries() {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let (server, cfg) = start_server("chlive_e2e_steady").await.unwrap();
+    let (server, cfg) = start_server().await.unwrap();
     let main = main_client(&cfg);
     let gen = generator(&cfg).unwrap();
 
@@ -279,7 +280,7 @@ async fn snapshot_tail_boundary_race() {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let (server, cfg) = start_server("chlive_e2e_race").await.unwrap();
+    let (server, cfg) = start_server().await.unwrap();
     let main = main_client(&cfg);
     let gen = generator(&cfg).unwrap();
     let mut produced = gen.produce(Some(500), None, TsMode::Now).await.unwrap();
@@ -322,8 +323,8 @@ async fn refcount_and_cleanup() {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let (server, cfg) = start_server("chlive_e2e_refs").await.unwrap();
-    let cache = cache_client(&cfg);
+    let (server, _cfg) = start_server().await.unwrap();
+    let cache = server.cache.clone();
     let sql = "SELECT country, count() AS n FROM events GROUP BY country";
     let a = LiveConn::connect(&server).await.unwrap();
     let b = LiveConn::connect(&server).await.unwrap();
@@ -373,7 +374,7 @@ async fn rejections_over_websocket() {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let (server, _cfg) = start_server("chlive_e2e_reject").await.unwrap();
+    let (server, _cfg) = start_server().await.unwrap();
     let conn = LiveConn::connect(&server).await.unwrap();
     let cases = [
         (
@@ -423,8 +424,7 @@ async fn watermark_predicate_in_clickhouse() {
     if !enabled() {
         return;
     }
-    let cfg = config("default").unwrap();
-    let cache = cache_client(&cfg);
+    let cache = chlive_server::cache_engine::ChdbCache::shared(1).unwrap();
     let w = chlive_server::watermark::Watermark(BTreeMap::from([(0, 120), (1, 98), (2, -1)]));
     let sql = format!(
         "SELECT countIf(h AND t) AS both, countIf(NOT h AND NOT t) AS neither, countIf(h) AS hist, count() AS total \
@@ -450,8 +450,8 @@ async fn alias_expansion_matches_clickhouse_resolution() {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let (server, cfg) = start_server("chlive_e2e_alias").await.unwrap();
-    let cache = cache_client(&cfg);
+    let (server, cfg) = start_server().await.unwrap();
+    let cache = server.cache.clone();
     let main = main_client(&cfg);
     let sql = cases().into_iter().find(|c| c.id == "orders").unwrap().sql;
     let catalog = server.manager.catalog();

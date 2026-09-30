@@ -16,6 +16,7 @@ pub struct Config {
     #[serde(default = "default_rows_limit_cap")]
     pub rows_limit_cap: u64,
     pub main: ClickHouseConfig,
+    #[serde(default)]
     pub cache: CacheConfig,
     pub kafka: KafkaConfig,
     /// Allowlisted source tables.
@@ -31,22 +32,32 @@ pub struct ClickHouseConfig {
     pub password: String,
     #[serde(default = "default_database")]
     pub database: String,
+    /// Native-protocol address of main as seen from this process, used by `remote()` from
+    /// the embedded chDB cache.
+    #[serde(default = "default_native_address")]
+    pub native_address: String,
 }
 
+/// The embedded chDB cache (in-process, in-memory; it holds no durable state).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
-    pub url: String,
-    pub user: String,
-    #[serde(default)]
-    pub password: String,
-    /// Database in the cache server holding `tail_*` and `sub_*_hist` tables. It is wiped
-    /// on startup: the cache holds no durable state.
-    #[serde(default = "default_cache_database")]
-    pub database: String,
+    /// Number of chDB connections; each runs one statement at a time.
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
     /// Table expression the cache uses to read main. `{database}` and `{table}` are replaced.
+    /// `main_ro` is a named collection created at startup from `[main]`.
     #[serde(default = "default_remote_source")]
     pub remote_source: String,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            pool_size: default_pool_size(),
+            remote_source: default_remote_source(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,8 +89,11 @@ fn default_rows_limit_cap() -> u64 {
 fn default_database() -> String {
     "default".into()
 }
-fn default_cache_database() -> String {
-    "chlive".into()
+fn default_native_address() -> String {
+    "localhost:19000".into()
+}
+fn default_pool_size() -> usize {
+    4
 }
 fn default_remote_source() -> String {
     "remote(main_ro, database = '{database}', table = '{table}')".into()

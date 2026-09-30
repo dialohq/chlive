@@ -8,7 +8,7 @@ SEED_COUNT="${SEED_COUNT:-1000000}"
 RATE="${RATE:-200}"
 
 echo "==> starting docker compose stack"
-docker compose up -d --wait redpanda clickhouse-main clickhouse-cache
+docker compose up -d --wait redpanda clickhouse-main
 
 echo "==> building"
 cargo build --release -p chlive-server -p chlive-generator
