@@ -1,0 +1,28 @@
+# chlive server configuration (matches docker-compose.yml)
+listen = "0.0.0.0:8080"
+debounce_ms = 100
+rows_limit_cap = 1000
+
+[main]
+url = "http://localhost:8123"
+# readonly=2 user with max_execution_time / max_memory_usage (infra/main-users.xml)
+user = "chlive_ro"
+password = "chlive_ro"
+database = "default"
+
+[cache]
+url = "http://localhost:8124"
+user = "default"
+password = "default"
+database = "chlive"
+# named collection defined in infra/cache-config.xml
+remote_source = "remote(main_ro, database = '{database}', table = '{table}')"
+
+[kafka]
+brokers = "localhost:19092"
+batch_rows = 1000
+batch_ms = 50
+
+[[tables]]
+name = "events"
+topic = "events"
