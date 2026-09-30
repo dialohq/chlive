@@ -73,6 +73,13 @@ fn cases() -> Vec<Case> {
             tol: |_| Tol::Exact,
         },
         Case {
+            // Rows plan without ORDER BY or LIMIT: every matching row, in Kafka order.
+            id: "unordered_rows",
+            sql: "SELECT ts, user_id, path, latency_ms FROM events WHERE latency_ms > 5000",
+            params: || json!({}),
+            tol: |_| Tol::Exact,
+        },
+        Case {
             id: "counters",
             sql: "SELECT count() AS total, avg(latency_ms) AS avg_latency, sum(amount) AS revenue FROM events",
             params: || json!({}),
@@ -147,6 +154,10 @@ fn cases() -> Vec<Case> {
 /// the last tie group may be chosen. Compare the `ts` sequence exactly, and full rows for
 /// everything outside the last tie group (sorted within tie groups).
 fn normalize_ties(id: &str, mut rows: Vec<Row>) -> Vec<Row> {
+    // Without ORDER BY the direct query's order is arbitrary; compare as a set.
+    if id == "unordered_rows" {
+        rows.sort_by_cached_key(|r| Value::Object(r.clone()).to_string());
+    }
     if id == "latest" {
         rows.sort_by(|a, b| {
             b["ts"].as_str().cmp(&a["ts"].as_str()).then_with(|| {
@@ -387,7 +398,7 @@ async fn rejections_over_websocket() {
             "SELECT e.country, d.name FROM events e JOIN countries d ON e.country = d.code",
             "joins",
         ),
-        ("nolimit", "SELECT * FROM events", "ORDER BY and LIMIT"),
+        ("final", "SELECT count() FROM events FINAL", "FINAL"),
         (
             "window",
             "SELECT count() OVER () FROM events",
@@ -403,7 +414,7 @@ async fn rejections_over_websocket() {
         json!({}),
     );
     conn.wait_ready(
-        &["now", "join", "nolimit", "window", "param"],
+        &["now", "join", "final", "window", "param"],
         Duration::from_secs(10),
     )
     .await

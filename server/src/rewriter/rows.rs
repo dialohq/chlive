@@ -1,4 +1,9 @@
 //! Rows plan: `topN(history ∪ tail) == topN(topN(history) ∪ tail)`.
+//!
+//! `ORDER BY` and `LIMIT` are both optional. Without `ORDER BY`, rows are in Kafka order:
+//! by `(_partition, _offset)`, which is Kafka's own order within each partition (there is
+//! no global order across partitions). Without `LIMIT`, history holds every matching row;
+//! how much that is, is the query author's call.
 
 use sqlparser::ast::{Expr, SelectItem};
 
@@ -7,20 +12,6 @@ use super::validate::Parts;
 use super::{ident_expr, params, quote_ident, Catalog, ParamTypes, Plan, PlanKind, RewriteError};
 
 pub fn plan(parts: Parts, catalog: &Catalog, types: &ParamTypes) -> Result<Plan, RewriteError> {
-    let cap = catalog.rows_limit_cap;
-    let limit = match parts.limit {
-        Some(n) if !parts.order_by.is_empty() => n,
-        _ => {
-            return Err(RewriteError::unsupported(format!(
-                "queries without aggregates must have ORDER BY and LIMIT n (n ≤ {cap})"
-            )))
-        }
-    };
-    if limit > cap {
-        return Err(RewriteError::unsupported(format!(
-            "LIMIT {limit} exceeds the maximum of {cap}"
-        )));
-    }
     if parts.having.is_some() {
         return Err(RewriteError::unsupported(
             "HAVING requires GROUP BY or aggregates",
@@ -69,10 +60,20 @@ pub fn plan(parts: Parts, catalog: &Catalog, types: &ParamTypes) -> Result<Plan,
     }
     select.push("_partition AS __partition".into());
     select.push("_offset AS __offset".into());
-    // Tie-break on the Kafka position so the result (and thus the diff) is deterministic.
+    // Kafka position: the whole order without ORDER BY, otherwise the tie-break that keeps
+    // the result (and thus the diff) deterministic.
     order.push("__partition".into());
     order.push("__offset".into());
-    let suffix = format!(" ORDER BY {} LIMIT {limit}", order.join(", "));
+    let merge_suffix = match parts.limit {
+        Some(n) => format!(" ORDER BY {} LIMIT {n}", order.join(", ")),
+        None => format!(" ORDER BY {}", order.join(", ")),
+    };
+    // History and tail only need sorting when a LIMIT cuts them.
+    let inner_suffix = if parts.limit.is_some() {
+        merge_suffix.clone()
+    } else {
+        String::new()
+    };
 
     Ok(Plan {
         kind: PlanKind::Rows,
@@ -83,14 +84,13 @@ pub fn plan(parts: Parts, catalog: &Catalog, types: &ParamTypes) -> Result<Plan,
             .collect(),
         output_columns: items.into_iter().map(|(_, n)| n).collect(),
         has_order: true,
-        result_cap: None,
         param_types: ParamTypes::new(),
         normalized_sql: String::new(),
         select_list: select.join(", "),
         filter: parts.selection.map(|w| w.to_string()),
-        inner_suffix: suffix.clone(),
+        inner_suffix,
         merge_select: "*".into(),
-        merge_suffix: suffix,
+        merge_suffix,
         source: catalog.source_for(&parts.table),
         tail_table: format!("tail_{}", parts.table),
     })

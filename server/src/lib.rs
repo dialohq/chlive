@@ -192,7 +192,6 @@ pub async fn start(cfg: Config) -> Result<Server> {
         database: cfg.main.database.clone(),
         tables: schemas,
         functions,
-        rows_limit_cap: cfg.rows_limit_cap,
         source_template: cfg.cache.remote_source.clone(),
     });
     let cache_handle = cache.clone();

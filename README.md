@@ -46,7 +46,7 @@ For each distinct subscription `(sql, params)`, the server does the following:
 2. **Tail.** The server consumes Kafka itself, using `assign()` with explicit offsets starting after the startup watermark. It appends the raw rows to `tail_<table>` in the cache.
 3. **Merge.** The live result is `merge(history states, states over tail rows with _offset > W[_partition])`. After each tail insert, affected subscriptions re-run this cheap merge right away, throttled to at most one merge per 100 ms under load. The server diffs the result by key and pushes a `patch`.
 
-Queries without aggregates (`SELECT … ORDER BY … LIMIT n`) use the same trick with rows: `topN(history ∪ tail) == topN(topN(history) ∪ tail)`.
+Queries without aggregates use the same trick with rows. With a `LIMIT`, `topN(history ∪ tail) == topN(topN(history) ∪ tail)`, so only the top N history rows are copied. Without one, every matching history row is copied, so keep such queries selective.
 
 The rewriter (`server/src/rewriter/`) turns the client's SQL into the history, tail-state, and merge queries. See the golden files in `server/src/rewriter/golden/` for exactly what gets generated from each demo query.
 
@@ -104,5 +104,6 @@ SELECT <items> FROM <allowlisted table> [WHERE …] [GROUP BY …] [HAVING …] 
 
 - Aggregates: `count sum min max avg any uniq uniqExact argMin argMax quantile(p) quantiles(…)`, each also in its `-If` form.
 - Expressions over aggregates work, and so do references to aggregate aliases.
-- Queries without aggregates need `ORDER BY` and `LIMIT n ≤ 1000`.
+- `ORDER BY` and `LIMIT` are optional everywhere, and there is no result-size cap. How much a query selects is up to its author; these results go to a frontend.
+- Without `ORDER BY`, rows come in **Kafka order**: by `(partition, offset)`. That is Kafka's order within each partition; there is no global order across partitions.
 - These are rejected with a clear error: `now()`/`today()`/`rand()`, joins, subqueries, CTEs, UNION, window functions, ARRAY JOIN, FINAL, SETTINGS, FORMAT, and table functions.

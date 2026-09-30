@@ -12,9 +12,6 @@ pub struct Config {
     /// quiet period merges immediately; bursts coalesce to one merge per interval).
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
-    /// Maximum LIMIT for Rows plans and maximum result size for Aggregate plans.
-    #[serde(default = "default_rows_limit_cap")]
-    pub rows_limit_cap: u64,
     pub main: ClickHouseConfig,
     #[serde(default)]
     pub cache: CacheConfig,
@@ -82,9 +79,6 @@ fn default_listen() -> String {
 }
 fn default_debounce_ms() -> u64 {
     100
-}
-fn default_rows_limit_cap() -> u64 {
-    1000
 }
 fn default_database() -> String {
     "default".into()

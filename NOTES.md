@@ -61,7 +61,11 @@ Partitions at `-1` or missing from `W` are omitted, so they fall through to the 
 - **Group keys.** A key that is a select alias uses that alias. A bare column uses its name. Otherwise the key gets a hidden `__key_i`. Key expressions inside merge-side expressions are replaced by the key alias. Keys that are not selected are still returned, because they are needed to build `__key`, but they are not client-visible columns.
 - **Unaliased output columns** are named after their expression text, as ClickHouse would name them, for example `` countMerge(__agg_0) AS `count()` ``.
 - **Rows plans** add hidden `__ord_i` columns for the ORDER BY expressions, so ordering by non-selected columns works. They also add `__partition`/`__offset` and break ties on them, which makes the result and its diffs deterministic. The key sent to clients is `[_partition, _offset]`.
-- **Result size.** `LIMIT` must be at most `rows_limit_cap` (1000). An Aggregate query without LIMIT gets `LIMIT cap+1`, and if it returns more than `cap` rows, the subscription fails with `RESULT_TOO_LARGE`.
+- **Result size is the query author's responsibility.** `ORDER BY` and `LIMIT` are optional for every query, and there is no cap. (The spec required both, with `LIMIT ≤ 1000`, for row queries; that was dropped because results go to a frontend and the author knows how much they need.)
+  - A row query without `LIMIT` copies every matching history row into chDB and re-reads it on every merge, so it should be selective (e.g. a `WHERE` on an id).
+  - Without `ORDER BY`, row queries are ordered by `(_partition, _offset)`, which is Kafka order within each partition. Across partitions it is simply partition 0 first, then 1, and so on: Kafka has no global order.
+  - `LIMIT n` without `ORDER BY` therefore means "the first n rows by Kafka position". That is deterministic, but once filled it never changes, since new rows always sort after them. To follow new rows, use `ORDER BY ts DESC LIMIT n`.
+  - History and tail are sorted only when a `LIMIT` cuts them. Without one, only the merge sorts.
 - **Aggregate detection** uses main's `system.functions` (`is_aggregate`) and `system.aggregate_function_combinators`, loaded at startup, with a builtin fallback list. Any aggregate outside the allowlist is rejected, including other combinators like `uniqState` and `sumArray`, and aggregates like `anyLast`.
 - **Rejected functions:** time-relative ones (`now`, `now64`, `today`, `yesterday`, `current_timestamp`, …), whose error suggests passing the time as a parameter, and non-deterministic ones (`rand*`, `random*`, `generateUUID*`, `runningDifference`, `dictGet*`, …).
 - Identifiers starting with `__` are reserved.
@@ -129,7 +133,7 @@ The cache is chDB (`chdb-rust` 2.0 over libchdb, chdb-core v26.7.3) inside `chli
 - **The tail grows forever** (see compaction below).
 - **No sliding windows:** `now()`-relative filters are rejected. The per-minute example passes a fixed `since` computed at subscribe time.
 - **ORDER BY ties** in Rows plans are broken by Kafka position, while the original query breaks them arbitrarily. At a LIMIT boundary, the row picked among equal sort keys can therefore differ from a direct query. The e2e test compares the sort-key sequence exactly and full rows outside the last tie group. For the same reason, `argMax(user_id, latency_ms)` with tied maxima is only as deterministic as ClickHouse itself. The all-functions test uses a `(latency, user)` tuple so that it is deterministic.
-- The patch `order` is the full key list. That is fine given the 1000-row cap.
+- The patch `order` is the full key list, so it grows with the result. That's fine for frontend-sized results, but large unbounded results would want incremental order diffs.
 - No auth, multi-tenancy or row-level security. There is a table allowlist (`[[tables]]` in `chlive.toml`), and main is accessed with a readonly user that has execution-time and memory limits.
 - A single process holds all state. There is no horizontal scaling, and a server restart means clients resubscribe and get fresh snapshots. The client reconnects automatically.
 

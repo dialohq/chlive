@@ -27,7 +27,6 @@ pub fn catalog() -> Catalog {
             },
         )]),
         functions: FunctionCatalog::builtin(),
-        rows_limit_cap: 1000,
         source_template: "remote(main_ro, database = '{database}', table = '{table}')".into(),
     }
 }
@@ -88,6 +87,44 @@ fn golden_example_5_without_alias_expansion() {
     golden("example_5_no_expand.sql", &render(EXAMPLES[4], &opts));
 }
 
+/// Rows plans without ORDER BY and/or LIMIT: Kafka order, and no LIMIT means history holds
+/// every matching row (so history/tail need no sorting).
+#[test]
+fn golden_rows_without_order_or_limit() {
+    let cases = [
+        ("rows_no_order_no_limit.sql", "SELECT * FROM events"),
+        (
+            "rows_no_order_limit.sql",
+            "SELECT user_id, amount FROM events WHERE amount > 400 LIMIT 5",
+        ),
+        (
+            "rows_order_no_limit.sql",
+            "SELECT ts, path FROM events WHERE path = {path:String} ORDER BY ts DESC",
+        ),
+    ];
+    for (file, sql) in cases {
+        golden(file, &render(sql, &Options::default()));
+    }
+    let p = rewrite("SELECT * FROM events", &catalog()).unwrap();
+    assert_eq!(p.kind, PlanKind::Rows);
+    assert!(p.has_order);
+    assert!(!p.history_sql(&w()).contains("ORDER BY"));
+    assert!(p
+        .merge_sql(&w(), "h")
+        .ends_with(" ORDER BY __partition, __offset"));
+}
+
+#[test]
+fn big_limits_are_allowed() {
+    rewrite("SELECT ts FROM events ORDER BY ts LIMIT 50000", &catalog()).unwrap();
+    let p = rewrite(
+        "SELECT country, count() AS n FROM events GROUP BY country",
+        &catalog(),
+    )
+    .unwrap();
+    assert!(!p.merge_sql(&w(), "h").contains("LIMIT"));
+}
+
 #[test]
 fn plan_kinds_and_keys() {
     let c = catalog();
@@ -109,7 +146,6 @@ fn plan_kinds_and_keys() {
     let p = rewrite(EXAMPLES[1], &c).unwrap();
     assert!(p.key_columns.is_empty());
     assert!(!p.has_order);
-    assert_eq!(p.result_cap, Some(1000));
     let p = rewrite(EXAMPLES[3], &c).unwrap();
     assert_eq!(p.param_types["since"], "DateTime64(3)");
 }
@@ -190,8 +226,8 @@ fn rejections_from_spec() {
     let e = reject("SELECT e.country, d.name FROM events e JOIN countries d ON e.country = d.code");
     assert!(e.message.contains("joins"), "{e}");
 
-    let e = reject("SELECT * FROM events");
-    assert!(e.message.contains("ORDER BY and LIMIT"), "{e}");
+    let e = reject("SELECT count() FROM events FINAL");
+    assert!(e.message.contains("FINAL"), "{e}");
 
     let e = reject("SELECT count() OVER () FROM events");
     assert!(e.message.contains("window functions"), "{e}");
@@ -241,15 +277,6 @@ fn other_rejections() {
         (
             "SELECT count() FROM remote('x', default, events)",
             "table functions",
-        ),
-        (
-            "SELECT ts FROM events ORDER BY ts LIMIT 5000",
-            "exceeds the maximum",
-        ),
-        ("SELECT ts FROM events LIMIT 5", "ORDER BY and LIMIT"),
-        (
-            "SELECT country, count() FROM events GROUP BY country LIMIT 2000",
-            "exceeds",
         ),
         ("SELECT sum(count()) FROM events", "nested"),
         ("SELECT count(DISTINCT user_id) FROM events", "uniqExact"),

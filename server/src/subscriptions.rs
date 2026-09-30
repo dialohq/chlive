@@ -308,16 +308,6 @@ impl Manager {
             sub.stats.lock().expect("stats").last_error = Some(format!("{e:#}"));
             SubError::query(&e)
         })?;
-        if let Some(cap) = sub.plan.result_cap {
-            if result.data.len() as u64 > cap {
-                return Err(SubError {
-                    code: "RESULT_TOO_LARGE",
-                    message: format!(
-                        "the result has more than {cap} rows; add a LIMIT or narrow the query"
-                    ),
-                });
-            }
-        }
         let rows = diff::key_rows(&sub.plan, result.data);
         let d = diff::diff(&st.rows, &rows);
         st.rows = rows;

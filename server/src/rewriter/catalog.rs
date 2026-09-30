@@ -172,7 +172,6 @@ pub struct Catalog {
     pub database: String,
     pub tables: HashMap<String, TableSchema>,
     pub functions: FunctionCatalog,
-    pub rows_limit_cap: u64,
     /// Table expression for reading main from the cache; `{table}` is substituted.
     pub source_template: String,
 }

@@ -242,22 +242,9 @@ pub fn plan(
         let o: Vec<String> = order_by.iter().map(|o| o.to_string()).collect();
         merge_suffix.push_str(&format!(" ORDER BY {}", o.join(", ")));
     }
-    let result_cap = match parts.limit {
-        Some(n) if n > catalog.rows_limit_cap => {
-            return Err(RewriteError::unsupported(format!(
-                "LIMIT {n} exceeds the maximum of {}",
-                catalog.rows_limit_cap
-            )))
-        }
-        Some(n) => {
-            merge_suffix.push_str(&format!(" LIMIT {n}"));
-            None
-        }
-        None => {
-            merge_suffix.push_str(&format!(" LIMIT {}", catalog.rows_limit_cap + 1));
-            Some(catalog.rows_limit_cap)
-        }
-    };
+    if let Some(n) = parts.limit {
+        merge_suffix.push_str(&format!(" LIMIT {n}"));
+    }
 
     Ok(Plan {
         kind: PlanKind::Aggregate,
@@ -265,7 +252,6 @@ pub fn plan(
         key_columns: keys.iter().map(|k| k.alias.clone()).collect(),
         output_columns: items.iter().map(|i| i.name.clone()).collect(),
         has_order: !order_by.is_empty(),
-        result_cap,
         param_types: ParamTypes::new(),
         normalized_sql: String::new(),
         select_list: select_list.join(", "),

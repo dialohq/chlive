@@ -1,7 +1,6 @@
 # chlive server configuration (matches docker-compose.yml)
 listen = "0.0.0.0:8080"
 debounce_ms = 100
-rows_limit_cap = 1000
 
 [main]
 url = "http://localhost:8123"

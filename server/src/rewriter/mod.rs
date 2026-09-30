@@ -80,9 +80,6 @@ pub struct Plan {
     /// Columns sent to clients, in order. Never contains `__` columns.
     pub output_columns: Vec<String>,
     pub has_order: bool,
-    /// Maximum number of rows the merge may return before it is an error; `None` when the
-    /// query carries its own LIMIT.
-    pub result_cap: Option<u64>,
     pub param_types: ParamTypes,
     /// Canonical SQL (as re-printed by the parser) used for subscription dedupe.
     pub normalized_sql: String,

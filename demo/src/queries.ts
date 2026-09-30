@@ -44,7 +44,7 @@ LIMIT 10`,
 export const REJECTIONS = [
   { label: "time-relative", sql: "SELECT count() FROM events WHERE ts > now() - INTERVAL 1 HOUR" },
   { label: "join", sql: "SELECT e.country, d.name FROM events e JOIN countries d ON e.country = d.code" },
-  { label: "no LIMIT", sql: "SELECT * FROM events" },
+  { label: "FINAL", sql: "SELECT count() FROM events FINAL" },
   { label: "window", sql: "SELECT count() OVER () FROM events" },
 ];
 
