@@ -5,6 +5,13 @@ x-clickhouse-image: &ch_image clickhouse/clickhouse-server:25.8
 services:
   redpanda:
     image: redpandadata/redpanda:v25.2.1
+    # The HTTP proxy batches produce requests for 100 ms by default; disable that so a
+    # single write from the simple demo is acknowledged (and visible) immediately.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - rpk redpanda config set pandaproxy_client.produce_batch_delay_ms 0 && exec /entrypoint.sh "$$@"
+      - --
     command:
       - redpanda start
       - --mode dev-container

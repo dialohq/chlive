@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::FutureExt;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use serde_json::Value;
@@ -180,10 +181,14 @@ async fn run(
             let recv = consumer.recv();
             let msg = match deadline {
                 None => recv.await,
-                Some(d) => match tokio::time::timeout_at(d, recv).await {
-                    Ok(m) => m,
-                    Err(_) => break,
+                // Flush as soon as nothing more is already buffered: a lone event is
+                // inserted immediately, while under load batches grow on their own (messages
+                // pile up during the previous insert). `batch_ms` only caps a batch's age.
+                Some(d) if tokio::time::Instant::now() < d => match recv.now_or_never() {
+                    Some(m) => m,
+                    None => break,
                 },
+                Some(_) => break,
             };
             let msg = match msg {
                 Ok(m) => m,

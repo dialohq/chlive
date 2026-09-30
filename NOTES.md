@@ -72,7 +72,22 @@ Partitions at `-1` or missing from `W` are omitted, so they fall through to the 
 
 - **Dedupe:** subscriptions are keyed by sha256 of the parser-normalized SQL plus the bound params. Whitespace differences therefore share a subscription. Concurrent first subscribers wait on one `OnceCell` initialization, so a history table is only ever built once. The refcount lives in the manager map, and when it reaches 0 the merge task is aborted and `sub_<id>_hist` is dropped.
 - **Snapshot/patch ordering:** a client is attached, and gets its snapshot, while holding the subscription's state lock. Patches are broadcast under the same lock, so a client never sees a patch before its snapshot. The same lock serializes merges, so there are never two concurrent merges for one subscription.
-- **Debounce:** one `Notify` per subscription coalesces `TableAdvanced` events, followed by a 100 ms sleep (`debounce_ms`), then one merge.
+- **Debounce (leading-edge throttle):** one `Notify` per subscription coalesces `TableAdvanced` events. The first change after a quiet period merges immediately, and changes arriving during a merge or within `debounce_ms` (100 ms) of the last one coalesce into one merge per interval. This used to be a trailing 100 ms sleep, which added 100 ms to every single event.
+- **Tail batching is adaptive:** a batch is flushed as soon as no further message is already buffered, so a lone event is inserted immediately. Under load, messages pile up during the previous insert and batches grow by themselves. `batch_rows` and `batch_ms` only cap a batch's size and age.
+- **Redpanda HTTP proxy:** `pandaproxy_client.produce_batch_delay_ms` is set to 0 in `docker-compose.yml`. The default of 100 ms added 100 ms to every write from the simple demo.
+
+### Measured per-event latency (simple demo path: HTTP proxy write, then a patch at the client)
+
+| Stage | Before | After |
+|---|---|---|
+| Produce via the HTTP proxy until acknowledged | 105 ms | 3 ms |
+| Acknowledged → tail insert | 59 ms (the 50 ms batch window) | 6 ms |
+| Tail insert → merge start | 102 ms (trailing debounce) | 0.1 ms |
+| Merge query | 15 ms | 13 ms |
+| Merge → client | 0.5 ms | 0.5 ms |
+| **End to end (median of 20)** | **281 ms** | **24 ms** |
+
+The merge query now dominates. It is mostly fixed ClickHouse per-query overhead (HTTP, parsing, planning) plus Docker Desktop networking on macOS, not data volume. Embedded chDB behind `CacheEngine` would remove the HTTP hop.
 - **Tail consumer:** `assign()` with explicit offsets `W0[p] + 1`, `enable.auto.commit=false`, and a throwaway group id that rdkafka requires. It batches 1000 rows or 50 ms, and failed inserts are retried with backoff indefinitely. An undecodable message is logged and skipped. Main's Kafka engine would stall on the same message (`kafka_skip_broken_messages = 0`), so the upstream contract is that such messages don't exist.
 - **The cache holds no durable state:** the `chlive` database in the cache is dropped and recreated on startup. The e2e tests use their own cache databases.
 - The live result is always correct up to the tail's progress. If the tail has not yet reached `W`, the rows it is missing are all `> W`, and those only show up later.

@@ -356,12 +356,20 @@ impl Manager {
         let this = Arc::downgrade(self);
         // The task holds the subscription; `release` aborts it when the refcount hits zero.
         let sub_ref = sub.clone();
-        let debounce = self.debounce;
+        let interval = self.debounce;
         let handle = tokio::spawn(async move {
             let sub = sub_ref;
+            // Leading-edge throttle: the first change after a quiet period merges right away;
+            // changes arriving during a merge or within `debounce_ms` of the previous one
+            // coalesce (the Notify keeps a single permit) into one merge at most every
+            // `debounce_ms`.
+            let mut last_merge: Option<tokio::time::Instant> = None;
             loop {
                 sub.dirty.notified().await;
-                tokio::time::sleep(debounce).await;
+                if let Some(last) = last_merge {
+                    tokio::time::sleep_until(last + interval).await;
+                }
+                last_merge = Some(tokio::time::Instant::now());
                 let Some(this) = this.upgrade() else { return };
                 // The state lock serializes merges for this subscription.
                 let mut st = sub.state.lock().await;

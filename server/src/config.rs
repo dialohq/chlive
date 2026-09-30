@@ -8,7 +8,8 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Per-subscription debounce between a tail advance and the merge query.
+    /// Minimum interval between merges of one subscription (leading edge: a change after a
+    /// quiet period merges immediately; bursts coalesce to one merge per interval).
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
     /// Maximum LIMIT for Rows plans and maximum result size for Aggregate plans.

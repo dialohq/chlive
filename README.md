@@ -44,7 +44,7 @@ For each distinct subscription `(sql, params)`, the server does the following:
 
 1. **Snapshot, once.** It takes a per-partition Kafka offset watermark `W` from main (`max(_offset)` per `_partition`). The cache ClickHouse then materializes the states of every row with `_offset <= W[_partition]` by reading main through `remote()`. The result goes into `sub_<id>_hist`, an in-memory table.
 2. **Tail.** The server consumes Kafka itself, using `assign()` with explicit offsets starting after the startup watermark. It appends the raw rows to `tail_<table>` in the cache.
-3. **Merge.** The live result is `merge(history states, states over tail rows with _offset > W[_partition])`. After each tail insert, affected subscriptions re-run this cheap merge (debounced, 100 ms). The server diffs the result by key and pushes a `patch`.
+3. **Merge.** The live result is `merge(history states, states over tail rows with _offset > W[_partition])`. After each tail insert, affected subscriptions re-run this cheap merge right away, throttled to at most one merge per 100 ms under load. The server diffs the result by key and pushes a `patch`.
 
 Queries without aggregates (`SELECT … ORDER BY … LIMIT n`) use the same trick with rows: `topN(history ∪ tail) == topN(topN(history) ∪ tail)`.
 
