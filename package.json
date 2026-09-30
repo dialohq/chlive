@@ -1,0 +1,9 @@
+{
+  "name": "chlive-workspace",
+  "private": true,
+  "workspaces": ["client", "demo"],
+  "scripts": {
+    "build": "npm run build -w client && npm run build -w demo",
+    "test": "npm test -w client"
+  }
+}
