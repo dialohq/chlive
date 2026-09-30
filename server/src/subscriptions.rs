@@ -30,13 +30,19 @@ pub struct SubError {
 
 impl From<RewriteError> for SubError {
     fn from(e: RewriteError) -> Self {
-        Self { code: e.code, message: e.message }
+        Self {
+            code: e.code,
+            message: e.message,
+        }
     }
 }
 
 impl SubError {
     fn query(e: &anyhow::Error) -> Self {
-        Self { code: "QUERY_FAILED", message: format!("{e:#}") }
+        Self {
+            code: "QUERY_FAILED",
+            message: format!("{e:#}"),
+        }
     }
 }
 
@@ -106,8 +112,15 @@ impl Manager {
         })
     }
 
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
     /// Mark subscriptions dirty whenever their table's tail advances.
-    pub fn spawn_router(self: &Arc<Self>, mut rx: broadcast::Receiver<TableAdvanced>) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_router(
+        self: &Arc<Self>,
+        mut rx: broadcast::Receiver<TableAdvanced>,
+    ) -> tokio::task::JoinHandle<()> {
         let this = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
@@ -202,7 +215,11 @@ impl Manager {
             subs.get(hash).map(|e| e.sub.clone())
         };
         if let Some(sub) = sub {
-            sub.state.lock().await.clients.remove(&(conn, client_id.to_string()));
+            sub.state
+                .lock()
+                .await
+                .clients
+                .remove(&(conn, client_id.to_string()));
             self.release(hash);
         }
     }
@@ -246,18 +263,25 @@ impl Manager {
                 .map_err(|e| SubError::query(&e))?;
             let history = sub.plan.history_sql(&w);
             let _ = sub.watermark.set(w);
-            let ddl = format!("CREATE TABLE {} ENGINE = Memory AS {history}", sub.hist_table);
-            self.cache.exec(&ddl, &sub.params).await.map_err(|e| SubError::query(&e))?;
+            let ddl = format!(
+                "CREATE TABLE {} ENGINE = Memory AS {history}",
+                sub.hist_table
+            );
+            self.cache
+                .exec(&ddl, &sub.params)
+                .await
+                .map_err(|e| SubError::query(&e))?;
             let hist_ms = started.elapsed().as_secs_f64() * 1e3;
             let mut st = sub.state.lock().await;
-            self.merge_into(sub, &mut st).await.map_err(|e| {
+            self.merge_into(sub, &mut st).await.inspect_err(|_| {
                 // don't leak the history table of a subscription that never became live
                 let cache = self.cache.clone();
                 let t = sub.hist_table.clone();
                 tokio::spawn(async move {
-                    let _ = cache.exec(&format!("DROP TABLE IF EXISTS {t} SYNC"), &Params::new()).await;
+                    let _ = cache
+                        .exec(&format!("DROP TABLE IF EXISTS {t} SYNC"), &Params::new())
+                        .await;
                 });
-                e
             })?;
             let total = started.elapsed().as_secs_f64() * 1e3;
             sub.stats.lock().expect("stats").snapshot_ms = total;
@@ -288,7 +312,9 @@ impl Manager {
             if result.data.len() as u64 > cap {
                 return Err(SubError {
                     code: "RESULT_TOO_LARGE",
-                    message: format!("the result has more than {cap} rows; add a LIMIT or narrow the query"),
+                    message: format!(
+                        "the result has more than {cap} rows; add a LIMIT or narrow the query"
+                    ),
                 });
             }
         }
@@ -299,14 +325,30 @@ impl Manager {
             .plan
             .output_columns
             .iter()
-            .map(|c| result.meta.iter().find(|m| &m.name == c).cloned().unwrap_or(Column { name: c.clone(), ty: "".into() }))
+            .map(|c| {
+                result
+                    .meta
+                    .iter()
+                    .find(|m| &m.name == c)
+                    .cloned()
+                    .unwrap_or(Column {
+                        name: c.clone(),
+                        ty: "".into(),
+                    })
+            })
             .collect();
         let ms = started.elapsed().as_secs_f64() * 1e3;
         let mut stats = sub.stats.lock().expect("stats");
         stats.merges += 1;
         stats.last_merge_ms = ms;
         stats.last_error = None;
-        tracing::debug!(sub = sub.id, ms = format!("{ms:.1}"), upserts = d.upserts.len(), deletes = d.deletes.len(), "merge");
+        tracing::debug!(
+            sub = sub.id,
+            ms = format!("{ms:.1}"),
+            upserts = d.upserts.len(),
+            deletes = d.deletes.len(),
+            "merge"
+        );
         Ok(d)
     }
 
@@ -337,7 +379,12 @@ impl Manager {
                         }
                     }
                     Ok(_) => {}
-                    Err(e) => warn!(sub = sub.id, code = e.code, error = e.message, "merge failed"),
+                    Err(e) => warn!(
+                        sub = sub.id,
+                        code = e.code,
+                        error = e.message,
+                        "merge failed"
+                    ),
                 }
             }
         });
@@ -407,7 +454,11 @@ pub fn dedupe_hash(normalized_sql: &str, params: &Params) -> String {
     h.update(normalized_sql.as_bytes());
     h.update([0]);
     h.update(serde_json::to_vec(params).expect("serializable"));
-    h.finalize().iter().take(12).map(|b| format!("{b:02x}")).collect()
+    h.finalize()
+        .iter()
+        .take(12)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[cfg(test)]

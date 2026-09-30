@@ -20,8 +20,18 @@ pub struct FunctionCatalog {
 
 /// Aggregates the rewriter can split into State/Merge. Values are the canonical spelling.
 const ALLOWED: &[&str] = &[
-    "count", "sum", "min", "max", "avg", "any", "uniq", "uniqExact", "argMin", "argMax",
-    "quantile", "quantiles",
+    "count",
+    "sum",
+    "min",
+    "max",
+    "avg",
+    "any",
+    "uniq",
+    "uniqExact",
+    "argMin",
+    "argMax",
+    "quantile",
+    "quantiles",
 ];
 /// Allowlisted aggregates whose names ClickHouse matches case-insensitively.
 const ALLOWED_CI: &[&str] = &["count", "sum", "min", "max", "avg"];
@@ -42,24 +52,83 @@ impl FunctionCatalog {
         let mut combinators: Vec<String> = combinators.into_iter().collect();
         // longest first so e.g. "OrDefault" is tried before "If"-like short suffixes
         combinators.sort_by_key(|c| std::cmp::Reverse(c.len()));
-        Self { aggregates: exact, aggregates_ci: ci, combinators }
+        Self {
+            aggregates: exact,
+            aggregates_ci: ci,
+            combinators,
+        }
     }
 
     pub fn builtin() -> Self {
         const AGGS: &[&str] = &[
-            "count", "sum", "min", "max", "avg", "any", "anyLast", "anyHeavy", "uniq",
-            "uniqExact", "uniqCombined", "uniqCombined64", "uniqHLL12", "uniqTheta", "argMin",
-            "argMax", "quantile", "quantiles", "quantileExact", "quantilesExact",
-            "quantileTDigest", "quantileTiming", "quantileDeterministic", "median",
-            "medianExact", "groupArray", "groupUniqArray", "groupBitmap", "topK", "sumMap",
-            "stddevPop", "stddevSamp", "varPop", "varSamp", "corr", "covarPop", "covarSamp",
-            "avgWeighted", "entropy", "histogram", "first_value", "last_value", "any_value",
-            "sumWithOverflow", "deltaSum", "windowFunnel", "retention", "sequenceMatch",
-            "sequenceCount", "simpleLinearRegression", "countDistinct", "groupConcat",
+            "count",
+            "sum",
+            "min",
+            "max",
+            "avg",
+            "any",
+            "anyLast",
+            "anyHeavy",
+            "uniq",
+            "uniqExact",
+            "uniqCombined",
+            "uniqCombined64",
+            "uniqHLL12",
+            "uniqTheta",
+            "argMin",
+            "argMax",
+            "quantile",
+            "quantiles",
+            "quantileExact",
+            "quantilesExact",
+            "quantileTDigest",
+            "quantileTiming",
+            "quantileDeterministic",
+            "median",
+            "medianExact",
+            "groupArray",
+            "groupUniqArray",
+            "groupBitmap",
+            "topK",
+            "sumMap",
+            "stddevPop",
+            "stddevSamp",
+            "varPop",
+            "varSamp",
+            "corr",
+            "covarPop",
+            "covarSamp",
+            "avgWeighted",
+            "entropy",
+            "histogram",
+            "first_value",
+            "last_value",
+            "any_value",
+            "sumWithOverflow",
+            "deltaSum",
+            "windowFunnel",
+            "retention",
+            "sequenceMatch",
+            "sequenceCount",
+            "simpleLinearRegression",
+            "countDistinct",
+            "groupConcat",
         ];
         const COMBINATORS: &[&str] = &[
-            "If", "Array", "Map", "State", "Merge", "MergeState", "ForEach", "Distinct",
-            "OrDefault", "OrNull", "Resample", "SimpleState", "ArgMin", "ArgMax",
+            "If",
+            "Array",
+            "Map",
+            "State",
+            "Merge",
+            "MergeState",
+            "ForEach",
+            "Distinct",
+            "OrDefault",
+            "OrNull",
+            "Resample",
+            "SimpleState",
+            "ArgMin",
+            "ArgMax",
         ];
         Self::new(
             AGGS.iter().map(|a| (a.to_string(), ALLOWED_CI.contains(a))),
@@ -77,8 +146,9 @@ impl FunctionCatalog {
         }
         depth < 4
             && self.combinators.iter().any(|c| {
-                name.strip_suffix(c.as_str())
-                    .is_some_and(|base| !base.is_empty() && self.is_aggregate_depth(base, depth + 1))
+                name.strip_suffix(c.as_str()).is_some_and(|base| {
+                    !base.is_empty() && self.is_aggregate_depth(base, depth + 1)
+                })
             })
     }
 
@@ -89,9 +159,9 @@ impl FunctionCatalog {
             Some(b) if !b.is_empty() => (b, "If"),
             _ => (name, ""),
         };
-        let canonical = ALLOWED.iter().find(|a| {
-            **a == base || (ALLOWED_CI.contains(a) && a.eq_ignore_ascii_case(base))
-        })?;
+        let canonical = ALLOWED
+            .iter()
+            .find(|a| **a == base || (ALLOWED_CI.contains(a) && a.eq_ignore_ascii_case(base)))?;
         Some(format!("{canonical}{suffix}"))
     }
 }
@@ -122,7 +192,14 @@ mod tests {
     #[test]
     fn detects_aggregates_and_combinators() {
         let c = FunctionCatalog::builtin();
-        for name in ["count", "COUNT", "sumIf", "uniqState", "quantilesExactIf", "groupArrayDistinct"] {
+        for name in [
+            "count",
+            "COUNT",
+            "sumIf",
+            "uniqState",
+            "quantilesExactIf",
+            "groupArrayDistinct",
+        ] {
             assert!(c.is_aggregate(name), "{name}");
         }
         for name in ["toStartOfMinute", "if", "plus", "Merge"] {

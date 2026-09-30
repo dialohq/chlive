@@ -94,11 +94,17 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        anyhow::ensure!(!cfg.tables.is_empty(), "config must allowlist at least one table");
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        anyhow::ensure!(
+            !cfg.tables.is_empty(),
+            "config must allowlist at least one table"
+        );
         for t in &cfg.tables {
             anyhow::ensure!(
-                t.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                t.name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
                 "table name {:?} must be a plain identifier",
                 t.name
             );

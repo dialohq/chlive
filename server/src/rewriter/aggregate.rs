@@ -4,12 +4,14 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
-    Ident, ObjectName, ObjectNamePart, SelectItem, VisitMut, VisitorMut,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+    ObjectName, ObjectNamePart, SelectItem, VisitMut, VisitorMut,
 };
 
 use super::validate::{contains_aggregate, func_name, Parts};
-use super::{ident_expr, params, quote_ident, Catalog, Options, ParamTypes, Plan, PlanKind, RewriteError};
+use super::{
+    ident_expr, params, quote_ident, Catalog, Options, ParamTypes, Plan, PlanKind, RewriteError,
+};
 
 struct Item {
     expr: Expr,
@@ -23,7 +25,12 @@ struct Key {
     alias: String,
 }
 
-pub fn plan(parts: Parts, catalog: &Catalog, opts: &Options, types: &ParamTypes) -> Result<Plan, RewriteError> {
+pub fn plan(
+    parts: Parts,
+    catalog: &Catalog,
+    opts: &Options,
+    types: &ParamTypes,
+) -> Result<Plan, RewriteError> {
     let schema = &catalog.tables[&parts.table];
     let columns: HashSet<&str> = schema.columns.iter().map(|(n, _)| n.as_str()).collect();
     let functions = &catalog.functions;
@@ -33,14 +40,22 @@ pub fn plan(parts: Parts, catalog: &Catalog, opts: &Options, types: &ParamTypes)
         match item {
             SelectItem::UnnamedExpr(e) => {
                 let name = params::restore(&e.to_string(), types);
-                items.push(Item { expr: e, alias: None, name });
+                items.push(Item {
+                    expr: e,
+                    alias: None,
+                    name,
+                });
             }
             SelectItem::ExprWithAlias { expr, alias } => items.push(Item {
                 expr,
                 name: alias.value.clone(),
                 alias: Some(alias.value),
             }),
-            _ => return Err(RewriteError::unsupported("SELECT * cannot be combined with aggregates or GROUP BY")),
+            _ => {
+                return Err(RewriteError::unsupported(
+                    "SELECT * cannot be combined with aggregates or GROUP BY",
+                ))
+            }
         }
     }
     check_unique_names(items.iter().map(|i| i.name.as_str()))?;
@@ -54,7 +69,9 @@ pub fn plan(parts: Parts, catalog: &Catalog, opts: &Options, types: &ParamTypes)
             if agg_aliases.contains_key(alias) {
                 continue;
             }
-            if contains_aggregate(&it.expr, functions) || references_any(&it.expr, &agg_aliases, alias) {
+            if contains_aggregate(&it.expr, functions)
+                || references_any(&it.expr, &agg_aliases, alias)
+            {
                 if columns.contains(alias.as_str()) {
                     return Err(RewriteError::unsupported(format!(
                         "alias '{alias}' of an aggregate expression shadows a column of '{}'; pick another name",
@@ -88,24 +105,45 @@ pub fn plan(parts: Parts, catalog: &Catalog, opts: &Options, types: &ParamTypes)
     for (i, g) in parts.group_by.iter().enumerate() {
         reject_positional(g, "GROUP BY")?;
         let by_alias = match g {
-            Expr::Identifier(id) => items.iter().find(|it| it.alias.as_deref() == Some(id.value.as_str())),
+            Expr::Identifier(id) => items
+                .iter()
+                .find(|it| it.alias.as_deref() == Some(id.value.as_str())),
             _ => None,
         };
         let key = if let Some(it) = by_alias.filter(|it| !agg_aliases.contains_key(&it.name)) {
-            Key { expr: it.expr.clone(), alias: it.name.clone() }
+            Key {
+                expr: it.expr.clone(),
+                alias: it.name.clone(),
+            }
         } else if by_alias.is_some() {
-            return Err(RewriteError::unsupported("GROUP BY cannot reference an aggregate"));
+            return Err(RewriteError::unsupported(
+                "GROUP BY cannot reference an aggregate",
+            ));
         } else if let Expr::Identifier(id) = g {
             if !columns.contains(id.value.as_str()) && !id.value.starts_with(params::PREFIX) {
-                return Err(RewriteError::unsupported(format!("unknown GROUP BY column '{}'", id.value)));
+                return Err(RewriteError::unsupported(format!(
+                    "unknown GROUP BY column '{}'",
+                    id.value
+                )));
             }
-            Key { expr: g.clone(), alias: id.value.clone() }
+            Key {
+                expr: g.clone(),
+                alias: id.value.clone(),
+            }
         } else {
             let text = g.to_string();
-            let aliased = items.iter().find(|it| it.alias.is_some() && it.expr.to_string() == text);
+            let aliased = items
+                .iter()
+                .find(|it| it.alias.is_some() && it.expr.to_string() == text);
             match aliased {
-                Some(it) => Key { expr: g.clone(), alias: it.name.clone() },
-                None => Key { expr: g.clone(), alias: format!("__key_{i}") },
+                Some(it) => Key {
+                    expr: g.clone(),
+                    alias: it.name.clone(),
+                },
+                None => Key {
+                    expr: g.clone(),
+                    alias: format!("__key_{i}"),
+                },
             }
         };
         if columns.contains(key.alias.as_str())
@@ -164,7 +202,12 @@ pub fn plan(parts: Parts, catalog: &Catalog, opts: &Options, types: &ParamTypes)
             e => format!("{e} AS {}", quote_ident(&k.alias)),
         })
         .collect();
-    select_list.extend(rw.slots.iter().enumerate().map(|(i, s)| format!("{} AS __agg_{i}", s.state)));
+    select_list.extend(
+        rw.slots
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{} AS __agg_{i}", s.state)),
+    );
 
     let key_aliases: Vec<String> = keys.iter().map(|k| quote_ident(&k.alias)).collect();
     let inner_suffix = if keys.is_empty() {
@@ -178,7 +221,11 @@ pub fn plan(parts: Parts, catalog: &Catalog, opts: &Options, types: &ParamTypes)
         .map(|it| {
             let e = it.expr.to_string();
             let q = quote_ident(&it.name);
-            if e == q { e } else { format!("{e} AS {q}") }
+            if e == q {
+                e
+            } else {
+                format!("{e} AS {q}")
+            }
         })
         .collect();
     merge_select.extend(
@@ -231,11 +278,15 @@ pub fn plan(parts: Parts, catalog: &Catalog, opts: &Options, types: &ParamTypes)
     })
 }
 
-pub(super) fn check_unique_names<'a>(names: impl Iterator<Item = &'a str>) -> Result<(), RewriteError> {
+pub(super) fn check_unique_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+) -> Result<(), RewriteError> {
     let mut seen = HashSet::new();
     for n in names {
         if n.starts_with("__") {
-            return Err(RewriteError::unsupported(format!("column names starting with '__' are reserved: {n}")));
+            return Err(RewriteError::unsupported(format!(
+                "column names starting with '__' are reserved: {n}"
+            )));
         }
         if !seen.insert(n) {
             return Err(RewriteError::unsupported(format!(
@@ -257,14 +308,20 @@ pub(super) fn reject_positional(e: &Expr, clause: &str) -> Result<(), RewriteErr
 
 fn references_any(e: &Expr, aliases: &HashMap<String, Expr>, own: &str) -> bool {
     sqlparser::ast::visit_expressions(e, |e| match e {
-        Expr::Identifier(id) if id.value != own && aliases.contains_key(&id.value) => ControlFlow::Break(()),
+        Expr::Identifier(id) if id.value != own && aliases.contains_key(&id.value) => {
+            ControlFlow::Break(())
+        }
         _ => ControlFlow::Continue(()),
     })
     .is_break()
 }
 
 /// Replace references to aggregate aliases with the aliased expression.
-fn expand_aliases(e: &mut Expr, aliases: &HashMap<String, Expr>, own: Option<&str>) -> Result<(), RewriteError> {
+fn expand_aliases(
+    e: &mut Expr,
+    aliases: &HashMap<String, Expr>,
+    own: Option<&str>,
+) -> Result<(), RewriteError> {
     struct Expander<'a> {
         aliases: &'a HashMap<String, Expr>,
         own: Option<&'a str>,
@@ -278,7 +335,9 @@ fn expand_aliases(e: &mut Expr, aliases: &HashMap<String, Expr>, own: Option<&st
                     if let Some(target) = self.aliases.get(&id.value) {
                         self.steps += 1;
                         if self.steps > 256 {
-                            return ControlFlow::Break(RewriteError::unsupported("cyclic alias references"));
+                            return ControlFlow::Break(RewriteError::unsupported(
+                                "cyclic alias references",
+                            ));
                         }
                         *e = Expr::Nested(Box::new(target.clone()));
                     }
@@ -287,7 +346,11 @@ fn expand_aliases(e: &mut Expr, aliases: &HashMap<String, Expr>, own: Option<&st
             ControlFlow::Continue(())
         }
     }
-    match e.visit(&mut Expander { aliases, own, steps: 0 }) {
+    match e.visit(&mut Expander {
+        aliases,
+        own,
+        steps: 0,
+    }) {
         ControlFlow::Break(err) => Err(err),
         ControlFlow::Continue(()) => Ok(()),
     }
@@ -327,13 +390,18 @@ impl SlotRewriter<'_> {
             for a in &l.args {
                 if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
                     if contains_aggregate(e, self.functions) {
-                        return Err(RewriteError::unsupported("nested aggregate functions are not supported"));
+                        return Err(RewriteError::unsupported(
+                            "nested aggregate functions are not supported",
+                        ));
                     }
                 }
             }
             // count(*) ≡ count()
             if canonical == "count"
-                && matches!(l.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)])
+                && matches!(
+                    l.args.as_slice(),
+                    [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+                )
             {
                 l.args.clear();
             }
@@ -347,7 +415,9 @@ impl SlotRewriter<'_> {
         let idx = match self.slot_index.get(&signature) {
             Some(i) => *i,
             None => {
-                self.slots.push(Slot { state: state.to_string() });
+                self.slots.push(Slot {
+                    state: state.to_string(),
+                });
                 self.slot_index.insert(signature, self.slots.len() - 1);
                 self.slots.len() - 1
             }
@@ -356,7 +426,9 @@ impl SlotRewriter<'_> {
         merge.name = fn_name(&format!("{canonical}Merge"));
         merge.args = FunctionArguments::List(FunctionArgumentList {
             duplicate_treatment: None,
-            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(ident_expr(&format!("__agg_{idx}"))))],
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(ident_expr(
+                &format!("__agg_{idx}"),
+            )))],
             clauses: vec![],
         });
         Ok(Expr::Function(merge))

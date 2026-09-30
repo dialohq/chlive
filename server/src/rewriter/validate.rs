@@ -4,8 +4,8 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     visit_expressions, DuplicateTreatment, Expr, Function, FunctionArguments, GroupByExpr,
-    LimitClause, ObjectNamePart, OrderByExpr, OrderByKind, Query, SelectItem, SetExpr,
-    TableFactor, Value,
+    LimitClause, ObjectNamePart, OrderByExpr, OrderByKind, Query, SelectItem, SetExpr, TableFactor,
+    Value,
 };
 
 use super::{params, Catalog, FunctionCatalog, RewriteError};
@@ -30,7 +30,10 @@ impl Parts {
                 contains_aggregate(e, f)
             }
             _ => false,
-        }) || self.having.as_ref().is_some_and(|h| contains_aggregate(h, f))
+        }) || self
+            .having
+            .as_ref()
+            .is_some_and(|h| contains_aggregate(h, f))
             || self.order_by.iter().any(|o| contains_aggregate(&o.expr, f))
     }
 }
@@ -66,12 +69,20 @@ pub fn validate(q: Query, catalog: &Catalog) -> Result<Parts, RewriteError> {
     if q.format_clause.is_some() {
         return unsupported("FORMAT is not supported");
     }
-    if q.fetch.is_some() || !q.locks.is_empty() || q.for_clause.is_some() || !q.pipe_operators.is_empty() {
+    if q.fetch.is_some()
+        || !q.locks.is_empty()
+        || q.for_clause.is_some()
+        || !q.pipe_operators.is_empty()
+    {
         return unsupported("FETCH / FOR / locking clauses are not supported");
     }
     let limit = match &q.limit_clause {
         None => None,
-        Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
+        Some(LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => {
             if offset.is_some() {
                 return unsupported("OFFSET is not supported");
             }
@@ -89,7 +100,9 @@ pub fn validate(q: Query, catalog: &Catalog) -> Result<Parts, RewriteError> {
                 Some(_) => return unsupported("LIMIT must be a non-negative integer literal"),
             }
         }
-        Some(LimitClause::OffsetCommaLimit { .. }) => return unsupported("OFFSET is not supported"),
+        Some(LimitClause::OffsetCommaLimit { .. }) => {
+            return unsupported("OFFSET is not supported")
+        }
     };
     let order_by = match q.order_by {
         None => Vec::new(),
@@ -110,7 +123,9 @@ pub fn validate(q: Query, catalog: &Catalog) -> Result<Parts, RewriteError> {
     };
     let select = match *q.body {
         SetExpr::Select(s) => s,
-        SetExpr::SetOperation { .. } => return unsupported("UNION / INTERSECT / EXCEPT are not supported"),
+        SetExpr::SetOperation { .. } => {
+            return unsupported("UNION / INTERSECT / EXCEPT are not supported")
+        }
         SetExpr::Query(_) => return unsupported("subqueries are not supported"),
         _ => return unsupported("only plain SELECT queries are supported"),
     };
@@ -121,7 +136,11 @@ pub fn validate(q: Query, catalog: &Catalog) -> Result<Parts, RewriteError> {
     if s.into.is_some() {
         return unsupported("INTO is not supported");
     }
-    if s.top.is_some() || s.exclude.is_some() || s.select_modifiers.is_some() || !s.optimizer_hints.is_empty() {
+    if s.top.is_some()
+        || s.exclude.is_some()
+        || s.select_modifiers.is_some()
+        || !s.optimizer_hints.is_empty()
+    {
         return unsupported("SELECT modifiers are not supported");
     }
     if s.prewhere.is_some() {
@@ -178,8 +197,18 @@ fn validate_from(
     if !twj.joins.is_empty() {
         return unsupported("joins (including ARRAY JOIN) are not supported");
     }
-    let TableFactor::Table { name, alias, args, sample, version, with_hints, partitions, json_path, index_hints, with_ordinality } =
-        &twj.relation
+    let TableFactor::Table {
+        name,
+        alias,
+        args,
+        sample,
+        version,
+        with_hints,
+        partitions,
+        json_path,
+        index_hints,
+        with_ordinality,
+    } = &twj.relation
     else {
         return unsupported("FROM must name a table directly; subqueries are not supported");
     };
@@ -188,15 +217,21 @@ fn validate_from(
     }
     if let Some(a) = alias {
         if a.name.value.eq_ignore_ascii_case("FINAL") {
-            return unsupported("FINAL is not supported (source tables are plain append-only MergeTree)");
+            return unsupported(
+                "FINAL is not supported (source tables are plain append-only MergeTree)",
+            );
         }
         return unsupported("table aliases are not supported");
     }
     if sample.is_some() {
         return unsupported("SAMPLE is not supported");
     }
-    if version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || json_path.is_some()
-        || !index_hints.is_empty() || *with_ordinality
+    if version.is_some()
+        || !with_hints.is_empty()
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || !index_hints.is_empty()
+        || *with_ordinality
     {
         return unsupported("unsupported table modifier");
     }
@@ -225,21 +260,62 @@ fn validate_from(
 }
 
 const TIME_FUNCTIONS: &[&str] = &[
-    "now", "now64", "nowinblock", "today", "yesterday", "current_timestamp", "current_date",
-    "curdate", "localtimestamp", "utctimestamp", "utc_timestamp", "sysdate", "timezoneof",
+    "now",
+    "now64",
+    "nowinblock",
+    "today",
+    "yesterday",
+    "current_timestamp",
+    "current_date",
+    "curdate",
+    "localtimestamp",
+    "utctimestamp",
+    "utc_timestamp",
+    "sysdate",
+    "timezoneof",
 ];
 const NONDETERMINISTIC: &[&str] = &[
-    "uptime", "rownumberinblock", "rownumberinallblocks", "blocknumber", "blocksize",
-    "runningdifference", "runningdifferencestartingwithfirstvalue", "runningaccumulate",
-    "neighbor", "hostname", "fqdn", "serveruuid", "currentuser", "currentdatabase",
-    "currentprofiles", "currentroles", "initialqueryid", "queryid", "sleep",
-    "sleepeachrow", "throwif", "getsetting", "dictget", "joinget",
+    "uptime",
+    "rownumberinblock",
+    "rownumberinallblocks",
+    "blocknumber",
+    "blocksize",
+    "runningdifference",
+    "runningdifferencestartingwithfirstvalue",
+    "runningaccumulate",
+    "neighbor",
+    "hostname",
+    "fqdn",
+    "serveruuid",
+    "currentuser",
+    "currentdatabase",
+    "currentprofiles",
+    "currentroles",
+    "initialqueryid",
+    "queryid",
+    "sleep",
+    "sleepeachrow",
+    "throwif",
+    "getsetting",
+    "dictget",
+    "joinget",
 ];
-const NONDETERMINISTIC_PREFIXES: &[&str] = &["rand", "random", "generateuuid", "generateulid", "generatesnowflake", "fuzzbits", "dictget"];
+const NONDETERMINISTIC_PREFIXES: &[&str] = &[
+    "rand",
+    "random",
+    "generateuuid",
+    "generateulid",
+    "generatesnowflake",
+    "fuzzbits",
+    "dictget",
+];
 
 fn check_function(f: &Function) -> Result<(), RewriteError> {
     let Some(name) = func_name(f) else {
-        return unsupported(format!("qualified function names are not supported: {}", f.name));
+        return unsupported(format!(
+            "qualified function names are not supported: {}",
+            f.name
+        ));
     };
     let lower = name.to_ascii_lowercase();
     if TIME_FUNCTIONS.contains(&lower.as_str()) {
@@ -249,7 +325,9 @@ fn check_function(f: &Function) -> Result<(), RewriteError> {
         ));
     }
     if NONDETERMINISTIC.contains(&lower.as_str())
-        || NONDETERMINISTIC_PREFIXES.iter().any(|p| lower.starts_with(p))
+        || NONDETERMINISTIC_PREFIXES
+            .iter()
+            .any(|p| lower.starts_with(p))
     {
         return unsupported(format!(
             "{name}() is not allowed: live queries must be deterministic"
@@ -258,7 +336,11 @@ fn check_function(f: &Function) -> Result<(), RewriteError> {
     if f.over.is_some() {
         return unsupported("window functions (OVER) are not supported");
     }
-    if f.filter.is_some() || !f.within_group.is_empty() || f.null_treatment.is_some() || f.uses_odbc_syntax {
+    if f.filter.is_some()
+        || !f.within_group.is_empty()
+        || f.null_treatment.is_some()
+        || f.uses_odbc_syntax
+    {
         return unsupported(format!("unsupported syntax in call to {name}"));
     }
     for args in [&f.args, &f.parameters] {
@@ -290,7 +372,11 @@ fn check_expr(e: &Expr) -> Result<(), RewriteError> {
         // There is exactly one table and table aliases are rejected, so qualifiers are noise.
         Expr::CompoundIdentifier(parts) => unsupported(format!(
             "qualified column names are not supported: {}",
-            parts.iter().map(|p| p.value.as_str()).collect::<Vec<_>>().join(".")
+            parts
+                .iter()
+                .map(|p| p.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
         )),
         _ => Ok(()),
     }
@@ -298,7 +384,9 @@ fn check_expr(e: &Expr) -> Result<(), RewriteError> {
 
 fn check_ident(name: &str) -> Result<(), RewriteError> {
     if name.starts_with("__") && !name.starts_with(params::PREFIX) {
-        return unsupported(format!("identifiers starting with '__' are reserved: {name}"));
+        return unsupported(format!(
+            "identifiers starting with '__' are reserved: {name}"
+        ));
     }
     Ok(())
 }

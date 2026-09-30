@@ -13,11 +13,31 @@ use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 
 const COUNTRIES: &[(&str, u32)] = &[
-    ("US", 30), ("DE", 12), ("GB", 10), ("PL", 8), ("FR", 8), ("IN", 7), ("BR", 5), ("JP", 5),
-    ("CA", 4), ("ES", 3), ("IT", 3), ("NL", 2), ("SE", 1), ("AU", 1), ("MX", 1),
+    ("US", 30),
+    ("DE", 12),
+    ("GB", 10),
+    ("PL", 8),
+    ("FR", 8),
+    ("IN", 7),
+    ("BR", 5),
+    ("JP", 5),
+    ("CA", 4),
+    ("ES", 3),
+    ("IT", 3),
+    ("NL", 2),
+    ("SE", 1),
+    ("AU", 1),
+    ("MX", 1),
 ];
 pub const PATHS: &[&str] = &[
-    "/", "/search", "/product", "/cart", "/checkout", "/login", "/account", "/api/orders",
+    "/",
+    "/search",
+    "/product",
+    "/cart",
+    "/checkout",
+    "/login",
+    "/account",
+    "/api/orders",
 ];
 const USERS: u32 = 5_000;
 
@@ -59,12 +79,21 @@ impl Generator {
             .map(|t| t.partitions().len() as i32)
             .filter(|n| *n > 0)
             .with_context(|| format!("topic {topic} has no partitions"))?;
-        Ok(Self { producer, topic: topic.to_string(), partitions })
+        Ok(Self {
+            producer,
+            topic: topic.to_string(),
+            partitions,
+        })
     }
 
     /// Produce `count` events (forever when `None`) at up to `rate` events/s (unthrottled
     /// when `None`). Returns the highest acknowledged offset per partition.
-    pub async fn produce(&self, count: Option<u64>, rate: Option<f64>, ts: TsMode) -> Result<Offsets> {
+    pub async fn produce(
+        &self,
+        count: Option<u64>,
+        rate: Option<f64>,
+        ts: TsMode,
+    ) -> Result<Offsets> {
         let mut offsets = Offsets::new();
         let mut inflight = FuturesUnordered::new();
         let started = tokio::time::Instant::now();
@@ -76,14 +105,19 @@ impl Generator {
             }
             let (payload, partition) = {
                 let mut rng = rand::rng();
-                (random_event(&mut rng, ts, Utc::now()), rng.random_range(0..self.partitions))
+                (
+                    random_event(&mut rng, ts, Utc::now()),
+                    rng.random_range(0..self.partitions),
+                )
             };
             let producer = &self.producer;
             let topic = &self.topic;
             inflight.push(async move {
                 producer
                     .send(
-                        FutureRecord::<(), _>::to(topic).payload(&payload).partition(partition),
+                        FutureRecord::<(), _>::to(topic)
+                            .payload(&payload)
+                            .partition(partition),
                         Duration::from_secs(30),
                     )
                     .await
@@ -98,7 +132,7 @@ impl Generator {
             while let Some(Some(done)) = futures::FutureExt::now_or_never(inflight.next()) {
                 record(&mut offsets, done?);
             }
-            if sent % 100_000 == 0 {
+            if sent.is_multiple_of(100_000) {
                 tracing::info!(sent, "produced");
             }
         }

@@ -17,19 +17,26 @@ pub fn plan(parts: Parts, catalog: &Catalog, types: &ParamTypes) -> Result<Plan,
         }
     };
     if limit > cap {
-        return Err(RewriteError::unsupported(format!("LIMIT {limit} exceeds the maximum of {cap}")));
+        return Err(RewriteError::unsupported(format!(
+            "LIMIT {limit} exceeds the maximum of {cap}"
+        )));
     }
     if parts.having.is_some() {
-        return Err(RewriteError::unsupported("HAVING requires GROUP BY or aggregates"));
+        return Err(RewriteError::unsupported(
+            "HAVING requires GROUP BY or aggregates",
+        ));
     }
     let schema = &catalog.tables[&parts.table];
 
     let mut items: Vec<(Expr, String)> = Vec::new();
     for item in parts.projection {
         match item {
-            SelectItem::Wildcard(_) => {
-                items.extend(schema.columns.iter().map(|(c, _)| (ident_expr(c), c.clone())))
-            }
+            SelectItem::Wildcard(_) => items.extend(
+                schema
+                    .columns
+                    .iter()
+                    .map(|(c, _)| (ident_expr(c), c.clone())),
+            ),
             SelectItem::UnnamedExpr(e) => {
                 let name = params::restore(&e.to_string(), types);
                 items.push((e, name));
@@ -45,7 +52,11 @@ pub fn plan(parts: Parts, catalog: &Catalog, types: &ParamTypes) -> Result<Plan,
         .map(|(e, name)| {
             let e = e.to_string();
             let q = quote_ident(name);
-            if e == q { e } else { format!("{e} AS {q}") }
+            if e == q {
+                e
+            } else {
+                format!("{e} AS {q}")
+            }
         })
         .collect();
     let mut order = Vec::new();
@@ -66,7 +77,10 @@ pub fn plan(parts: Parts, catalog: &Catalog, types: &ParamTypes) -> Result<Plan,
     Ok(Plan {
         kind: PlanKind::Rows,
         table: parts.table.clone(),
-        key_columns: super::ROW_KEY_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        key_columns: super::ROW_KEY_COLUMNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         output_columns: items.into_iter().map(|(_, n)| n).collect(),
         has_order: true,
         result_cap: None,

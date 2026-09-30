@@ -26,7 +26,10 @@ impl Diff {
 
 /// JSON-encoded array of the key column values, e.g. `["PL"]`.
 pub fn row_key(key_columns: &[String], row: &Row) -> String {
-    let vals: Vec<&Value> = key_columns.iter().map(|c| row.get(c).unwrap_or(&Value::Null)).collect();
+    let vals: Vec<&Value> = key_columns
+        .iter()
+        .map(|c| row.get(c).unwrap_or(&Value::Null))
+        .collect();
     serde_json::to_string(&vals).expect("serializable")
 }
 
@@ -53,7 +56,11 @@ pub fn diff(old: &KeyedRows, new: &KeyedRows) -> Diff {
         .filter(|(k, row)| old.get(*k) != Some(*row))
         .map(|(_, row)| row.clone())
         .collect();
-    let deletes = old.keys().filter(|k| !new.contains_key(*k)).cloned().collect();
+    let deletes = old
+        .keys()
+        .filter(|k| !new.contains_key(*k))
+        .cloned()
+        .collect();
     Diff { upserts, deletes }
 }
 
@@ -70,8 +77,14 @@ mod tests {
         items
             .iter()
             .map(|(c, n)| {
-                let key = row_key(&["country".into()], json!({"country": c}).as_object().unwrap());
-                let row = json!({"__key": key, "country": c, "n": n}).as_object().unwrap().clone();
+                let key = row_key(
+                    &["country".into()],
+                    json!({"country": c}).as_object().unwrap(),
+                );
+                let row = json!({"__key": key, "country": c, "n": n})
+                    .as_object()
+                    .unwrap()
+                    .clone();
                 (key, row)
             })
             .collect()
@@ -80,7 +93,10 @@ mod tests {
     #[test]
     fn keys_are_json_arrays() {
         let r = json!({"a": "PL", "b": 3});
-        assert_eq!(row_key(&["a".into(), "b".into()], r.as_object().unwrap()), r#"["PL",3]"#);
+        assert_eq!(
+            row_key(&["a".into(), "b".into()], r.as_object().unwrap()),
+            r#"["PL",3]"#
+        );
         assert_eq!(row_key(&[], r.as_object().unwrap()), "[]");
     }
 
@@ -89,7 +105,11 @@ mod tests {
         let old = rows(&[("PL", 1), ("DE", 2), ("FR", 3)]);
         let new = rows(&[("PL", 1), ("DE", 5), ("US", 1)]);
         let d = diff(&old, &new);
-        let up: Vec<_> = d.upserts.iter().map(|r| r["country"].as_str().unwrap()).collect();
+        let up: Vec<_> = d
+            .upserts
+            .iter()
+            .map(|r| r["country"].as_str().unwrap())
+            .collect();
         assert_eq!(up, ["DE", "US"]);
         assert_eq!(d.deletes, [r#"["FR"]"#]);
         assert!(diff(&new, &new).is_empty());

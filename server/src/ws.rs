@@ -66,7 +66,10 @@ pub struct AppState {
 }
 
 pub fn router(manager: Arc<Manager>) -> Router {
-    let state = AppState { manager, next_conn: Arc::new(AtomicU64::new(1)) };
+    let state = AppState {
+        manager,
+        next_conn: Arc::new(AtomicU64::new(1)),
+    };
     Router::new()
         .route("/live", get(live))
         .route("/debug/subscriptions", get(debug_subs))
@@ -108,7 +111,11 @@ async fn connection(socket: WebSocket, conn: ConnId, manager: Arc<Manager>) {
         let parsed: ClientMsg = match serde_json::from_str(&text) {
             Ok(m) => m,
             Err(e) => {
-                let _ = tx.send(ServerMsg::Error { id: None, code: "BAD_MESSAGE".into(), message: e.to_string() });
+                let _ = tx.send(ServerMsg::Error {
+                    id: None,
+                    code: "BAD_MESSAGE".into(),
+                    message: e.to_string(),
+                });
                 continue;
             }
         };
@@ -130,7 +137,10 @@ async fn connection(socket: WebSocket, conn: ConnId, manager: Arc<Manager>) {
                 // Snapshots can take a while; don't block other messages on this socket.
                 let (manager, tx, subs) = (manager.clone(), tx.clone(), subs.clone());
                 tasks.spawn(async move {
-                    match manager.subscribe(conn, id.clone(), &sql, &params, tx.clone()).await {
+                    match manager
+                        .subscribe(conn, id.clone(), &sql, &params, tx.clone())
+                        .await
+                    {
                         Ok(hash) => {
                             let mut s = subs.lock().await;
                             match s.get_mut(&id) {
@@ -144,7 +154,11 @@ async fn connection(socket: WebSocket, conn: ConnId, manager: Arc<Manager>) {
                         }
                         Err(e) => {
                             subs.lock().await.remove(&id);
-                            let _ = tx.send(ServerMsg::Error { id: Some(id), code: e.code.into(), message: e.message });
+                            let _ = tx.send(ServerMsg::Error {
+                                id: Some(id),
+                                code: e.code.into(),
+                                message: e.message,
+                            });
                         }
                     }
                 });

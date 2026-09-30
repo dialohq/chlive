@@ -38,7 +38,9 @@ async fn main() -> Result<()> {
     let generator = Generator::new(&cli.brokers, &cli.topic)?;
     let offsets = match cli.cmd {
         Cmd::Seed { count, days } => {
-            generator.produce(Some(count), None, TsMode::Backdated { days }).await?
+            generator
+                .produce(Some(count), None, TsMode::Backdated { days })
+                .await?
         }
         Cmd::Stream { rate, count } => {
             tokio::select! {

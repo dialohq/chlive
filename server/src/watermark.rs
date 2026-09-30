@@ -12,7 +12,11 @@ pub struct Watermark(pub BTreeMap<u32, i64>);
 impl Watermark {
     /// Watermark covering `partitions`, filling partitions without rows with `-1`.
     pub fn from_max_offsets(partitions: u32, max: &BTreeMap<u32, i64>) -> Self {
-        Self((0..partitions).map(|p| (p, max.get(&p).copied().unwrap_or(-1))).collect())
+        Self(
+            (0..partitions)
+                .map(|p| (p, max.get(&p).copied().unwrap_or(-1)))
+                .collect(),
+        )
     }
 
     pub fn get(&self, partition: u32) -> i64 {
@@ -81,7 +85,10 @@ mod tests {
             w.tail_pred(),
             "toInt64(_offset) > multiIf(_partition = 0, 120, _partition = 1, 98, -1)"
         );
-        assert_eq!(Watermark::default().history_pred(), "toInt64(_offset) <= -1");
+        assert_eq!(
+            Watermark::default().history_pred(),
+            "toInt64(_offset) <= -1"
+        );
     }
 
     #[test]

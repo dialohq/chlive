@@ -50,25 +50,56 @@ impl Drop for Server {
 
 async fn load_functions(main: &ChHttp) -> Result<FunctionCatalog> {
     let aggs = main
-        .query("SELECT name, case_insensitive FROM system.functions WHERE is_aggregate", &Params::new())
+        .query(
+            "SELECT name, case_insensitive FROM system.functions WHERE is_aggregate",
+            &Params::new(),
+        )
         .await?;
-    let combs = main.query("SELECT name FROM system.aggregate_function_combinators", &Params::new()).await?;
+    let combs = main
+        .query(
+            "SELECT name FROM system.aggregate_function_combinators",
+            &Params::new(),
+        )
+        .await?;
     Ok(FunctionCatalog::new(
         aggs.data.iter().filter_map(|r| {
-            Some((r["name"].as_str()?.to_string(), r["case_insensitive"].as_u64().unwrap_or(0) == 1))
+            Some((
+                r["name"].as_str()?.to_string(),
+                r["case_insensitive"].as_u64().unwrap_or(0) == 1,
+            ))
         }),
-        combs.data.iter().filter_map(|r| r["name"].as_str().map(str::to_string)),
+        combs
+            .data
+            .iter()
+            .filter_map(|r| r["name"].as_str().map(str::to_string)),
     ))
 }
 
 /// Prepare the cache, start tail consumers and serve HTTP/WebSocket on `cfg.listen`.
 pub async fn start(cfg: Config) -> Result<Server> {
-    let main = ChHttp::new(&cfg.main.url, &cfg.main.user, &cfg.main.password, &cfg.main.database);
-    let cache_root = ChHttp::new(&cfg.cache.url, &cfg.cache.user, &cfg.cache.password, "default");
+    let main = ChHttp::new(
+        &cfg.main.url,
+        &cfg.main.user,
+        &cfg.main.password,
+        &cfg.main.database,
+    );
+    let cache_root = ChHttp::new(
+        &cfg.cache.url,
+        &cfg.cache.user,
+        &cfg.cache.password,
+        "default",
+    );
     // The cache holds no durable state: start from an empty database every time.
     let db = &cfg.cache.database;
-    cache_root.exec(&format!("DROP DATABASE IF EXISTS {db} SYNC"), &Params::new()).await?;
-    cache_root.exec(&format!("CREATE DATABASE {db}"), &Params::new()).await?;
+    cache_root
+        .exec(
+            &format!("DROP DATABASE IF EXISTS {db} SYNC"),
+            &Params::new(),
+        )
+        .await?;
+    cache_root
+        .exec(&format!("CREATE DATABASE {db}"), &Params::new())
+        .await?;
     let cache: Arc<dyn CacheEngine> = Arc::new(ClickHouseCache(cache_root.with_database(db)));
 
     let functions = match load_functions(&main).await {
@@ -95,7 +126,12 @@ pub async fn start(cfg: Config) -> Result<Server> {
             tail_max: RwLock::new(w0.clone()),
             w0,
         });
-        tasks.push(tail::spawn(cfg.kafka.clone(), cache.clone(), rt.clone(), tx.clone())?);
+        tasks.push(tail::spawn(
+            cfg.kafka.clone(),
+            cache.clone(),
+            rt.clone(),
+            tx.clone(),
+        )?);
         schemas.insert(t.name.clone(), schema);
         tables.insert(t.name.clone(), rt);
     }
@@ -107,10 +143,18 @@ pub async fn start(cfg: Config) -> Result<Server> {
         rows_limit_cap: cfg.rows_limit_cap,
         source_template: cfg.cache.remote_source.clone(),
     });
-    let manager = Manager::new(catalog, tables.clone(), main, cache, Duration::from_millis(cfg.debounce_ms));
+    let manager = Manager::new(
+        catalog,
+        tables.clone(),
+        main,
+        cache,
+        Duration::from_millis(cfg.debounce_ms),
+    );
     tasks.push(manager.spawn_router(rx));
 
-    let listener = tokio::net::TcpListener::bind(&cfg.listen).await.with_context(|| format!("binding {}", cfg.listen))?;
+    let listener = tokio::net::TcpListener::bind(&cfg.listen)
+        .await
+        .with_context(|| format!("binding {}", cfg.listen))?;
     let addr = listener.local_addr()?;
     let app = ws::router(manager.clone());
     tasks.insert(
@@ -122,5 +166,10 @@ pub async fn start(cfg: Config) -> Result<Server> {
         }),
     );
     info!(%addr, "chlive listening");
-    Ok(Server { addr, manager, tables, tasks })
+    Ok(Server {
+        addr,
+        manager,
+        tables,
+        tasks,
+    })
 }

@@ -24,7 +24,7 @@ pub fn extract(sql: &str) -> Result<(String, ParamTypes), RewriteError> {
     while let Some(tok) = scanner.next() {
         match tok {
             Tok::Opaque(s) => out.push_str(s),
-            Tok::Code(c) if c == '{' => {
+            Tok::Code('{') => {
                 let (name, ty) = scanner.placeholder()?;
                 if let Some(prev) = types.get(&name) {
                     if *prev != ty {
@@ -58,7 +58,10 @@ pub fn restore(sql: &str, types: &ParamTypes) -> String {
                 if !prev_ident && c == '_' && scanner.rest().starts_with(&PREFIX[1..]) {
                     let word = scanner.take_ident_tail();
                     let full = format!("_{word}");
-                    match full.strip_prefix(PREFIX).and_then(|n| types.get_key_value(n)) {
+                    match full
+                        .strip_prefix(PREFIX)
+                        .and_then(|n| types.get_key_value(n))
+                    {
                         Some((name, ty)) => out.push_str(&format!("{{{name}:{ty}}}")),
                         None => out.push_str(&full),
                     }
@@ -158,7 +161,8 @@ impl<'a> Scanner<'a> {
 
     /// Called right after a `{`; consumes `name:Type}`.
     fn placeholder(&mut self) -> Result<(String, String), RewriteError> {
-        let bad = || RewriteError::unsupported("malformed parameter placeholder; expected {name:Type}");
+        let bad =
+            || RewriteError::unsupported("malformed parameter placeholder; expected {name:Type}");
         let rest = self.rest();
         let name_len = rest
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))

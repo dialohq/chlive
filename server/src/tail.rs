@@ -43,7 +43,10 @@ pub fn tail_table(table: &str) -> String {
 
 pub async fn describe(main: &ChHttp, table: &str) -> Result<TableSchema> {
     let r = main
-        .query(&format!("DESCRIBE TABLE {}.{}", main.database(), quote_ident(table)), &Params::new())
+        .query(
+            &format!("DESCRIBE TABLE {}.{}", main.database(), quote_ident(table)),
+            &Params::new(),
+        )
         .await
         .with_context(|| format!("describing {table} on main"))?;
     let columns: Vec<(String, String)> = r
@@ -62,7 +65,10 @@ pub async fn describe(main: &ChHttp, table: &str) -> Result<TableSchema> {
             "source table {table} must have a {required} column (see NOTES.md assumptions)"
         );
     }
-    Ok(TableSchema { name: table.to_string(), columns })
+    Ok(TableSchema {
+        name: table.to_string(),
+        columns,
+    })
 }
 
 /// Current `max(_offset)` per partition on main.
@@ -73,8 +79,14 @@ pub async fn fetch_watermark(main: &ChHttp, table: &str, partitions: u32) -> Res
         .with_context(|| format!("fetching watermark of {table}"))?;
     let mut max = BTreeMap::new();
     for row in &r.data {
-        let p = row.get("p").and_then(Value::as_u64).context("bad _partition")? as u32;
-        let o = row.get("o").and_then(Value::as_i64).context("bad max(_offset)")?;
+        let p = row
+            .get("p")
+            .and_then(Value::as_u64)
+            .context("bad _partition")? as u32;
+        let o = row
+            .get("o")
+            .and_then(Value::as_i64)
+            .context("bad max(_offset)")?;
         max.insert(p, o);
     }
     Ok(Watermark::from_max_offsets(partitions, &max))
@@ -83,11 +95,20 @@ pub async fn fetch_watermark(main: &ChHttp, table: &str, partitions: u32) -> Res
 /// Drop and recreate `tail_<table>` with the source schema.
 pub async fn create_tail_table(cache: &dyn CacheEngine, schema: &TableSchema) -> Result<()> {
     let t = tail_table(&schema.name);
-    cache.exec(&format!("DROP TABLE IF EXISTS {t} SYNC"), &Params::new()).await?;
-    let cols: Vec<String> = schema.columns.iter().map(|(n, ty)| format!("{} {ty}", quote_ident(n))).collect();
+    cache
+        .exec(&format!("DROP TABLE IF EXISTS {t} SYNC"), &Params::new())
+        .await?;
+    let cols: Vec<String> = schema
+        .columns
+        .iter()
+        .map(|(n, ty)| format!("{} {ty}", quote_ident(n)))
+        .collect();
     cache
         .exec(
-            &format!("CREATE TABLE {t} ({}) ENGINE = MergeTree ORDER BY (_partition, _offset)", cols.join(", ")),
+            &format!(
+                "CREATE TABLE {t} ({}) ENGINE = MergeTree ORDER BY (_partition, _offset)",
+                cols.join(", ")
+            ),
             &Params::new(),
         )
         .await
@@ -109,8 +130,14 @@ fn consumer(kafka: &KafkaConfig) -> Result<StreamConsumer> {
 
 pub fn partition_count(kafka: &KafkaConfig, topic: &str) -> Result<u32> {
     let c = consumer(kafka)?;
-    let md = c.fetch_metadata(Some(topic), Duration::from_secs(10)).context("fetching kafka metadata")?;
-    let n = md.topics().first().map(|t| t.partitions().len()).unwrap_or(0) as u32;
+    let md = c
+        .fetch_metadata(Some(topic), Duration::from_secs(10))
+        .context("fetching kafka metadata")?;
+    let n = md
+        .topics()
+        .first()
+        .map(|t| t.partitions().len())
+        .unwrap_or(0) as u32;
     anyhow::ensure!(n > 0, "topic {topic} has no partitions");
     Ok(n)
 }
@@ -169,11 +196,19 @@ async fn run(
                 deadline = Some(tokio::time::Instant::now() + window);
             }
             let (p, o) = (msg.partition() as u32, msg.offset());
-            let mut row = match msg.payload().map(serde_json::from_slice::<serde_json::Map<String, Value>>) {
+            let mut row = match msg
+                .payload()
+                .map(serde_json::from_slice::<serde_json::Map<String, Value>>)
+            {
                 Some(Ok(r)) => r,
                 other => {
                     // Main's Kafka engine would reject the same message; see NOTES.md.
-                    error!(partition = p, offset = o, ?other, "skipping undecodable message");
+                    error!(
+                        partition = p,
+                        offset = o,
+                        ?other,
+                        "skipping undecodable message"
+                    );
                     continue;
                 }
             };
@@ -199,7 +234,10 @@ async fn run(
         };
         tracing::debug!(table, rows = n, "tail advanced");
         // No receivers is fine (no subscriptions yet).
-        let _ = tx.send(TableAdvanced { table: table.clone(), max_offsets });
+        let _ = tx.send(TableAdvanced {
+            table: table.clone(),
+            max_offsets,
+        });
     }
 }
 

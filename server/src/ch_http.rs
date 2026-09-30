@@ -57,10 +57,19 @@ impl ChHttp {
     }
 
     pub fn with_database(&self, database: &str) -> Self {
-        Self { database: database.into(), ..self.clone() }
+        Self {
+            database: database.into(),
+            ..self.clone()
+        }
     }
 
-    async fn post(&self, query_in_url: Option<&str>, body: String, params: &Params, settings: &[(&str, &str)]) -> Result<String> {
+    async fn post(
+        &self,
+        query_in_url: Option<&str>,
+        body: String,
+        params: &Params,
+        settings: &[(&str, &str)],
+    ) -> Result<String> {
         let mut qs: Vec<(String, String)> = vec![("database".into(), self.database.clone())];
         if let Some(q) = query_in_url {
             qs.push(("query".into(), q.into()));
@@ -91,7 +100,9 @@ impl ChHttp {
 
     /// Run a statement that returns no rows (DDL, INSERT ... SELECT).
     pub async fn exec(&self, sql: &str, params: &Params) -> Result<()> {
-        self.post(None, sql.to_string(), params, &[]).await.map(|_| ())
+        self.post(None, sql.to_string(), params, &[])
+            .await
+            .map(|_| ())
     }
 
     /// Run a SELECT and return its rows as JSON objects.
@@ -109,7 +120,10 @@ impl ChHttp {
             )
             .await?;
         serde_json::from_str(&text).with_context(|| {
-            format!("decoding ClickHouse JSON response: {}", text.chars().take(200).collect::<String>())
+            format!(
+                "decoding ClickHouse JSON response: {}",
+                text.chars().take(200).collect::<String>()
+            )
         })
     }
 
@@ -119,6 +133,8 @@ impl ChHttp {
             bail!("empty insert");
         }
         let q = format!("INSERT INTO {table} FORMAT JSONEachRow");
-        self.post(Some(&q), rows, &Params::new(), &[]).await.map(|_| ())
+        self.post(Some(&q), rows, &Params::new(), &[])
+            .await
+            .map(|_| ())
     }
 }

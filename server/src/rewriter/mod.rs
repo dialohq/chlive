@@ -27,13 +27,22 @@ pub struct RewriteError {
 
 impl RewriteError {
     pub fn unsupported(msg: impl Into<String>) -> Self {
-        Self { code: "UNSUPPORTED_QUERY", message: msg.into() }
+        Self {
+            code: "UNSUPPORTED_QUERY",
+            message: msg.into(),
+        }
     }
     pub fn params(msg: impl Into<String>) -> Self {
-        Self { code: "INVALID_PARAMS", message: msg.into() }
+        Self {
+            code: "INVALID_PARAMS",
+            message: msg.into(),
+        }
     }
     pub fn parse(msg: impl Into<String>) -> Self {
-        Self { code: "PARSE_ERROR", message: msg.into() }
+        Self {
+            code: "PARSE_ERROR",
+            message: msg.into(),
+        }
     }
 }
 
@@ -92,7 +101,10 @@ impl Plan {
             Some(f) => format!("({f}) AND ({pred})"),
             None => pred.to_string(),
         };
-        format!("SELECT {} FROM {from} WHERE {cond}{}", self.select_list, self.inner_suffix)
+        format!(
+            "SELECT {} FROM {from} WHERE {cond}{}",
+            self.select_list, self.inner_suffix
+        )
     }
 
     pub fn history_sql(&self, w: &Watermark) -> String {
@@ -124,7 +136,9 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { expand_aliases: true }
+        Self {
+            expand_aliases: true,
+        }
     }
 }
 
@@ -137,10 +151,14 @@ pub fn rewrite_with(sql: &str, catalog: &Catalog, opts: &Options) -> Result<Plan
     let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, &sql)
         .map_err(|e| RewriteError::parse(e.to_string()))?;
     if stmts.len() != 1 {
-        return Err(RewriteError::unsupported("exactly one SELECT statement is expected"));
+        return Err(RewriteError::unsupported(
+            "exactly one SELECT statement is expected",
+        ));
     }
     let Statement::Query(query) = stmts.remove(0) else {
-        return Err(RewriteError::unsupported("only SELECT queries are supported"));
+        return Err(RewriteError::unsupported(
+            "only SELECT queries are supported",
+        ));
     };
     let normalized_sql = params::restore(&query.to_string(), &param_types);
     let parts = validate::validate(*query, catalog)?;
