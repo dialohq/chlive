@@ -14,37 +14,35 @@
         "aarch64-darwin"
       ];
 
-      perSystem =
-        { pkgs, ... }:
-        {
-          formatter = pkgs.nixfmt;
+      perSystem = { pkgs, ... }: {
+        formatter = pkgs.nixfmt;
 
-          devShells.default = pkgs.mkShell {
-            buildInputs = with pkgs; [
-              nixfmt
+        devShells.default = pkgs.mkShell {
+          buildInputs = with pkgs; [
+            nixfmt
 
-              # Rust toolchain
-              cargo
-              rustc
-              clippy
-              rustfmt
-              rust-analyzer
+            # Rust toolchain
+            cargo
+            rustc
+            clippy
+            rustfmt
+            rust-analyzer
 
-              # native deps for the rdkafka crate (dynamic-linking feature)
-              pkg-config
-              rdkafka
-              zlib
+            # native deps for the rdkafka crate (dynamic-linking feature)
+            pkg-config
+            rdkafka
+            zlib
 
-              # client / demo
-              nodejs_24
+            # client / demo
+            nodejs_24
 
-              # debugging helpers (rpk is unfree in nixpkgs; use `docker compose exec redpanda rpk`)
-              jq
-              curl
-            ];
+            # debugging helpers (rpk is unfree in nixpkgs; use `docker compose exec redpanda rpk`)
+            jq
+            curl
+          ];
 
-            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
-          };
+          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
+      };
     };
 }

@@ -26,3 +26,11 @@ batch_ms = 50
 [[tables]]
 name = "events"
 topic = "events"
+
+[[tables]]
+name = "customers"
+topic = "customers"
+
+[[tables]]
+name = "orders"
+topic = "orders"

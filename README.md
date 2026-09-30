@@ -23,6 +23,15 @@ npm install && npm run dev -w demo                       # demo UI
 curl localhost:8080/debug/subscriptions                  # shared subscriptions + refcounts
 ```
 
+### Simple demo
+
+`simple/` is a nearly empty plain React (JSX) page, served at <http://localhost:5174>. It needs the server running (`cargo run -p chlive-server`), then `npm run dev -w simple`. It has:
+
+- a live list of the latest `events` rows, with a button that writes a new event;
+- a live list of the latest `orders`, joined in the browser with the latest `customers` rows (two live queries; joins are not supported server-side). Buttons write a customer, write an order, or rename a customer. A rename is a new row, and `argMax(name, ts)` picks the latest one.
+
+The buttons write **straight to Kafka** through Redpanda's HTTP proxy (`localhost:18082`, proxied as `/kafka`), so you can watch each write travel Kafka → tail → patch → UI.
+
 ## How it works: history states + tail
 
 ClickHouse aggregates have mergeable intermediate **states** (`countState`, `uniqState`, `quantileState(0.95)` …). Merging them is associative and commutative:
