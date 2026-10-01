@@ -1,6 +1,6 @@
 # chlive: notes, decisions, verified behaviors
 
-The behaviors below were first verified against `clickhouse/clickhouse-server:25.8` with a separate cache ClickHouse server. Since the move to chDB (see *Embedded chDB cache* below), main runs **26.7.2** and the cache is chDB 26.7.3 (ClickHouse 26.7.2.1). The e2e suite passes on that setup. Redpanda v25.2.1, `sqlparser` 0.63.
+The behaviors below were first verified against `clickhouse/clickhouse-server:25.8` with a separate cache ClickHouse server. Since the move to chDB (see *Embedded chDB cache* below), main runs **26.7.2** and the cache is chDB 26.7.3 (ClickHouse 26.7.2.1). The e2e suite passes on that setup. `sqlparser` 0.63. Kafka was originally Redpanda v25.2.1 in Docker; it is now Apache Kafka 4.3.1 from nixpkgs, run by dnvr (see *Local stack (dnvr)*).
 
 ## Data assumptions (enforced by the demo setup)
 
@@ -76,7 +76,7 @@ Partitions at `-1` or missing from `W` are omitted, so they fall through to the 
 - **Snapshot/patch ordering:** a client is attached, and gets its snapshot, while holding the subscription's state lock. Patches are broadcast under the same lock, so a client never sees a patch before its snapshot. The same lock serializes merges, so there are never two concurrent merges for one subscription.
 - **Debounce (leading-edge throttle):** one `Notify` per subscription coalesces `TableAdvanced` events. The first change after a quiet period merges immediately, and changes arriving during a merge or within `debounce_ms` (100 ms) of the last one coalesce into one merge per interval. This used to be a trailing 100 ms sleep, which added 100 ms to every single event.
 - **Tail batching is adaptive:** a batch is flushed as soon as no further message is already buffered, so a lone event is inserted immediately. Under load, messages pile up during the previous insert and batches grow by themselves. `batch_rows` and `batch_ms` only cap a batch's size and age.
-- **Redpanda HTTP proxy:** `pandaproxy_client.produce_batch_delay_ms` is set to 0 in `docker-compose.yml`. The default of 100 ms added 100 ms to every write from the simple demo.
+- **HTTP produce proxy:** the simple demo's writes originally went through Redpanda's HTTP proxy, whose default `produce_batch_delay_ms` of 100 ms added 100 ms to every write; it was set to 0. With Kafka there is no built-in proxy; `chlive-generator http-proxy` sends each record immediately (`linger.ms=0`).
 
 ### Measured per-event latency (simple demo path: HTTP proxy write, then a patch at the client)
 
@@ -99,11 +99,11 @@ The merge query now dominates. With the HTTP cache it was mostly per-query overh
 
 The cache is chDB (`chdb-rust` 2.0 over libchdb, chdb-core v26.7.3) inside `chlive-server`. It implements `CacheEngine` in `server/src/cache_engine.rs`; nothing else changed.
 
-- **Version lock:** libchdb is ClickHouse 26.7.2.1, and main is pinned to `clickhouse/clickhouse-server:26.7.2`. AggregateFunction states cross between them in binary form, so **upgrade both together**: bump `libchdbVersion` and the hashes in `flake.nix`, and `x-clickhouse-image` in `docker-compose.yml`. The chdb-rust version pins the engine it expects, and 2.0 requires chdb-core ≥ 26.7.3.
-- **Moving main from 25.8 to 26.7:** the upgrade recreated main with empty tables. Main's Kafka consumer-group offsets live in Redpanda, so they were deleted (`rpk group delete ch-main ch-main-customers ch-main-orders`) so that main re-ingested every topic from offset 0. Offsets and watermarks stay consistent this way.
+- **Version lock:** libchdb is ClickHouse 26.7.2.1, and main is pinned to ClickHouse 26.7.2.59 (packaged in `flake.nix` from the official release binary). AggregateFunction states cross between them in binary form, so **upgrade both together**: bump `libchdbVersion`, `clickhouseVersion`, and their hashes in `flake.nix`. The chdb-rust version pins the engine it expects, and 2.0 requires chdb-core ≥ 26.7.3.
+- **Moving main from 25.8 to 26.7** (in the Docker days): the upgrade recreated main with empty tables, and main's consumer-group offsets in Redpanda had to be deleted so it re-ingested every topic from offset 0. That kept offsets and watermarks consistent.
 - **Nix packaging:** `flake.nix` fetches the release tarball (hashes from its `SHA256SUMS`). It contains `libchdb.so` (also on macOS) and `chdb.h`. The dev shell sets `CHDB_LIB_DIR` / `CHDB_INCLUDE_DIR`, so chdb-rust's `build.rs` links the store copy and never downloads; bindgen gets `LIBCLANG_PATH`. The library's install name is `@rpath/libchdb.so`, so `server/build.rs` and `tests/build.rs` add an rpath to the store path, and binaries run outside cargo. Caveat: a build with a stale environment, such as an editor still holding the pre-chDB direnv shell, has no `CHDB_LIB_DIR`, and chdb-rust then silently downloads an engine into `~/Library/Caches/chdb-rust`. That happened once here. Reload direnv after flake changes.
 - **Verified in a spike** (26.7.2 main, chDB 26.7.3):
-  - `remote('localhost:19000', …)` works. Main's native port is exposed as 19000.
+  - `remote('localhost:19000', …)` works. Main's native port is 19000.
   - SQL-defined named collections work.
   - `CREATE TABLE … ENGINE = Memory AS SELECT …State() FROM remote(…)` round-trips states.
   - Typed `{name:Type}` params via `chdb_query_with_params` work, including params inside queries forwarded through `remote()`.
@@ -126,6 +126,18 @@ The cache is chDB (`chdb-rust` 2.0 over libchdb, chdb-core v26.7.3) inside `chli
   | **End to end (median)** | **23.6 ms** | **22.9 ms** |
 
   The merge got ~4 ms faster: no HTTP, JSON over the wire, or Docker network hop. The remaining ~9 ms is ClickHouse's own parsing, planning and execution, which chDB doesn't remove. End to end is about the same within noise, so the win is operational (one service fewer, no cache container config) rather than latency.
+
+## Local stack (dnvr)
+
+The local stack is a [dnvr](https://github.com/dialohq/dnvr) shell (`dnvr.shells.default` in `flake.nix`). `nix develop` gives the toolchain, and `dnvr up` runs the processes in a tmux dashboard. Docker is gone: there is no `docker-compose.yml`, and `scripts/dev.sh` was replaced by `dnvr up`.
+
+- **ClickHouse 26.7.2 is packaged from the official release binary.** nixpkgs has 26.5 and 26.3 LTS, and main must match chDB's 26.7.2. The binaries are self-extracting: the first run decompresses the file in place, which fails in the read-only Nix store ("mkstemp: Permission denied"). The derivation therefore runs `clickhouse --version` once at build time. The unpacked binary is 815 MB.
+- **Main runs on dnvr's `clickhouse` preset,** with `access_control_path` added in `extraConfigXml`. Without it the server has no writable user storage, and `CREATE USER chlive_ro` fails with `ACCESS_STORAGE_FOR_INSERTION_NOT_FOUND`. The `chlive_ro` user (`readonly=2`, `max_execution_time`, `max_memory_usage`) is now created in SQL in `infra/main-init.sql`, not in a users.d XML file.
+- **Ports 18123/19000/19092** instead of the defaults, because this machine already runs another ClickHouse on 8123.
+- **The `ch` client uses its own config file** (`--config-file`). Otherwise `~/.clickhouse-client/config.xml` applied, and here it set a different user (`readonly`), which broke the schema step.
+- **Kafka** is Apache Kafka 4.3.1 from nixpkgs as a single-node KRaft broker and controller, with data in `.dnvr/kafka`. The `kafka` process formats storage on first start, creates the three topics, and only then publishes `kafka.topics`, which dependents wait on. Restarting main's ClickHouse while Kafka keeps running leaves the old Kafka-engine consumers in their groups until the session timeout (~45 s), and ingestion pauses until the group rebalances.
+- **Start-up order comes from `dnvr://` refs:** `schema` waits for `clickhouse.database` and `kafka.topics`, `seed` and `server` wait for `schema.ready`, `stream` waits for `seed.seeded`, `proxy` waits for `kafka.topics`, and `simple` waits for `demo.deps` (the `npm install`). Refs only resolve while the producer is alive, so `schema` and `seed` idle after finishing.
+- **Vite binds `localhost` to `[::1]` only,** so open the demos at `localhost`, not `127.0.0.1`.
 
 ## Known limitations
 

@@ -15,9 +15,9 @@ export default defineConfig({
   server: {
     port: 5174,
     proxy: {
-      "/live": { target: "ws://localhost:8080", ws: true },
-      // Redpanda HTTP proxy (pandaproxy): writes go straight to Kafka
-      "/kafka": { target: "http://localhost:18082", rewrite: (p) => p.replace(/^\/kafka/, "") },
+      "/live": { target: "ws://127.0.0.1:8080", ws: true },
+      // `chlive-generator http-proxy` (dnvr `proxy` process): writes go straight to Kafka
+      "/kafka": { target: "http://127.0.0.1:18082", rewrite: (p) => p.replace(/^\/kafka/, "") },
     },
   },
 });

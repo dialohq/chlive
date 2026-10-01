@@ -2,6 +2,8 @@
 //!
 //! Every message is one `JSONEachRow` row matching `default.events_queue` on main ClickHouse.
 
+pub mod proxy;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 

@@ -3,6 +3,8 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
+    dnvr.url = "github:dialohq/dnvr";
+    dnvr.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -13,13 +15,23 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
+      imports = [ inputs.dnvr.flakeModule ];
 
       perSystem =
-        { pkgs, system, ... }:
+        {
+          pkgs,
+          lib,
+          system,
+          presets,
+          dnvrState,
+          ...
+        }:
         let
+          inherit (pkgs.stdenv.hostPlatform) isLinux;
+
           # chDB (embedded ClickHouse) is not in nixpkgs. Its engine version MUST match the
-          # main ClickHouse server in docker-compose.yml: aggregate states cross between them.
-          libchdbVersion = "26.7.3";
+          # main ClickHouse below: aggregate states cross between them in binary form.
+          libchdbVersion = "26.7.3"; # = ClickHouse 26.7.2.1
           libchdbAssets = {
             aarch64-darwin = {
               name = "macos-arm64";
@@ -38,14 +50,12 @@
             pname = "libchdb";
             version = libchdbVersion;
             src = pkgs.fetchurl {
-              url = "https://github.com/chdb-io/chdb-core/releases/download/v${libchdbVersion}/${
-                libchdbAssets.${system}.name
-              }-libchdb.tar.gz";
+              url = "https://github.com/chdb-io/chdb-core/releases/download/v${libchdbVersion}/${libchdbAssets.${system}.name}-libchdb.tar.gz";
               inherit (libchdbAssets.${system}) sha256;
             };
             sourceRoot = ".";
-            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.autoPatchelfHook ];
-            buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.stdenv.cc.cc.lib ];
+            nativeBuildInputs = lib.optionals isLinux [ pkgs.autoPatchelfHook ];
+            buildInputs = lib.optionals isLinux [ pkgs.stdenv.cc.cc.lib ];
             dontConfigure = true;
             dontBuild = true;
             dontStrip = true;
@@ -54,45 +64,296 @@
               install -Dm644 chdb.h $out/include/chdb.h
             '';
           };
+
+          # Main ClickHouse, pinned to chDB's engine version (nixpkgs has 26.5). Official
+          # release binaries: a single `clickhouse` multi-tool.
+          clickhouseVersion = "26.7.2.59";
+          clickhouseAssets =
+            let
+              base = "https://github.com/ClickHouse/ClickHouse/releases/download/v${clickhouseVersion}-stable";
+            in
+            {
+              aarch64-darwin = {
+                url = "${base}/clickhouse-macos-aarch64";
+                sha256 = "003gy3c5r4hprakgd071qgyir4z4jliwb7mdlir03yn5lkdasl2d";
+              };
+              x86_64-linux = {
+                url = "${base}/clickhouse-common-static-${clickhouseVersion}-amd64.tgz";
+                sha512 = "cafbb6a6651ee72210d2ee6bb67c1c2b4d2aee8cf6197df02c8323f674213c335e114acacc94e70190dfb77bbb5e82869f6e08c4eb3058f8972b12f86ed95a1a";
+              };
+              aarch64-linux = {
+                url = "${base}/clickhouse-common-static-${clickhouseVersion}-arm64.tgz";
+                sha512 = "6945f48dc72f539072d2e102abfb806dac2f65d80d7f78e4b646cd1aa451433fd84d91a4551fc26366fec9414f44a239d9e5fa40942868fc80e7be909f0a7a25";
+              };
+            };
+          clickhouse = pkgs.stdenvNoCC.mkDerivation {
+            pname = "clickhouse";
+            version = clickhouseVersion;
+            src = pkgs.fetchurl clickhouseAssets.${system};
+            dontUnpack = true;
+            dontStrip = true;
+            installPhase = ''
+              mkdir -p $out/bin
+              ${
+                if isLinux then
+                  ''
+                    tar xzf $src
+                    install -m755 "$(find . -path '*/bin/clickhouse' -type f | head -1)" $out/bin/clickhouse
+                  ''
+                else
+                  "install -m755 $src $out/bin/clickhouse"
+              }
+              # Release binaries are self-extracting: the first run decompresses the binary in
+              # place, which must happen here while $out is still writable.
+              HOME=$TMPDIR $out/bin/clickhouse --version
+              for tool in server client local; do ln -s clickhouse $out/bin/clickhouse-$tool; done
+            '';
+          };
+
+          kafka = pkgs.apacheKafka;
+          kafkaPort = 19092;
+          kafkaControllerPort = 19093;
+          topics = [
+            "events"
+            "customers"
+            "orders"
+          ];
+
+          # Single-node KRaft broker (no ZooKeeper). Data lives in .dnvr/kafka.
+          kafkaCommand = pkgs.writeShellApplication {
+            name = "chlive-kafka";
+            runtimeInputs = [
+              kafka
+              pkgs.coreutils
+              dnvrState
+            ];
+            text = ''
+              : "''${DNVR_ROOT:?}"
+              dir="$DNVR_ROOT/.dnvr/kafka"
+              mkdir -p "$dir/data" "$DNVR_ROOT/.dnvr/logs/kafka"
+              cat > "$dir/server.properties" <<EOF
+              process.roles=broker,controller
+              node.id=1
+              controller.quorum.voters=1@127.0.0.1:${toString kafkaControllerPort}
+              listeners=PLAINTEXT://127.0.0.1:${toString kafkaPort},CONTROLLER://127.0.0.1:${toString kafkaControllerPort}
+              advertised.listeners=PLAINTEXT://127.0.0.1:${toString kafkaPort}
+              controller.listener.names=CONTROLLER
+              listener.security.protocol.map=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+              log.dirs=$dir/data
+              num.partitions=3
+              offsets.topic.replication.factor=1
+              transaction.state.log.replication.factor=1
+              transaction.state.log.min.isr=1
+              share.coordinator.state.topic.replication.factor=1
+              share.coordinator.state.topic.min.isr=1
+              group.initial.rebalance.delay.ms=0
+              EOF
+              if [ ! -f "$dir/data/meta.properties" ]; then
+                kafka-storage.sh format -t "$(kafka-storage.sh random-uuid)" -c "$dir/server.properties"
+              fi
+              export LOG_DIR="$DNVR_ROOT/.dnvr/logs/kafka"
+              export KAFKA_HEAP_OPTS="-Xms256m -Xmx512m"
+              kafka-server-start.sh "$dir/server.properties" &
+              pid=$!
+              trap 'kill -TERM $pid 2>/dev/null || true; wait $pid 2>/dev/null || true' EXIT INT TERM
+
+              bootstrap=127.0.0.1:${toString kafkaPort}
+              dnvr-state set bootstrap "$bootstrap"
+              until kafka-topics.sh --bootstrap-server "$bootstrap" --list >/dev/null 2>&1; do
+                kill -0 $pid 2>/dev/null || { echo "[kafka] exited before becoming ready" >&2; exit 1; }
+                sleep 0.5
+              done
+              for t in ${lib.concatStringsSep " " topics}; do
+                kafka-topics.sh --bootstrap-server "$bootstrap" --create --if-not-exists \
+                  --topic "$t" --partitions 3 --replication-factor 1
+              done
+              # readiness key: topics exist
+              dnvr-state set topics ${lib.concatStringsSep "," topics}
+              echo "[kafka] ready on $bootstrap, topics: ${lib.concatStringsSep ", " topics}"
+              wait $pid
+            '';
+          };
+
+          # Main ClickHouse is reached as the default user on these fixed ports (see chlive.toml).
+          # Own client config, so ~/.clickhouse-client/config.xml (user, TLS, ...) never applies.
+          chClientConfig = pkgs.writeText "chlive-clickhouse-client.xml" ''
+            <config>
+              <host>127.0.0.1</host>
+              <port>19000</port>
+              <user>default</user>
+              <password></password>
+              <secure>false</secure>
+            </config>
+          '';
+          chClient = "clickhouse client --config-file ${chClientConfig}";
         in
         {
           formatter = pkgs.nixfmt;
-          packages.libchdb = libchdb;
+          packages = { inherit libchdb clickhouse; };
 
-          devShells.default = pkgs.mkShell {
-            buildInputs = with pkgs; [
-              nixfmt
+          dnvr.shells.default =
+            { config, ... }:
+            {
+              description = "chlive: Kafka + ClickHouse main + chlive-server (embedded chDB) + demos";
 
-              # Rust toolchain
-              cargo
-              rustc
-              clippy
-              rustfmt
-              rust-analyzer
+              packages = with pkgs; [
+                nixfmt
 
-              # embedded cache: chdb-rust links libchdb; its bindgen needs libclang
-              libchdb
-              llvmPackages.libclang
+                # Rust toolchain
+                cargo
+                rustc
+                clippy
+                rustfmt
+                rust-analyzer
 
-              # native deps for the rdkafka crate (dynamic-linking feature)
-              pkg-config
-              rdkafka
-              zlib
+                # embedded cache: chdb-rust links libchdb; its bindgen needs libclang
+                libchdb
+                llvmPackages.libclang
 
-              # client / demo
-              nodejs_24
+                # native deps for the rdkafka crate (dynamic-linking feature)
+                pkg-config
+                rdkafka
+                zlib
 
-              # debugging helpers (rpk is unfree in nixpkgs; use `docker compose exec redpanda rpk`)
-              jq
-              curl
-            ];
+                # client / demos
+                nodejs_24
 
-            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
-            # chdb-rust links against these instead of downloading an engine at build time.
-            CHDB_LIB_DIR = "${libchdb}/lib";
-            CHDB_INCLUDE_DIR = "${libchdb}/include";
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-          };
+                # local services (also on PATH for ad-hoc use: kafka-*.sh, clickhouse client)
+                kafka
+                clickhouse
+
+                jq
+                curl
+              ];
+
+              env = {
+                RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+                # chdb-rust links against these instead of downloading an engine at build time.
+                CHDB_LIB_DIR = "${libchdb}/lib";
+                CHDB_INCLUDE_DIR = "${libchdb}/include";
+                LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+                CHLIVE_KAFKA = "127.0.0.1:${toString kafkaPort}";
+                # events seeded into an empty main on `dnvr up`, and the live stream's rate
+                SEED_COUNT = "1000000";
+                STREAM_RATE = "200";
+              };
+
+              processes = {
+                kafka.command = kafkaCommand;
+
+                # Main ClickHouse via dnvr's preset, on the version chDB was built from.
+                clickhouse = {
+                  imports = [ presets.clickhouse ];
+                  package = clickhouse;
+                  database = "default";
+                  # 18123/19000 rather than 8123/9000, so it can run next to another local ClickHouse
+                  httpPort = 18123;
+                  # native protocol, used by remote() from the chDB cache inside chlive-server
+                  tcpPort = 19000;
+                  timezone = "UTC";
+                  # Writable storage for SQL-created users (chlive_ro, see infra/main-init.sql);
+                  # relative to DNVR_ROOT like the preset's other paths.
+                  extraConfigXml = "<access_control_path>.dnvr/clickhouse/access/</access_control_path>";
+                };
+
+                # Schema, Kafka-engine ingestion and the readonly user. Idempotent; reruns on
+                # every start and then idles so its `ready` key stays live.
+                schema = {
+                  env = {
+                    CH_DATABASE = "dnvr://clickhouse/database";
+                    KAFKA_TOPICS = "dnvr://kafka/topics";
+                  };
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    ${chClient} --multiquery < infra/main-init.sql
+                    dnvr-state set ready 1
+                    echo "[schema] applied infra/main-init.sql"
+                    exec tail -f /dev/null
+                  '';
+                };
+
+                # Seed historical events through Kafka when main has fewer than $SEED_COUNT.
+                seed = {
+                  env.SCHEMA_READY = "dnvr://schema/ready";
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    have=$(${chClient} --query "SELECT count() FROM default.events")
+                    if [ "$have" -lt "$SEED_COUNT" ]; then
+                      echo "[seed] main has $have events; seeding $((SEED_COUNT - have))"
+                      cargo run --release -p chlive-generator -- seed --count $((SEED_COUNT - have))
+                    else
+                      echo "[seed] main already has $have events"
+                    fi
+                    dnvr-state set seeded 1
+                    exec tail -f /dev/null
+                  '';
+                };
+
+                server = {
+                  env.SCHEMA_READY = "dnvr://schema/ready";
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    exec cargo run --release -p chlive-server -- --config chlive.toml
+                  '';
+                };
+
+                # HTTP → Kafka produce API for the simple demo's buttons (Kafka has none built in).
+                proxy = {
+                  env.KAFKA_TOPICS = "dnvr://kafka/topics";
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    exec cargo run --release -p chlive-generator -- http-proxy --listen 127.0.0.1:18082
+                  '';
+                };
+
+                # Steady live traffic; stop it (x in the dashboard) before running the e2e tests.
+                stream = {
+                  env.SEED_DONE = "dnvr://seed/seeded";
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    exec cargo run --release -p chlive-generator -- stream --rate "$STREAM_RATE"
+                  '';
+                };
+
+                demo = {
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    [ -d node_modules ] || npm install
+                    dnvr-state set deps 1
+                    exec npm run dev -w demo -- --port 5173 --strictPort
+                  '';
+                };
+
+                simple = {
+                  env.NPM_DEPS = "dnvr://demo/deps";
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    exec npm run dev -w simple -- --port 5174 --strictPort
+                  '';
+                };
+              };
+
+              scripts = {
+                ch = {
+                  description = "clickhouse client connected to main";
+                  text = ''exec ${chClient} "$@"'';
+                };
+                e2e = {
+                  description = "Run the end-to-end tests (stop the `stream` process first)";
+                  text = ''
+                    cd "$DNVR_ROOT"
+                    CHLIVE_E2E=1 exec cargo test -p chlive-e2e "$@"
+                  '';
+                };
+                reset-data = {
+                  description = "Delete local Kafka and ClickHouse data (run while `dnvr up` is stopped)";
+                  text = ''
+                    rm -rf "$DNVR_ROOT/.dnvr/kafka" "$DNVR_ROOT/${config.processes.clickhouse.dataDir}"
+                    echo "removed Kafka and ClickHouse data; next \`dnvr up\` starts empty and re-seeds"
+                  '';
+                };
+              };
+            };
         };
     };
 }

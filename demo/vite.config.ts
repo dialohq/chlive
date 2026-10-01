@@ -2,7 +2,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-const server = process.env.CHLIVE_SERVER ?? "http://localhost:8080";
+const server = process.env.CHLIVE_SERVER ?? "http://127.0.0.1:8080";
 
 export default defineConfig({
   plugins: [react()],

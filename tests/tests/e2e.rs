@@ -1,7 +1,8 @@
 //! End-to-end correctness: live results (snapshot + patches, reconstructed client-side) must
 //! equal the original query run directly on main ClickHouse once ingestion has settled.
 //!
-//! Run with: `docker compose up -d && CHLIVE_E2E=1 cargo test -p chlive-e2e -- --nocapture`
+//! Run with `e2e -- --nocapture` in the dev shell, while `dnvr up` runs with the `stream`
+//! process stopped.
 //!
 //! Tolerances (see NOTES.md): exact for count/sum of integers/min/max/argMin/argMax/uniqExact
 //! and strings; 1e-9 relative for float sums/averages/ratios; 2% for `uniq`; 15% for

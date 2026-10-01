@@ -1,15 +1,15 @@
-# chlive server configuration (matches docker-compose.yml)
+# chlive server configuration (matches the dnvr processes in flake.nix)
 listen = "0.0.0.0:8080"
 debounce_ms = 100
 
 [main]
-url = "http://localhost:8123"
-# readonly=2 user with max_execution_time / max_memory_usage (infra/main-users.xml)
+url = "http://127.0.0.1:18123"
+# readonly=2 user with max_execution_time / max_memory_usage (created in infra/main-init.sql)
 user = "chlive_ro"
 password = "chlive_ro"
 database = "default"
-# native protocol port exposed by docker-compose.yml, for remote() from the embedded chDB cache
-native_address = "localhost:19000"
+# main's native protocol port (dnvr `clickhouse` process), for remote() from the embedded chDB cache
+native_address = "127.0.0.1:19000"
 
 [cache]
 # embedded chDB (in-process, in-memory); each connection runs one statement at a time
@@ -18,7 +18,7 @@ pool_size = 4
 remote_source = "remote(main_ro, database = '{database}', table = '{table}')"
 
 [kafka]
-brokers = "localhost:19092"
+brokers = "127.0.0.1:19092"
 batch_rows = 1000
 batch_ms = 50
 

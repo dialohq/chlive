@@ -1,6 +1,6 @@
-//! Helpers for end-to-end tests against the docker-compose stack.
+//! Helpers for end-to-end tests against the local stack (`dnvr up`).
 //!
-//! Tests only run when `CHLIVE_E2E=1`; they need `docker compose up -d` and no other
+//! Tests only run when `CHLIVE_E2E=1` (the `e2e` script sets it); they need `dnvr up` and no other
 //! producers writing to the `events` topic while they run.
 
 use std::collections::{BTreeMap, HashMap};
@@ -24,7 +24,7 @@ pub type Row = Map<String, Value>;
 pub fn enabled() -> bool {
     let on = std::env::var_os("CHLIVE_E2E").is_some();
     if !on {
-        eprintln!("skipping: set CHLIVE_E2E=1 (requires `docker compose up -d`)");
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`; the `e2e` script sets it)");
     }
     on
 }

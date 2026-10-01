@@ -568,11 +568,13 @@ name = "chlive-generator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "futures",
  "rand 0.9.5",
  "rdkafka",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

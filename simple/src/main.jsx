@@ -2,9 +2,9 @@ import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { useLiveQuery } from "@chlive/client/react";
 
-let setWriteError = () => {};
+let setWriteError = () => { };
 
-// Produce one JSON row to a Kafka topic through Redpanda's HTTP proxy.
+// Produce one JSON row to a Kafka topic through the local HTTP produce proxy (dnvr `proxy`).
 async function write(topic, row) {
   const res = await fetch(`/kafka/topics/${topic}`, {
     method: "POST",
