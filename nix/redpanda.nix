@@ -1,0 +1,59 @@
+# The `redpanda` dnvr process: Redpanda (Kafka API + HTTP proxy) in Docker; `docker` comes from
+# the host. Data persists in the `chlive-redpanda` volume, alongside main's data in
+# .dnvr/clickhouse (reset both together: `reset-data`).
+{
+  lib,
+  writeShellApplication,
+  coreutils,
+  gnugrep,
+  dnvrState,
+  settings,
+}:
+let
+  inherit (settings) kafkaPort pandaproxyPort topics;
+  kafka = toString kafkaPort;
+  proxy = toString pandaproxyPort;
+in
+writeShellApplication {
+  name = "chlive-redpanda";
+  runtimeInputs = [
+    coreutils
+    gnugrep
+    dnvrState
+  ];
+  text = ''
+    name=chlive-redpanda
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    # The HTTP proxy batches produce requests for 100 ms by default; disable that so a
+    # single write from the simple example is acknowledged (and visible) immediately.
+    # The proxy's own Kafka client uses the in-container listener on 9092 (not
+    # published); the host (main ClickHouse, chlive-server, tests) uses ${kafka}.
+    docker run --rm --name "$name" \
+      -p 127.0.0.1:${kafka}:${kafka} \
+      -p 127.0.0.1:${proxy}:${proxy} \
+      -v chlive-redpanda:/var/lib/redpanda/data \
+      --entrypoint /bin/bash \
+      redpandadata/redpanda:v25.2.1 -c '
+        rpk redpanda config set pandaproxy_client.produce_batch_delay_ms 0 &&
+        exec /entrypoint.sh redpanda start --mode dev-container --smp 1 \
+          --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:${kafka} \
+          --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:${kafka} \
+          --pandaproxy-addr 0.0.0.0:${proxy} \
+          --advertise-pandaproxy-addr 127.0.0.1:${proxy}' &
+    pid=$!
+    trap 'docker stop -t 10 "$name" >/dev/null 2>&1 || true; wait $pid 2>/dev/null || true' EXIT INT TERM
+
+    until docker exec "$name" rpk cluster health 2>/dev/null | grep -qE 'Healthy:.+true'; do
+      kill -0 $pid 2>/dev/null || { echo "[redpanda] exited before becoming ready" >&2; exit 1; }
+      sleep 1
+    done
+    for t in ${lib.concatStringsSep " " topics}; do
+      docker exec "$name" rpk topic create "$t" -p 3 -r 1 >/dev/null 2>&1 || true
+    done
+    dnvr-state set bootstrap 127.0.0.1:${kafka}
+    # readiness key: topics exist
+    dnvr-state set topics ${lib.concatStringsSep "," topics}
+    echo "[redpanda] ready: kafka 127.0.0.1:${kafka}, http proxy 127.0.0.1:${proxy}"
+    wait $pid
+  '';
+}

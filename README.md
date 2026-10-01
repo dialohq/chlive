@@ -64,7 +64,8 @@ Kafka ──▶ ClickHouse main (Kafka engine + MV adds _partition/_offset)
 
 | path | what |
 |---|---|
-| `flake.nix` | dev shell (toolchain, libchdb, ClickHouse) and the local stack as dnvr processes: Redpanda (Docker), main ClickHouse 26.7.2, schema, seed, server, examples |
+| `flake.nix` | inputs and wiring only |
+| `nix/` | `packages/` (libchdb and ClickHouse 26.7.2 derivations), `settings.nix` (ports, topics, seed size), `redpanda.nix` (Docker-run Redpanda process), `clickhouse-client.nix`, and `shell/` (the dnvr dev shell: toolchain and env, `processes.nix`, `scripts.nix`) |
 | `scripts/` | `schema.sql` (main's tables, Kafka ingestion, readonly user) and `seed.sql` (historical events via Kafka) |
 | `server/` | `chlive-server` (Rust): rewriter, watermark, tail consumer, subscription manager, diff, WebSocket |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
