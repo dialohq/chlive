@@ -1,28 +1,31 @@
-# The `redpanda` dnvr process: Redpanda (Kafka API + HTTP proxy) in Docker; `docker` comes from
-# the host. Data persists in the `chlive-redpanda` volume, alongside main's data in
-# .dnvr/clickhouse (reset both together: `reset-data`). `settings` comes from flake.nix.
+# A Redpanda (Kafka API + HTTP proxy) dnvr process in Docker; `docker` comes from the host.
+# `name` is both the container and its data volume, so each dev shell can run its own Redpanda
+# next to the other's. Reset the volume together with the ClickHouse that ingests it
+# (`reset-data`): Kafka offsets and ClickHouse's _offset watermarks must match.
 {
   lib,
   writeShellApplication,
   coreutils,
   gnugrep,
   dnvrState,
-  settings,
+  name,
+  kafkaPort,
+  pandaproxyPort,
+  topics,
 }:
 let
-  inherit (settings) kafkaPort pandaproxyPort topics;
   kafka = toString kafkaPort;
   proxy = toString pandaproxyPort;
 in
 writeShellApplication {
-  name = "chlive-redpanda";
+  inherit name;
   runtimeInputs = [
     coreutils
     gnugrep
     dnvrState
   ];
   text = ''
-    name=chlive-redpanda
+    name=${name}
     docker rm -f "$name" >/dev/null 2>&1 || true
     # The HTTP proxy batches produce requests for 100 ms by default; disable that so a
     # single write from the simple example is acknowledged (and visible) immediately.
@@ -31,7 +34,7 @@ writeShellApplication {
     docker run --rm --name "$name" \
       -p 127.0.0.1:${kafka}:${kafka} \
       -p 127.0.0.1:${proxy}:${proxy} \
-      -v chlive-redpanda:/var/lib/redpanda/data \
+      -v ${name}:/var/lib/redpanda/data \
       --entrypoint /bin/bash \
       redpandadata/redpanda:v25.2.1 -c '
         rpk redpanda config set pandaproxy_client.produce_batch_delay_ms 0 &&
@@ -47,7 +50,8 @@ writeShellApplication {
       kill -0 $pid 2>/dev/null || { echo "[redpanda] exited before becoming ready" >&2; exit 1; }
       sleep 1
     done
-    for t in ${lib.concatStringsSep " " topics}; do
+    topics=(${lib.escapeShellArgs topics})
+    for t in "''${topics[@]}"; do
       docker exec "$name" rpk topic create "$t" -p 3 -r 1 >/dev/null 2>&1 || true
     done
     dnvr-state set bootstrap 127.0.0.1:${kafka}

@@ -1,15 +1,20 @@
-//! The engine loop without ClickHouse or Kafka: fake history, temporary JSONL topics.
+//! The engine loop without ClickHouse or Kafka: fake history, events in memory.
 
 use async_trait::async_trait;
 use chlive_engine::diff::{Diff, Row};
 use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
 use chlive_engine::rules::{HardcodedRules, TopicId};
-use chlive_engine::stream::JsonlTopics;
+use chlive_engine::source::MemorySource;
 use chlive_engine::{Engine, Iteration, Origin};
 use futures::StreamExt;
 use serde_json::json;
 
+/// `events`: ClickHouse has offsets 0..=1 of partition 0 and nothing of partition 1.
+/// `requests`: ClickHouse has offset 0 of partition 0.
 struct FakeHistory;
+
+const EVENTS_BOUND: &str = "toInt64(_offset) <= multiIf(_partition = 0, 1, -1)";
+const REQUESTS_BOUND: &str = "toInt64(_offset) <= multiIf(_partition = 0, 0, -1)";
 
 #[async_trait]
 impl HistorySource for FakeHistory {
@@ -25,25 +30,39 @@ impl HistorySource for FakeHistory {
                 col("_partition", "UInt64"),
                 col("_offset", "UInt64"),
             ]),
-            "default.requests" => Ok(vec![col("user_id", "String"), col("latency_ms", "UInt32")]),
+            "default.requests" => Ok(vec![
+                col("user_id", "String"),
+                col("latency_ms", "UInt32"),
+                col("_partition", "UInt64"),
+                col("_offset", "UInt64"),
+            ]),
             _ => Err(HistoryError::UnknownTable(table.into())),
         }
     }
 
     async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError> {
         // ClickHouse returns exactly the selected columns, in order
+        let events = format!("SELECT ts, user_id FROM default.events WHERE {EVENTS_BOUND}");
+        let events_users = format!("SELECT user_id FROM default.events WHERE {EVENTS_BOUND}");
+        let slow = format!(
+            "SELECT user_id FROM default.requests WHERE (latency_ms > 100) AND ({REQUESTS_BOUND})"
+        );
         match sql {
-            "SELECT ts, user_id FROM default.events" => Ok(vec![
+            "SELECT _partition AS p, max(_offset) AS o FROM default.events GROUP BY p" => {
+                Ok(vec![row(json!({"p": 0, "o": 1}))])
+            }
+            "SELECT _partition AS p, max(_offset) AS o FROM default.requests GROUP BY p" => {
+                Ok(vec![row(json!({"p": 0, "o": 0}))])
+            }
+            s if s == events => Ok(vec![
                 row(json!({"ts": "h1", "user_id": "u1"})),
                 row(json!({"ts": "h2", "user_id": "u2"})),
             ]),
-            "SELECT user_id FROM default.events" => Ok(vec![
+            s if s == events_users => Ok(vec![
                 row(json!({"user_id": "u1"})),
                 row(json!({"user_id": "u2"})),
             ]),
-            "SELECT user_id FROM default.requests WHERE latency_ms > 100" => {
-                Ok(vec![row(json!({"user_id": "slow-history"}))])
-            }
+            s if s == slow => Ok(vec![row(json!({"user_id": "slow-history"}))]),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -53,30 +72,39 @@ fn row(v: serde_json::Value) -> Row {
     v.as_object().unwrap().clone()
 }
 
-fn engine(topics: JsonlTopics) -> Engine {
-    Engine::new(HardcodedRules::default(), FakeHistory, topics)
+/// Partition 0 of `events` starts with the two events ClickHouse already has (offsets 0, 1).
+fn events_topic() -> MemorySource {
+    let mut source = MemorySource::new();
+    source
+        .push("events", 0, r#"{"ts": "h1", "user_id": "u1"}"#)
+        .push("events", 0, r#"{"ts": "h2", "user_id": "u2"}"#);
+    source
+}
+
+fn engine(source: MemorySource) -> Engine {
+    Engine::new(HardcodedRules::default(), FakeHistory, source)
 }
 
 #[tokio::test]
-async fn history_then_one_iteration_per_event_of_the_subscribed_topic_only() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("events.jsonl"),
-        concat!(
+async fn history_up_to_the_watermark_then_events_after_it() {
+    let mut source = events_topic();
+    source
+        .push(
+            "events",
+            0,
             r#"{"ts": "e1", "user_id": "u3", "_offset": 9}"#,
-            "\n",
-            "not json\n",
-            "\n",
-            r#"{"ts": "e2"}"#,
-            "\n",
-        ),
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("orders.jsonl"), r#"{"order_id": "o1"}"#).unwrap();
+        )
+        .push("events", 0, "not json")
+        .push("events", 0, r#"{"ts": "e2"}"#)
+        .push("events", 1, r#"{"ts": "e3", "user_id": "u4"}"#)
+        .push("orders", 0, r#"{"order_id": "o1"}"#);
 
-    let engine = engine(JsonlTopics::new(dir.path()));
-    let subscription = engine.subscribe("select * from events").await.unwrap();
+    let subscription = engine(source)
+        .subscribe("select * from events")
+        .await
+        .unwrap();
     assert_eq!(subscription.plan.stream.topics, [TopicId("events".into())]);
+    assert_eq!(subscription.watermark.describe(), "{0: 1}");
 
     let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
     let history = &iterations[0];
@@ -89,67 +117,40 @@ async fn history_then_one_iteration_per_event_of_the_subscribed_topic_only() {
         ]
     );
 
-    // the malformed line (2) and the empty line (3) are skipped; hidden columns are not output
+    // Partition 0 resumes after the watermark (offsets 0 and 1 are history, not repeated);
+    // partition 1 has nothing in ClickHouse, so it is read from its start. The malformed
+    // message (0:3) is skipped; hidden columns are not output; `orders` is never read.
     let events: Vec<_> = iterations[1..]
         .iter()
         .map(|i| (i.origin.clone(), i.diffs.clone()))
         .collect();
-    let at = |line| Origin::Event {
+    let at = |partition, offset| Origin::Event {
         topic: TopicId("events".into()),
-        line,
+        partition,
+        offset,
     };
     assert_eq!(
         events,
         [
             (
-                at(1),
+                at(0, 2),
                 vec![Diff::Insert(row(json!({"ts": "e1", "user_id": "u3"})))]
             ),
             (
-                at(4),
+                at(0, 4),
                 vec![Diff::Insert(row(json!({"ts": "e2", "user_id": ""})))]
+            ),
+            (
+                at(1, 0),
+                vec![Diff::Insert(row(json!({"ts": "e3", "user_id": "u4"})))]
             ),
         ]
     );
 }
 
 #[tokio::test]
-async fn follow_mode_picks_up_appended_events() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("events.jsonl");
-    std::fs::write(&path, "{\"ts\": \"e1\"}\n").unwrap();
-    let mut topics = JsonlTopics::new(dir.path());
-    topics.follow = true;
-    let engine = engine(topics);
-    let mut iterations = engine.subscribe("select * from events").await.unwrap();
-    assert_eq!(
-        iterations.next().await.unwrap().unwrap().origin,
-        Origin::History
-    );
-    assert_eq!(iterations.next().await.unwrap().unwrap().diffs.len(), 1);
-
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap();
-    writeln!(f, "{{\"ts\": \"e2\", \"user_id\": \"late\"}}").unwrap();
-    let next = tokio::time::timeout(std::time::Duration::from_secs(5), iterations.next())
-        .await
-        .expect("appended event arrives")
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        next.diffs,
-        [Diff::Insert(row(json!({"ts": "e2", "user_id": "late"})))]
-    );
-}
-
-#[tokio::test]
 async fn errors_are_clear() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("events.jsonl"), "").unwrap();
-    let engine = engine(JsonlTopics::new(dir.path()));
+    let engine = engine(events_topic());
     let e = engine
         .explain("select * form events")
         .await
@@ -178,10 +179,8 @@ async fn errors_are_clear() {
 
 #[tokio::test]
 async fn missing_topic_is_a_bind_error() {
-    // ClickHouse has the table, but there is no events.jsonl
-    let dir = tempfile::tempdir().unwrap();
-    let engine = engine(JsonlTopics::new(dir.path()));
-    let e = engine
+    // ClickHouse has the table, but Kafka has no `events` topic
+    let e = engine(MemorySource::new())
         .subscribe("select * from events")
         .await
         .err()
@@ -192,25 +191,25 @@ async fn missing_topic_is_a_bind_error() {
 
 #[tokio::test]
 async fn column_list_prunes_history_and_events() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("events.jsonl"),
-        concat!(
+    let mut source = events_topic();
+    source
+        .push(
+            "events",
+            0,
             r#"{"ts": "e1", "user_id": "u3", "big": {"nested": [1, 2, 3]}, "_offset": 9}"#,
-            "\n",
-            r#"{"ts": "e2"}"#,
-            "\n",
-        ),
-    )
-    .unwrap();
-    let engine = engine(JsonlTopics::new(dir.path()));
-    let subscription = engine
+        )
+        .push("events", 0, r#"{"ts": "e2"}"#);
+    let subscription = engine(source)
         .subscribe("select user_id from events")
         .await
         .unwrap();
     assert_eq!(
-        subscription.plan.history.sql,
+        subscription.plan.history.sql(None),
         "SELECT user_id FROM default.events"
+    );
+    assert_eq!(
+        subscription.history_sql,
+        format!("SELECT user_id FROM default.events WHERE {EVENTS_BOUND}")
     );
     assert_eq!(subscription.plan.stream.required_keys(), ["user_id"]);
     let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
@@ -219,33 +218,36 @@ async fn column_list_prunes_history_and_events() {
         lines,
         [
             "+ {\"user_id\":\"u1\"}\n+ {\"user_id\":\"u2\"}\nhistory: 2 rows",
-            "events:1 + {\"user_id\":\"u3\"}",
-            "events:2 + {\"user_id\":\"\"}",
+            "events/0:2 + {\"user_id\":\"u3\"}",
+            "events/0:3 + {\"user_id\":\"\"}",
         ]
     );
 }
 
 #[tokio::test]
 async fn where_filters_events_by_typed_values() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("requests.jsonl"),
-        concat!(
-            r#"{"user_id": "fast", "latency_ms": 50}"#,
-            "\n",
-            r#"{"user_id": "slow", "latency_ms": 500}"#,
-            "\n",
+    let mut source = MemorySource::new();
+    source
+        // offset 0 is already in ClickHouse (the history's "slow-history")
+        .push(
+            "requests",
+            0,
+            r#"{"user_id": "slow-history", "latency_ms": 900}"#,
+        )
+        .push("requests", 0, r#"{"user_id": "fast", "latency_ms": 50}"#)
+        .push("requests", 0, r#"{"user_id": "slow", "latency_ms": 500}"#)
+        .push(
+            "requests",
+            0,
             r#"{"user_id": "as-text", "latency_ms": "250"}"#,
-            "\n",
-            r#"{"user_id": "missing"}"#,
-            "\n",
+        )
+        .push("requests", 0, r#"{"user_id": "missing"}"#)
+        .push(
+            "requests",
+            0,
             r#"{"user_id": "broken", "latency_ms": "abc"}"#,
-            "\n",
-        ),
-    )
-    .unwrap();
-    let engine = engine(JsonlTopics::new(dir.path()));
-    let subscription = engine
+        );
+    let subscription = engine(source)
         .subscribe("select user_id from requests where latency_ms > 100")
         .await
         .unwrap();
@@ -264,10 +266,10 @@ async fn where_filters_events_by_typed_values() {
         lines,
         [
             "+ {\"user_id\":\"slow-history\"}\nhistory: 1 rows",
-            "requests:2 + {\"user_id\":\"slow\"}",
+            "requests/0:2 + {\"user_id\":\"slow\"}",
             // "250" is read as UInt32, like ClickHouse does; a missing latency_ms is 0;
             // "abc" can't be read as UInt32, so that event is skipped with a warning
-            "requests:3 + {\"user_id\":\"as-text\"}",
+            "requests/0:3 + {\"user_id\":\"as-text\"}",
         ]
     );
 }

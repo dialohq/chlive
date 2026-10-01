@@ -66,26 +66,30 @@ Kafka ──▶ ClickHouse main (Kafka engine + MV adds _partition/_offset)
 |---|---|
 | `flake.nix` | the dnvr dev shell: toolchain, env, the local stack's processes (Redpanda in Docker, main ClickHouse 26.7.2, schema, seed, server, examples) and scripts |
 | `nix/packages/` | custom derivations: `libchdb.nix`, `clickhouse.nix` (26.7.2, matching chDB), `redpanda.nix` (the Docker-run Redpanda process) |
-| `scripts/` | `schema.sql` (main's tables, Kafka ingestion, readonly user) and `seed.sql` (historical events via Kafka) |
-| `engine/` | `chlive-engine` (Rust, new architecture, in progress): a custom SQL dialect with its own parser; plans each query into a ClickHouse history query plus the topics to consume, then runs the event loop. Kafka is simulated by `engine/topics/*.jsonl` for now |
+| `scripts/` | `schema.sql` (main's tables, Kafka ingestion, readonly user) and `seed.sql` (historical events via Kafka); `engine/` has the same pair for the engine shell |
+| `engine/` | `chlive-engine` (Rust, new architecture, in progress): a custom SQL dialect with its own parser; plans each query into a ClickHouse history query plus the topics to consume, then runs the event loop over Kafka |
 | `server/` | `chlive-server` (Rust): rewriter, watermark, tail consumer, subscription manager, diff, WebSocket |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
 | `examples/` | example apps; `examples/simple` for now |
 | `tests/` | end-to-end correctness tests (`chlive-e2e`), with a small Kafka producer for test events |
 
-## Engine (custom dialect, step 1)
+## Engine (custom dialect)
 
-The engine has its own dev shell with just ClickHouse and 10 fixed events (`scripts/engine/`), and no Redpanda:
+The engine has its own dev shell: its own ClickHouse and Redpanda, with ClickHouse ingesting the `events` topic like the full stack, and 10 seed events (`scripts/engine/`) produced through Kafka:
 
 ```sh
 nix develop .#engine
-dnvr up                                     # engine-clickhouse (HTTP 28123, native 29000) + engine-seed
-engine --explain "select * from events"     # plan: ClickHouse SQL + topics
-engine --follow "select * from events"      # history (10 rows), then events from engine/topics/
-engine-test                                 # all engine tests, including the ClickHouse one
+dnvr up                                     # engine-redpanda (Kafka 29092), engine-clickhouse (HTTP 28123, native 29000), engine-schema, engine-seed
+engine --explain "select * from events"     # plan: ClickHouse SQL, topics, keys, filter
+engine "select * from events"               # history (10 rows), then live events until Ctrl-C
+produce events '{"user_id": "u7", "latency_ms": 120}'   # one event per JSON argument (or JSON lines on stdin)
+engine-test                                 # all engine tests, including the ClickHouse and Kafka ones
+reset-data                                  # with `dnvr up` stopped: wipe the engine shell's Redpanda and ClickHouse together
 ```
 
-Its process names and ports differ from the default shell's, so the two never share data and can run at the same time. In either shell, the engine uses that shell's ClickHouse via `CHLIVE_CLICKHOUSE_URL`.
+Its process names, ports, Redpanda container and volume differ from the default shell's, so the two never share data and can run at the same time. In either shell, the engine uses that shell's ClickHouse and Kafka via `CHLIVE_CLICKHOUSE_URL` and `CHLIVE_KAFKA`; the default shell has `produce` too.
+
+**History and stream meet at a watermark.** At subscribe time the engine reads `max(_offset)` per `_partition` from the ClickHouse table. History is every row up to it (the history query gets `toInt64(_offset) <= multiIf(_partition = 0, W0, …)`), and each Kafka partition is consumed from the offset right after it. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. The table must have `_partition` and `_offset` columns; the binder says so if it doesn't.
 
 So far the dialect accepts `SELECT * | col, … FROM <table> [WHERE <condition>]`. A condition can use:
 - comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), with `AND`, `OR`, `NOT` and parentheses;
@@ -100,15 +104,15 @@ Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 - **Conditions.** They're evaluated with SQL's three-valued logic.
 - **Literals.** They're typed and checked at bind time; for example, comparing `latency_ms` with a string is a positioned error.
 - **Output.** Event rows are rendered the way ClickHouse renders rows.
-- **Tested.** The agreement test in `engine/tests/clickhouse.rs` checks that both sides return the same rows for 22 predicates.
+- **Tested.** The agreement test in `engine/tests/clickhouse.rs` checks, for 22 predicates, that three setups return the same rows: everything in history; everything from the stream; and half from each, split at the watermark. `engine/tests/kafka.rs` produces events before, around and after subscribing, against the real Redpanda and ClickHouse, and checks that each arrives exactly once.
 
-The query goes through parser → binder → planner. The binder resolves FROM, then SELECT, in SQL's evaluation order:
-- **FROM:** the table must exist in ClickHouse and have a topic.
+The query goes through parser → binder → planner. The binder resolves FROM, then WHERE, then SELECT, in SQL's evaluation order:
+- **FROM:** the table must exist in ClickHouse, have a Kafka topic, and have the `_partition` and `_offset` columns.
 - **SELECT:** listed columns must exist, and none may be selected twice.
 
-The planner selects only the needed columns from ClickHouse, and the stream decodes only the needed JSON keys of each event; the other keys are skipped unparsed. Hard-coded naming rules map table `t` to ClickHouse `default.t` and to topic `t` (`engine/topics/t.jsonl`), and keep column names the same on both sides; columns starting with `_` are hidden.
+The planner selects only the needed columns from ClickHouse, and the stream decodes only the needed JSON keys of each event; the other keys are skipped unparsed. Hard-coded naming rules map table `t` to ClickHouse `default.t` and to topic `t`, and keep column names the same on both sides; columns starting with `_` are hidden.
 
-Each iteration prints its diff: first the history (`+ {row}` per ClickHouse row, then `history: N rows`), then one line per event of the subscribed topics, e.g. `events:21 + {…}`. Only the query's topics are opened: lines appended to `events.jsonl` show up with `--follow`, and lines appended to `orders.jsonl` don't.
+Each iteration prints its diff: first the history (`+ {row}` per ClickHouse row, then `history: N rows`), then one line per relevant event of the subscribed topics, as `<topic>/<partition>:<offset> + {…}`, e.g. `events/0:21 + {…}`. Only the query's topics are consumed.
 
 ## Client
 

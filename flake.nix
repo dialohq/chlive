@@ -44,16 +44,44 @@
             ];
             # events seeded into an empty main on `dnvr up` (scripts/seed.sql)
             seedCount = 10;
-            # ClickHouse of the `engine` shell, on its own ports so both shells can run at once
+            # The `engine` shell's ClickHouse and Redpanda, on their own ports so both shells can
+            # run at once.
             engineClickhouse = {
               httpPort = 28123;
               tcpPort = 29000;
             };
+            engineKafkaPort = 29092;
+            enginePandaproxyPort = 28082;
           };
 
           libchdb = pkgs.callPackage ./nix/packages/libchdb.nix { };
           clickhouse = pkgs.callPackage ./nix/packages/clickhouse.nix { };
-          redpanda = pkgs.callPackage ./nix/packages/redpanda.nix { inherit dnvrState settings; };
+          redpanda = pkgs.callPackage ./nix/packages/redpanda.nix {
+            inherit dnvrState;
+            name = "chlive-redpanda";
+            inherit (settings) kafkaPort pandaproxyPort topics;
+          };
+          engineRedpanda = pkgs.callPackage ./nix/packages/redpanda.nix {
+            inherit dnvrState;
+            name = "chlive-engine-redpanda";
+            kafkaPort = settings.engineKafkaPort;
+            pandaproxyPort = settings.enginePandaproxyPort;
+            topics = [ "events" ];
+          };
+
+          # `produce <topic> '<json>' …`, or JSON lines on stdin: one Kafka message per line.
+          produceScript = container: {
+            description = "Produce JSON events to a topic: `produce events '{\"user_id\": \"u1\"}'` (or lines on stdin)";
+            text = ''
+              topic="''${1:?usage: produce <topic> [json …] (or JSON lines on stdin)}"
+              shift
+              if [ "$#" -gt 0 ]; then
+                printf '%s\n' "$@" | docker exec -i ${container} rpk topic produce "$topic"
+              else
+                docker exec -i ${container} rpk topic produce "$topic"
+              fi
+            '';
+          };
 
           # `clickhouse client` against a local ClickHouse (by native port), as the default user.
           # It brings its own config file, so ~/.clickhouse-client/config.xml (user, TLS, ...)
@@ -127,7 +155,14 @@
         in
         {
           formatter = pkgs.nixfmt;
-          packages = { inherit libchdb clickhouse redpanda; };
+          packages = {
+            inherit
+              libchdb
+              clickhouse
+              redpanda
+              engineRedpanda
+              ;
+          };
 
           dnvr.shells.default =
             { config, ... }:
@@ -140,6 +175,7 @@
                 SEED_COUNT = toString settings.seedCount;
                 # chlive-engine CLI and its ClickHouse test
                 CHLIVE_CLICKHOUSE_URL = "http://127.0.0.1:${toString settings.clickhouse.httpPort}";
+                CHLIVE_KAFKA = "127.0.0.1:${toString settings.kafkaPort}";
               };
 
               # Start-up order follows the `dnvr://` refs in each process's `env`.
@@ -203,6 +239,7 @@
               };
 
               scripts = {
+                produce = produceScript "chlive-redpanda";
                 ch = {
                   description = "clickhouse client connected to main";
                   text = ''exec ${chClient} "$@"'';
@@ -220,39 +257,63 @@
                     # Kafka offsets and main's _offset watermarks must be reset together.
                     docker rm -f chlive-redpanda >/dev/null 2>&1 || true
                     docker volume rm chlive-redpanda >/dev/null 2>&1 || true
-                    rm -rf "$DNVR_ROOT/${config.processes.clickhouse.dataDir}"
+                    rm -rf "''${DNVR_ROOT:?}/${config.processes.clickhouse.dataDir}"
                     echo "removed Redpanda and ClickHouse data; next \`dnvr up\` starts empty and re-seeds"
                   '';
                 };
               };
             };
 
-          # Just ClickHouse with 10 fixed events, for working on chlive-engine without Redpanda:
-          # `nix develop .#engine`, then `dnvr up`. Process names differ from the default shell's
-          # so their state (.dnvr/<process>) never mixes; ports differ so both can run at once.
+          # ClickHouse + Redpanda for working on chlive-engine: `nix develop .#engine`, then `dnvr up`.
+          # ClickHouse ingests the `events` topic like the full stack, and the 10 seed events go
+          # through Kafka, so history and stream share real offsets. Process names differ from the
+          # default shell's so their state (.dnvr/<process>) never mixes; ports, container and
+          # volume differ so both can run at once.
           dnvr.shells.engine =
             { config, ... }:
             {
-              description = "chlive engine: ClickHouse with a 10-row seed (no Redpanda)";
+              description = "chlive engine: ClickHouse + Redpanda with a 10-event seed";
 
               packages = toolchain;
 
               env = toolchainEnv // {
                 CHLIVE_CLICKHOUSE_URL = "http://127.0.0.1:${toString settings.engineClickhouse.httpPort}";
+                CHLIVE_KAFKA = "127.0.0.1:${toString settings.engineKafkaPort}";
               };
 
               processes = {
+                engine-redpanda.command = engineRedpanda;
+
                 engine-clickhouse = clickhouseProcess settings.engineClickhouse ".dnvr/engine-clickhouse";
 
-                # Plain events table (no Kafka ingestion) and exactly the 10 rows of
-                # scripts/engine/seed.sql, re-applied on every start; then idles so `seeded` stays live.
-                engine-seed = {
-                  env.CH_DATABASE = "dnvr://engine-clickhouse/database";
+                # Tables and Kafka ingestion (scripts/engine/schema.sql). Idempotent; then idles so
+                # `ready` stays live.
+                engine-schema = {
+                  env = {
+                    CH_DATABASE = "dnvr://engine-clickhouse/database";
+                    KAFKA_TOPICS = "dnvr://engine-redpanda/topics";
+                  };
                   command = ''
                     cd "$DNVR_ROOT"
                     ${engineChClient} --multiquery < scripts/engine/schema.sql
-                    ${engineChClient} --multiquery < scripts/engine/seed.sql
-                    echo "[engine-seed] default.events has $(${engineChClient} --query "SELECT count() FROM default.events") rows"
+                    dnvr-state set ready 1
+                    echo "[engine-schema] applied scripts/engine/schema.sql"
+                    exec tail -f /dev/null
+                  '';
+                };
+
+                # The 10 events of scripts/engine/seed.sql, produced through Kafka once (when the
+                # table is empty); then waits until ClickHouse has ingested them.
+                engine-seed = {
+                  env.SCHEMA_READY = "dnvr://engine-schema/ready";
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    count() { ${engineChClient} --query "SELECT count() FROM default.events"; }
+                    if [ "$(count)" -eq 0 ]; then
+                      ${engineChClient} --multiquery < scripts/engine/seed.sql
+                      until [ "$(count)" -ge 10 ]; do sleep 1; done
+                    fi
+                    echo "[engine-seed] default.events has $(count) rows"
                     dnvr-state set seeded 1
                     exec tail -f /dev/null
                   '';
@@ -260,29 +321,33 @@
               };
 
               scripts = {
+                produce = produceScript "chlive-engine-redpanda";
                 ch = {
                   description = "clickhouse client connected to the engine shell's ClickHouse";
                   text = ''exec ${engineChClient} "$@"'';
                 };
                 engine = {
-                  description = "Run chlive-engine against this ClickHouse, e.g. `engine --explain \"select * from events\"`";
+                  description = "Run chlive-engine against this shell's ClickHouse and Redpanda, e.g. `engine --explain \"select * from events\"`";
                   text = ''
                     cd "$DNVR_ROOT"
                     exec cargo run -q -p chlive-engine -- "$@"
                   '';
                 };
                 engine-test = {
-                  description = "Run chlive-engine's tests, including the ClickHouse one";
+                  description = "Run chlive-engine's tests, including the ClickHouse and Kafka ones";
                   text = ''
                     cd "$DNVR_ROOT"
                     CHLIVE_E2E=1 exec cargo test -p chlive-engine "$@"
                   '';
                 };
                 reset-data = {
-                  description = "Delete the engine shell's ClickHouse data (run while `dnvr up` is stopped)";
+                  description = "Delete the engine shell's Redpanda and ClickHouse data (run while `dnvr up` is stopped)";
                   text = ''
-                    rm -rf "$DNVR_ROOT/${config.processes.engine-clickhouse.dataDir}"
-                    echo "removed the engine shell's ClickHouse data"
+                    # Kafka offsets and ClickHouse's _offset watermarks must be reset together.
+                    docker rm -f chlive-engine-redpanda >/dev/null 2>&1 || true
+                    docker volume rm chlive-engine-redpanda >/dev/null 2>&1 || true
+                    rm -rf "''${DNVR_ROOT:?}/${config.processes.engine-clickhouse.dataDir}"
+                    echo "removed the engine shell's Redpanda and ClickHouse data"
                   '';
                 };
               };

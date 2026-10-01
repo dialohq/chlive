@@ -1,5 +1,5 @@
 //! chlive engine: a custom SQL dialect for live queries over ClickHouse history plus a stream
-//! of events (Kafka, simulated here by JSONL files).
+//! of events from Kafka.
 //!
 //! ```no_run
 //! use chlive_engine::{Config, Engine};
@@ -17,7 +17,8 @@
 //! ```
 //!
 //! Inside: [`parser`] → [`binder`] (via [`rules`]) → [`plan`] → [`engine`], which yields the
-//! history from ClickHouse and then one iteration per event of the subscribed topics.
+//! history from ClickHouse and then one iteration per event of the subscribed topics. History
+//! and events meet at a per-partition offset [`watermark`], so each event is in exactly one.
 
 pub mod ast;
 pub mod binder;
@@ -29,8 +30,9 @@ pub mod lexer;
 pub mod parser;
 pub mod plan;
 pub mod rules;
-pub mod stream;
+pub mod source;
 pub mod types;
+pub mod watermark;
 
 pub use binder::{BoundColumn, BoundExpr, BoundQuery};
 pub use engine::{Config, Engine, EngineError, Iteration, Origin, Subscription};

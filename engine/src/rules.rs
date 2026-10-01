@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-/// A Kafka topic (simulated by `<topics dir>/<topic>.jsonl`).
+/// A Kafka topic.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TopicId(pub String);
 
@@ -31,6 +31,15 @@ pub trait NamingRules: Send + Sync {
     fn column(&self, clickhouse_column: &str) -> ColumnMapping;
     /// ClickHouse columns that are not part of the dialect table (e.g. Kafka bookkeeping).
     fn is_hidden(&self, clickhouse_column: &str) -> bool;
+    /// ClickHouse columns holding each row's Kafka partition and offset, which line history up
+    /// with the topic (see [`crate::watermark`]).
+    fn kafka_columns(&self) -> KafkaColumns;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KafkaColumns {
+    pub partition: String,
+    pub offset: String,
 }
 
 /// Identity mapping: table `t` is ClickHouse `<database>.t` and topic `t`; columns keep their
@@ -66,6 +75,13 @@ impl NamingRules for HardcodedRules {
 
     fn is_hidden(&self, clickhouse_column: &str) -> bool {
         clickhouse_column.starts_with('_')
+    }
+
+    fn kafka_columns(&self) -> KafkaColumns {
+        KafkaColumns {
+            partition: "_partition".into(),
+            offset: "_offset".into(),
+        }
     }
 }
 

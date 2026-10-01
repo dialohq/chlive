@@ -7,8 +7,9 @@ use std::cmp::Ordering;
 use crate::ast::CmpOp;
 use crate::binder::{BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId};
 use crate::diff::Row;
-use crate::rules::{quote_ident, TopicId};
+use crate::rules::{quote_ident, KafkaColumns, TopicId};
 use crate::types::{decode, DecodeError, Type, Value};
+use crate::watermark::Watermark;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
@@ -19,9 +20,30 @@ pub struct Plan {
     pub stream: StreamPlan,
 }
 
+/// The history query. Its upper bound, the [`Watermark`], is only known when subscribing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryPlan {
-    pub sql: String,
+    /// The fully qualified ClickHouse table.
+    pub table: String,
+    /// `SELECT … FROM …`
+    pub select: String,
+    /// The WHERE condition, rendered for ClickHouse.
+    pub filter: Option<String>,
+    pub kafka: KafkaColumns,
+}
+
+impl HistoryPlan {
+    /// The query, bounded by `watermark` (rows up to it) or, without one, unbounded.
+    pub fn sql(&self, watermark: Option<&Watermark>) -> String {
+        let bound =
+            watermark.map(|w| w.history_predicate(&self.kafka.partition, &self.kafka.offset));
+        match (&self.filter, bound) {
+            (None, None) => self.select.clone(),
+            (Some(f), None) => format!("{} WHERE {f}", self.select),
+            (None, Some(b)) => format!("{} WHERE {b}", self.select),
+            (Some(f), Some(b)) => format!("{} WHERE ({f}) AND ({b})", self.select),
+        }
+    }
 }
 
 /// A column the stream needs: decoded from `json_key` as `ty`.
@@ -259,8 +281,17 @@ impl std::fmt::Display for Plan {
             .collect();
         writeln!(f, "table:   {}", self.table)?;
         writeln!(f, "columns: {}", columns.join(", "))?;
-        writeln!(f, "history: {}", self.history.sql)?;
-        writeln!(f, "topics:  {}", topics.join(", "))?;
+        writeln!(f, "history: {}", self.history.sql(None))?;
+        writeln!(
+            f,
+            "         up to max({}) per {}, read when subscribing",
+            self.history.kafka.offset, self.history.kafka.partition
+        )?;
+        writeln!(
+            f,
+            "topics:  {} (each partition from right after that)",
+            topics.join(", ")
+        )?;
         writeln!(f, "keys:    {}", keys.join(", "))?;
         match &self.stream.filter {
             Filter::All => write!(f, "filter:  all events"),
@@ -282,15 +313,16 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             }
         })
         .collect();
-    let mut sql = format!(
-        "SELECT {} FROM {}",
-        select_list.join(", "),
-        table.clickhouse_table
-    );
-    if let Some(filter) = &bound.filter {
-        sql.push_str(" WHERE ");
-        sql.push_str(&to_clickhouse(filter, table));
-    }
+    let history = HistoryPlan {
+        table: table.clickhouse_table.clone(),
+        select: format!(
+            "SELECT {} FROM {}",
+            select_list.join(", "),
+            table.clickhouse_table
+        ),
+        filter: bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
+        kafka: table.kafka.clone(),
+    };
 
     // Columns to decode: the output's, then the filter's that aren't output.
     let mut needed: Vec<ColumnId> = bound.projection.clone();
@@ -323,7 +355,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
     Plan {
         table: table.name.clone(),
         columns,
-        history: HistoryPlan { sql },
+        history,
         stream,
     }
 }
@@ -345,6 +377,10 @@ mod tests {
             name: "events".into(),
             clickhouse_table: "default.events".into(),
             topic: TopicId("events".into()),
+            kafka: KafkaColumns {
+                partition: "_partition".into(),
+                offset: "_offset".into(),
+            },
             columns: vec![
                 col(0, "ts", "DateTime64(3)"),
                 col(1, "user_id", "String"),
@@ -378,7 +414,7 @@ mod tests {
     fn select_star_plan() {
         let p = plan(&bound(&[0, 1, 2, 3], None));
         assert_eq!(
-            p.history.sql,
+            p.history.sql(None),
             "SELECT ts, user_id, latency_ms, coupon FROM default.events"
         );
         assert_eq!(p.stream.topics, [TopicId("events".into())]);
@@ -398,7 +434,7 @@ mod tests {
         };
         let p = plan(&bound(&[1], Some(f)));
         assert_eq!(
-            p.history.sql,
+            p.history.sql(None),
             "SELECT user_id FROM default.events WHERE latency_ms > 100"
         );
         assert_eq!(p.stream.required_keys(), ["user_id", "latency_ms"]);
@@ -444,8 +480,31 @@ mod tests {
         );
         let p = plan(&bound(&[1], Some(f)));
         assert_eq!(
-            p.history.sql,
+            p.history.sql(None),
             r"SELECT user_id FROM default.events WHERE ((user_id = 'it\'s') OR (coupon IS NOT NULL)) AND (latency_ms NOT IN (1, -2))"
+        );
+    }
+
+    #[test]
+    fn history_is_bounded_by_the_watermark() {
+        let w = Watermark(std::collections::BTreeMap::from([(0, 7), (2, 3)]));
+        let p = plan(&bound(&[1], None));
+        assert_eq!(
+            p.history.sql(Some(&w)),
+            "SELECT user_id FROM default.events WHERE toInt64(_offset) <= multiIf(_partition = 0, 7, _partition = 2, 3, -1)"
+        );
+        let f = BoundExpr::Or(
+            Box::new(BoundExpr::IsNull {
+                expr: col(3),
+                negated: false,
+            }),
+            lit(Value::Bool(false)),
+        );
+        let p = plan(&bound(&[1], Some(f)));
+        // the filter is parenthesized as a whole, so its OR can't swallow the bound
+        assert_eq!(
+            p.history.sql(Some(&w)),
+            "SELECT user_id FROM default.events WHERE ((coupon IS NULL) OR (false)) AND (toInt64(_offset) <= multiIf(_partition = 0, 7, _partition = 2, 3, -1))"
         );
     }
 

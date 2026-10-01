@@ -1,5 +1,5 @@
 //! Resolves a parsed query against the catalog, clause by clause in SQL's logical evaluation
-//! order: FROM, then SELECT. Everything after binding works with resolved identifiers, never
+//! order: FROM, then WHERE, then SELECT. Everything after binding works with resolved identifiers, never
 //! with the names as written.
 
 use std::fmt;
@@ -7,15 +7,15 @@ use std::fmt;
 use crate::ast::{CmpOp, Expr, Literal, Projection, Query};
 use crate::error::{render_at, Span};
 use crate::history::{HistoryError, HistorySource};
-use crate::rules::{NamingRules, TopicId};
-use crate::stream::TopicCatalog;
+use crate::rules::{KafkaColumns, NamingRules, TopicId};
+use crate::source::{EventSource, SourceError};
 use crate::types::{parse_date, parse_datetime, Kind, Type, Value};
 
 /// What the binder can look things up in.
 pub struct Catalog<'a> {
     pub rules: &'a dyn NamingRules,
     pub history: &'a dyn HistorySource,
-    pub topics: &'a dyn TopicCatalog,
+    pub source: &'a dyn EventSource,
 }
 
 /// Index of a column in [`BoundTable::columns`].
@@ -42,6 +42,8 @@ pub struct BoundTable {
     pub name: String,
     pub clickhouse_table: String,
     pub topic: TopicId,
+    /// ClickHouse columns with each row's Kafka partition and offset.
+    pub kafka: KafkaColumns,
     pub columns: Vec<BoundColumn>,
 }
 
@@ -119,6 +121,8 @@ pub enum BindError {
     At { message: String, span: Span },
     /// The catalog could not be consulted (ClickHouse unreachable, …).
     History(HistoryError),
+    /// The event source could not be consulted (Kafka unreachable, …).
+    Source(SourceError),
 }
 
 impl BindError {
@@ -134,6 +138,7 @@ impl BindError {
         match self {
             BindError::At { message, span } => render_at(src, *span, message),
             BindError::History(e) => e.to_string(),
+            BindError::Source(e) => e.to_string(),
         }
     }
 }
@@ -143,6 +148,7 @@ impl fmt::Display for BindError {
         match self {
             BindError::At { message, span } => write!(f, "{message} at byte {}", span.start),
             BindError::History(e) => write!(f, "{e}"),
+            BindError::Source(e) => write!(f, "{e}"),
         }
     }
 }
@@ -163,7 +169,8 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
     })
 }
 
-/// FROM: the table must exist in ClickHouse and have an event stream.
+/// FROM: the table must exist in ClickHouse, have an event stream (a Kafka topic), and record
+/// each row's Kafka partition and offset (so history and stream can be lined up).
 async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, BindError> {
     let from = &query.from;
     let clickhouse_table = catalog.rules.clickhouse_table(&from.name);
@@ -181,11 +188,30 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
         Err(e) => return Err(BindError::History(e)),
     };
     let topic = catalog.rules.topic(&from.name);
-    if !catalog.topics.exists(&topic) {
+    if catalog
+        .source
+        .partitions(&topic)
+        .await
+        .map_err(BindError::Source)?
+        .is_none()
+    {
         return Err(BindError::at(
             format!("no event stream for table {} (topic {topic})", from.name),
             from.span,
         ));
+    }
+    let kafka = catalog.rules.kafka_columns();
+    for column in [&kafka.partition, &kafka.offset] {
+        if !described.iter().any(|c| &c.name == column) {
+            return Err(BindError::at(
+                format!(
+                    "table {} has no {column} column in ClickHouse ({clickhouse_table}); chlive \
+                     needs each row's Kafka partition and offset to line history up with the topic",
+                    from.name
+                ),
+                from.span,
+            ));
+        }
     }
     let columns = described
         .into_iter()
@@ -206,6 +232,7 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
         name: from.name.clone(),
         clickhouse_table,
         topic,
+        kafka,
         columns,
     })
 }
@@ -520,6 +547,7 @@ mod tests {
     use crate::history::DescribedColumn;
     use crate::parser::parse;
     use crate::rules::HardcodedRules;
+    use crate::source::MemorySource;
     use async_trait::async_trait;
 
     struct FakeHistory;
@@ -543,6 +571,7 @@ mod tests {
                     col("_offset", "UInt64"),
                 ]),
                 "default.orders" => Ok(vec![col("order_id", "String")]),
+                "default.plain" => Ok(vec![col("id", "String"), col("_partition", "UInt64")]),
                 _ => Err(HistoryError::UnknownTable(table.into())),
             }
         }
@@ -551,13 +580,11 @@ mod tests {
         }
     }
 
-    /// Only `events` has a stream.
-    struct FakeTopics;
-
-    impl TopicCatalog for FakeTopics {
-        fn exists(&self, topic: &TopicId) -> bool {
-            topic.0 == "events"
-        }
+    /// Only `events` and `plain` have a stream.
+    fn topics() -> MemorySource {
+        let mut source = MemorySource::new();
+        source.partition("events", 0).partition("plain", 0);
+        source
     }
 
     async fn bind_sql(sql: &str) -> Result<BoundQuery, String> {
@@ -565,7 +592,7 @@ mod tests {
         let catalog = Catalog {
             rules: &rules,
             history: &FakeHistory,
-            topics: &FakeTopics,
+            source: &topics(),
         };
         let q = parse(sql).map_err(|e| e.render(sql))?;
         bind(&q, &catalog).await.map_err(|e| e.render(sql))
@@ -603,6 +630,11 @@ mod tests {
         assert_eq!(
             bind_sql("select * from orders").await.unwrap_err(),
             "no event stream for table orders (topic orders) at 1:15"
+        );
+        assert_eq!(
+            bind_sql("select * from plain").await.unwrap_err(),
+            "table plain has no _offset column in ClickHouse (default.plain); chlive needs each \
+             row's Kafka partition and offset to line history up with the topic at 1:15"
         );
         assert_eq!(
             bind_sql("select ts, nope from events").await.unwrap_err(),

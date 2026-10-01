@@ -4,11 +4,9 @@
 //! the topics the query needs, each carrying the diffs it produced.
 
 use std::fmt;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 
@@ -18,7 +16,8 @@ use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
 use crate::parser::parse;
 use crate::plan::{plan, Plan};
 use crate::rules::{HardcodedRules, NamingRules, TopicId};
-use crate::stream::JsonlTopics;
+use crate::source::{EventSource, KafkaSource, SourceError, TopicStart};
+use crate::watermark::Watermark;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -30,10 +29,12 @@ pub enum EngineError {
     Bind(String),
     #[error(transparent)]
     History(#[from] HistoryError),
+    #[error(transparent)]
+    Source(#[from] SourceError),
 }
 
-/// Everything [`Engine::connect`] needs for the standard setup: ClickHouse over HTTP, the
-/// hard-coded naming rules, and JSONL files as topics.
+/// Everything [`Engine::connect`] needs for the standard setup: ClickHouse over HTTP, Kafka,
+/// and the hard-coded naming rules.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub clickhouse_url: String,
@@ -41,12 +42,8 @@ pub struct Config {
     pub password: String,
     /// ClickHouse database that dialect tables map to.
     pub database: String,
-    /// Directory with one `<topic>.jsonl` file per topic.
-    pub topics_dir: PathBuf,
-    /// Pause before each event, to simulate events arriving over time.
-    pub delay: Duration,
-    /// Keep waiting for lines appended to the topic files.
-    pub follow: bool,
+    /// Kafka bootstrap servers, e.g. `127.0.0.1:19092`.
+    pub kafka_brokers: String,
 }
 
 impl Default for Config {
@@ -56,9 +53,7 @@ impl Default for Config {
             user: "default".into(),
             password: String::new(),
             database: "default".into(),
-            topics_dir: "engine/topics".into(),
-            delay: Duration::ZERO,
-            follow: false,
+            kafka_brokers: "127.0.0.1:19092".into(),
         }
     }
 }
@@ -66,34 +61,31 @@ impl Default for Config {
 pub struct Engine {
     rules: Arc<dyn NamingRules>,
     history: Arc<dyn HistorySource>,
-    topics: JsonlTopics,
+    source: Arc<dyn EventSource>,
 }
 
 impl Engine {
     /// The standard setup from a [`Config`].
     pub fn connect(config: Config) -> Self {
-        let mut topics = JsonlTopics::new(config.topics_dir);
-        topics.delay = config.delay;
-        topics.follow = config.follow;
         Self::new(
             HardcodedRules {
                 database: config.database,
             },
             ClickHouseHttp::new(&config.clickhouse_url, &config.user, &config.password),
-            topics,
+            KafkaSource::new(&config.kafka_brokers),
         )
     }
 
-    /// Any naming rules and history source, e.g. fakes in tests.
+    /// Any naming rules, history and event source, e.g. fakes in tests.
     pub fn new(
         rules: impl NamingRules + 'static,
         history: impl HistorySource + 'static,
-        topics: JsonlTopics,
+        source: impl EventSource + 'static,
     ) -> Self {
         Self {
             rules: Arc::new(rules),
             history: Arc::new(history),
-            topics,
+            source: Arc::new(source),
         }
     }
 
@@ -103,10 +95,11 @@ impl Engine {
         let catalog = Catalog {
             rules: self.rules.as_ref(),
             history: self.history.as_ref(),
-            topics: &self.topics,
+            source: self.source.as_ref(),
         };
         let bound = bind(&query, &catalog).await.map_err(|e| match e {
             BindError::History(e) => EngineError::History(e),
+            BindError::Source(e) => EngineError::Source(e),
             e => EngineError::Bind(e.render(sql)),
         })?;
         Ok(plan(&bound))
@@ -114,52 +107,93 @@ impl Engine {
 
     /// Plan a query and start it: the history first, then one iteration per event of the
     /// plan's topics.
+    ///
+    /// History and stream meet at the [`Watermark`], read now: history is every row up to it,
+    /// and each partition is consumed from right after it. So every event is in exactly one of
+    /// them, wherever ClickHouse's ingestion is at.
     pub async fn subscribe(&self, sql: &str) -> Result<Subscription, EngineError> {
         let plan = self.explain(sql).await?;
-        let files: Vec<_> = plan
-            .stream
-            .topics
-            .iter()
-            .map(|t| self.topics.path(t).display().to_string())
-            .collect();
-        tracing::info!(history = %plan.history.sql, topics = ?files, "subscribed");
-        let iterations = self.iterations(&plan);
-        Ok(Subscription { plan, iterations })
+        let kafka = &plan.history.kafka;
+        let watermark = Watermark::fetch(
+            self.history.as_ref(),
+            &plan.history.table,
+            &kafka.partition,
+            &kafka.offset,
+        )
+        .await?;
+        let history_sql = plan.history.sql(Some(&watermark));
+        let mut starts = Vec::new();
+        for topic in &plan.stream.topics {
+            let partitions = self
+                .source
+                .partitions(topic)
+                .await?
+                .ok_or_else(|| SourceError(format!("topic {topic} disappeared")))?;
+            starts.push(TopicStart {
+                topic: topic.clone(),
+                partitions: partitions
+                    .into_iter()
+                    .map(|p| (p, watermark.start(p)))
+                    .collect(),
+            });
+        }
+        tracing::info!(history = %history_sql, watermark = %watermark.describe(), "subscribed");
+        let events = self
+            .source
+            .subscribe(&starts, &plan.stream.required_keys())
+            .await?;
+        let iterations = self.iterations(&plan, history_sql.clone(), events);
+        Ok(Subscription {
+            plan,
+            watermark,
+            history_sql,
+            iterations,
+        })
     }
 
-    fn iterations(&self, plan: &Plan) -> BoxStream<'static, Result<Iteration, EngineError>> {
+    fn iterations(
+        &self,
+        plan: &Plan,
+        history_sql: String,
+        events: BoxStream<'static, crate::source::Event>,
+    ) -> BoxStream<'static, Result<Iteration, EngineError>> {
         let history = self.history.clone();
-        let sql = plan.history.sql.clone();
         let initial = stream::once(async move {
-            let rows = history.fetch(&sql).await?;
+            let rows = history.fetch(&history_sql).await?;
             Ok(Iteration {
                 origin: Origin::History,
                 diffs: rows.into_iter().map(Diff::Insert).collect(),
             })
         });
         let stream_plan = plan.stream.clone();
-        let events = self
-            .topics
-            .subscribe(&stream_plan.topics, &stream_plan.required_keys())
-            .map(move |event| {
-                // decode by column types, then filter, then project
-                let diffs = match stream_plan.decode(&event.value) {
-                    Ok(row) if stream_plan.matches(&row) => vec![Diff::Insert(stream_plan.project(&row))],
-                    Ok(_) => Vec::new(),
-                    Err(e) => {
-                        // ClickHouse's ingestion would reject this message too
-                        tracing::warn!(topic = %event.topic, line = event.line, error = %e, "skipping event");
-                        Vec::new()
-                    }
-                };
-                Ok(Iteration {
-                    origin: Origin::Event {
-                        topic: event.topic,
-                        line: event.line,
-                    },
-                    diffs,
-                })
-            });
+        let events = events.map(move |event| {
+            // decode by column types, then filter, then project
+            let diffs = match stream_plan.decode(&event.value) {
+                Ok(row) if stream_plan.matches(&row) => {
+                    vec![Diff::Insert(stream_plan.project(&row))]
+                }
+                Ok(_) => Vec::new(),
+                Err(e) => {
+                    // ClickHouse's ingestion would reject this message too
+                    tracing::warn!(
+                        topic = %event.topic,
+                        partition = event.partition,
+                        offset = event.offset,
+                        error = %e,
+                        "skipping event"
+                    );
+                    Vec::new()
+                }
+            };
+            Ok(Iteration {
+                origin: Origin::Event {
+                    topic: event.topic,
+                    partition: event.partition,
+                    offset: event.offset,
+                },
+                diffs,
+            })
+        });
         initial.chain(events).boxed()
     }
 }
@@ -167,6 +201,10 @@ impl Engine {
 /// A running query: a stream of [`Iteration`]s, plus the plan it runs.
 pub struct Subscription {
     pub plan: Plan,
+    /// Where history ends and the stream begins.
+    pub watermark: Watermark,
+    /// The history query as run: the plan's, bounded by the watermark.
+    pub history_sql: String,
     iterations: BoxStream<'static, Result<Iteration, EngineError>>,
 }
 
@@ -184,7 +222,11 @@ pub enum Origin {
     /// The initial result, from ClickHouse.
     History,
     /// One event of a subscribed topic.
-    Event { topic: TopicId, line: usize },
+    Event {
+        topic: TopicId,
+        partition: i32,
+        offset: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,7 +237,7 @@ pub struct Iteration {
 }
 
 /// One line per diff: `+ {row}` for the history (followed by `history: N rows`), and
-/// `<topic>:<line> + {row}` for events. Irrelevant events print nothing.
+/// `<topic>/<partition>:<offset> + {row}` for events. Irrelevant events print nothing.
 impl fmt::Display for Iteration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.origin {
@@ -205,14 +247,18 @@ impl fmt::Display for Iteration {
                 }
                 write!(f, "history: {} rows", self.diffs.len())
             }
-            Origin::Event { topic, line } => {
+            Origin::Event {
+                topic,
+                partition,
+                offset,
+            } => {
                 let mut first = true;
                 for d in &self.diffs {
                     if !first {
                         writeln!(f)?;
                     }
                     first = false;
-                    write!(f, "{topic}:{line} {d}")?;
+                    write!(f, "{topic}/{partition}:{offset} {d}")?;
                 }
                 Ok(())
             }

@@ -1,9 +1,6 @@
 //! `chlive-engine`: run a chlive-dialect query and print each iteration's diffs.
 //! A thin user of the `chlive-engine` library.
 
-use std::path::PathBuf;
-use std::time::Duration;
-
 use anyhow::Result;
 use chlive_engine::{Config, Engine};
 use clap::Parser;
@@ -11,7 +8,7 @@ use futures::StreamExt;
 
 #[derive(Parser)]
 #[command(
-    about = "Run a chlive-dialect query: history from ClickHouse, then events from JSONL topics"
+    about = "Run a chlive-dialect query: history from ClickHouse, then live events from Kafka"
 )]
 struct Cli {
     /// The query, e.g. "select * from events"
@@ -30,15 +27,9 @@ struct Cli {
     /// ClickHouse database that dialect tables map to
     #[arg(long, default_value = "default")]
     database: String,
-    /// Directory with one `<topic>.jsonl` file per topic
-    #[arg(long, default_value = "engine/topics")]
-    topics_dir: PathBuf,
-    /// Pause before each event (milliseconds)
-    #[arg(long, default_value_t = 0)]
-    delay_ms: u64,
-    /// Keep waiting for lines appended to the topic files
-    #[arg(long)]
-    follow: bool,
+    /// Kafka bootstrap servers; each dev shell sets CHLIVE_KAFKA to its own Redpanda
+    #[arg(long, env = "CHLIVE_KAFKA", default_value = "127.0.0.1:19092")]
+    kafka: String,
     /// Print the plan instead of running it
     #[arg(long)]
     explain: bool,
@@ -58,9 +49,7 @@ async fn main() -> Result<()> {
         user: cli.user,
         password: cli.password,
         database: cli.database,
-        topics_dir: cli.topics_dir,
-        delay: Duration::from_millis(cli.delay_ms),
-        follow: cli.follow,
+        kafka_brokers: cli.kafka,
     });
 
     if cli.explain {
