@@ -566,6 +566,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "chlive-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "chlive-server"
 version = "0.1.0"
 dependencies = [

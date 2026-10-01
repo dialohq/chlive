@@ -67,10 +67,22 @@ Kafka ──▶ ClickHouse main (Kafka engine + MV adds _partition/_offset)
 | `flake.nix` | the dnvr dev shell: toolchain, env, the local stack's processes (Redpanda in Docker, main ClickHouse 26.7.2, schema, seed, server, examples) and scripts |
 | `nix/packages/` | custom derivations: `libchdb.nix`, `clickhouse.nix` (26.7.2, matching chDB), `redpanda.nix` (the Docker-run Redpanda process) |
 | `scripts/` | `schema.sql` (main's tables, Kafka ingestion, readonly user) and `seed.sql` (historical events via Kafka) |
+| `engine/` | `chlive-engine` (Rust, new architecture, in progress): a custom SQL dialect with its own parser; plans each query into a ClickHouse history query plus the topics to consume, then runs the event loop. Kafka is simulated by `engine/topics/*.jsonl` for now |
 | `server/` | `chlive-server` (Rust): rewriter, watermark, tail consumer, subscription manager, diff, WebSocket |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
 | `examples/` | example apps; `examples/simple` for now |
 | `tests/` | end-to-end correctness tests (`chlive-e2e`), with a small Kafka producer for test events |
+
+## Engine (custom dialect, step 1)
+
+```sh
+cargo run -p chlive-engine -- --explain "select * from events"     # plan: ClickHouse SQL + topics
+cargo run -p chlive-engine -- --follow "select * from events"      # history, then live events
+```
+
+So far the dialect accepts only `SELECT * FROM <table>`. Hard-coded naming rules map table `t` to ClickHouse `default.t` and to topic `t` (`engine/topics/t.jsonl`), and keep column names the same on both sides; columns starting with `_` are hidden.
+
+Each iteration prints its diff: first the history (`+ {row}` per ClickHouse row, then `history: N rows`), then one line per event of the subscribed topics, e.g. `events:21 + {…}`. Only the query's topics are opened: lines appended to `events.jsonl` show up with `--follow`, and lines appended to `orders.jsonl` don't.
 
 ## Client
 
