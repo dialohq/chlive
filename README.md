@@ -20,12 +20,11 @@ dnvr up          # starts everything in a tmux dashboard
 | `schema` → clickhouse, kafka | applies `infra/main-init.sql` (Kafka-engine tables, MVs, the `chlive_ro` user) | |
 | `seed` → schema | seeds main up to `$SEED_COUNT` (1M) backdated events, through Kafka | |
 | `server` → schema | chlive-server with the embedded chDB cache | `:8080` (`/live`, `/debug/subscriptions`) |
-| `stream` → seed | live events at `$STREAM_RATE` (200) per second | |
 | `proxy` → kafka | HTTP → Kafka produce API for the simple demo | `127.0.0.1:18082` |
 | `demo` | the full demo (examples 1–8) | <http://localhost:5173> |
 | `simple` | the simple demo | <http://localhost:5174> |
 
-Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. The shell also has these scripts: `ch` (clickhouse client on main), `e2e` (end-to-end tests), and `reset-data` (wipe Kafka and ClickHouse data; run it with the group stopped).
+Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. Live traffic is not started automatically; run `stream [rate]` (default 200 events/s) in a terminal while the stack is up. The shell also has these scripts: `ch` (clickhouse client on main), `e2e` (end-to-end tests), and `reset-data` (wipe Kafka and ClickHouse data; run it with the group stopped).
 
 All state lives in `.dnvr/` (gitignored). The ports avoid the defaults (8123/9000/9092), so the stack can run next to another local ClickHouse or Kafka.
 
@@ -99,7 +98,7 @@ npm test -w client                         # client state + reconnect/resubscrib
 e2e                                        # = CHLIVE_E2E=1 cargo test -p chlive-e2e, against `dnvr up`
 ```
 
-The e2e tests produce their own events and compare against the whole `events` table, so **stop the `stream` process** (`x` in the dashboard) while they run. Regenerate golden files with `UPDATE_GOLDEN=1 cargo test -p chlive-server`.
+The e2e tests produce their own events and compare against the whole `events` table, so don't run the `stream` script (or any other producer) while they run. Regenerate golden files with `UPDATE_GOLDEN=1 cargo test -p chlive-server`.
 
 ## Supported queries
 

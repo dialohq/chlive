@@ -141,7 +141,8 @@ The local stack is a [dnvr](https://github.com/dialohq/dnvr) shell (`dnvr.shells
 - **Ports 18123/19000/19092** instead of the defaults, because this machine already runs another ClickHouse on 8123.
 - **The `ch` client uses its own config file** (`--config-file`). Otherwise `~/.clickhouse-client/config.xml` applied, and here it set a different user (`readonly`), which broke the schema step.
 - **Kafka** is Apache Kafka 4.3.1 from nixpkgs as a single-node KRaft broker and controller, with data in `.dnvr/kafka`. The `kafka` process formats storage on first start, creates the three topics, and only then publishes `kafka.topics`, which dependents wait on. Restarting main's ClickHouse while Kafka keeps running leaves the old Kafka-engine consumers in their groups until the session timeout (~45 s), and ingestion pauses until the group rebalances.
-- **Start-up order comes from `dnvr://` refs:** `schema` waits for `clickhouse.database` and `kafka.topics`, `seed` and `server` wait for `schema.ready`, `stream` waits for `seed.seeded`, `proxy` waits for `kafka.topics`, and `simple` waits for `demo.deps` (the `npm install`). Refs only resolve while the producer is alive, so `schema` and `seed` idle after finishing.
+- **Start-up order comes from `dnvr://` refs:** `schema` waits for `clickhouse.database` and `kafka.topics`, `seed` and `server` wait for `schema.ready`, `proxy` waits for `kafka.topics`, and `simple` waits for `demo.deps` (the `npm install`). Refs only resolve while the producer is alive, so `schema` and `seed` idle after finishing.
+- **No live traffic by default:** the event stream is a `stream` script, not a dnvr process, so the stack is quiet until you start it (or use the simple demo's buttons).
 - **Vite binds `localhost` to `[::1]` only,** so open the demos at `localhost`, not `127.0.0.1`.
 
 ## Known limitations

@@ -233,7 +233,7 @@
                 CHDB_INCLUDE_DIR = "${libchdb}/include";
                 LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
                 CHLIVE_KAFKA = "127.0.0.1:${toString kafkaPort}";
-                # events seeded into an empty main on `dnvr up`, and the live stream's rate
+                # events seeded into an empty main on `dnvr up`; default rate of the `stream` script
                 SEED_COUNT = "1000000";
                 STREAM_RATE = "200";
               };
@@ -306,15 +306,6 @@
                   '';
                 };
 
-                # Steady live traffic; stop it (x in the dashboard) before running the e2e tests.
-                stream = {
-                  env.SEED_DONE = "dnvr://seed/seeded";
-                  command = ''
-                    cd "$DNVR_ROOT"
-                    exec cargo run --release -p chlive-generator -- stream --rate "$STREAM_RATE"
-                  '';
-                };
-
                 demo = {
                   command = ''
                     cd "$DNVR_ROOT"
@@ -339,10 +330,18 @@
                   text = ''exec ${chClient} "$@"'';
                 };
                 e2e = {
-                  description = "Run the end-to-end tests (stop the `stream` process first)";
+                  description = "Run the end-to-end tests (no `stream` running)";
                   text = ''
                     cd "$DNVR_ROOT"
                     CHLIVE_E2E=1 exec cargo test -p chlive-e2e "$@"
+                  '';
+                };
+                # Live traffic is opt-in: run it in a terminal while the stack is up.
+                stream = {
+                  description = "Produce live events: `stream [rate]`, default 200/s, until Ctrl-C";
+                  text = ''
+                    cd "$DNVR_ROOT"
+                    exec cargo run --release -p chlive-generator -- stream --rate "''${1:-$STREAM_RATE}"
                   '';
                 };
                 reset-data = {
