@@ -25,17 +25,17 @@
           ...
         }:
         let
-          # Ports and names shared by the dnvr processes below. chlive.toml (server and e2e
-          # tests) and examples/simple/vite.config.js must agree with these.
+          # Ports and names shared by the dnvr processes below. examples/simple/vite.config.js
+          # must agree with these.
           settings = {
             kafkaPort = 19092; # Redpanda Kafka API, published to the host
             pandaproxyPort = 18082; # Redpanda HTTP proxy (the simple example's writes)
             clickhouse = {
               # 18123/19000 rather than 8123/9000, so it can run next to another local ClickHouse
               httpPort = 18123;
-              # native protocol, used by remote() from the chDB cache inside chlive-server
-              tcpPort = 19000;
+              tcpPort = 19000; # native protocol (`ch`)
             };
+            serverPort = 8080; # chlive-server: WebSocket at /live
             simplePort = 5174;
             topics = [
               "events"
@@ -54,7 +54,6 @@
             enginePandaproxyPort = 28082;
           };
 
-          libchdb = pkgs.callPackage ./nix/packages/libchdb.nix { };
           clickhouse = pkgs.callPackage ./nix/packages/clickhouse.nix { };
           redpanda = pkgs.callPackage ./nix/packages/redpanda.nix {
             inherit dnvrState;
@@ -114,9 +113,6 @@
             rustfmt
             rust-analyzer
 
-            # embedded cache: chdb-rust links libchdb; its bindgen needs libclang
-            libchdb
-            llvmPackages.libclang
 
             # native deps for the rdkafka crate (dynamic-linking feature)
             pkg-config
@@ -134,13 +130,9 @@
           ];
           toolchainEnv = {
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
-            # chdb-rust links against these instead of downloading an engine at build time.
-            CHDB_LIB_DIR = "${libchdb}/lib";
-            CHDB_INCLUDE_DIR = "${libchdb}/include";
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
 
-          # Main ClickHouse via dnvr's preset, on the version chDB was built from. Writable
+          # ClickHouse via dnvr's preset, on our pinned version (nix/packages/clickhouse.nix). Writable
           # storage for SQL-created users (chlive_ro, see scripts/schema.sql), relative to
           # DNVR_ROOT like the preset's other paths.
           clickhouseProcess = ports: dataDir: {
@@ -157,7 +149,6 @@
           formatter = pkgs.nixfmt;
           packages = {
             inherit
-              libchdb
               clickhouse
               redpanda
               engineRedpanda
@@ -167,7 +158,7 @@
           dnvr.shells.default =
             { config, ... }:
             {
-              description = "chlive: Redpanda (Docker) + ClickHouse main + chlive-server (embedded chDB) + examples";
+              description = "chlive: Redpanda (Docker) + ClickHouse + chlive-server (WebSocket over chlive-engine) + examples";
 
               packages = toolchain;
 
@@ -221,11 +212,15 @@
                   '';
                 };
 
+                # ClickHouse and Kafka come from the shell's CHLIVE_CLICKHOUSE_URL / CHLIVE_KAFKA.
                 server = {
-                  env.SCHEMA_READY = "dnvr://schema/ready";
+                  env = {
+                    SCHEMA_READY = "dnvr://schema/ready";
+                    CHLIVE_LISTEN = "0.0.0.0:${toString settings.serverPort}";
+                  };
                   command = ''
                     cd "$DNVR_ROOT"
-                    exec cargo run --release -p chlive-server -- --config chlive.toml
+                    exec cargo run --release -p chlive-server
                   '';
                 };
 

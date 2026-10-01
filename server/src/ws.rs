@@ -1,184 +1,283 @@
-//! WebSocket protocol (`/live`) and the debug endpoint.
+//! `/live` (the WebSocket protocol, see [`crate::protocol`]), `/debug/subscriptions` and
+//! `/healthz`.
+//!
+//! Each connection has a writer task fed by a bounded channel, and one task per subscription
+//! that runs an engine [`Subscription`](chlive_engine::Subscription) and forwards its
+//! iterations. Unsubscribing or disconnecting aborts the task, which drops the subscription and
+//! with it its Kafka consumer. A slow client fills the channel, which pauses its subscriptions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use chlive_engine::{Engine, Origin};
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 
-use crate::ch_http::Column;
-use crate::diff::Row;
-use crate::subscriptions::{ConnId, Manager};
+use crate::protocol::{Change, ClientMsg, Column, ServerMsg, BAD_MESSAGE, DUPLICATE_ID};
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum ClientMsg {
-    Subscribe {
-        id: String,
-        sql: String,
-        #[serde(default)]
-        params: serde_json::Map<String, serde_json::Value>,
-    },
-    Unsubscribe {
-        id: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum ServerMsg {
-    #[serde(rename_all = "camelCase")]
-    Snapshot {
-        id: String,
-        columns: Vec<Column>,
-        key_columns: Vec<String>,
-        rows: Vec<Row>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        order: Option<Vec<String>>,
-    },
-    Patch {
-        id: String,
-        upserts: Vec<Row>,
-        deletes: Vec<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        order: Option<Vec<String>>,
-    },
-    Error {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-        code: String,
-        message: String,
-    },
-}
+/// Iterations already waiting are sent together, in one `diff`, up to this many.
+const MAX_ITERATIONS_PER_MESSAGE: usize = 256;
+/// Messages buffered per connection before its subscriptions pause.
+const OUTBOX: usize = 256;
 
 #[derive(Clone)]
-pub struct AppState {
-    pub manager: Arc<Manager>,
+struct AppState {
+    engine: Arc<Engine>,
+    registry: Arc<Registry>,
     next_conn: Arc<AtomicU64>,
 }
 
-pub fn router(manager: Arc<Manager>) -> Router {
+pub fn router(engine: Arc<Engine>) -> Router {
     let state = AppState {
-        manager,
+        engine,
+        registry: Arc::default(),
         next_conn: Arc::new(AtomicU64::new(1)),
     };
     Router::new()
         .route("/live", get(live))
-        .route("/debug/subscriptions", get(debug_subs))
+        .route("/debug/subscriptions", get(debug_subscriptions))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
 
-async fn debug_subs(State(s): State<AppState>) -> impl IntoResponse {
-    Json(s.manager.debug().await)
+/// Open subscriptions, for `/debug/subscriptions`.
+#[derive(Default)]
+struct Registry(Mutex<BTreeMap<(u64, String), Arc<Entry>>>);
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Entry {
+    sql: String,
+    /// Set once subscribed: where history ends and the stream begins.
+    watermark: Mutex<Option<String>>,
+    rows_sent: AtomicU64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugEntry {
+    conn: u64,
+    id: String,
+    sql: String,
+    watermark: Option<String>,
+    rows_sent: u64,
+}
+
+impl Registry {
+    fn insert(&self, conn: u64, id: &str, entry: Arc<Entry>) {
+        self.0.lock().unwrap().insert((conn, id.to_string()), entry);
+    }
+
+    fn remove(&self, conn: u64, id: &str) {
+        self.0.lock().unwrap().remove(&(conn, id.to_string()));
+    }
+
+    fn remove_conn(&self, conn: u64) {
+        self.0.lock().unwrap().retain(|(c, _), _| *c != conn);
+    }
+
+    fn list(&self) -> Vec<DebugEntry> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((conn, id), e)| DebugEntry {
+                conn: *conn,
+                id: id.clone(),
+                sql: e.sql.clone(),
+                watermark: e.watermark.lock().unwrap().clone(),
+                rows_sent: e.rows_sent.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+}
+
+async fn debug_subscriptions(State(s): State<AppState>) -> impl IntoResponse {
+    Json(s.registry.list())
 }
 
 async fn live(ws: WebSocketUpgrade, State(s): State<AppState>) -> impl IntoResponse {
     let conn = s.next_conn.fetch_add(1, Ordering::Relaxed);
-    ws.on_upgrade(move |socket| connection(socket, conn, s.manager))
+    ws.on_upgrade(move |socket| connection(socket, s, conn))
 }
 
-async fn connection(socket: WebSocket, conn: ConnId, manager: Arc<Manager>) {
+async fn connection(socket: WebSocket, s: AppState, conn: u64) {
     info!(conn, "connected");
-    let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let (mut sink, mut incoming) = socket.split();
+    let (tx, mut rx) = mpsc::channel::<ServerMsg>(OUTBOX);
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let text = serde_json::to_string(&msg).expect("serializable");
+            let text = serde_json::to_string(&msg).expect("server messages serialize");
             if sink.send(Message::Text(text.into())).await.is_err() {
                 break;
             }
         }
     });
 
-    // client subscription id → dedupe hash; `None` while the subscribe is in flight.
-    let subs: Arc<tokio::sync::Mutex<HashMap<String, Option<String>>>> = Default::default();
-    let mut tasks = tokio::task::JoinSet::new();
-    while let Some(Ok(msg)) = stream.next().await {
+    let mut subscriptions: HashMap<String, JoinHandle<()>> = HashMap::new();
+    while let Some(Ok(msg)) = incoming.next().await {
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
             _ => continue,
         };
-        let parsed: ClientMsg = match serde_json::from_str(&text) {
+        let msg = match serde_json::from_str::<ClientMsg>(&text) {
             Ok(m) => m,
             Err(e) => {
-                let _ = tx.send(ServerMsg::Error {
-                    id: None,
-                    code: "BAD_MESSAGE".into(),
-                    message: e.to_string(),
-                });
+                let _ = tx
+                    .send(ServerMsg::error(
+                        None,
+                        BAD_MESSAGE,
+                        format!("bad message: {e}"),
+                    ))
+                    .await;
                 continue;
             }
         };
-        match parsed {
-            ClientMsg::Subscribe { id, sql, params } => {
-                {
-                    let mut s = subs.lock().await;
-                    if s.contains_key(&id) {
-                        let _ = tx.send(ServerMsg::Error {
-                            id: Some(id),
-                            code: "DUPLICATE_ID".into(),
-                            message: "subscription id already in use on this connection".into(),
-                        });
-                        continue;
-                    }
-                    s.insert(id.clone(), None);
+        match msg {
+            ClientMsg::Subscribe { id, sql } => {
+                if subscriptions.get(&id).is_some_and(|t| !t.is_finished()) {
+                    let _ = tx
+                        .send(ServerMsg::error(
+                            Some(&id),
+                            DUPLICATE_ID,
+                            format!("subscription {id} already exists on this connection"),
+                        ))
+                        .await;
+                    continue;
                 }
                 debug!(conn, id, sql, "subscribe");
-                // Snapshots can take a while; don't block other messages on this socket.
-                let (manager, tx, subs) = (manager.clone(), tx.clone(), subs.clone());
-                tasks.spawn(async move {
-                    match manager
-                        .subscribe(conn, id.clone(), &sql, &params, tx.clone())
-                        .await
-                    {
-                        Ok(hash) => {
-                            let mut s = subs.lock().await;
-                            match s.get_mut(&id) {
-                                Some(slot) => *slot = Some(hash),
-                                // unsubscribed while the snapshot was being built
-                                None => {
-                                    drop(s);
-                                    manager.unsubscribe(conn, &id, &hash).await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            subs.lock().await.remove(&id);
-                            let _ = tx.send(ServerMsg::Error {
-                                id: Some(id),
-                                code: e.code.into(),
-                                message: e.message,
-                            });
-                        }
-                    }
+                let entry = Arc::new(Entry {
+                    sql: sql.clone(),
+                    watermark: Mutex::new(None),
+                    rows_sent: AtomicU64::new(0),
                 });
+                s.registry.insert(conn, &id, entry.clone());
+                let task = tokio::spawn(run(
+                    s.engine.clone(),
+                    s.registry.clone(),
+                    conn,
+                    id.clone(),
+                    sql,
+                    entry,
+                    tx.clone(),
+                ));
+                subscriptions.insert(id, task);
             }
             ClientMsg::Unsubscribe { id } => {
-                let entry = subs.lock().await.remove(&id);
-                if let Some(Some(hash)) = entry {
-                    manager.unsubscribe(conn, &id, &hash).await;
+                debug!(conn, id, "unsubscribe");
+                if let Some(task) = subscriptions.remove(&id) {
+                    task.abort();
+                }
+                s.registry.remove(conn, &id);
+            }
+        }
+    }
+
+    for task in subscriptions.into_values() {
+        task.abort();
+    }
+    s.registry.remove_conn(conn);
+    drop(tx);
+    let _ = writer.await;
+    info!(conn, "disconnected");
+}
+
+/// One subscription: subscribe, send the snapshot, then a diff per batch of ready iterations.
+async fn run(
+    engine: Arc<Engine>,
+    registry: Arc<Registry>,
+    conn: u64,
+    id: String,
+    sql: String,
+    entry: Arc<Entry>,
+    tx: mpsc::Sender<ServerMsg>,
+) {
+    let subscription = match engine.subscribe(&sql).await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!(conn, id, error = %e, "subscribe failed");
+            registry.remove(conn, &id);
+            let _ = tx.send(ServerMsg::engine_error(&id, &e)).await;
+            return;
+        }
+    };
+    *entry.watermark.lock().unwrap() = Some(subscription.watermark.describe());
+    let columns: Vec<Column> = subscription
+        .plan
+        .columns
+        .iter()
+        .map(|c| Column {
+            name: c.name.clone(),
+            ty: c.ty.clickhouse.clone(),
+        })
+        .collect();
+    let mut columns = Some(columns);
+
+    let mut batches = subscription.ready_chunks(MAX_ITERATIONS_PER_MESSAGE);
+    while let Some(batch) = batches.next().await {
+        let mut changes: Vec<Change> = Vec::new();
+        let mut out = Vec::new();
+        let mut failed = false;
+        for iteration in batch {
+            match iteration {
+                Ok(it) if it.origin == Origin::History => {
+                    out.push(ServerMsg::Snapshot {
+                        id: id.clone(),
+                        columns: columns.take().unwrap_or_default(),
+                        rows: it
+                            .diffs
+                            .into_iter()
+                            .map(|d| match d {
+                                chlive_engine::diff::Diff::Insert(row) => row,
+                            })
+                            .collect(),
+                    });
+                }
+                Ok(it) => changes.extend(it.diffs.into_iter().map(Change::from)),
+                Err(e) => {
+                    warn!(conn, id, error = %e, "subscription failed");
+                    if !changes.is_empty() {
+                        out.push(ServerMsg::Diff {
+                            id: id.clone(),
+                            changes: std::mem::take(&mut changes),
+                        });
+                    }
+                    out.push(ServerMsg::engine_error(&id, &e));
+                    failed = true;
+                    break;
                 }
             }
         }
-    }
-    // Let in-flight subscribes settle so they can be released below.
-    while tasks.join_next().await.is_some() {}
-    let remaining: Vec<(String, Option<String>)> = subs.lock().await.drain().collect();
-    for (id, hash) in remaining {
-        if let Some(hash) = hash {
-            manager.unsubscribe(conn, &id, &hash).await;
+        if !changes.is_empty() {
+            out.push(ServerMsg::Diff {
+                id: id.clone(),
+                changes,
+            });
+        }
+        for msg in out {
+            let rows = match &msg {
+                ServerMsg::Snapshot { rows, .. } => rows.len(),
+                ServerMsg::Diff { changes, .. } => changes.len(),
+                ServerMsg::Error { .. } => 0,
+            };
+            entry.rows_sent.fetch_add(rows as u64, Ordering::Relaxed);
+            if tx.send(msg).await.is_err() {
+                return; // the connection is gone
+            }
+        }
+        if failed {
+            break;
         }
     }
-    writer.abort();
-    info!(conn, "disconnected");
+    registry.remove(conn, &id);
 }

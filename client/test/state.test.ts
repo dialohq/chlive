@@ -3,26 +3,33 @@ import assert from "node:assert/strict";
 
 import { ResultStore } from "../src/state.ts";
 
-const row = (c: string, n: number) => ({ __key: JSON.stringify([c]), country: c, n });
+const columns = [{ name: "n", type: "UInt32" }];
 
-test("snapshot then patches reconstructs the latest result in order", () => {
-  const s = new ResultStore();
-  s.applySnapshot({
-    type: "snapshot", id: "a", columns: [], keyColumns: ["country"],
-    rows: [row("PL", 3), row("DE", 2), row("FR", 1)],
-    order: ['["PL"]', '["DE"]', '["FR"]'],
-  });
-  s.applyPatch({ type: "patch", id: "a", upserts: [row("DE", 5), row("US", 4)], deletes: ['["FR"]'], order: ['["DE"]', '["US"]', '["PL"]'] });
-  assert.deepEqual(s.rows(), [row("DE", 5), row("US", 4), row("PL", 3)]);
-  s.applyPatch({ type: "patch", id: "a", upserts: [row("PL", 9)], deletes: [], order: ['["PL"]', '["DE"]', '["US"]'] });
-  assert.deepEqual(s.rows().map((r) => r.n), [9, 5, 4]);
+test("snapshot, then inserts in arrival order", () => {
+  const s = new ResultStore<{ n: number }>();
+  s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }, { n: 2 }] });
+  assert.equal(s.size, 2);
+  const before = s.rows();
+  s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 3 } }, { op: "insert", row: { n: 4 } }] });
+  assert.deepEqual(s.rows().map((r) => r.n), [1, 2, 3, 4]);
+  assert.deepEqual(before.map((r) => r.n), [1, 2], "earlier arrays are not mutated");
+  assert.deepEqual(s.columns, columns);
 });
 
-test("without order rows keep insertion order and a snapshot replaces state", () => {
-  const s = new ResultStore();
-  s.applySnapshot({ type: "snapshot", id: "a", columns: [], keyColumns: [], rows: [row("A", 1)] });
-  s.applyPatch({ type: "patch", id: "a", upserts: [row("B", 1), row("A", 2)], deletes: [] });
-  assert.deepEqual(s.rows(), [row("A", 2), row("B", 1)]);
-  s.applySnapshot({ type: "snapshot", id: "a", columns: [], keyColumns: [], rows: [row("C", 1)] });
-  assert.deepEqual(s.rows(), [row("C", 1)]);
+test("a snapshot replaces everything", () => {
+  const s = new ResultStore<{ n: number }>();
+  s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }] });
+  s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 2 } }] });
+  s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }, { n: 2 }, { n: 3 }] });
+  assert.deepEqual(s.rows().map((r) => r.n), [1, 2, 3]);
+});
+
+test("unknown ops throw and leave the rows untouched", () => {
+  const s = new ResultStore<{ n: number }>();
+  s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }] });
+  assert.throws(
+    () => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 2 } }, { op: "delete" } as any] }),
+    /unsupported change "delete"/,
+  );
+  assert.deepEqual(s.rows().map((r) => r.n), [1]);
 });

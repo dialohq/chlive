@@ -1,4 +1,4 @@
-# Main ClickHouse, pinned to chDB's engine version (./libchdb.nix; nixpkgs has 26.5).
+# ClickHouse for both dev shells, pinned (nixpkgs has 26.5).
 # Official release binaries: a single `clickhouse` multi-tool.
 {
   stdenvNoCC,

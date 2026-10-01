@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS default.orders (
 CREATE MATERIALIZED VIEW IF NOT EXISTS default.orders_mv TO default.orders AS
 SELECT *, _partition, _offset FROM default.orders_queue;
 
--- Readonly user chlive-server (and remote() from its embedded chDB cache) connects as.
--- readonly=2: read-only, but per-query settings are allowed (remote() and HTTP send some).
+-- Read-only user chlive-server's engine connects as (DESCRIBE, the watermark and history).
+-- readonly=2: read-only, but per-query settings are allowed (the engine sends output formats).
 CREATE USER IF NOT EXISTS chlive_ro IDENTIFIED WITH plaintext_password BY 'chlive_ro'
   SETTINGS readonly = 2, max_execution_time = 60, max_memory_usage = 4000000000;
 GRANT SELECT ON default.* TO chlive_ro;

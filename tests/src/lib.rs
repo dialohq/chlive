@@ -1,22 +1,21 @@
-//! Helpers for end-to-end tests against the local stack (`dnvr up`).
+//! Helpers for end-to-end tests against the full local stack (`dnvr up` in the default shell):
+//! an in-process `chlive-server` over the real ClickHouse and Redpanda, spoken to over
+//! WebSocket like a client would.
 //!
-//! Tests only run when `CHLIVE_E2E=1` (the `e2e` script sets it); they need `dnvr up` and no other
-//! producers writing to the `events` topic while they run.
+//! Tests only run when `CHLIVE_E2E=1` (the `e2e` script sets it); they need `dnvr up` and no
+//! other producers writing to the `events` topic while they run.
 
 pub mod producer;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use chlive_server::ch_http::{ChHttp, Params};
-use chlive_server::config::Config;
-use chlive_server::watermark::Watermark;
+use chlive_engine::history::{ClickHouseHttp, HistorySource};
+use chlive_engine::{Config, Engine};
 use chlive_server::Server;
 use futures::{SinkExt, StreamExt};
-use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -31,7 +30,7 @@ pub fn enabled() -> bool {
     on
 }
 
-/// Tests share one Kafka topic and one main table, so they must not overlap.
+/// Tests share one Kafka topic and one ClickHouse table, so they must not overlap.
 pub async fn exclusive() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -48,84 +47,71 @@ pub fn init_tracing() {
         .try_init();
 }
 
-pub fn config() -> Result<Config> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../chlive.toml");
-    let mut cfg = Config::load(&path)?;
-    cfg.listen = "127.0.0.1:0".into();
-    cfg.debounce_ms = 50;
-    Ok(cfg)
+/// The stack of the shell the tests run in (CHLIVE_CLICKHOUSE_URL, CHLIVE_KAFKA), as the
+/// server's read-only ClickHouse user.
+pub fn config() -> Config {
+    Config {
+        clickhouse_url: std::env::var("CHLIVE_CLICKHOUSE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18123".into()),
+        user: "chlive_ro".into(),
+        password: "chlive_ro".into(),
+        database: "default".into(),
+        kafka_brokers: std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:19092".into()),
+    }
 }
 
-/// Start a server. All servers in this test process share the one embedded chDB engine
-/// (chDB allows a single engine per process); each start drops the previous tables.
-pub async fn start_server() -> Result<(Server, Config)> {
-    let cfg = config()?;
-    let server = chlive_server::start(cfg.clone()).await?;
-    Ok((server, cfg))
+pub async fn start_server() -> Result<Server> {
+    Ok(chlive_server::start("127.0.0.1:0", Engine::connect(config())).await?)
 }
 
-pub fn main_client(cfg: &Config) -> ChHttp {
-    ChHttp::new(
-        &cfg.main.url,
-        &cfg.main.user,
-        &cfg.main.password,
-        &cfg.main.database,
-    )
+pub fn producer() -> Result<producer::Producer> {
+    producer::Producer::new(&config().kafka_brokers, "events")
 }
 
-pub fn producer(cfg: &Config) -> Result<producer::Producer> {
-    producer::Producer::new(&cfg.kafka.brokers, &cfg.tables[0].topic)
-}
-
-/// Client-side reconstruction of one live query, built exactly like `@chlive/client`.
-#[derive(Debug, Default, Clone)]
+/// What one subscription has received, applied the way a client applies it.
+#[derive(Debug, Clone, Default)]
 pub struct LiveResult {
-    pub rows: IndexMap<String, Row>,
-    pub order: Option<Vec<String>>,
-    pub snapshots: usize,
-    pub patches: usize,
+    pub snapshot: bool,
+    pub rows: Vec<Row>,
+    /// Rows that came as inserts after the snapshot.
+    pub inserted: usize,
+    pub diffs: usize,
     pub error: Option<(String, String)>,
-    pub last_msg: Option<Instant>,
+    /// Anything after an error, or a second snapshot.
+    pub protocol_violations: Vec<String>,
 }
 
 impl LiveResult {
     fn apply(&mut self, msg: &Value) {
-        self.last_msg = Some(Instant::now());
-        let rows = |v: &Value| -> Vec<Row> {
-            v.as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|r| r.as_object().cloned())
-                .collect()
-        };
-        let order = msg.get("order").and_then(|o| {
-            o.as_array().map(|a| {
-                a.iter()
-                    .map(|k| k.as_str().unwrap_or_default().to_string())
-                    .collect()
-            })
-        });
+        if self.error.is_some() {
+            self.protocol_violations
+                .push(format!("after an error: {msg}"));
+        }
         match msg["type"].as_str() {
             Some("snapshot") => {
-                self.snapshots += 1;
-                self.rows.clear();
-                for r in rows(&msg["rows"]) {
-                    self.rows
-                        .insert(r["__key"].as_str().unwrap().to_string(), r);
+                if self.snapshot {
+                    self.protocol_violations.push("second snapshot".into());
                 }
-                self.order = order;
+                self.snapshot = true;
+                self.rows = rows(&msg["rows"]);
             }
-            Some("patch") => {
-                self.patches += 1;
-                for k in msg["deletes"].as_array().into_iter().flatten() {
-                    self.rows.shift_remove(k.as_str().unwrap());
+            Some("diff") => {
+                if !self.snapshot {
+                    self.protocol_violations
+                        .push("diff before the snapshot".into());
                 }
-                for r in rows(&msg["upserts"]) {
-                    self.rows
-                        .insert(r["__key"].as_str().unwrap().to_string(), r);
-                }
-                if order.is_some() {
-                    self.order = order;
+                self.diffs += 1;
+                for change in msg["changes"].as_array().expect("changes") {
+                    match change["op"].as_str() {
+                        Some("insert") => {
+                            self.rows
+                                .push(change["row"].as_object().expect("row").clone());
+                            self.inserted += 1;
+                        }
+                        other => self
+                            .protocol_violations
+                            .push(format!("unknown op {other:?}")),
+                    }
                 }
             }
             Some("error") => {
@@ -134,30 +120,27 @@ impl LiveResult {
                     msg["message"].as_str().unwrap_or_default().into(),
                 ))
             }
-            _ => {}
+            _ => self
+                .protocol_violations
+                .push(format!("unknown message {msg}")),
         }
-    }
-
-    /// Rows in result order, without `__key`.
-    pub fn ordered_rows(&self) -> Vec<Row> {
-        let keys: Vec<&String> = match &self.order {
-            Some(o) => o.iter().collect(),
-            None => self.rows.keys().collect(),
-        };
-        keys.into_iter()
-            .filter_map(|k| self.rows.get(k))
-            .map(|r| {
-                let mut r = r.clone();
-                r.shift_remove("__key");
-                r
-            })
-            .collect()
     }
 }
 
+fn rows(v: &Value) -> Vec<Row> {
+    v.as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r.as_object().expect("row").clone())
+        .collect()
+}
+
+/// One WebSocket connection; a background task applies every message to its subscription's
+/// [`LiveResult`].
 pub struct LiveConn {
     tx: mpsc::UnboundedSender<String>,
     results: Arc<Mutex<HashMap<String, LiveResult>>>,
+    last_msg: Arc<Mutex<Option<Instant>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -170,7 +153,8 @@ impl LiveConn {
         let (mut sink, mut stream) = ws.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let results: Arc<Mutex<HashMap<String, LiveResult>>> = Default::default();
-        let res = results.clone();
+        let last_msg: Arc<Mutex<Option<Instant>>> = Default::default();
+        let (res, last) = (results.clone(), last_msg.clone());
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -183,6 +167,7 @@ impl LiveConn {
                             let v: Value = serde_json::from_str(&t).expect("server sends JSON");
                             let id = v["id"].as_str().unwrap_or_default().to_string();
                             res.lock().unwrap().entry(id).or_default().apply(&v);
+                            *last.lock().unwrap() = Some(Instant::now());
                         }
                         Some(Ok(_)) => {}
                         _ => return,
@@ -193,12 +178,13 @@ impl LiveConn {
         Ok(Self {
             tx,
             results,
+            last_msg,
             _task: task,
         })
     }
 
-    pub fn subscribe(&self, id: &str, sql: &str, params: Value) {
-        let msg = json!({"type": "subscribe", "id": id, "sql": sql, "params": params});
+    pub fn subscribe(&self, id: &str, sql: &str) {
+        let msg = json!({"type": "subscribe", "id": id, "sql": sql});
         self.tx.send(msg.to_string()).expect("socket open");
     }
 
@@ -221,7 +207,7 @@ impl LiveConn {
                 .copied()
                 .filter(|id| {
                     self.result(id)
-                        .is_none_or(|r| r.snapshots == 0 && r.error.is_none())
+                        .is_none_or(|r| !r.snapshot && r.error.is_none())
                 })
                 .collect();
             if pending.is_empty() {
@@ -238,13 +224,7 @@ impl LiveConn {
     pub async fn wait_quiet(&self, quiet: Duration, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            let last = self
-                .results
-                .lock()
-                .unwrap()
-                .values()
-                .filter_map(|r| r.last_msg)
-                .max();
+            let last = *self.last_msg.lock().unwrap();
             if last.is_none_or(|l| l.elapsed() >= quiet) {
                 return Ok(());
             }
@@ -256,126 +236,58 @@ impl LiveConn {
     }
 }
 
-pub async fn main_max_offsets(main: &ChHttp, table: &str) -> Result<BTreeMap<u32, i64>> {
-    let r = main
-        .query(
-            &chlive_server::watermark::max_offsets_sql(main.database(), table),
-            &Params::new(),
-        )
+pub fn clickhouse() -> ClickHouseHttp {
+    let c = config();
+    ClickHouseHttp::new(&c.clickhouse_url, &c.user, &c.password)
+}
+
+/// Highest offset per partition that ClickHouse has ingested into `default.events`.
+pub async fn ingested() -> Result<BTreeMap<i32, i64>> {
+    let rows = clickhouse()
+        .fetch("SELECT _partition AS p, max(_offset) AS o FROM default.events GROUP BY p")
         .await?;
-    Ok(r.data
+    Ok(rows
         .iter()
-        .map(|row| {
-            (
-                row["p"].as_u64().unwrap() as u32,
-                row["o"].as_i64().unwrap(),
-            )
-        })
+        .map(|r| (r["p"].as_i64().unwrap() as i32, r["o"].as_i64().unwrap()))
         .collect())
 }
 
-/// Wait until main and the server's tail have ingested everything up to `produced`, then
-/// until the client has seen no patches for a while.
-pub async fn settle(
-    server: &Server,
-    main: &ChHttp,
-    conn: &LiveConn,
-    produced: &BTreeMap<i32, i64>,
-) -> Result<()> {
-    let target = Watermark(produced.iter().map(|(p, o)| (*p as u32, *o)).collect());
+/// Wait until ClickHouse has ingested everything up to `produced`, then until the connection
+/// has been quiet for a while (the stream has delivered the rest).
+pub async fn settle(conn: &LiveConn, produced: &BTreeMap<i32, i64>) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        let main_w = Watermark(main_max_offsets(main, "events").await?);
-        let tail_w = server.tables["events"].tail_max.read().unwrap().clone();
-        if main_w.covers(&target) && tail_w.covers(&target) {
+        let have = ingested().await?;
+        if produced
+            .iter()
+            .all(|(p, o)| have.get(p).is_some_and(|h| h >= o))
+        {
             break;
         }
         if Instant::now() > deadline {
-            bail!("ingestion did not catch up: target={target:?} main={main_w:?} tail={tail_w:?}");
+            bail!("ClickHouse did not catch up: produced={produced:?} ingested={have:?}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    conn.wait_quiet(Duration::from_millis(750), Duration::from_secs(60))
+    conn.wait_quiet(Duration::from_millis(1000), Duration::from_secs(60))
         .await
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Tol {
-    Exact,
-    /// Relative tolerance for numbers (and element-wise for arrays).
-    Rel(f64),
-    /// Within `rel` relative OR `abs` absolute (for sampled quantiles of small values).
-    Approx {
-        rel: f64,
-        abs: f64,
-    },
+/// The query run directly on ClickHouse, unbounded: the SQL the engine plans for its history.
+pub async fn direct(sql: &str) -> Result<Vec<Row>> {
+    let plan = Engine::connect(config())
+        .explain(sql)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(clickhouse().fetch(&plan.history.sql(None)).await?)
 }
 
-fn close(a: &Value, b: &Value, tol: Tol) -> bool {
-    match (a, b, tol) {
-        (Value::Number(x), Value::Number(y), Tol::Rel(_) | Tol::Approx { .. }) => {
-            let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
-            let (rel, abs) = match tol {
-                Tol::Rel(r) => (r, 0.0),
-                Tol::Approx { rel, abs } => (rel, abs),
-                Tol::Exact => unreachable!(),
-            };
-            let d = (x - y).abs();
-            d <= rel * x.abs().max(y.abs()).max(1e-12) || d <= abs
-        }
-        (Value::Array(x), Value::Array(y), _) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| close(a, b, tol))
-        }
-        _ => a == b,
-    }
-}
-
-/// Assert `live` equals `direct` row by row, using `tol(column)` per column.
-pub fn assert_results_match(name: &str, live: &[Row], direct: &[Row], tol: impl Fn(&str) -> Tol) {
-    let show = |rows: &[Row]| {
-        rows.iter()
-            .map(|r| Value::Object(r.clone()).to_string())
-            .collect::<Vec<_>>()
-            .join("\n  ")
-    };
-    assert_eq!(
-        live.len(),
-        direct.len(),
-        "{name}: row count differs\nlive:\n  {}\ndirect:\n  {}",
-        show(live),
-        show(direct)
-    );
-    for (i, (l, d)) in live.iter().zip(direct).enumerate() {
-        let lk: Vec<&String> = l.keys().collect();
-        let dk: Vec<&String> = d.keys().collect();
-        assert_eq!(lk, dk, "{name}: columns differ in row {i}");
-        for (col, dv) in d {
-            let lv = &l[col];
-            assert!(
-                close(lv, dv, tol(col)),
-                "{name}: row {i} column {col}: live={lv} direct={dv} (tol {:?})\nlive:\n  {}\ndirect:\n  {}",
-                tol(col),
-                show(live),
-                show(direct)
-            );
-        }
-    }
-}
-
-/// Run a query on main with JSON params, the way a client would have sent them.
-pub async fn direct(main: &ChHttp, sql: &str, params: &Value) -> Result<Vec<Row>> {
-    let p: Params = params
-        .as_object()
-        .into_iter()
-        .flatten()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                v.as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| v.to_string()),
-            )
-        })
+/// Rows as a sorted list of their JSON, to compare results as multisets (duplicates count).
+pub fn multiset(rows: &[Row]) -> Vec<String> {
+    let mut v: Vec<String> = rows
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
         .collect();
-    Ok(main.query(sql, &p).await?.data)
+    v.sort();
+    v
 }

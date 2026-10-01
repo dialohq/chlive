@@ -4,6 +4,7 @@ edition = "2021"
 version = "0.1.0"
 license = "MIT"
 
+# A thin WebSocket layer over chlive-engine (src/lib.rs); the binary runs it (src/main.rs).
 [lib]
 path = "src/lib.rs"
 
@@ -12,24 +13,18 @@ name = "chlive-server"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-thiserror = "2"
+chlive-engine = { path = "../engine" }
+axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
-rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dynamic-linking"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# binary only
+anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-futures = "0.3"
-sqlparser = { version = "0.63", features = ["visitor"] }
-axum = { version = "0.8", features = ["ws"] }
-toml = "0.9"
-sha2 = "0.10"
-async-trait = "0.1"
-indexmap = { version = "2", features = ["serde"] }
-chdb-rust = "2.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-rand = "0.9"
+async-trait = "0.1"
+tokio-tungstenite = "0.30"

@@ -1,4 +1,4 @@
-import type { ClientMessage, Column, Params, Row, ServerMessage } from "./protocol.ts";
+import type { ClientMessage, Column, Row, ServerMessage } from "./protocol.ts";
 import { ResultStore } from "./state.ts";
 
 export type * from "./protocol.ts";
@@ -10,7 +10,6 @@ export interface LiveState<R extends Row = Row> {
   status: Status;
   rows: R[];
   columns: Column[];
-  keyColumns: string[];
   error?: string;
   errorCode?: string;
 }
@@ -33,7 +32,6 @@ export interface LiveClientOptions {
 
 interface SubRecord {
   sql: string;
-  params: Params;
   store: ResultStore<any>;
   state: LiveState<any>;
   listener: Listener<any>;
@@ -59,20 +57,19 @@ export class LiveClient {
     this.backoff = this.opts.minBackoffMs;
   }
 
-  subscribe<R extends Row = Row>(sql: string, params: Params, listener: Listener<R>): Subscription {
+  subscribe<R extends Row = Row>(sql: string, listener: Listener<R>): Subscription {
     if (this.closed) throw new Error("LiveClient is closed");
     const id = `s${this.nextId++}`;
     const rec: SubRecord = {
       sql,
-      params,
       store: new ResultStore<R>(),
-      state: { status: "loading", rows: [], columns: [], keyColumns: [] },
+      state: { status: "loading", rows: [], columns: [] },
       listener,
     };
     this.subs.set(id, rec);
     listener(rec.state);
     this.ensureConnected();
-    this.send({ type: "subscribe", id, sql, params });
+    this.send({ type: "subscribe", id, sql });
     let active = true;
     return {
       unsubscribe: () => {
@@ -106,7 +103,7 @@ export class LiveClient {
     ws.onopen = () => {
       this.backoff = this.opts.minBackoffMs;
       for (const [id, rec] of this.subs) {
-        ws.send(JSON.stringify({ type: "subscribe", id, sql: rec.sql, params: rec.params } satisfies ClientMessage));
+        ws.send(JSON.stringify({ type: "subscribe", id, sql: rec.sql } satisfies ClientMessage));
       }
     };
     ws.onmessage = (ev: MessageEvent) => this.onMessage(JSON.parse(String(ev.data)) as ServerMessage);
@@ -140,19 +137,19 @@ export class LiveClient {
       case "snapshot":
         rec.store.applySnapshot(msg);
         break;
-      case "patch":
-        rec.store.applyPatch(msg);
+      case "diff":
+        try {
+          rec.store.applyDiff(msg);
+        } catch (e) {
+          this.emit(rec, { ...rec.state, status: "error", error: String(e), errorCode: "CLIENT_ERROR" });
+          return;
+        }
         break;
       case "error":
         this.emit(rec, { ...rec.state, status: "error", error: msg.message, errorCode: msg.code });
         return;
     }
-    this.emit(rec, {
-      status: "live",
-      rows: rec.store.rows(),
-      columns: rec.store.columns,
-      keyColumns: rec.store.keyColumns,
-    });
+    this.emit(rec, { status: "live", rows: rec.store.rows(), columns: rec.store.columns });
   }
 
   private emit(rec: SubRecord, state: LiveState<any>): void {

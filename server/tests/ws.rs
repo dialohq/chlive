@@ -1,0 +1,319 @@
+//! The protocol over a real WebSocket, without ClickHouse or Kafka: a fake history and
+//! in-memory events behind an in-process server.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chlive_engine::diff::Row;
+use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
+use chlive_engine::rules::{HardcodedRules, TopicId};
+use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
+use chlive_engine::Engine;
+use futures::stream::{self, BoxStream, StreamExt};
+use futures::SinkExt;
+use serde_json::{json, Value};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+/// `requests`: ClickHouse has offset 0 of partition 0 (the row `h1`).
+struct FakeHistory;
+
+#[async_trait]
+impl HistorySource for FakeHistory {
+    async fn describe(&self, table: &str) -> Result<Vec<DescribedColumn>, HistoryError> {
+        let col = |n: &str, ty: &str| DescribedColumn {
+            name: n.into(),
+            ty: ty.into(),
+        };
+        match table {
+            "default.requests" => Ok(vec![
+                col("user_id", "String"),
+                col("latency_ms", "UInt32"),
+                col("_partition", "UInt64"),
+                col("_offset", "UInt64"),
+            ]),
+            _ => Err(HistoryError::UnknownTable(table.into())),
+        }
+    }
+
+    async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError> {
+        if sql.contains("max(_offset)") {
+            return Ok(vec![obj(json!({"p": 0, "o": 0}))]);
+        }
+        // the history row, projected to the selected columns (the WHERE is the test's job)
+        let history = obj(json!({"user_id": "h1", "latency_ms": 900}));
+        let columns = sql
+            .strip_prefix("SELECT ")
+            .and_then(|s| s.split(" FROM ").next())
+            .ok_or_else(|| HistoryError::ClickHouse(format!("unexpected query {sql}")))?;
+        Ok(vec![columns
+            .split(", ")
+            .map(|c| (c.to_string(), history[c].clone()))
+            .collect()])
+    }
+}
+
+/// Like Kafka: after the events there are, the stream stays open.
+struct Endless(MemorySource);
+
+#[async_trait]
+impl EventSource for Endless {
+    async fn partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
+        self.0.partitions(topic).await
+    }
+
+    async fn subscribe(
+        &self,
+        starts: &[TopicStart],
+        keys: &[String],
+    ) -> Result<BoxStream<'static, Event>, SourceError> {
+        Ok(self
+            .0
+            .subscribe(starts, keys)
+            .await?
+            .chain(stream::pending())
+            .boxed())
+    }
+}
+
+fn obj(v: Value) -> Row {
+    v.as_object().unwrap().clone()
+}
+
+async fn server() -> chlive_server::Server {
+    let mut events = MemorySource::new();
+    events
+        .push("requests", 0, r#"{"user_id": "h1", "latency_ms": 900}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "fast", "latency_ms": 5}"#)
+        .push("requests", 0, r#"{"user_id": "slow", "latency_ms": 500}"#)
+        .push(
+            "requests",
+            0,
+            r#"{"user_id": "slower", "latency_ms": "700"}"#,
+        );
+    let engine = Engine::new(HardcodedRules::default(), FakeHistory, Endless(events));
+    chlive_server::start("127.0.0.1:0", engine).await.unwrap()
+}
+
+struct Client(WebSocketStream<MaybeTlsStream<TcpStream>>);
+
+impl Client {
+    async fn connect(server: &chlive_server::Server) -> Self {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/live", server.addr))
+            .await
+            .unwrap();
+        Self(ws)
+    }
+
+    async fn send(&mut self, v: Value) {
+        self.send_text(&v.to_string()).await;
+    }
+
+    async fn send_text(&mut self, text: &str) {
+        self.0.send(Message::Text(text.into())).await.unwrap();
+    }
+
+    async fn subscribe(&mut self, id: &str, sql: &str) {
+        self.send(json!({"type": "subscribe", "id": id, "sql": sql}))
+            .await;
+    }
+
+    /// The next message, or `None` if none arrives in a while.
+    async fn next(&mut self) -> Option<Value> {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_millis(500), self.0.next())
+                .await
+                .ok()??
+                .unwrap();
+            if let Message::Text(t) = msg {
+                return Some(serde_json::from_str(&t).unwrap());
+            }
+        }
+    }
+
+    async fn expect(&mut self) -> Value {
+        self.next().await.expect("a message")
+    }
+
+    /// The inserted rows of `diff`s for `id` until `n` have arrived.
+    async fn inserts(&mut self, id: &str, n: usize) -> Vec<Value> {
+        let mut rows = Vec::new();
+        while rows.len() < n {
+            let m = self.expect().await;
+            assert_eq!(
+                (m["type"].as_str(), m["id"].as_str()),
+                (Some("diff"), Some(id)),
+                "{m}"
+            );
+            for c in m["changes"].as_array().unwrap() {
+                assert_eq!(c["op"], "insert");
+                rows.push(c["row"].clone());
+            }
+        }
+        rows
+    }
+}
+
+#[tokio::test]
+async fn snapshot_then_inserts_of_matching_events() {
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe(
+        "s1",
+        "select user_id, latency_ms from requests where latency_ms > 100",
+    )
+    .await;
+    assert_eq!(
+        c.expect().await,
+        json!({"type": "snapshot", "id": "s1",
+               "columns": [{"name": "user_id", "type": "String"}, {"name": "latency_ms", "type": "UInt32"}],
+               "rows": [{"user_id": "h1", "latency_ms": 900}]})
+    );
+    // offset 0 is history (not repeated); "fast" doesn't match; "700" is read as UInt32
+    assert_eq!(
+        c.inserts("s1", 2).await,
+        [
+            json!({"user_id": "slow", "latency_ms": 500}),
+            json!({"user_id": "slower", "latency_ms": 700})
+        ]
+    );
+    assert_eq!(c.next().await, None, "nothing for non-matching events");
+}
+
+#[tokio::test]
+async fn subscriptions_on_one_connection_are_independent() {
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe("a", "select user_id from requests where latency_ms < 100")
+        .await;
+    c.subscribe("b", "select latency_ms from requests").await;
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    while let Some(m) = c.next().await {
+        let rows: Vec<Value> = match m["type"].as_str().unwrap() {
+            "snapshot" => m["rows"].as_array().unwrap().clone(),
+            "diff" => m["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["row"].clone())
+                .collect(),
+            other => panic!("unexpected {other}: {m}"),
+        };
+        match m["id"].as_str().unwrap() {
+            "a" => a.extend(rows),
+            "b" => b.extend(rows),
+            other => panic!("unknown id {other}"),
+        }
+    }
+    // (the fake history ignores WHERE, so `a` gets h1 from history)
+    assert_eq!(a, [json!({"user_id": "h1"}), json!({"user_id": "fast"})]);
+    assert_eq!(
+        b,
+        [
+            json!({"latency_ms": 900}),
+            json!({"latency_ms": 5}),
+            json!({"latency_ms": 500}),
+            json!({"latency_ms": 700})
+        ]
+    );
+}
+
+#[tokio::test]
+async fn errors() {
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+
+    c.subscribe("s1", "select * form requests").await;
+    assert_eq!(
+        c.expect().await,
+        json!({"type": "error", "id": "s1", "code": "SYNTAX_ERROR",
+               "message": "syntax error: expected FROM, found identifier `form` at 1:10"})
+    );
+    c.subscribe("s2", "select nope from requests").await;
+    assert_eq!(
+        c.expect().await,
+        json!({"type": "error", "id": "s2", "code": "INVALID_QUERY",
+               "message": "unknown column nope in table requests (columns: user_id, latency_ms) at 1:8"})
+    );
+    c.subscribe("s3", "select * from requests where latency_ms > 'x'")
+        .await;
+    let m = c.expect().await;
+    assert_eq!(
+        (m["code"].as_str(), m["message"].as_str()),
+        (
+            Some("INVALID_QUERY"),
+            Some("cannot compare UInt32 with a string at 1:43")
+        )
+    );
+
+    c.send_text("not json").await;
+    let m = c.expect().await;
+    assert_eq!(m["code"], "BAD_MESSAGE");
+    assert!(m.get("id").is_none());
+    c.send(json!({"type": "subscribe", "id": "p", "sql": "select * from requests", "params": {}}))
+        .await;
+    assert_eq!(c.expect().await["code"], "BAD_MESSAGE");
+
+    // a failed subscription's id can be reused; a live one's can't
+    c.subscribe("s1", "select user_id from requests").await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    c.subscribe("s1", "select user_id from requests").await;
+    let mut codes = Vec::new();
+    while let Some(m) = c.next().await {
+        codes
+            .push(m["type"].as_str().unwrap().to_string() + "/" + m["code"].as_str().unwrap_or(""));
+    }
+    assert!(
+        codes.contains(&"error/DUPLICATE_ID".to_string()),
+        "{codes:?}"
+    );
+}
+
+#[tokio::test]
+async fn unsubscribe_stops_the_subscription() {
+    let server = server().await;
+    let debug = || async {
+        let resp = http_get(&format!("http://{}/debug/subscriptions", server.addr)).await;
+        serde_json::from_str::<Value>(&resp).unwrap()
+    };
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s1", "select user_id from requests").await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    assert_eq!(c.inserts("s1", 3).await.len(), 3);
+    let listed = debug().await;
+    assert_eq!(listed[0]["id"], "s1");
+    assert_eq!(listed[0]["watermark"], "{0: 0}");
+    assert_eq!(listed[0]["rowsSent"], 4);
+
+    c.send(json!({"type": "unsubscribe", "id": "s1"})).await;
+    assert_eq!(c.next().await, None);
+    assert_eq!(debug().await, json!([]));
+
+    // disconnecting releases everything too
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s1", "select user_id from requests").await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    assert_eq!(debug().await.as_array().unwrap().len(), 1);
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(debug().await, json!([]));
+}
+
+/// A plain HTTP GET (no client library needed for one endpoint).
+async fn http_get(url: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rest = url.strip_prefix("http://").unwrap();
+    let (host, path) = rest.split_once('/').unwrap();
+    let mut s = TcpStream::connect(host).await.unwrap();
+    s.write_all(
+        format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut buf = String::new();
+    s.read_to_string(&mut buf).await.unwrap();
+    let body = buf.split_once("\r\n\r\n").unwrap().1;
+    body.to_string()
+}

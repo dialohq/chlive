@@ -1,228 +1,41 @@
-pub mod cache_engine;
-pub mod ch_http;
-pub mod config;
-pub mod diff;
-pub mod rewriter;
-pub mod subscriptions;
-pub mod tail;
-pub mod watermark;
+//! chlive server: a thin WebSocket layer over [`chlive_engine`]. The engine plans and runs
+//! each query (ClickHouse history, then Kafka events); the server only speaks the
+//! [`protocol`] with clients.
+
+pub mod protocol;
 pub mod ws;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use tokio::sync::broadcast;
-use tracing::{info, warn};
+use chlive_engine::Engine;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
-use cache_engine::{CacheEngine, ChdbCache};
-use ch_http::{ChHttp, Params};
-use config::Config;
-use rewriter::{Catalog, FunctionCatalog};
-use subscriptions::Manager;
-use tail::TableRuntime;
+pub use ws::router;
 
-/// A running server.
+/// A running server (see [`start`]).
 pub struct Server {
     pub addr: SocketAddr,
-    pub cache: Arc<dyn CacheEngine>,
-    pub manager: Arc<Manager>,
-    pub tables: HashMap<String, Arc<TableRuntime>>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    task: JoinHandle<std::io::Result<()>>,
 }
 
 impl Server {
-    pub async fn wait(mut self) -> Result<()> {
-        let http = self.tasks.remove(0);
-        http.await.context("http server task")?;
-        Ok(())
+    /// Until the server stops.
+    pub async fn wait(self) -> std::io::Result<()> {
+        self.task.await.map_err(std::io::Error::other)?
+    }
+
+    pub fn stop(&self) {
+        self.task.abort();
     }
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        for t in &self.tasks {
-            t.abort();
-        }
-    }
-}
-
-async fn load_functions(main: &ChHttp) -> Result<FunctionCatalog> {
-    let aggs = main
-        .query(
-            "SELECT name, case_insensitive FROM system.functions WHERE is_aggregate",
-            &Params::new(),
-        )
-        .await?;
-    let combs = main
-        .query(
-            "SELECT name FROM system.aggregate_function_combinators",
-            &Params::new(),
-        )
-        .await?;
-    Ok(FunctionCatalog::new(
-        aggs.data.iter().filter_map(|r| {
-            Some((
-                r["name"].as_str()?.to_string(),
-                r["case_insensitive"].as_u64().unwrap_or(0) == 1,
-            ))
-        }),
-        combs
-            .data
-            .iter()
-            .filter_map(|r| r["name"].as_str().map(str::to_string)),
-    ))
-}
-
-/// SQL string literal for trusted, operator-supplied config values.
-fn sql_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
-}
-
-/// Make the (process-wide) chDB cache ready for a fresh server: define the `main_ro` named
-/// collection used by `remote()`, and drop tables left behind by an earlier server in this
-/// process (tests start several).
-async fn prepare_cache(cache: &ChdbCache, main: &ChHttp, cfg: &Config) -> Result<()> {
-    // chDB defaults to the host's local timezone; DateTime values must be parsed and
-    // printed exactly as main does, or tail rows and results shift by the UTC offset.
-    let tz = main
-        .query("SELECT timezone() AS tz", &Params::new())
-        .await
-        .context("reading main's timezone")?;
-    let tz = tz
-        .data
-        .first()
-        .and_then(|r| r["tz"].as_str())
-        .unwrap_or("UTC")
-        .to_string();
-    cache
-        .exec_on_all(&format!("SET session_timezone = {}", sql_literal(&tz)))
-        .await?;
-    let (host, port) = cfg
-        .main
-        .native_address
-        .rsplit_once(':')
-        .context("main.native_address must be host:port")?;
-    let port: u16 = port.parse().context("main.native_address port")?;
-    cache
-        .exec("DROP NAMED COLLECTION IF EXISTS main_ro", &Params::new())
-        .await?;
-    cache
-        .exec(
-            &format!(
-                "CREATE NAMED COLLECTION main_ro AS host = {}, port = {port}, user = {}, password = {}, database = {}",
-                sql_literal(host),
-                sql_literal(&cfg.main.user),
-                sql_literal(&cfg.main.password),
-                sql_literal(&cfg.main.database),
-            ),
-            &Params::new(),
-        )
-        .await
-        .context("creating named collection main_ro in chDB")?;
-    let leftovers = cache
-        .query(
-            "SELECT name FROM system.tables WHERE database = currentDatabase() \
-             AND (name LIKE 'tail\\_%' OR name LIKE 'sub\\_%')",
-            &Params::new(),
-        )
-        .await?;
-    for row in &leftovers.data {
-        if let Some(name) = row["name"].as_str() {
-            cache
-                .exec(
-                    &format!("DROP TABLE IF EXISTS {} SYNC", rewriter::quote_ident(name)),
-                    &Params::new(),
-                )
-                .await?;
-        }
-    }
-    Ok(())
-}
-
-/// Prepare the cache, start tail consumers and serve HTTP/WebSocket on `cfg.listen`.
-pub async fn start(cfg: Config) -> Result<Server> {
-    let main = ChHttp::new(
-        &cfg.main.url,
-        &cfg.main.user,
-        &cfg.main.password,
-        &cfg.main.database,
-    );
-    let chdb = ChdbCache::shared(cfg.cache.pool_size, cfg.cache.console_log)?;
-    prepare_cache(&chdb, &main, &cfg).await?;
-    let cache: Arc<dyn CacheEngine> = Arc::new(chdb);
-
-    let functions = match load_functions(&main).await {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(error = %e, "could not load aggregate function list from main; using builtin list");
-            FunctionCatalog::builtin()
-        }
-    };
-
-    let (tx, rx) = broadcast::channel(1024);
-    let mut tables = HashMap::new();
-    let mut schemas = HashMap::new();
-    let mut tasks = Vec::new();
-    for t in &cfg.tables {
-        let schema = tail::describe(&main, &t.name).await?;
-        tail::create_tail_table(cache.as_ref(), &schema).await?;
-        let partitions = tail::partition_count(&cfg.kafka, &t.topic)?;
-        let w0 = tail::fetch_watermark(&main, &t.name, partitions).await?;
-        let rt = Arc::new(TableRuntime {
-            schema: schema.clone(),
-            topic: t.topic.clone(),
-            partitions,
-            tail_max: RwLock::new(w0.clone()),
-            w0,
-        });
-        tasks.push(tail::spawn(
-            cfg.kafka.clone(),
-            cache.clone(),
-            rt.clone(),
-            tx.clone(),
-        )?);
-        schemas.insert(t.name.clone(), schema);
-        tables.insert(t.name.clone(), rt);
-    }
-
-    let catalog = Arc::new(Catalog {
-        database: cfg.main.database.clone(),
-        tables: schemas,
-        functions,
-        source_template: cfg.cache.remote_source.clone(),
-    });
-    let cache_handle = cache.clone();
-    let manager = Manager::new(
-        catalog,
-        tables.clone(),
-        main,
-        cache,
-        Duration::from_millis(cfg.debounce_ms),
-    );
-    tasks.push(manager.spawn_router(rx));
-
-    let listener = tokio::net::TcpListener::bind(&cfg.listen)
-        .await
-        .with_context(|| format!("binding {}", cfg.listen))?;
+/// Listen on `addr` (port 0 picks a free one) and serve `engine` in the background.
+pub async fn start(addr: &str, engine: Engine) -> std::io::Result<Server> {
+    let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
-    let app = ws::router(manager.clone());
-    tasks.insert(
-        0,
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
-                tracing::error!(error = %e, "http server failed");
-            }
-        }),
-    );
-    info!(%addr, "chlive listening");
-    Ok(Server {
-        addr,
-        cache: cache_handle,
-        manager,
-        tables,
-        tasks,
-    })
+    let router = router(Arc::new(engine));
+    let task = tokio::spawn(async move { axum::serve(listener, router).await });
+    Ok(Server { addr, task })
 }

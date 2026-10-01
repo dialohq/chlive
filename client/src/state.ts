@@ -1,41 +1,37 @@
-import type { Column, PatchMessage, Row, SnapshotMessage } from "./protocol.ts";
+import type { Column, DiffMessage, Row, SnapshotMessage } from "./protocol.ts";
 
-/**
- * Client-side copy of one live result: a key → row map plus the server's ordering.
- * Rows come out in `order` when the query has ORDER BY, otherwise in insertion order.
- */
+/** A live result: the snapshot's rows, then each diff's changes applied in order. */
 export class ResultStore<R extends Row = Row> {
-  private rowsByKey = new Map<string, R>();
-  private order: string[] | null = null;
   columns: Column[] = [];
-  keyColumns: string[] = [];
+  private data: R[] = [];
 
-  /** A snapshot replaces all local state. */
+  /** Replaces everything (also after a reconnect: the new snapshot is the whole result). */
   applySnapshot(msg: SnapshotMessage): void {
-    this.rowsByKey.clear();
-    for (const row of msg.rows) this.rowsByKey.set(row.__key, row as R);
-    this.order = msg.order ?? null;
     this.columns = msg.columns;
-    this.keyColumns = msg.keyColumns;
+    this.data = msg.rows as R[];
   }
 
-  applyPatch(msg: PatchMessage): void {
-    for (const key of msg.deletes) this.rowsByKey.delete(key);
-    for (const row of msg.upserts) this.rowsByKey.set(row.__key, row as R);
-    if (msg.order) this.order = msg.order;
+  /** Throws on a change it doesn't understand (a newer server), leaving the rows untouched. */
+  applyDiff(msg: DiffMessage): void {
+    const next = this.data.slice();
+    for (const change of msg.changes) {
+      switch (change.op) {
+        case "insert":
+          next.push(change.row as R);
+          break;
+        default:
+          throw new Error(`unsupported change ${JSON.stringify((change as { op: unknown }).op)}`);
+      }
+    }
+    this.data = next;
+  }
+
+  /** In arrival order: history first, then inserts as they came. A new array after each change. */
+  rows(): R[] {
+    return this.data;
   }
 
   get size(): number {
-    return this.rowsByKey.size;
-  }
-
-  rows(): R[] {
-    if (!this.order) return [...this.rowsByKey.values()];
-    const out: R[] = [];
-    for (const key of this.order) {
-      const row = this.rowsByKey.get(key);
-      if (row) out.push(row);
-    }
-    return out;
+    return this.data.length;
   }
 }
