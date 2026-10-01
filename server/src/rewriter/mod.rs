@@ -127,7 +127,7 @@ impl Plan {
 pub struct Options {
     /// Expand references to aggregate aliases (e.g. `big_orders / count()`) into the aliased
     /// expression before rewriting. When false, ClickHouse resolves the alias inside the
-    /// merge query instead. Both are tested; expansion is the default (see NOTES.md).
+    /// merge query instead. Both are tested; expansion is the default.
     pub expand_aliases: bool,
 }
 

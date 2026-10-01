@@ -133,7 +133,7 @@
               # The HTTP proxy batches produce requests for 100 ms by default; disable that so a
               # single write from the simple demo is acknowledged (and visible) immediately.
               # The proxy's own Kafka client uses the in-container listener on 9092 (not
-              # published); the host (main ClickHouse, server, generator) uses 19092.
+              # published); the host (main ClickHouse, chlive-server, tests) uses 19092.
               docker run --rm --name "$name" \
                 -p 127.0.0.1:${toString kafkaPort}:${toString kafkaPort} \
                 -p 127.0.0.1:${toString pandaproxyPort}:${toString pandaproxyPort} \
@@ -184,7 +184,7 @@
           dnvr.shells.default =
             { config, ... }:
             {
-              description = "chlive: Redpanda (Docker) + ClickHouse main + chlive-server (embedded chDB) + demos";
+              description = "chlive: Redpanda (Docker) + ClickHouse main + chlive-server (embedded chDB) + simple demo";
 
               packages = with pkgs; [
                 nixfmt
@@ -205,7 +205,7 @@
                 rdkafka
                 zlib
 
-                # client / demos
+                # client / examples
                 nodejs_24
 
                 # main ClickHouse (also on PATH for ad-hoc use; Redpanda runs in Docker)
@@ -221,10 +221,8 @@
                 CHDB_LIB_DIR = "${libchdb}/lib";
                 CHDB_INCLUDE_DIR = "${libchdb}/include";
                 LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-                CHLIVE_KAFKA = "127.0.0.1:${toString kafkaPort}";
-                # events seeded into an empty main on `dnvr up`; default rate of the `stream` script
+                # events seeded into an empty main on `dnvr up` (scripts/seed.sql)
                 SEED_COUNT = "1000000";
-                STREAM_RATE = "200";
               };
 
               processes = {
@@ -240,7 +238,7 @@
                   # native protocol, used by remote() from the chDB cache inside chlive-server
                   tcpPort = 19000;
                   timezone = "UTC";
-                  # Writable storage for SQL-created users (chlive_ro, see infra/main-init.sql);
+                  # Writable storage for SQL-created users (chlive_ro, see scripts/schema.sql);
                   # relative to DNVR_ROOT like the preset's other paths.
                   extraConfigXml = "<access_control_path>.dnvr/clickhouse/access/</access_control_path>";
                 };
@@ -254,22 +252,26 @@
                   };
                   command = ''
                     cd "$DNVR_ROOT"
-                    ${chClient} --multiquery < infra/main-init.sql
+                    ${chClient} --multiquery < scripts/schema.sql
                     dnvr-state set ready 1
-                    echo "[schema] applied infra/main-init.sql"
+                    echo "[schema] applied scripts/schema.sql"
                     exec tail -f /dev/null
                   '';
                 };
 
-                # Seed historical events through Kafka when main has fewer than $SEED_COUNT.
+                # Seed historical events (scripts/seed.sql, produced through Kafka) when main has
+                # fewer than $SEED_COUNT, then wait until main has ingested them.
                 seed = {
                   env.SCHEMA_READY = "dnvr://schema/ready";
                   command = ''
                     cd "$DNVR_ROOT"
-                    have=$(${chClient} --query "SELECT count() FROM default.events")
+                    count() { ${chClient} --query "SELECT count() FROM default.events"; }
+                    have=$(count)
                     if [ "$have" -lt "$SEED_COUNT" ]; then
                       echo "[seed] main has $have events; seeding $((SEED_COUNT - have))"
-                      cargo run --release -p chlive-generator -- seed --count $((SEED_COUNT - have))
+                      ${chClient} --param_count=$((SEED_COUNT - have)) --queries-file scripts/seed.sql
+                      until [ "$(count)" -ge "$SEED_COUNT" ]; do sleep 1; done
+                      echo "[seed] main now has $(count) events"
                     else
                       echo "[seed] main already has $have events"
                     fi
@@ -286,20 +288,11 @@
                   '';
                 };
 
-                demo = {
+                simple = {
                   command = ''
                     cd "$DNVR_ROOT"
                     [ -d node_modules ] || npm install
-                    dnvr-state set deps 1
-                    exec npm run dev -w demo -- --port 5173 --strictPort
-                  '';
-                };
-
-                simple = {
-                  env.NPM_DEPS = "dnvr://demo/deps";
-                  command = ''
-                    cd "$DNVR_ROOT"
-                    exec npm run dev -w simple -- --port 5174 --strictPort
+                    exec npm run dev -w examples/simple -- --port 5174 --strictPort
                   '';
                 };
               };
@@ -310,18 +303,10 @@
                   text = ''exec ${chClient} "$@"'';
                 };
                 e2e = {
-                  description = "Run the end-to-end tests (no `stream` running)";
+                  description = "Run the end-to-end tests against the running stack";
                   text = ''
                     cd "$DNVR_ROOT"
                     CHLIVE_E2E=1 exec cargo test -p chlive-e2e "$@"
-                  '';
-                };
-                # Live traffic is opt-in: run it in a terminal while the stack is up.
-                stream = {
-                  description = "Produce live events: `stream [rate]`, default 200/s, until Ctrl-C";
-                  text = ''
-                    cd "$DNVR_ROOT"
-                    exec cargo run --release -p chlive-generator -- stream --rate "''${1:-$STREAM_RATE}"
                   '';
                 };
                 reset-data = {

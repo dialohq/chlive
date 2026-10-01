@@ -553,29 +553,15 @@ name = "chlive-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chlive-generator",
  "chlive-server",
+ "chrono",
  "futures",
  "indexmap",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "chlive-generator"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "futures",
  "rand 0.9.5",
  "rdkafka",
  "serde_json",
  "tokio",
- "tracing",
+ "tokio-tungstenite 0.30.0",
  "tracing-subscriber",
 ]
 

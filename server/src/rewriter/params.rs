@@ -2,7 +2,7 @@
 //!
 //! `sqlparser` parses `{name:Type}` as a dictionary literal, which breaks for types such as
 //! `Map(String, UInt8)`. Placeholders are therefore swapped for plain identifiers
-//! (`__p_<name>`) before parsing and restored in the generated SQL. See NOTES.md.
+//! (`__p_<name>`) before parsing and restored in the generated SQL.
 
 use std::collections::BTreeMap;
 

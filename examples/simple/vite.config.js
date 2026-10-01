@@ -2,7 +2,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-const src = (p) => fileURLToPath(new URL(`../client/src/${p}`, import.meta.url));
+const src = (p) => fileURLToPath(new URL(`../../client/src/${p}`, import.meta.url));
 
 export default defineConfig({
   plugins: [react()],

@@ -12,6 +12,8 @@ serde_json.workspace = true
 futures.workspace = true
 tracing-subscriber.workspace = true
 chlive-server = { path = "../server" }
-chlive-generator = { path = "../generator" }
+rdkafka.workspace = true
+rand.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tokio-tungstenite = "0.30"
 indexmap = "2"

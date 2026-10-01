@@ -63,7 +63,7 @@ pub async fn describe(main: &ChHttp, table: &str) -> Result<TableSchema> {
     for required in ["_partition", "_offset"] {
         anyhow::ensure!(
             columns.iter().any(|(n, _)| n == required),
-            "source table {table} must have a {required} column (see NOTES.md assumptions)"
+            "source table {table} must have a {required} column persisted from the Kafka engine"
         );
     }
     Ok(TableSchema {
@@ -207,7 +207,7 @@ async fn run(
             {
                 Some(Ok(r)) => r,
                 other => {
-                    // Main's Kafka engine would reject the same message; see NOTES.md.
+                    // Main's Kafka engine would reject (and stall on) the same message.
                     error!(
                         partition = p,
                         offset = o,

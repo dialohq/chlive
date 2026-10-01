@@ -1,9 +1,9 @@
 //! End-to-end correctness: live results (snapshot + patches, reconstructed client-side) must
 //! equal the original query run directly on main ClickHouse once ingestion has settled.
 //!
-//! Run with `e2e -- --nocapture` in the dev shell while `dnvr up` runs (and no `stream`).
+//! Run with `e2e -- --nocapture` in the dev shell while `dnvr up` runs (and nothing else produces).
 //!
-//! Tolerances (see NOTES.md): exact for count/sum of integers/min/max/argMin/argMax/uniqExact
+//! Tolerances: exact for count/sum of integers/min/max/argMin/argMax/uniqExact
 //! and strings; 1e-9 relative for float sums/averages/ratios; 2% for `uniq`; 15% for
 //! `quantile(s)` or 5 ms absolute (reservoir sampling: merged states and a single pass
 //! sample differently).
@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chlive_e2e::*;
-use chlive_generator::TsMode;
 use chlive_server::cache_engine::CacheEngine;
 use chlive_server::ch_http::Params;
 use chlive_server::rewriter::{self, Options};
@@ -221,9 +220,9 @@ async fn live_results_match_direct_queries() {
     init_tracing();
     let (server, cfg) = start_server().await.unwrap();
     let main = main_client(&cfg);
-    let gen = generator(&cfg).unwrap();
+    let gen = producer(&cfg).unwrap();
 
-    let mut produced = gen.produce(Some(3000), None, TsMode::Now).await.unwrap();
+    let mut produced = gen.produce(3000, None).await.unwrap();
     let conn = LiveConn::connect(&server).await.unwrap();
     let cases: Vec<(Case, Value)> = cases()
         .into_iter()
@@ -242,9 +241,7 @@ async fn live_results_match_direct_queries() {
 
     merge_offsets(
         &mut produced,
-        gen.produce(Some(4000), Some(2000.0), TsMode::Now)
-            .await
-            .unwrap(),
+        gen.produce(4000, Some(2000.0)).await.unwrap(),
     );
     settle(&server, &main, &conn, &produced).await.unwrap();
     check_all(&conn, &main, &cases).await;
@@ -293,16 +290,12 @@ async fn snapshot_tail_boundary_race() {
     init_tracing();
     let (server, cfg) = start_server().await.unwrap();
     let main = main_client(&cfg);
-    let gen = generator(&cfg).unwrap();
-    let mut produced = gen.produce(Some(500), None, TsMode::Now).await.unwrap();
+    let gen = producer(&cfg).unwrap();
+    let mut produced = gen.produce(500, None).await.unwrap();
 
     let producer = {
-        let gen = generator(&cfg).unwrap();
-        tokio::spawn(async move {
-            gen.produce(Some(9000), Some(3000.0), TsMode::Now)
-                .await
-                .unwrap()
-        })
+        let gen = producer(&cfg).unwrap();
+        tokio::spawn(async move { gen.produce(9000, Some(3000.0)).await.unwrap() })
     };
     let conn = LiveConn::connect(&server).await.unwrap();
     let cases: Vec<(Case, Value)> = cases()

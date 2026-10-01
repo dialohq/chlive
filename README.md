@@ -17,19 +17,18 @@ dnvr up          # starts everything in a tmux dashboard
 |---|---|---|
 | `redpanda` | Redpanda in Docker (container `chlive-redpanda`, volume `chlive-redpanda`); creates topics `events`, `customers`, `orders` (3 partitions each) | Kafka `127.0.0.1:19092`, HTTP proxy `127.0.0.1:18082` |
 | `clickhouse` | main ClickHouse 26.7.2 (dnvr's clickhouse preset) | HTTP `127.0.0.1:18123`, native `127.0.0.1:19000` |
-| `schema` → clickhouse, redpanda | applies `infra/main-init.sql` (Kafka-engine tables, MVs, the `chlive_ro` user) | |
-| `seed` → schema | seeds main up to `$SEED_COUNT` (1M) backdated events, through Kafka | |
+| `schema` → clickhouse, redpanda | applies `scripts/schema.sql` (Kafka-engine tables, MVs, the `chlive_ro` user) | |
+| `seed` → schema | runs `scripts/seed.sql` if main has fewer than `$SEED_COUNT` (1M) events: generated, backdated events produced to Kafka from ClickHouse | |
 | `server` → schema | chlive-server with the embedded chDB cache | `:8080` (`/live`, `/debug/subscriptions`) |
-| `demo` | the full demo (examples 1–8) | <http://localhost:5173> |
-| `simple` | the simple demo | <http://localhost:5174> |
+| `simple` | the simple example app | <http://localhost:5174> |
 
-Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. Live traffic is not started automatically; run `stream [rate]` (default 200 events/s) in a terminal while the stack is up. The shell also has these scripts: `ch` (clickhouse client on main), `e2e` (end-to-end tests), and `reset-data` (wipe Redpanda and ClickHouse data together, since offsets and watermarks must match; run it with the group stopped).
+Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the simple example's buttons (or anything else producing to Kafka). The shell also has these scripts: `ch` (clickhouse client on main), `e2e` (end-to-end tests), and `reset-data` (wipe Redpanda and ClickHouse data together, since offsets and watermarks must match; run it with the group stopped).
 
 State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume. The ports avoid the defaults (8123/9000/9092), so the stack can run next to another local ClickHouse or Kafka.
 
-### Simple demo
+### Examples
 
-`simple/` is a nearly empty plain React (JSX) page, served by the `simple` process at <http://localhost:5174>. It has:
+`examples/` holds example apps (npm workspaces). `examples/simple` is a nearly empty plain React (JSX) page, served by the `simple` process at <http://localhost:5174>. It has:
 
 - a live list of the latest `events` rows, with a button that writes a new event;
 - a live list of the latest `orders`, joined in the browser with the latest `customers` rows (two live queries; joins are not supported server-side). Buttons write a customer, write an order, or rename a customer. A rename is a new row, and `argMax(name, ts)` picks the latest one.
@@ -52,7 +51,7 @@ For each distinct subscription `(sql, params)`, the server does the following:
 
 Queries without aggregates use the same trick with rows. With a `LIMIT`, `topN(history ∪ tail) == topN(topN(history) ∪ tail)`, so only the top N history rows are copied. Without one, every matching history row is copied, so keep such queries selective.
 
-The rewriter (`server/src/rewriter/`) turns the client's SQL into the history, tail-state, and merge queries. See the golden files in `server/src/rewriter/golden/` for exactly what gets generated from each demo query.
+The rewriter (`server/src/rewriter/`) turns the client's SQL into the history, tail-state, and merge queries. See the golden files in `server/src/rewriter/golden/` for exactly what gets generated from each example query.
 
 ```
 Kafka ──▶ ClickHouse main (Kafka engine + MV adds _partition/_offset)
@@ -65,13 +64,12 @@ Kafka ──▶ ClickHouse main (Kafka engine + MV adds _partition/_offset)
 
 | path | what |
 |---|---|
-| `flake.nix` (dnvr shell), `infra/` | dev shell (toolchain, libchdb, ClickHouse) and the local stack as dnvr processes: Redpanda (Docker), main ClickHouse 26.7.2, schema (`infra/main-init.sql`), seed, server, demos |
+| `flake.nix` | dev shell (toolchain, libchdb, ClickHouse) and the local stack as dnvr processes: Redpanda (Docker), main ClickHouse 26.7.2, schema, seed, server, examples |
+| `scripts/` | `schema.sql` (main's tables, Kafka ingestion, readonly user) and `seed.sql` (historical events via Kafka) |
 | `server/` | `chlive-server` (Rust): rewriter, watermark, tail consumer, subscription manager, diff, WebSocket |
-| `generator/` | `chlive-generator`: seeds history and streams live events through Kafka |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
-| `demo/` | Vite + React page with examples 1–8 |
-| `tests/` | end-to-end correctness tests (`chlive-e2e`) |
-| `NOTES.md` | decisions, verified ClickHouse behaviors, limitations, next steps |
+| `examples/` | example apps; `examples/simple` for now |
+| `tests/` | end-to-end correctness tests (`chlive-e2e`), with a small Kafka producer for test events |
 
 ## Client
 
@@ -96,7 +94,7 @@ npm test -w client                         # client state + reconnect/resubscrib
 e2e                                        # = CHLIVE_E2E=1 cargo test -p chlive-e2e, against `dnvr up`
 ```
 
-The e2e tests produce their own events and compare against the whole `events` table, so don't run the `stream` script (or any other producer) while they run. Regenerate golden files with `UPDATE_GOLDEN=1 cargo test -p chlive-server`.
+The e2e tests produce their own events and compare against the whole `events` table, so don't produce other events (e.g. with the simple example's buttons) while they run. Regenerate golden files with `UPDATE_GOLDEN=1 cargo test -p chlive-server`.
 
 ## Supported queries
 

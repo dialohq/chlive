@@ -1,4 +1,4 @@
-//! Synthetic event producer for the `events` topic.
+//! Synthetic event producer for the e2e tests (historical seeding is `scripts/seed.sql`).
 //!
 //! Every message is one `JSONEachRow` row matching `default.events_queue` on main ClickHouse.
 
@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
 use rdkafka::config::ClientConfig;
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer as _};
 
 const COUNTRIES: &[(&str, u32)] = &[
     ("US", 30),
@@ -29,7 +29,7 @@ const COUNTRIES: &[(&str, u32)] = &[
     ("AU", 1),
     ("MX", 1),
 ];
-pub const PATHS: &[&str] = &[
+const PATHS: &[&str] = &[
     "/",
     "/search",
     "/product",
@@ -41,16 +41,7 @@ pub const PATHS: &[&str] = &[
 ];
 const USERS: u32 = 5_000;
 
-/// How event timestamps are chosen.
-#[derive(Clone, Copy, Debug)]
-pub enum TsMode {
-    /// Uniformly spread over the `days` before now (historical seed).
-    Backdated { days: u32 },
-    /// Wall clock at production time (live stream).
-    Now,
-}
-
-pub struct Generator {
+pub struct Producer {
     producer: FutureProducer,
     topic: String,
     partitions: i32,
@@ -59,7 +50,7 @@ pub struct Generator {
 /// Highest acknowledged offset per partition for the messages produced in one call.
 pub type Offsets = BTreeMap<i32, i64>;
 
-impl Generator {
+impl Producer {
     pub fn new(brokers: &str, topic: &str) -> Result<Self> {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
@@ -86,19 +77,14 @@ impl Generator {
         })
     }
 
-    /// Produce `count` events (forever when `None`) at up to `rate` events/s (unthrottled
-    /// when `None`). Returns the highest acknowledged offset per partition.
-    pub async fn produce(
-        &self,
-        count: Option<u64>,
-        rate: Option<f64>,
-        ts: TsMode,
-    ) -> Result<Offsets> {
+    /// Produce `count` live events at up to `rate` events/s (unthrottled when `None`).
+    /// Returns the highest acknowledged offset per partition.
+    pub async fn produce(&self, count: u64, rate: Option<f64>) -> Result<Offsets> {
         let mut offsets = Offsets::new();
         let mut inflight = FuturesUnordered::new();
         let started = tokio::time::Instant::now();
         let mut sent: u64 = 0;
-        while count.is_none_or(|c| sent < c) {
+        while sent < count {
             if let Some(r) = rate {
                 let due = started + Duration::from_secs_f64(sent as f64 / r);
                 tokio::time::sleep_until(due).await;
@@ -106,7 +92,7 @@ impl Generator {
             let (payload, partition) = {
                 let mut rng = rand::rng();
                 (
-                    random_event(&mut rng, ts, Utc::now()),
+                    random_event(&mut rng, Utc::now()),
                     rng.random_range(0..self.partitions),
                 )
             };
@@ -132,9 +118,6 @@ impl Generator {
             while let Some(Some(done)) = futures::FutureExt::now_or_never(inflight.next()) {
                 record(&mut offsets, done?);
             }
-            if sent.is_multiple_of(100_000) {
-                tracing::info!(sent, "produced");
-            }
         }
         while let Some(done) = inflight.next().await {
             record(&mut offsets, done?);
@@ -149,13 +132,7 @@ fn record(offsets: &mut Offsets, d: rdkafka::producer::future_producer::Delivery
     *e = (*e).max(d.offset);
 }
 
-pub fn random_event(rng: &mut impl Rng, ts: TsMode, now: DateTime<Utc>) -> String {
-    let ts = match ts {
-        TsMode::Now => now,
-        TsMode::Backdated { days } => {
-            now - chrono::Duration::milliseconds(rng.random_range(0..i64::from(days) * 86_400_000))
-        }
-    };
+pub fn random_event(rng: &mut impl Rng, ts: DateTime<Utc>) -> String {
     let total: u32 = COUNTRIES.iter().map(|c| c.1).sum();
     let mut pick = rng.random_range(0..total);
     let country = COUNTRIES

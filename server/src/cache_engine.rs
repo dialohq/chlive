@@ -61,7 +61,7 @@ impl ChdbCache {
         // chDB writes its own ClickHouse server log to the console whenever stderr is a
         // terminal (e.g. a dnvr pane). Every tail insert made it log
         // `<Fatal> ThreadStatus: current_thread contains invalid address` (~85/s), an
-        // internal bookkeeping diagnostic with no effect on results (see NOTES.md). Query
+        // internal bookkeeping diagnostic with no effect on results. Query
         // errors still come back through the API and are logged by the server.
         let args: &[&str] = if console_log {
             &[]

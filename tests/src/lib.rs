@@ -3,6 +3,8 @@
 //! Tests only run when `CHLIVE_E2E=1` (the `e2e` script sets it); they need `dnvr up` and no other
 //! producers writing to the `events` topic while they run.
 
+pub mod producer;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -71,8 +73,8 @@ pub fn main_client(cfg: &Config) -> ChHttp {
     )
 }
 
-pub fn generator(cfg: &Config) -> Result<chlive_generator::Generator> {
-    chlive_generator::Generator::new(&cfg.kafka.brokers, &cfg.tables[0].topic)
+pub fn producer(cfg: &Config) -> Result<producer::Producer> {
+    producer::Producer::new(&cfg.kafka.brokers, &cfg.tables[0].topic)
 }
 
 /// Client-side reconstruction of one live query, built exactly like `@chlive/client`.

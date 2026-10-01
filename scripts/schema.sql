@@ -1,5 +1,5 @@
 -- Main ClickHouse schema, applied (idempotently) by the dnvr `schema` process on every start.
--- Assumptions (see NOTES.md):
+-- Assumptions:
 --  * one Kafka message = one row (JSONEachRow), MV is a pure passthrough adding _partition/_offset
 --  * plain append-only MergeTree
 CREATE TABLE IF NOT EXISTS default.events_queue (
