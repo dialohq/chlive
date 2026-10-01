@@ -1,6 +1,6 @@
 # The `redpanda` dnvr process: Redpanda (Kafka API + HTTP proxy) in Docker; `docker` comes from
 # the host. Data persists in the `chlive-redpanda` volume, alongside main's data in
-# .dnvr/clickhouse (reset both together: `reset-data`).
+# .dnvr/clickhouse (reset both together: `reset-data`). `settings` comes from flake.nix.
 {
   lib,
   writeShellApplication,
