@@ -55,6 +55,19 @@ impl StreamPlan {
     }
 }
 
+/// What `--explain` shows: table, columns, the history query, and the stream side.
+impl std::fmt::Display for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let columns: Vec<&str> = self.columns.iter().map(|c| c.name.as_str()).collect();
+        let topics: Vec<&str> = self.stream.topics.iter().map(|t| t.0.as_str()).collect();
+        writeln!(f, "table:   {}", self.table)?;
+        writeln!(f, "columns: {}", columns.join(", "))?;
+        writeln!(f, "history: {}", self.history.sql)?;
+        writeln!(f, "topics:  {}", topics.join(", "))?;
+        write!(f, "filter:  {:?}", self.stream.filter)
+    }
+}
+
 pub fn plan(query: &Query, rules: &dyn NamingRules, schema: &TableSchema) -> Plan {
     let columns = match query.projection {
         Projection::Wildcard => schema.columns.clone(),

@@ -1,8 +1,8 @@
 [package]
 name = "chlive-server"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
 
 [lib]
 path = "src/lib.rs"
@@ -12,17 +12,17 @@ name = "chlive-server"
 path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-rdkafka.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-clap.workspace = true
-futures.workspace = true
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dynamic-linking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
 sqlparser = { version = "0.63", features = ["visitor"] }
 axum = { version = "0.8", features = ["ws"] }
 toml = "0.9"
@@ -32,4 +32,4 @@ indexmap = { version = "2", features = ["serde"] }
 chdb-rust = "2.0"
 
 [dev-dependencies]
-rand.workspace = true
+rand = "0.9"

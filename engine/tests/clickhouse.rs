@@ -1,13 +1,11 @@
 //! Against a real ClickHouse (either dev shell's, via CHLIVE_CLICKHOUSE_URL); runs only with
 //! CHLIVE_E2E=1. Uses its own small table instead of the seeded `default.events`.
 
-use std::sync::Arc;
-
 use chlive_engine::diff::Diff;
-use chlive_engine::engine::{Engine, Origin};
 use chlive_engine::history::ClickHouseHttp;
 use chlive_engine::rules::HardcodedRules;
 use chlive_engine::stream::JsonlTopics;
+use chlive_engine::{Engine, Origin};
 use futures::StreamExt;
 use serde_json::json;
 
@@ -47,20 +45,20 @@ async fn select_star_from_events_against_clickhouse() {
         "{\"ts\": \"2026-10-01 12:00:02.000\", \"user_id\": \"u3\", \"latency_ms\": 30}\n",
     )
     .unwrap();
-    let engine = Engine {
-        rules: Arc::new(HardcodedRules {
+    let engine = Engine::new(
+        HardcodedRules {
             database: "chlive_engine_test".into(),
-        }),
-        history: Arc::new(ClickHouseHttp::new(&url(), "default", "")),
-        topics: JsonlTopics::new(dir.path()),
-    };
-    let plan = engine.prepare("SELECT * FROM events").await.unwrap();
+        },
+        ClickHouseHttp::new(&url(), "default", ""),
+        JsonlTopics::new(dir.path()),
+    );
+    let subscription = engine.subscribe("SELECT * FROM events").await.unwrap();
     assert_eq!(
-        plan.history.sql,
+        subscription.plan.history.sql,
         "SELECT ts, user_id, latency_ms FROM chlive_engine_test.events"
     );
 
-    let its: Vec<_> = engine.run(plan).map(|i| i.unwrap()).collect().await;
+    let its: Vec<_> = subscription.map(|i| i.unwrap()).collect().await;
     assert_eq!(its.len(), 2);
     assert_eq!(its[0].origin, Origin::History);
     let mut history: Vec<String> = its[0].diffs.iter().map(|d| d.to_string()).collect();

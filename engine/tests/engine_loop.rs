@@ -1,13 +1,11 @@
 //! The engine loop without ClickHouse or Kafka: fake history, temporary JSONL topics.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use chlive_engine::diff::{Diff, Row};
-use chlive_engine::engine::{Engine, Iteration, Origin};
 use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
 use chlive_engine::rules::{HardcodedRules, TopicId};
 use chlive_engine::stream::JsonlTopics;
+use chlive_engine::{Engine, Iteration, Origin};
 use futures::StreamExt;
 use serde_json::json;
 
@@ -44,12 +42,8 @@ fn row(v: serde_json::Value) -> Row {
     v.as_object().unwrap().clone()
 }
 
-fn engine(dir: &std::path::Path) -> Engine {
-    Engine {
-        rules: Arc::new(HardcodedRules::default()),
-        history: Arc::new(FakeHistory),
-        topics: JsonlTopics::new(dir),
-    }
+fn engine(topics: JsonlTopics) -> Engine {
+    Engine::new(HardcodedRules::default(), FakeHistory, topics)
 }
 
 #[tokio::test]
@@ -69,11 +63,11 @@ async fn history_then_one_iteration_per_event_of_the_subscribed_topic_only() {
     .unwrap();
     std::fs::write(dir.path().join("orders.jsonl"), r#"{"order_id": "o1"}"#).unwrap();
 
-    let engine = engine(dir.path());
-    let plan = engine.prepare("select * from events").await.unwrap();
-    assert_eq!(plan.stream.topics, [TopicId("events".into())]);
+    let engine = engine(JsonlTopics::new(dir.path()));
+    let subscription = engine.subscribe("select * from events").await.unwrap();
+    assert_eq!(subscription.plan.stream.topics, [TopicId("events".into())]);
 
-    let iterations: Vec<Iteration> = engine.run(plan).map(|i| i.unwrap()).collect().await;
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
     let history = &iterations[0];
     assert_eq!(history.origin, Origin::History);
     assert_eq!(
@@ -113,10 +107,10 @@ async fn follow_mode_picks_up_appended_events() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.jsonl");
     std::fs::write(&path, "{\"ts\": \"e1\"}\n").unwrap();
-    let mut engine = engine(dir.path());
-    engine.topics.follow = true;
-    let plan = engine.prepare("select * from events").await.unwrap();
-    let mut iterations = engine.run(plan);
+    let mut topics = JsonlTopics::new(dir.path());
+    topics.follow = true;
+    let engine = engine(topics);
+    let mut iterations = engine.subscribe("select * from events").await.unwrap();
     assert_eq!(
         iterations.next().await.unwrap().unwrap().origin,
         Origin::History
@@ -143,9 +137,9 @@ async fn follow_mode_picks_up_appended_events() {
 #[tokio::test]
 async fn errors_are_clear() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = engine(dir.path());
+    let engine = engine(JsonlTopics::new(dir.path()));
     let e = engine
-        .prepare("select * form events")
+        .explain("select * form events")
         .await
         .unwrap_err()
         .to_string();
@@ -154,7 +148,7 @@ async fn errors_are_clear() {
         "syntax error: expected FROM, found identifier `form` at 1:10"
     );
     let e = engine
-        .prepare("select * from nope")
+        .explain("select * from nope")
         .await
         .unwrap_err()
         .to_string();

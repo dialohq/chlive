@@ -1,25 +1,30 @@
 [package]
 name = "chlive-engine"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+# The library is the engine; the binary is a thin user of it (src/main.rs).
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "chlive-engine"
-path = "src/bin/chlive-engine.rs"
+path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-clap.workspace = true
-futures.workspace = true
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+futures = "0.3"
 async-trait = "0.1"
+# binary only
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
