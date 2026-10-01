@@ -1,6 +1,6 @@
 # chlive: notes, decisions, verified behaviors
 
-The behaviors below were first verified against `clickhouse/clickhouse-server:25.8` with a separate cache ClickHouse server. Since the move to chDB (see *Embedded chDB cache* below), main runs **26.7.2** and the cache is chDB 26.7.3 (ClickHouse 26.7.2.1). The e2e suite passes on that setup. `sqlparser` 0.63. Kafka was originally Redpanda v25.2.1 in Docker; it is now Apache Kafka 4.3.1 from nixpkgs, run by dnvr (see *Local stack (dnvr)*).
+The behaviors below were first verified against `clickhouse/clickhouse-server:25.8` with a separate cache ClickHouse server. Since the move to chDB (see *Embedded chDB cache* below), main runs **26.7.2** and the cache is chDB 26.7.3 (ClickHouse 26.7.2.1). The e2e suite passes on that setup. `sqlparser` 0.63. Kafka is Redpanda v25.2.1 in Docker, run by dnvr (see *Local stack (dnvr)*).
 
 ## Data assumptions (enforced by the demo setup)
 
@@ -76,7 +76,7 @@ Partitions at `-1` or missing from `W` are omitted, so they fall through to the 
 - **Snapshot/patch ordering:** a client is attached, and gets its snapshot, while holding the subscription's state lock. Patches are broadcast under the same lock, so a client never sees a patch before its snapshot. The same lock serializes merges, so there are never two concurrent merges for one subscription.
 - **Debounce (leading-edge throttle):** one `Notify` per subscription coalesces `TableAdvanced` events. The first change after a quiet period merges immediately, and changes arriving during a merge or within `debounce_ms` (100 ms) of the last one coalesce into one merge per interval. This used to be a trailing 100 ms sleep, which added 100 ms to every single event.
 - **Tail batching is adaptive:** a batch is flushed as soon as no further message is already buffered, so a lone event is inserted immediately. Under load, messages pile up during the previous insert and batches grow by themselves. `batch_rows` and `batch_ms` only cap a batch's size and age.
-- **HTTP produce proxy:** the simple demo's writes originally went through Redpanda's HTTP proxy, whose default `produce_batch_delay_ms` of 100 ms added 100 ms to every write; it was set to 0. With Kafka there is no built-in proxy; `chlive-generator http-proxy` sends each record immediately (`linger.ms=0`).
+- **Redpanda HTTP proxy:** the simple demo's writes go through Redpanda's HTTP proxy, whose default `produce_batch_delay_ms` of 100 ms added 100 ms to every write. The `redpanda` process sets it to 0 before starting Redpanda.
 
 ### Measured per-event latency (simple demo path: HTTP proxy write, then a patch at the client)
 
@@ -134,14 +134,18 @@ The cache is chDB (`chdb-rust` 2.0 over libchdb, chdb-core v26.7.3) inside `chli
 
 ## Local stack (dnvr)
 
-The local stack is a [dnvr](https://github.com/dialohq/dnvr) shell (`dnvr.shells.default` in `flake.nix`). `nix develop` gives the toolchain, and `dnvr up` runs the processes in a tmux dashboard. Docker is gone: there is no `docker-compose.yml`, and `scripts/dev.sh` was replaced by `dnvr up`.
+The local stack is a [dnvr](https://github.com/dialohq/dnvr) shell (`dnvr.shells.default` in `flake.nix`). `nix develop` gives the toolchain, and `dnvr up` runs the processes in a tmux dashboard. There is no `docker-compose.yml`; `scripts/dev.sh` was replaced by `dnvr up`. Only Redpanda runs in Docker.
 
 - **ClickHouse 26.7.2 is packaged from the official release binary.** nixpkgs has 26.5 and 26.3 LTS, and main must match chDB's 26.7.2. The binaries are self-extracting: the first run decompresses the file in place, which fails in the read-only Nix store ("mkstemp: Permission denied"). The derivation therefore runs `clickhouse --version` once at build time. The unpacked binary is 815 MB.
 - **Main runs on dnvr's `clickhouse` preset,** with `access_control_path` added in `extraConfigXml`. Without it the server has no writable user storage, and `CREATE USER chlive_ro` fails with `ACCESS_STORAGE_FOR_INSERTION_NOT_FOUND`. The `chlive_ro` user (`readonly=2`, `max_execution_time`, `max_memory_usage`) is now created in SQL in `infra/main-init.sql`, not in a users.d XML file.
 - **Ports 18123/19000/19092** instead of the defaults, because this machine already runs another ClickHouse on 8123.
 - **The `ch` client uses its own config file** (`--config-file`). Otherwise `~/.clickhouse-client/config.xml` applied, and here it set a different user (`readonly`), which broke the schema step.
-- **Kafka** is Apache Kafka 4.3.1 from nixpkgs as a single-node KRaft broker and controller, with data in `.dnvr/kafka`. The `kafka` process formats storage on first start, creates the three topics, and only then publishes `kafka.topics`, which dependents wait on. Restarting main's ClickHouse while Kafka keeps running leaves the old Kafka-engine consumers in their groups until the session timeout (~45 s), and ingestion pauses until the group rebalances.
-- **Start-up order comes from `dnvr://` refs:** `schema` waits for `clickhouse.database` and `kafka.topics`, `seed` and `server` wait for `schema.ready`, `proxy` waits for `kafka.topics`, and `simple` waits for `demo.deps` (the `npm install`). Refs only resolve while the producer is alive, so `schema` and `seed` idle after finishing.
+- **Redpanda runs in Docker as a dnvr process** (`docker run`, container `chlive-redpanda`, volume `chlive-redpanda`). The process waits until the cluster is healthy, creates the three topics, and only then publishes `redpanda.topics`, which dependents wait on. Stopping the process stops the container.
+  - Two Kafka listeners: `19092` is published for the host (main ClickHouse, the server, the generator), and `9092` stays inside the container for the HTTP proxy's own Kafka client, which defaults to it. With only the 19092 listener, every proxy request hung.
+  - This replaced a native Apache Kafka (nixpkgs) setup, which needed its own HTTP produce proxy. Redpanda's built-in proxy makes that unnecessary.
+  - Docker Desktop's disk is a separate, fixed-size limit (13.5 GiB here). When it filled up, Redpanda crashed on `fallocate` during seeding.
+- **Consumer-group timeout:** restarting main's ClickHouse while Redpanda keeps running leaves the old Kafka-engine consumers in their groups until the session timeout (~45 s), and ingestion pauses until the group rebalances.
+- **Start-up order comes from `dnvr://` refs:** `schema` waits for `clickhouse.database` and `redpanda.topics`, `seed` and `server` wait for `schema.ready`, and `simple` waits for `demo.deps` (the `npm install`). Refs only resolve while the producer is alive, so `schema` and `seed` idle after finishing.
 - **No live traffic by default:** the event stream is a `stream` script, not a dnvr process, so the stack is quiet until you start it (or use the simple demo's buttons).
 - **Vite binds `localhost` to `[::1]` only,** so open the demos at `localhost`, not `127.0.0.1`.
 

@@ -16,7 +16,7 @@ export default defineConfig({
     port: 5174,
     proxy: {
       "/live": { target: "ws://127.0.0.1:8080", ws: true },
-      // `chlive-generator http-proxy` (dnvr `proxy` process): writes go straight to Kafka
+      // Redpanda's HTTP proxy (dnvr `redpanda` process): writes go straight to Kafka
       "/kafka": { target: "http://127.0.0.1:18082", rewrite: (p) => p.replace(/^\/kafka/, "") },
     },
   },

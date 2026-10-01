@@ -4,7 +4,7 @@ A minimal **query-driven live sync layer** for a Kafka → ClickHouse analytics 
 
 ## Quickstart
 
-Everything comes from the nix flake, with no Docker: the Rust and Node toolchains, **libchdb**, **ClickHouse 26.7.2** (both packaged in `flake.nix`, because nixpkgs lacks or has other versions), and **Apache Kafka** (nixpkgs). Local services run through [dnvr](https://github.com/dialohq/dnvr):
+Everything except Redpanda comes from the nix flake: the Rust and Node toolchains, **libchdb**, and **ClickHouse 26.7.2** (both packaged in `flake.nix`, because nixpkgs lacks them or has other versions). Redpanda runs in **Docker**, so Docker must be running. Local services run through [dnvr](https://github.com/dialohq/dnvr):
 
 ```sh
 nix develop      # or `direnv allow` once (run `direnv reload` after flake changes)
@@ -15,18 +15,17 @@ dnvr up          # starts everything in a tmux dashboard
 
 | process | what | where |
 |---|---|---|
-| `kafka` | Apache Kafka, single-node KRaft; creates topics `events`, `customers`, `orders` (3 partitions each) | `127.0.0.1:19092` |
+| `redpanda` | Redpanda in Docker (container `chlive-redpanda`, volume `chlive-redpanda`); creates topics `events`, `customers`, `orders` (3 partitions each) | Kafka `127.0.0.1:19092`, HTTP proxy `127.0.0.1:18082` |
 | `clickhouse` | main ClickHouse 26.7.2 (dnvr's clickhouse preset) | HTTP `127.0.0.1:18123`, native `127.0.0.1:19000` |
-| `schema` → clickhouse, kafka | applies `infra/main-init.sql` (Kafka-engine tables, MVs, the `chlive_ro` user) | |
+| `schema` → clickhouse, redpanda | applies `infra/main-init.sql` (Kafka-engine tables, MVs, the `chlive_ro` user) | |
 | `seed` → schema | seeds main up to `$SEED_COUNT` (1M) backdated events, through Kafka | |
 | `server` → schema | chlive-server with the embedded chDB cache | `:8080` (`/live`, `/debug/subscriptions`) |
-| `proxy` → kafka | HTTP → Kafka produce API for the simple demo | `127.0.0.1:18082` |
 | `demo` | the full demo (examples 1–8) | <http://localhost:5173> |
 | `simple` | the simple demo | <http://localhost:5174> |
 
-Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. Live traffic is not started automatically; run `stream [rate]` (default 200 events/s) in a terminal while the stack is up. The shell also has these scripts: `ch` (clickhouse client on main), `e2e` (end-to-end tests), and `reset-data` (wipe Kafka and ClickHouse data; run it with the group stopped).
+Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. Live traffic is not started automatically; run `stream [rate]` (default 200 events/s) in a terminal while the stack is up. The shell also has these scripts: `ch` (clickhouse client on main), `e2e` (end-to-end tests), and `reset-data` (wipe Redpanda and ClickHouse data together, since offsets and watermarks must match; run it with the group stopped).
 
-All state lives in `.dnvr/` (gitignored). The ports avoid the defaults (8123/9000/9092), so the stack can run next to another local ClickHouse or Kafka.
+State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume. The ports avoid the defaults (8123/9000/9092), so the stack can run next to another local ClickHouse or Kafka.
 
 ### Simple demo
 
@@ -35,7 +34,7 @@ All state lives in `.dnvr/` (gitignored). The ports avoid the defaults (8123/900
 - a live list of the latest `events` rows, with a button that writes a new event;
 - a live list of the latest `orders`, joined in the browser with the latest `customers` rows (two live queries; joins are not supported server-side). Buttons write a customer, write an order, or rename a customer. A rename is a new row, and `argMax(name, ts)` picks the latest one.
 
-The buttons write **straight to Kafka** through the `proxy` process (`chlive-generator http-proxy`, a minimal Kafka REST-style `POST /topics/<topic>`, proxied as `/kafka`), so you can watch each write travel Kafka → tail → patch → UI.
+The buttons write **straight to Kafka** through Redpanda's HTTP proxy (`127.0.0.1:18082`, proxied as `/kafka`), so you can watch each write travel Kafka → tail → patch → UI.
 
 ## How it works: history states + tail
 
@@ -66,8 +65,7 @@ Kafka ──▶ ClickHouse main (Kafka engine + MV adds _partition/_offset)
 
 | path | what |
 |---|---|
-| `flake.nix` | dev shell: rust toolchain, librdkafka, node |
-| `flake.nix` (dnvr shell), `infra/` | the local stack as dnvr processes: Kafka, main ClickHouse 26.7.2, schema (`infra/main-init.sql`), seed, server, stream, produce proxy, demos |
+| `flake.nix` (dnvr shell), `infra/` | dev shell (toolchain, libchdb, ClickHouse) and the local stack as dnvr processes: Redpanda (Docker), main ClickHouse 26.7.2, schema (`infra/main-init.sql`), seed, server, demos |
 | `server/` | `chlive-server` (Rust): rewriter, watermark, tail consumer, subscription manager, diff, WebSocket |
 | `generator/` | `chlive-generator`: seeds history and streams live events through Kafka |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |

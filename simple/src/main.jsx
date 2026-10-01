@@ -4,7 +4,7 @@ import { useLiveQuery } from "@chlive/client/react";
 
 let setWriteError = () => { };
 
-// Produce one JSON row to a Kafka topic through the local HTTP produce proxy (dnvr `proxy`).
+// Produce one JSON row to a Kafka topic through Redpanda's HTTP proxy.
 async function write(topic, row) {
   const res = await fetch(`/kafka/topics/${topic}`, {
     method: "POST",

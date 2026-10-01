@@ -22,11 +22,6 @@ enum Cmd {
         #[arg(long, default_value_t = 7)]
         days: u32,
     },
-    /// Serve a minimal HTTP produce API (`POST /topics/{topic}`) for the simple demo.
-    HttpProxy {
-        #[arg(long, default_value = "127.0.0.1:18082")]
-        listen: std::net::SocketAddr,
-    },
     /// Stream live events at a steady rate until interrupted (or --count is reached).
     Stream {
         #[arg(long, default_value_t = 200.0)]
@@ -40,9 +35,6 @@ enum Cmd {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let cli = Cli::parse();
-    if let Cmd::HttpProxy { listen } = cli.cmd {
-        return chlive_generator::proxy::serve(&cli.brokers, listen).await;
-    }
     let generator = Generator::new(&cli.brokers, &cli.topic)?;
     let offsets = match cli.cmd {
         Cmd::Seed { count, days } => {
@@ -50,7 +42,6 @@ async fn main() -> Result<()> {
                 .produce(Some(count), None, TsMode::Backdated { days })
                 .await?
         }
-        Cmd::HttpProxy { .. } => unreachable!("handled above"),
         Cmd::Stream { rate, count } => {
             tokio::select! {
                 r = generator.produce(count, Some(rate), TsMode::Now) => r?,

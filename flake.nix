@@ -110,66 +110,56 @@
             '';
           };
 
-          kafka = pkgs.apacheKafka;
           kafkaPort = 19092;
-          kafkaControllerPort = 19093;
+          pandaproxyPort = 18082;
           topics = [
             "events"
             "customers"
             "orders"
           ];
 
-          # Single-node KRaft broker (no ZooKeeper). Data lives in .dnvr/kafka.
-          kafkaCommand = pkgs.writeShellApplication {
-            name = "chlive-kafka";
+          # Redpanda (Kafka API + HTTP proxy) in Docker; `docker` comes from the host. Data
+          # persists in the `chlive-redpanda` volume, alongside main's data in .dnvr/clickhouse.
+          redpandaCommand = pkgs.writeShellApplication {
+            name = "chlive-redpanda";
             runtimeInputs = [
-              kafka
               pkgs.coreutils
+              pkgs.gnugrep
               dnvrState
             ];
             text = ''
-              : "''${DNVR_ROOT:?}"
-              dir="$DNVR_ROOT/.dnvr/kafka"
-              mkdir -p "$dir/data" "$DNVR_ROOT/.dnvr/logs/kafka"
-              cat > "$dir/server.properties" <<EOF
-              process.roles=broker,controller
-              node.id=1
-              controller.quorum.voters=1@127.0.0.1:${toString kafkaControllerPort}
-              listeners=PLAINTEXT://127.0.0.1:${toString kafkaPort},CONTROLLER://127.0.0.1:${toString kafkaControllerPort}
-              advertised.listeners=PLAINTEXT://127.0.0.1:${toString kafkaPort}
-              controller.listener.names=CONTROLLER
-              listener.security.protocol.map=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
-              log.dirs=$dir/data
-              num.partitions=3
-              offsets.topic.replication.factor=1
-              transaction.state.log.replication.factor=1
-              transaction.state.log.min.isr=1
-              share.coordinator.state.topic.replication.factor=1
-              share.coordinator.state.topic.min.isr=1
-              group.initial.rebalance.delay.ms=0
-              EOF
-              if [ ! -f "$dir/data/meta.properties" ]; then
-                kafka-storage.sh format -t "$(kafka-storage.sh random-uuid)" -c "$dir/server.properties"
-              fi
-              export LOG_DIR="$DNVR_ROOT/.dnvr/logs/kafka"
-              export KAFKA_HEAP_OPTS="-Xms256m -Xmx512m"
-              kafka-server-start.sh "$dir/server.properties" &
+              name=chlive-redpanda
+              docker rm -f "$name" >/dev/null 2>&1 || true
+              # The HTTP proxy batches produce requests for 100 ms by default; disable that so a
+              # single write from the simple demo is acknowledged (and visible) immediately.
+              # The proxy's own Kafka client uses the in-container listener on 9092 (not
+              # published); the host (main ClickHouse, server, generator) uses 19092.
+              docker run --rm --name "$name" \
+                -p 127.0.0.1:${toString kafkaPort}:${toString kafkaPort} \
+                -p 127.0.0.1:${toString pandaproxyPort}:${toString pandaproxyPort} \
+                -v chlive-redpanda:/var/lib/redpanda/data \
+                --entrypoint /bin/bash \
+                redpandadata/redpanda:v25.2.1 -c '
+                  rpk redpanda config set pandaproxy_client.produce_batch_delay_ms 0 &&
+                  exec /entrypoint.sh redpanda start --mode dev-container --smp 1 \
+                    --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:${toString kafkaPort} \
+                    --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:${toString kafkaPort} \
+                    --pandaproxy-addr 0.0.0.0:${toString pandaproxyPort} \
+                    --advertise-pandaproxy-addr 127.0.0.1:${toString pandaproxyPort}' &
               pid=$!
-              trap 'kill -TERM $pid 2>/dev/null || true; wait $pid 2>/dev/null || true' EXIT INT TERM
+              trap 'docker stop -t 10 "$name" >/dev/null 2>&1 || true; wait $pid 2>/dev/null || true' EXIT INT TERM
 
-              bootstrap=127.0.0.1:${toString kafkaPort}
-              dnvr-state set bootstrap "$bootstrap"
-              until kafka-topics.sh --bootstrap-server "$bootstrap" --list >/dev/null 2>&1; do
-                kill -0 $pid 2>/dev/null || { echo "[kafka] exited before becoming ready" >&2; exit 1; }
-                sleep 0.5
+              until docker exec "$name" rpk cluster health 2>/dev/null | grep -qE 'Healthy:.+true'; do
+                kill -0 $pid 2>/dev/null || { echo "[redpanda] exited before becoming ready" >&2; exit 1; }
+                sleep 1
               done
               for t in ${lib.concatStringsSep " " topics}; do
-                kafka-topics.sh --bootstrap-server "$bootstrap" --create --if-not-exists \
-                  --topic "$t" --partitions 3 --replication-factor 1
+                docker exec "$name" rpk topic create "$t" -p 3 -r 1 >/dev/null 2>&1 || true
               done
+              dnvr-state set bootstrap 127.0.0.1:${toString kafkaPort}
               # readiness key: topics exist
               dnvr-state set topics ${lib.concatStringsSep "," topics}
-              echo "[kafka] ready on $bootstrap, topics: ${lib.concatStringsSep ", " topics}"
+              echo "[redpanda] ready: kafka 127.0.0.1:${toString kafkaPort}, http proxy 127.0.0.1:${toString pandaproxyPort}"
               wait $pid
             '';
           };
@@ -194,7 +184,7 @@
           dnvr.shells.default =
             { config, ... }:
             {
-              description = "chlive: Kafka + ClickHouse main + chlive-server (embedded chDB) + demos";
+              description = "chlive: Redpanda (Docker) + ClickHouse main + chlive-server (embedded chDB) + demos";
 
               packages = with pkgs; [
                 nixfmt
@@ -218,8 +208,7 @@
                 # client / demos
                 nodejs_24
 
-                # local services (also on PATH for ad-hoc use: kafka-*.sh, clickhouse client)
-                kafka
+                # main ClickHouse (also on PATH for ad-hoc use; Redpanda runs in Docker)
                 clickhouse
 
                 jq
@@ -239,7 +228,7 @@
               };
 
               processes = {
-                kafka.command = kafkaCommand;
+                redpanda.command = redpandaCommand;
 
                 # Main ClickHouse via dnvr's preset, on the version chDB was built from.
                 clickhouse = {
@@ -261,7 +250,7 @@
                 schema = {
                   env = {
                     CH_DATABASE = "dnvr://clickhouse/database";
-                    KAFKA_TOPICS = "dnvr://kafka/topics";
+                    KAFKA_TOPICS = "dnvr://redpanda/topics";
                   };
                   command = ''
                     cd "$DNVR_ROOT"
@@ -294,15 +283,6 @@
                   command = ''
                     cd "$DNVR_ROOT"
                     exec cargo run --release -p chlive-server -- --config chlive.toml
-                  '';
-                };
-
-                # HTTP → Kafka produce API for the simple demo's buttons (Kafka has none built in).
-                proxy = {
-                  env.KAFKA_TOPICS = "dnvr://kafka/topics";
-                  command = ''
-                    cd "$DNVR_ROOT"
-                    exec cargo run --release -p chlive-generator -- http-proxy --listen 127.0.0.1:18082
                   '';
                 };
 
@@ -345,10 +325,13 @@
                   '';
                 };
                 reset-data = {
-                  description = "Delete local Kafka and ClickHouse data (run while `dnvr up` is stopped)";
+                  description = "Delete local Redpanda and ClickHouse data (run while `dnvr up` is stopped)";
                   text = ''
-                    rm -rf "$DNVR_ROOT/.dnvr/kafka" "$DNVR_ROOT/${config.processes.clickhouse.dataDir}"
-                    echo "removed Kafka and ClickHouse data; next \`dnvr up\` starts empty and re-seeds"
+                    # Kafka offsets and main's _offset watermarks must be reset together.
+                    docker rm -f chlive-redpanda >/dev/null 2>&1 || true
+                    docker volume rm chlive-redpanda >/dev/null 2>&1 || true
+                    rm -rf "$DNVR_ROOT/${config.processes.clickhouse.dataDir}"
+                    echo "removed Redpanda and ClickHouse data; next \`dnvr up\` starts empty and re-seeds"
                   '';
                 };
               };
