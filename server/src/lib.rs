@@ -150,7 +150,7 @@ pub async fn start(cfg: Config) -> Result<Server> {
         &cfg.main.password,
         &cfg.main.database,
     );
-    let chdb = ChdbCache::shared(cfg.cache.pool_size)?;
+    let chdb = ChdbCache::shared(cfg.cache.pool_size, cfg.cache.console_log)?;
     prepare_cache(&chdb, &main, &cfg).await?;
     let cache: Arc<dyn CacheEngine> = Arc::new(chdb);
 

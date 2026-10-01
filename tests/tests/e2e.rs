@@ -436,7 +436,7 @@ async fn watermark_predicate_in_clickhouse() {
     if !enabled() {
         return;
     }
-    let cache = chlive_server::cache_engine::ChdbCache::shared(1).unwrap();
+    let cache = chlive_server::cache_engine::ChdbCache::shared(1, false).unwrap();
     let w = chlive_server::watermark::Watermark(BTreeMap::from([(0, 120), (1, 98), (2, -1)]));
     let sql = format!(
         "SELECT countIf(h AND t) AS both, countIf(NOT h AND NOT t) AS neither, countIf(h) AS hist, count() AS total \

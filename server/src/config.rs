@@ -46,6 +46,10 @@ pub struct CacheConfig {
     /// `main_ro` is a named collection created at startup from `[main]`.
     #[serde(default = "default_remote_source")]
     pub remote_source: String,
+    /// Let chDB print its own ClickHouse log to the console (only when stderr is a terminal).
+    /// Off by default: it spams an internal `ThreadStatus` diagnostic on every insert.
+    #[serde(default)]
+    pub console_log: bool,
 }
 
 impl Default for CacheConfig {
@@ -53,6 +57,7 @@ impl Default for CacheConfig {
         Self {
             pool_size: default_pool_size(),
             remote_source: default_remote_source(),
+            console_log: false,
         }
     }
 }

@@ -16,6 +16,8 @@ native_address = "127.0.0.1:19000"
 pool_size = 4
 # `main_ro` is a named collection the server creates in chDB at startup from [main]
 remote_source = "remote(main_ro, database = '{database}', table = '{table}')"
+# chDB's own ClickHouse log on the console (only shown in a terminal); noisy, see NOTES.md
+console_log = false
 
 [kafka]
 brokers = "127.0.0.1:19092"

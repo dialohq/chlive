@@ -48,20 +48,30 @@ struct Pool {
 impl ChdbCache {
     /// The process-wide pool, created on first use with `pool_size` connections (later calls
     /// reuse it and ignore `pool_size`).
-    pub fn shared(pool_size: usize) -> Result<Self> {
+    pub fn shared(pool_size: usize, console_log: bool) -> Result<Self> {
         static POOL: OnceLock<std::result::Result<ChdbCache, String>> = OnceLock::new();
-        POOL.get_or_init(|| Self::open(pool_size.max(1)).map_err(|e| format!("{e:#}")))
+        POOL.get_or_init(|| Self::open(pool_size.max(1), console_log).map_err(|e| format!("{e:#}")))
             .clone()
             .map_err(|e| anyhow!(e))
     }
 
-    fn open(pool_size: usize) -> Result<Self> {
+    fn open(pool_size: usize, console_log: bool) -> Result<Self> {
         // Let tokio own SIGINT/SIGTERM; chDB would otherwise install its own handlers.
         chdb_rust::runtime::signal_handlers(false);
+        // chDB writes its own ClickHouse server log to the console whenever stderr is a
+        // terminal (e.g. a dnvr pane). Every tail insert made it log
+        // `<Fatal> ThreadStatus: current_thread contains invalid address` (~85/s), an
+        // internal bookkeeping diagnostic with no effect on results (see NOTES.md). Query
+        // errors still come back through the API and are logged by the server.
+        let args: &[&str] = if console_log {
+            &[]
+        } else {
+            &["--logger.console=0"]
+        };
         let mut conns = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
-            let conn = Connection::open_in_memory()
-                .with_context(|| format!("opening chDB connection {i}"))?;
+            let conn =
+                Connection::open(args).with_context(|| format!("opening chDB connection {i}"))?;
             for s in SESSION_SETTINGS {
                 conn.query(s, OutputFormat::TabSeparated)
                     .with_context(|| format!("applying `{s}`"))?;

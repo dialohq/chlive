@@ -113,6 +113,11 @@ The cache is chDB (`chdb-rust` 2.0 over libchdb, chdb-core v26.7.3) inside `chli
 - **Session settings, applied to every connection:**
   - `output_format_json_quote_64bit_integers = 0` and `output_format_json_quote_denormals = 1`, the same as the HTTP client used.
   - **`session_timezone` = main's `timezone()`.** chDB defaults to the host's local zone, which shifted every `DateTime` by the UTC offset (UTC+2 here). The e2e suite caught this.
+- **chDB console log is off** (`--logger.console=0`; `cache.console_log` in `chlive.toml` turns it back on). chDB prints its own ClickHouse server log to stderr, but only when stderr is a terminal, such as a dnvr pane. In the dnvr pane, every tail insert made it log `<Fatal> ThreadStatus: current_thread contains invalid address`: about 85/s with the stream at 200 events/s, and about 110/s during catch-up.
+  - **Bisection** (real server under a pty, repeated runs): 0 lines with tail inserts skipped, and still present with a fixed one-row body, so any insert triggers it and the data doesn't matter. Pool size, table count and parallel parsing make no difference.
+  - **Not reproduced standalone:** isolated chdb-rust programs (direct or through `ChdbCache`, sustained inserts, an active Kafka consumer) never emit it, so the root cause is still unknown. It is a chDB-internal `ThreadStatus` bookkeeping diagnostic.
+  - **No effect on results:** query results are unaffected, and the e2e suite passes with it present. A candidate for an upstream chDB report once a minimal repro exists.
+  - **Caveat for debugging:** with the console log off, chDB's own diagnostics don't show up; query errors still come back through the API.
 - **Signal handlers:** chDB's are disabled at startup (`runtime::signal_handlers(false)`), so tokio keeps SIGINT/SIGTERM.
 - **Footprint:** libchdb is 342 MB on disk, and the server's RSS was 132 MB with the demo subscriptions live. The separate cache container is gone.
 - **Latency, measured on the simple-demo path with 20 single events:**
