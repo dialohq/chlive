@@ -1,5 +1,5 @@
-//! Against the real ClickHouse of the dnvr stack (`dnvr up`); runs only with CHLIVE_E2E=1.
-//! Uses its own small table instead of the seeded `default.events`.
+//! Against a real ClickHouse (either dev shell's, via CHLIVE_CLICKHOUSE_URL); runs only with
+//! CHLIVE_E2E=1. Uses its own small table instead of the seeded `default.events`.
 
 use std::sync::Arc;
 
@@ -11,11 +11,13 @@ use chlive_engine::stream::JsonlTopics;
 use futures::StreamExt;
 use serde_json::json;
 
-const URL: &str = "http://127.0.0.1:18123";
+fn url() -> String {
+    std::env::var("CHLIVE_CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:18123".into())
+}
 
 async fn exec(sql: &str) {
     let resp = reqwest::Client::new()
-        .post(URL)
+        .post(url())
         .header("X-ClickHouse-User", "default")
         .body(sql.to_string())
         .send()
@@ -49,7 +51,7 @@ async fn select_star_from_events_against_clickhouse() {
         rules: Arc::new(HardcodedRules {
             database: "chlive_engine_test".into(),
         }),
-        history: Arc::new(ClickHouseHttp::new(URL, "default", "")),
+        history: Arc::new(ClickHouseHttp::new(&url(), "default", "")),
         topics: JsonlTopics::new(dir.path()),
     };
     let plan = engine.prepare("SELECT * FROM events").await.unwrap();

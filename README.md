@@ -4,7 +4,7 @@ A minimal **query-driven live sync layer** for a Kafka → ClickHouse analytics 
 
 ## Quickstart
 
-Everything except Redpanda comes from the nix flake: the Rust and Node toolchains, **libchdb**, and **ClickHouse 26.7.2** (both packaged in `flake.nix`, because nixpkgs lacks them or has other versions). Redpanda runs in **Docker**, so Docker must be running. Local services run through [dnvr](https://github.com/dialohq/dnvr):
+Everything except Redpanda comes from the nix flake: the Rust and Node toolchains, **libchdb**, and **ClickHouse 26.7.2** (both packaged in `flake.nix`, because nixpkgs lacks them or has other versions). Redpanda runs in **Docker**, so Docker must be running. Local services run through [dnvr](https://github.com/dialohq/dnvr). There are two dev shells: `default`, the full stack described here, and `engine`, just ClickHouse for working on the engine (see [Engine](#engine-custom-dialect-step-1)).
 
 ```sh
 nix develop      # or `direnv allow` once (run `direnv reload` after flake changes)
@@ -75,10 +75,17 @@ Kafka ──▶ ClickHouse main (Kafka engine + MV adds _partition/_offset)
 
 ## Engine (custom dialect, step 1)
 
+The engine has its own dev shell with just ClickHouse and 10 fixed events (`scripts/engine/`), and no Redpanda:
+
 ```sh
-cargo run -p chlive-engine -- --explain "select * from events"     # plan: ClickHouse SQL + topics
-cargo run -p chlive-engine -- --follow "select * from events"      # history, then live events
+nix develop .#engine
+dnvr up                                     # engine-clickhouse (HTTP 28123, native 29000) + engine-seed
+engine --explain "select * from events"     # plan: ClickHouse SQL + topics
+engine --follow "select * from events"      # history (10 rows), then events from engine/topics/
+engine-test                                 # all engine tests, including the ClickHouse one
 ```
+
+Its process names and ports differ from the default shell's, so the two never share data and can run at the same time. In either shell, the engine uses that shell's ClickHouse via `CHLIVE_CLICKHOUSE_URL`.
 
 So far the dialect accepts only `SELECT * FROM <table>`. Hard-coded naming rules map table `t` to ClickHouse `default.t` and to topic `t` (`engine/topics/t.jsonl`), and keep column names the same on both sides; columns starting with `_` are hidden.
 

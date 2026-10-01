@@ -17,7 +17,8 @@ use futures::StreamExt;
 struct Cli {
     /// The query, e.g. "select * from events"
     query: String,
-    #[arg(long, default_value = "http://127.0.0.1:18123")]
+    /// ClickHouse HTTP URL; each dev shell sets CHLIVE_CLICKHOUSE_URL to its own ClickHouse
+    #[arg(long, env = "CHLIVE_CLICKHOUSE_URL", default_value = "http://127.0.0.1:18123")]
     clickhouse_url: String,
     #[arg(long, default_value = "default")]
     user: String,
