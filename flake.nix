@@ -43,7 +43,7 @@
               "orders"
             ];
             # events seeded into an empty main on `dnvr up` (scripts/seed.sql)
-            seedCount = 1000000;
+            seedCount = 10;
           };
 
           libchdb = pkgs.callPackage ./nix/packages/libchdb.nix { };
@@ -91,8 +91,8 @@
                 rdkafka
                 zlib
 
-                # client / examples
-                nodejs_24
+                # client / examples (Bun, not Node)
+                bun
 
                 # main ClickHouse (also on PATH for ad-hoc use; Redpanda runs in Docker)
                 clickhouse
@@ -174,8 +174,8 @@
                 simple = {
                   command = ''
                     cd "$DNVR_ROOT"
-                    [ -d node_modules ] || npm install
-                    exec npm run dev -w examples/simple -- --port ${toString settings.simplePort} --strictPort
+                    [ -d node_modules ] || bun install
+                    exec bun --bun run --cwd examples/simple dev --port ${toString settings.simplePort} --strictPort
                   '';
                 };
               };

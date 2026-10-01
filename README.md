@@ -28,7 +28,7 @@ State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 
 ### Examples
 
-`examples/` holds example apps (npm workspaces). `examples/simple` is a nearly empty plain React (JSX) page, served by the `simple` process at <http://localhost:5174>. It has:
+`examples/` holds example apps (Bun workspaces). `examples/simple` is a nearly empty plain React (JSX) page, served by the `simple` process at <http://localhost:5174>. It has:
 
 - a live list of the latest `events` rows, with a button that writes a new event;
 - a live list of the latest `orders`, joined in the browser with the latest `customers` rows (two live queries; joins are not supported server-side). Buttons write a customer, write an order, or rename a customer. A rename is a new row, and `argMax(name, ts)` picks the latest one.
@@ -103,7 +103,7 @@ Params are typed by their placeholders in the SQL (`{path:String}`, `{since:Date
 
 ```sh
 cargo test --workspace                     # rewriter goldens + rejections, watermark, diff, params
-npm test -w client                         # client state + reconnect/resubscribe
+bun run test                               # client state + reconnect/resubscribe (bun test)
 e2e                                        # = CHLIVE_E2E=1 cargo test -p chlive-e2e, against `dnvr up`
 ```
 

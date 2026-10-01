@@ -12,9 +12,9 @@
   },
   "files": ["dist"],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test \"test/*.test.ts\""
+    "build": "bun --bun tsc -p tsconfig.json",
+    "typecheck": "bun --bun tsc -p tsconfig.json --noEmit",
+    "test": "bun test"
   },
   "peerDependencies": {
     "react": ">=18"

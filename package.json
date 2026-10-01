@@ -3,7 +3,7 @@
   "private": true,
   "workspaces": ["client", "examples/*"],
   "scripts": {
-    "build": "npm run build --workspaces",
-    "test": "npm test -w client"
+    "build": "bun --bun run --filter '*' build",
+    "test": "cd client && bun test"
   }
 }
