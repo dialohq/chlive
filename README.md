@@ -87,7 +87,13 @@ engine-test                                 # all engine tests, including the Cl
 
 Its process names and ports differ from the default shell's, so the two never share data and can run at the same time. In either shell, the engine uses that shell's ClickHouse via `CHLIVE_CLICKHOUSE_URL`.
 
-So far the dialect accepts only `SELECT * FROM <table>`. Hard-coded naming rules map table `t` to ClickHouse `default.t` and to topic `t` (`engine/topics/t.jsonl`), and keep column names the same on both sides; columns starting with `_` are hidden.
+So far the dialect accepts `SELECT * FROM <table>` and `SELECT col, … FROM <table>`.
+
+The query goes through parser → binder → planner. The binder resolves FROM, then SELECT, in SQL's evaluation order:
+- **FROM:** the table must exist in ClickHouse and have a topic.
+- **SELECT:** listed columns must exist, and none may be selected twice.
+
+The planner selects only the needed columns from ClickHouse, and the stream decodes only the needed JSON keys of each event; the other keys are skipped unparsed. Hard-coded naming rules map table `t` to ClickHouse `default.t` and to topic `t` (`engine/topics/t.jsonl`), and keep column names the same on both sides; columns starting with `_` are hidden.
 
 Each iteration prints its diff: first the history (`+ {row}` per ClickHouse row, then `history: N rows`), then one line per event of the subscribed topics, e.g. `events:21 + {…}`. Only the query's topics are opened: lines appended to `events.jsonl` show up with `--follow`, and lines appended to `orders.jsonl` don't.
 

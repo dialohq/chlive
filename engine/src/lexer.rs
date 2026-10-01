@@ -21,6 +21,8 @@ pub enum TokenKind {
     /// A single-quoted string literal, unescaped (`''` and `\'` are quotes).
     String(String),
     Star,
+    LParen,
+    RParen,
     Comma,
     Semicolon,
     Dot,
@@ -35,6 +37,8 @@ impl TokenKind {
             TokenKind::Number(n) => format!("number `{n}`"),
             TokenKind::String(v) => format!("string '{v}'"),
             TokenKind::Star => "`*`".into(),
+            TokenKind::LParen => "`(`".into(),
+            TokenKind::RParen => "`)`".into(),
             TokenKind::Comma => "`,`".into(),
             TokenKind::Semicolon => "`;`".into(),
             TokenKind::Dot => "`.`".into(),
@@ -63,9 +67,11 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                     i += 1;
                 }
             }
-            b'*' | b',' | b';' | b'.' => {
+            b'*' | b'(' | b')' | b',' | b';' | b'.' => {
                 let kind = match c {
                     b'*' => TokenKind::Star,
+                    b'(' => TokenKind::LParen,
+                    b')' => TokenKind::RParen,
                     b',' => TokenKind::Comma,
                     b';' => TokenKind::Semicolon,
                     _ => TokenKind::Dot,

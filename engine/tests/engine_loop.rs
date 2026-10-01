@@ -30,11 +30,18 @@ impl HistorySource for FakeHistory {
     }
 
     async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError> {
-        assert_eq!(sql, "SELECT ts, user_id FROM default.events");
-        Ok(vec![
-            row(json!({"ts": "h1", "user_id": "u1"})),
-            row(json!({"ts": "h2", "user_id": "u2"})),
-        ])
+        // ClickHouse returns exactly the selected columns, in order
+        match sql {
+            "SELECT ts, user_id FROM default.events" => Ok(vec![
+                row(json!({"ts": "h1", "user_id": "u1"})),
+                row(json!({"ts": "h2", "user_id": "u2"})),
+            ]),
+            "SELECT user_id FROM default.events" => Ok(vec![
+                row(json!({"user_id": "u1"})),
+                row(json!({"user_id": "u2"})),
+            ]),
+            other => panic!("unexpected history query: {other}"),
+        }
     }
 }
 
@@ -137,6 +144,7 @@ async fn follow_mode_picks_up_appended_events() {
 #[tokio::test]
 async fn errors_are_clear() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("events.jsonl"), "").unwrap();
     let engine = engine(JsonlTopics::new(dir.path()));
     let e = engine
         .explain("select * form events")
@@ -152,5 +160,63 @@ async fn errors_are_clear() {
         .await
         .unwrap_err()
         .to_string();
-    assert_eq!(e, "unknown table default.nope");
+    assert_eq!(e, "unknown table nope in ClickHouse (default.nope) at 1:15");
+    let e = engine
+        .explain("select ts, nope from events")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        e,
+        "unknown column nope in table events (columns: ts, user_id) at 1:12"
+    );
+}
+
+#[tokio::test]
+async fn missing_topic_is_a_bind_error() {
+    // ClickHouse has the table, but there is no events.jsonl
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(JsonlTopics::new(dir.path()));
+    let e = engine
+        .subscribe("select * from events")
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(e, "no event stream for table events (topic events) at 1:15");
+}
+
+#[tokio::test]
+async fn column_list_prunes_history_and_events() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("events.jsonl"),
+        concat!(
+            r#"{"ts": "e1", "user_id": "u3", "big": {"nested": [1, 2, 3]}, "_offset": 9}"#,
+            "\n",
+            r#"{"ts": "e2"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let engine = engine(JsonlTopics::new(dir.path()));
+    let subscription = engine
+        .subscribe("select user_id from events")
+        .await
+        .unwrap();
+    assert_eq!(
+        subscription.plan.history.sql,
+        "SELECT user_id FROM default.events"
+    );
+    assert_eq!(subscription.plan.stream.required_keys(), ["user_id"]);
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    let lines: Vec<String> = iterations.iter().map(|i| i.to_string()).collect();
+    assert_eq!(
+        lines,
+        [
+            "+ {\"user_id\":\"u1\"}\n+ {\"user_id\":\"u2\"}\nhistory: 2 rows",
+            "events:1 + {\"user_id\":\"u3\"}",
+            "events:2 + {\"user_id\":null}",
+        ]
+    );
 }

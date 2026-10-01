@@ -79,5 +79,28 @@ async fn select_star_from_events_against_clickhouse() {
                 .clone()
         )]
     );
+
+    // a column list: only those columns, in that order, on both sides
+    let subscription = engine
+        .subscribe("select latency_ms, user_id from events")
+        .await
+        .unwrap();
+    assert_eq!(
+        subscription.plan.history.sql,
+        "SELECT latency_ms, user_id FROM chlive_engine_test.events"
+    );
+    let lines: Vec<String> = subscription.map(|i| i.unwrap().to_string()).collect().await;
+    let mut history: Vec<&str> = lines[0].lines().collect();
+    history.sort();
+    assert_eq!(
+        history,
+        [
+            r#"+ {"latency_ms":10,"user_id":"u1"}"#,
+            r#"+ {"latency_ms":20,"user_id":"u2"}"#,
+            "history: 2 rows",
+        ]
+    );
+    assert_eq!(lines[1], r#"events:1 + {"latency_ms":30,"user_id":"u3"}"#);
+
     exec("DROP DATABASE chlive_engine_test").await;
 }

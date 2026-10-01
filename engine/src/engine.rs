@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 
+use crate::binder::{bind, BindError, Catalog};
 use crate::diff::Diff;
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
 use crate::parser::parse;
 use crate::plan::{plan, Plan};
 use crate::rules::{HardcodedRules, NamingRules, TopicId};
-use crate::schema::resolve;
 use crate::stream::JsonlTopics;
 
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +25,9 @@ pub enum EngineError {
     /// Rendered with line and column.
     #[error("syntax error: {0}")]
     Syntax(String),
+    /// The query doesn't fit the catalog (unknown table/column, …); rendered with position.
+    #[error("{0}")]
+    Bind(String),
     #[error(transparent)]
     History(#[from] HistoryError),
 }
@@ -94,11 +97,19 @@ impl Engine {
         }
     }
 
-    /// Parse and plan a query without running it.
+    /// Parse, bind and plan a query without running it.
     pub async fn explain(&self, sql: &str) -> Result<Plan, EngineError> {
         let query = parse(sql).map_err(|e| EngineError::Syntax(e.render(sql)))?;
-        let schema = resolve(&query.from.name, self.rules.as_ref(), self.history.as_ref()).await?;
-        Ok(plan(&query, self.rules.as_ref(), &schema))
+        let catalog = Catalog {
+            rules: self.rules.as_ref(),
+            history: self.history.as_ref(),
+            topics: &self.topics,
+        };
+        let bound = bind(&query, &catalog).await.map_err(|e| match e {
+            BindError::History(e) => EngineError::History(e),
+            e => EngineError::Bind(e.render(sql)),
+        })?;
+        Ok(plan(&bound))
     }
 
     /// Plan a query and start it: the history first, then one iteration per event of the
@@ -129,7 +140,7 @@ impl Engine {
         let stream_plan = plan.stream.clone();
         let events = self
             .topics
-            .subscribe(&stream_plan.topics)
+            .subscribe(&stream_plan.topics, &stream_plan.required_keys())
             .map(move |event| {
                 let diffs = if stream_plan.filter.matches(&event.value) {
                     vec![Diff::Insert(stream_plan.project(&event.value))]

@@ -13,6 +13,14 @@ impl Span {
     }
 }
 
+/// `message at line:col` (both 1-based) for a span in `src`.
+pub fn render_at(src: &str, span: Span, message: &str) -> String {
+    let before = &src[..span.start.min(src.len())];
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    format!("{message} at {line}:{col}")
+}
+
 /// A lexing or parsing error, pointing at the offending part of the query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxError {
@@ -28,12 +36,8 @@ impl SyntaxError {
         }
     }
 
-    /// `message at line:col`, both 1-based.
     pub fn render(&self, src: &str) -> String {
-        let before = &src[..self.span.start.min(src.len())];
-        let line = before.matches('\n').count() + 1;
-        let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-        format!("{} at {line}:{col}", self.message)
+        render_at(src, self.span, &self.message)
     }
 }
 

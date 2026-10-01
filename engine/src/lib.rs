@@ -16,10 +16,11 @@
 //! # }
 //! ```
 //!
-//! Inside: [`parser`] → [`schema`] (via [`rules`]) → [`plan`] → [`engine`], which yields the
+//! Inside: [`parser`] → [`binder`] (via [`rules`]) → [`plan`] → [`engine`], which yields the
 //! history from ClickHouse and then one iteration per event of the subscribed topics.
 
 pub mod ast;
+pub mod binder;
 pub mod diff;
 pub mod engine;
 pub mod error;
@@ -28,8 +29,8 @@ pub mod lexer;
 pub mod parser;
 pub mod plan;
 pub mod rules;
-pub mod schema;
 pub mod stream;
 
+pub use binder::{BoundColumn, BoundQuery};
 pub use engine::{Config, Engine, EngineError, Iteration, Origin, Subscription};
 pub use plan::Plan;

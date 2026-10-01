@@ -3,11 +3,12 @@
 //! Grammar so far:
 //! ```text
 //! query      := SELECT projection FROM table [';'] EOF
-//! projection := '*'
+//! projection := '*' | column (',' column)*
+//! column     := identifier
 //! table      := identifier
 //! ```
 
-use crate::ast::{Projection, Query, TableRef};
+use crate::ast::{ColumnRef, Projection, Query, TableRef};
 use crate::error::SyntaxError;
 use crate::lexer::{tokenize, Token, TokenKind};
 
@@ -63,17 +64,52 @@ impl Parser {
     }
 
     fn projection(&mut self) -> Result<Projection, SyntaxError> {
-        let t = self.peek().clone();
-        match t.kind {
-            TokenKind::Star => {
-                self.next();
-                Ok(Projection::Wildcard)
+        if self.peek().kind == TokenKind::Star {
+            self.next();
+            if self.peek().kind == TokenKind::Comma {
+                return Err(SyntaxError::new(
+                    "cannot mix * with column names",
+                    self.peek().span,
+                ));
             }
-            TokenKind::Ident(_) => Err(SyntaxError::new(
-                "column lists are not supported yet; use `*`",
+            return Ok(Projection::Wildcard);
+        }
+        let mut columns = vec![self.column()?];
+        while self.peek().kind == TokenKind::Comma {
+            self.next();
+            if self.peek().kind == TokenKind::Star {
+                return Err(SyntaxError::new(
+                    "cannot mix * with column names",
+                    self.peek().span,
+                ));
+            }
+            columns.push(self.column()?);
+        }
+        Ok(Projection::Columns(columns))
+    }
+
+    fn column(&mut self) -> Result<ColumnRef, SyntaxError> {
+        let t = self.peek().clone();
+        let TokenKind::Ident(name) = t.kind else {
+            return Err(self.expected(
+                if self.pos > 0 && self.tokens[self.pos - 1].kind == TokenKind::Comma {
+                    "a column name"
+                } else {
+                    "`*` or a column name"
+                },
+            ));
+        };
+        self.next();
+        match self.peek().kind {
+            TokenKind::LParen => Err(SyntaxError::new(
+                "expressions are not supported yet; list column names",
                 t.span,
             )),
-            _ => Err(self.expected("`*`")),
+            TokenKind::Dot => Err(SyntaxError::new(
+                "qualified column names are not supported",
+                self.peek().span,
+            )),
+            _ => Ok(ColumnRef { name, span: t.span }),
         }
     }
 
@@ -141,6 +177,66 @@ mod tests {
         );
     }
 
+    fn columns(src: &str) -> Vec<String> {
+        match parse(src)
+            .unwrap_or_else(|e| panic!("{}", e.render(src)))
+            .projection
+        {
+            Projection::Columns(cols) => cols.into_iter().map(|c| c.name).collect(),
+            Projection::Wildcard => panic!("expected a column list"),
+        }
+    }
+
+    #[test]
+    fn accepts_column_lists() {
+        assert_eq!(columns("select ts from events"), ["ts"]);
+        assert_eq!(
+            columns("select ts, user_id,latency_ms from events"),
+            ["ts", "user_id", "latency_ms"]
+        );
+        assert_eq!(
+            columns("SELECT\n  \"ts\",\n  `user id`\nFROM events"),
+            ["ts", "user id"]
+        );
+        let q = parse("select ts, user_id from events").unwrap();
+        let Projection::Columns(cols) = q.projection else {
+            panic!()
+        };
+        assert_eq!(cols[1].span, crate::error::Span::new(11, 18));
+    }
+
+    #[test]
+    fn rejects_bad_column_lists() {
+        assert_eq!(
+            error("select ts, from events"),
+            "expected a column name, found FROM at 1:12"
+        );
+        assert_eq!(
+            error("select from events"),
+            "expected `*` or a column name, found FROM at 1:8"
+        );
+        assert_eq!(
+            error("select *, ts from events"),
+            "cannot mix * with column names at 1:9"
+        );
+        assert_eq!(
+            error("select ts, * from events"),
+            "cannot mix * with column names at 1:12"
+        );
+        assert_eq!(
+            error("select count(ts) from events"),
+            "expressions are not supported yet; list column names at 1:8"
+        );
+        assert_eq!(
+            error("select e.ts from events"),
+            "qualified column names are not supported at 1:9"
+        );
+        assert_eq!(
+            error("select ts user_id from events"),
+            "expected FROM, found identifier `user_id` at 1:11"
+        );
+    }
+
     #[test]
     fn rejects_with_positions() {
         assert_eq!(error(""), "expected SELECT, found end of input at 1:1");
@@ -151,10 +247,6 @@ mod tests {
         assert_eq!(
             error("select * from"),
             "expected a table name, found end of input at 1:14"
-        );
-        assert_eq!(
-            error("select a from events"),
-            "column lists are not supported yet; use `*` at 1:8"
         );
         assert_eq!(
             error("select * from events where x"),
