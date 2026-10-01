@@ -30,7 +30,8 @@ pub mod parser;
 pub mod plan;
 pub mod rules;
 pub mod stream;
+pub mod types;
 
-pub use binder::{BoundColumn, BoundQuery};
+pub use binder::{BoundColumn, BoundExpr, BoundQuery};
 pub use engine::{Config, Engine, EngineError, Iteration, Origin, Subscription};
 pub use plan::Plan;

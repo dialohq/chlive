@@ -2,12 +2,12 @@
 
 use crate::error::{Span, SyntaxError};
 
-/// Words the dialect reserves. Only `SELECT` and `FROM` are used by the grammar so far; the
-/// rest are recognised so that queries using them get a clear "not supported yet" error
-/// instead of being mistaken for identifiers.
+/// Words the dialect reserves. Some are not used by the grammar yet; they are recognised so
+/// that queries using them get a clear "not supported yet" error instead of being mistaken for
+/// identifiers.
 pub const KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "LIMIT", "JOIN", "UNION", "AS",
-    "AND", "OR", "NOT",
+    "AND", "OR", "NOT", "IS", "IN", "NULL", "TRUE", "FALSE", "LIKE", "ILIKE", "BETWEEN",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +21,16 @@ pub enum TokenKind {
     /// A single-quoted string literal, unescaped (`''` and `\'` are quotes).
     String(String),
     Star,
+    Plus,
+    Minus,
+    Slash,
+    Eq,
+    /// `!=` or `<>`
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
     LParen,
     RParen,
     Comma,
@@ -37,6 +47,15 @@ impl TokenKind {
             TokenKind::Number(n) => format!("number `{n}`"),
             TokenKind::String(v) => format!("string '{v}'"),
             TokenKind::Star => "`*`".into(),
+            TokenKind::Plus => "`+`".into(),
+            TokenKind::Minus => "`-`".into(),
+            TokenKind::Slash => "`/`".into(),
+            TokenKind::Eq => "`=`".into(),
+            TokenKind::NotEq => "`!=`".into(),
+            TokenKind::Lt => "`<`".into(),
+            TokenKind::LtEq => "`<=`".into(),
+            TokenKind::Gt => "`>`".into(),
+            TokenKind::GtEq => "`>=`".into(),
             TokenKind::LParen => "`(`".into(),
             TokenKind::RParen => "`)`".into(),
             TokenKind::Comma => "`,`".into(),
@@ -66,6 +85,41 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
+            }
+            b'=' | b'!' | b'<' | b'>' => {
+                let next = bytes.get(i + 1).copied();
+                let (kind, len) = match (c, next) {
+                    (b'=', _) => (TokenKind::Eq, 1),
+                    (b'!', Some(b'=')) => (TokenKind::NotEq, 2),
+                    (b'<', Some(b'=')) => (TokenKind::LtEq, 2),
+                    (b'<', Some(b'>')) => (TokenKind::NotEq, 2),
+                    (b'<', _) => (TokenKind::Lt, 1),
+                    (b'>', Some(b'=')) => (TokenKind::GtEq, 2),
+                    (b'>', _) => (TokenKind::Gt, 1),
+                    _ => {
+                        return Err(SyntaxError::new(
+                            "unexpected character `!`",
+                            Span::new(start, start + 1),
+                        ))
+                    }
+                };
+                i += len;
+                tokens.push(Token {
+                    kind,
+                    span: Span::new(start, i),
+                });
+            }
+            b'-' | b'+' | b'/' => {
+                let kind = match c {
+                    b'-' => TokenKind::Minus,
+                    b'+' => TokenKind::Plus,
+                    _ => TokenKind::Slash,
+                };
+                i += 1;
+                tokens.push(Token {
+                    kind,
+                    span: Span::new(start, i),
+                });
             }
             b'*' | b'(' | b')' | b',' | b';' | b'.' => {
                 let kind = match c {
@@ -220,6 +274,39 @@ mod tests {
             ]
         );
         assert_eq!(kinds("`my table`")[0], TokenKind::Ident("my table".into()));
+    }
+
+    #[test]
+    fn operators() {
+        assert_eq!(
+            kinds("a = 1 != 2 <> 3 < <= > >= - -- comment\n+ /"),
+            [
+                TokenKind::Ident("a".into()),
+                TokenKind::Eq,
+                TokenKind::Number("1".into()),
+                TokenKind::NotEq,
+                TokenKind::Number("2".into()),
+                TokenKind::NotEq,
+                TokenKind::Number("3".into()),
+                TokenKind::Lt,
+                TokenKind::LtEq,
+                TokenKind::Gt,
+                TokenKind::GtEq,
+                TokenKind::Minus,
+                TokenKind::Plus,
+                TokenKind::Slash,
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("is NULL true")[..3],
+            [
+                TokenKind::Keyword("IS"),
+                TokenKind::Keyword("NULL"),
+                TokenKind::Keyword("TRUE")
+            ]
+        );
+        assert!(tokenize("a ! b").is_err());
     }
 
     #[test]

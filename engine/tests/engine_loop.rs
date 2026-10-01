@@ -14,19 +14,20 @@ struct FakeHistory;
 #[async_trait]
 impl HistorySource for FakeHistory {
     async fn describe(&self, table: &str) -> Result<Vec<DescribedColumn>, HistoryError> {
-        if table != "default.events" {
-            return Err(HistoryError::UnknownTable(table.into()));
-        }
-        let col = |n: &str| DescribedColumn {
+        let col = |n: &str, ty: &str| DescribedColumn {
             name: n.into(),
-            ty: "String".into(),
+            ty: ty.into(),
         };
-        Ok(vec![
-            col("ts"),
-            col("user_id"),
-            col("_partition"),
-            col("_offset"),
-        ])
+        match table {
+            "default.events" => Ok(vec![
+                col("ts", "String"),
+                col("user_id", "String"),
+                col("_partition", "UInt64"),
+                col("_offset", "UInt64"),
+            ]),
+            "default.requests" => Ok(vec![col("user_id", "String"), col("latency_ms", "UInt32")]),
+            _ => Err(HistoryError::UnknownTable(table.into())),
+        }
     }
 
     async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError> {
@@ -40,6 +41,9 @@ impl HistorySource for FakeHistory {
                 row(json!({"user_id": "u1"})),
                 row(json!({"user_id": "u2"})),
             ]),
+            "SELECT user_id FROM default.requests WHERE latency_ms > 100" => {
+                Ok(vec![row(json!({"user_id": "slow-history"}))])
+            }
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -103,7 +107,7 @@ async fn history_then_one_iteration_per_event_of_the_subscribed_topic_only() {
             ),
             (
                 at(4),
-                vec![Diff::Insert(row(json!({"ts": "e2", "user_id": null})))]
+                vec![Diff::Insert(row(json!({"ts": "e2", "user_id": ""})))]
             ),
         ]
     );
@@ -216,7 +220,54 @@ async fn column_list_prunes_history_and_events() {
         [
             "+ {\"user_id\":\"u1\"}\n+ {\"user_id\":\"u2\"}\nhistory: 2 rows",
             "events:1 + {\"user_id\":\"u3\"}",
-            "events:2 + {\"user_id\":null}",
+            "events:2 + {\"user_id\":\"\"}",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn where_filters_events_by_typed_values() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("requests.jsonl"),
+        concat!(
+            r#"{"user_id": "fast", "latency_ms": 50}"#,
+            "\n",
+            r#"{"user_id": "slow", "latency_ms": 500}"#,
+            "\n",
+            r#"{"user_id": "as-text", "latency_ms": "250"}"#,
+            "\n",
+            r#"{"user_id": "missing"}"#,
+            "\n",
+            r#"{"user_id": "broken", "latency_ms": "abc"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let engine = engine(JsonlTopics::new(dir.path()));
+    let subscription = engine
+        .subscribe("select user_id from requests where latency_ms > 100")
+        .await
+        .unwrap();
+    // the filter's column is decoded (as UInt32) but not output
+    assert_eq!(
+        subscription.plan.stream.required_keys(),
+        ["user_id", "latency_ms"]
+    );
+    let lines: Vec<String> = subscription
+        .map(|i| i.unwrap())
+        .filter(|i| std::future::ready(!i.diffs.is_empty()))
+        .map(|i| i.to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines,
+        [
+            "+ {\"user_id\":\"slow-history\"}\nhistory: 1 rows",
+            "requests:2 + {\"user_id\":\"slow\"}",
+            // "250" is read as UInt32, like ClickHouse does; a missing latency_ms is 0;
+            // "abc" can't be read as UInt32, so that event is skipped with a warning
+            "requests:3 + {\"user_id\":\"as-text\"}",
         ]
     );
 }

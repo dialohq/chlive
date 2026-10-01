@@ -142,10 +142,15 @@ impl Engine {
             .topics
             .subscribe(&stream_plan.topics, &stream_plan.required_keys())
             .map(move |event| {
-                let diffs = if stream_plan.filter.matches(&event.value) {
-                    vec![Diff::Insert(stream_plan.project(&event.value))]
-                } else {
-                    Vec::new()
+                // decode by column types, then filter, then project
+                let diffs = match stream_plan.decode(&event.value) {
+                    Ok(row) if stream_plan.matches(&row) => vec![Diff::Insert(stream_plan.project(&row))],
+                    Ok(_) => Vec::new(),
+                    Err(e) => {
+                        // ClickHouse's ingestion would reject this message too
+                        tracing::warn!(topic = %event.topic, line = event.line, error = %e, "skipping event");
+                        Vec::new()
+                    }
                 };
                 Ok(Iteration {
                     origin: Origin::Event {

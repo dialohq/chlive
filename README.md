@@ -87,7 +87,20 @@ engine-test                                 # all engine tests, including the Cl
 
 Its process names and ports differ from the default shell's, so the two never share data and can run at the same time. In either shell, the engine uses that shell's ClickHouse via `CHLIVE_CLICKHOUSE_URL`.
 
-So far the dialect accepts `SELECT * FROM <table>` and `SELECT col, … FROM <table>`.
+So far the dialect accepts `SELECT * | col, … FROM <table> [WHERE <condition>]`. A condition can use:
+- comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), with `AND`, `OR`, `NOT` and parentheses;
+- `IS [NOT] NULL` and `[NOT] IN (…)`;
+- operands that are columns or literals: numbers, strings, `TRUE`/`FALSE`.
+
+Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
+
+**WHERE runs in two places, which must agree on every row.** ClickHouse evaluates it for history; the engine evaluates it for each event.
+- **Typed decoding.** Each event's needed JSON fields are decoded by their ClickHouse column types, following ClickHouse's input rules: a quoted number is read as a number, and a DateTime string is parsed.
+- **Missing keys.** A missing key is NULL for a `Nullable` column, and the type's zero value otherwise, just as ClickHouse's ingestion stores it.
+- **Conditions.** They're evaluated with SQL's three-valued logic.
+- **Literals.** They're typed and checked at bind time; for example, comparing `latency_ms` with a string is a positioned error.
+- **Output.** Event rows are rendered the way ClickHouse renders rows.
+- **Tested.** The agreement test in `engine/tests/clickhouse.rs` checks that both sides return the same rows for 22 predicates.
 
 The query goes through parser → binder → planner. The binder resolves FROM, then SELECT, in SQL's evaluation order:
 - **FROM:** the table must exist in ClickHouse and have a topic.

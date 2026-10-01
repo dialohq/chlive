@@ -4,11 +4,12 @@
 
 use std::fmt;
 
-use crate::ast::{Projection, Query};
+use crate::ast::{CmpOp, Expr, Literal, Projection, Query};
 use crate::error::{render_at, Span};
 use crate::history::{HistoryError, HistorySource};
 use crate::rules::{NamingRules, TopicId};
 use crate::stream::TopicCatalog;
+use crate::types::{parse_date, parse_datetime, Kind, Type, Value};
 
 /// What the binder can look things up in.
 pub struct Catalog<'a> {
@@ -31,8 +32,8 @@ pub struct BoundColumn {
     pub clickhouse: String,
     /// Key in the topic's JSON objects.
     pub json_key: String,
-    /// ClickHouse type, informational for now.
-    pub ty: String,
+    /// From the ClickHouse column type; decides how event JSON is decoded.
+    pub ty: Type,
 }
 
 /// The FROM table: its ClickHouse table, its topic, and its (visible) columns.
@@ -53,8 +54,57 @@ impl BoundTable {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundQuery {
     pub table: BoundTable,
+    /// The WHERE condition, typed.
+    pub filter: Option<BoundExpr>,
     /// Output columns, in output order.
     pub projection: Vec<ColumnId>,
+}
+
+/// A typed expression. Literals are already coerced to the type they are compared with.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundExpr {
+    Column(ColumnId),
+    Literal(Value),
+    Compare {
+        op: CmpOp,
+        left: Box<BoundExpr>,
+        right: Box<BoundExpr>,
+    },
+    And(Box<BoundExpr>, Box<BoundExpr>),
+    Or(Box<BoundExpr>, Box<BoundExpr>),
+    Not(Box<BoundExpr>),
+    IsNull {
+        expr: Box<BoundExpr>,
+        negated: bool,
+    },
+    InList {
+        expr: Box<BoundExpr>,
+        list: Vec<Value>,
+        negated: bool,
+    },
+}
+
+impl BoundExpr {
+    /// Columns the expression reads, in first-use order.
+    pub fn columns(&self, out: &mut Vec<ColumnId>) {
+        match self {
+            BoundExpr::Column(id) => {
+                if !out.contains(id) {
+                    out.push(*id);
+                }
+            }
+            BoundExpr::Literal(_) => {}
+            BoundExpr::Compare { left, right, .. }
+            | BoundExpr::And(left, right)
+            | BoundExpr::Or(left, right) => {
+                left.columns(out);
+                right.columns(out);
+            }
+            BoundExpr::Not(e)
+            | BoundExpr::IsNull { expr: e, .. }
+            | BoundExpr::InList { expr: e, .. } => e.columns(out),
+        }
+    }
 }
 
 impl BoundQuery {
@@ -101,8 +151,16 @@ impl std::error::Error for BindError {}
 
 pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, BindError> {
     let table = bind_from(query, catalog).await?;
+    let filter = match &query.selection {
+        Some(expr) => Some(bind_where(expr, &table)?),
+        None => None,
+    };
     let projection = bind_select(query, &table)?;
-    Ok(BoundQuery { table, projection })
+    Ok(BoundQuery {
+        table,
+        filter,
+        projection,
+    })
 }
 
 /// FROM: the table must exist in ClickHouse and have an event stream.
@@ -140,7 +198,7 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
                 name: m.name,
                 clickhouse: c.name,
                 json_key: m.json_key,
-                ty: c.ty,
+                ty: Type::parse(&c.ty),
             }
         })
         .collect();
@@ -150,6 +208,277 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
         topic,
         columns,
     })
+}
+
+/// WHERE: a boolean expression over the table's columns. Comparisons need compatible types;
+/// literals are coerced to the other side's type here, once, not per event.
+fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
+    match expr {
+        Expr::And(l, r) => Ok(BoundExpr::And(
+            Box::new(bind_where(l, table)?),
+            Box::new(bind_where(r, table)?),
+        )),
+        Expr::Or(l, r) => Ok(BoundExpr::Or(
+            Box::new(bind_where(l, table)?),
+            Box::new(bind_where(r, table)?),
+        )),
+        Expr::Not { expr, .. } => Ok(BoundExpr::Not(Box::new(bind_where(expr, table)?))),
+        Expr::Compare {
+            op,
+            left,
+            right,
+            span,
+        } => {
+            let (l, r) = (operand(left, table)?, operand(right, table)?);
+            if matches!(l, Operand::Literal(Literal::Null, _))
+                || matches!(r, Operand::Literal(Literal::Null, _))
+            {
+                let what = if *op == CmpOp::NotEq {
+                    "IS NOT NULL"
+                } else {
+                    "IS NULL"
+                };
+                return Err(BindError::at(
+                    format!("comparing with NULL is never true; use {what}"),
+                    *span,
+                ));
+            }
+            let (left, right, ty) = match (l, r) {
+                (Operand::Column(a, ta), Operand::Column(b, tb)) => {
+                    check_comparable(&ta, &tb, *span)?;
+                    (BoundExpr::Column(a), BoundExpr::Column(b), ta)
+                }
+                (Operand::Column(c, t), Operand::Literal(lit, lspan)) => (
+                    BoundExpr::Column(c),
+                    BoundExpr::Literal(coerce(&lit, lspan, &t)?),
+                    t,
+                ),
+                (Operand::Literal(lit, lspan), Operand::Column(c, t)) => (
+                    BoundExpr::Literal(coerce(&lit, lspan, &t)?),
+                    BoundExpr::Column(c),
+                    t,
+                ),
+                (Operand::Literal(a, aspan), Operand::Literal(b, bspan)) => {
+                    let ta = natural_type(&a, aspan)?;
+                    let tb = natural_type(&b, bspan)?;
+                    check_comparable(&ta, &tb, *span)?;
+                    (
+                        BoundExpr::Literal(coerce(&a, aspan, &ta)?),
+                        BoundExpr::Literal(coerce(&b, bspan, &tb)?),
+                        ta,
+                    )
+                }
+            };
+            if ty.kind == Kind::Bool && !matches!(op, CmpOp::Eq | CmpOp::NotEq) {
+                return Err(BindError::at(
+                    "booleans can only be compared with = or !=",
+                    *span,
+                ));
+            }
+            Ok(BoundExpr::Compare {
+                op: *op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        Expr::IsNull { expr, negated, .. } => {
+            let e = match operand(expr, table)? {
+                Operand::Column(c, _) => BoundExpr::Column(c),
+                Operand::Literal(lit, span) => {
+                    BoundExpr::Literal(coerce(&lit, span, &natural_type(&lit, span)?)?)
+                }
+            };
+            Ok(BoundExpr::IsNull {
+                expr: Box::new(e),
+                negated: *negated,
+            })
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+            span,
+        } => {
+            let Operand::Column(c, ty) = operand(expr, table)? else {
+                return Err(BindError::at("IN needs a column on its left", *span));
+            };
+            if ty.kind == Kind::Bool {
+                return Err(BindError::at(
+                    "IN is not supported for booleans; use =",
+                    *span,
+                ));
+            }
+            let values = list
+                .iter()
+                .map(|(lit, lspan)| match lit {
+                    Literal::Null => Err(BindError::at(
+                        "NULL in an IN list never matches; use IS NULL",
+                        *lspan,
+                    )),
+                    _ => coerce(lit, *lspan, &ty),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(BoundExpr::InList {
+                expr: Box::new(BoundExpr::Column(c)),
+                list: values,
+                negated: *negated,
+            })
+        }
+        Expr::Column(c) => {
+            let col = column(table, &c.name, c.span)?;
+            if col.ty.kind != Kind::Bool {
+                return Err(BindError::at(
+                    format!(
+                        "column {} ({}) is not a condition; compare it with something",
+                        col.name, col.ty
+                    ),
+                    c.span,
+                ));
+            }
+            Ok(BoundExpr::Column(col.id))
+        }
+        Expr::Literal {
+            value: Literal::Bool(b),
+            ..
+        } => Ok(BoundExpr::Literal(Value::Bool(*b))),
+        Expr::Literal { span, .. } => Err(BindError::at("this value is not a condition", *span)),
+    }
+}
+
+/// One side of a comparison, before type checking.
+enum Operand {
+    Column(ColumnId, Type),
+    Literal(Literal, Span),
+}
+
+fn operand(expr: &Expr, table: &BoundTable) -> Result<Operand, BindError> {
+    match expr {
+        Expr::Column(c) => {
+            let col = column(table, &c.name, c.span)?;
+            if col.ty.kind == Kind::Other {
+                return Err(BindError::at(
+                    format!(
+                        "filtering on column {} of type {} is not supported",
+                        col.name, col.ty
+                    ),
+                    c.span,
+                ));
+            }
+            Ok(Operand::Column(col.id, col.ty.clone()))
+        }
+        Expr::Literal { value, span } => Ok(Operand::Literal(value.clone(), *span)),
+        other => Err(BindError::at(
+            "only columns and values can be compared",
+            other.span(),
+        )),
+    }
+}
+
+fn column<'a>(table: &'a BoundTable, name: &str, span: Span) -> Result<&'a BoundColumn, BindError> {
+    table
+        .columns
+        .iter()
+        .find(|c| c.name == name)
+        .ok_or_else(|| {
+            let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+            BindError::at(
+                format!(
+                    "unknown column {name} in table {} (columns: {})",
+                    table.name,
+                    names.join(", ")
+                ),
+                span,
+            )
+        })
+}
+
+/// What kind of values can be compared with each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Number,
+    String,
+    DateTime,
+    Date,
+    Bool,
+}
+
+fn class(ty: &Type) -> Class {
+    match ty.kind {
+        Kind::Int { .. } | Kind::Float => Class::Number,
+        Kind::String => Class::String,
+        Kind::DateTime { .. } => Class::DateTime,
+        Kind::Date => Class::Date,
+        Kind::Bool => Class::Bool,
+        Kind::Other => unreachable!("rejected in operand()"),
+    }
+}
+
+fn check_comparable(a: &Type, b: &Type, span: Span) -> Result<(), BindError> {
+    if class(a) == class(b) {
+        Ok(())
+    } else {
+        Err(BindError::at(format!("cannot compare {a} with {b}"), span))
+    }
+}
+
+/// The type a literal has on its own (when compared with another literal).
+fn natural_type(lit: &Literal, span: Span) -> Result<Type, BindError> {
+    Ok(Type::parse(match lit {
+        Literal::Number(n) if n.contains('.') => "Float64",
+        Literal::Number(_) => "Int64",
+        Literal::String(_) => "String",
+        Literal::Bool(_) => "Bool",
+        Literal::Null => return Err(BindError::at("NULL has no type here", span)),
+    }))
+}
+
+/// A literal as a value of `ty`, or an error pointing at the literal.
+fn coerce(lit: &Literal, span: Span, ty: &Type) -> Result<Value, BindError> {
+    let mismatch = || {
+        let what = match lit {
+            Literal::Number(_) => "a number",
+            Literal::String(_) => "a string",
+            Literal::Bool(_) => "a boolean",
+            Literal::Null => "NULL",
+        };
+        BindError::at(format!("cannot compare {ty} with {what}"), span)
+    };
+    match (&ty.kind, lit) {
+        (_, Literal::Null) => Ok(Value::Null),
+        // A value outside the column's range is fine: it simply never (or always) matches, as
+        // in ClickHouse, which compares integers of different types exactly.
+        (Kind::Int { .. }, Literal::Number(n)) => {
+            if n.contains('.') {
+                return n.parse::<f64>().map(Value::Float).map_err(|_| mismatch());
+            }
+            n.parse::<i128>()
+                .map(Value::Int)
+                .map_err(|_| BindError::at(format!("number {n} is too large"), span))
+        }
+        (Kind::Float, Literal::Number(n)) => {
+            n.parse::<f64>().map(Value::Float).map_err(|_| mismatch())
+        }
+        (Kind::String, Literal::String(s)) => Ok(Value::String(s.clone())),
+        (Kind::DateTime { precision }, Literal::String(s)) => parse_datetime(s, *precision)
+            .map(|ticks| Value::DateTime {
+                ticks,
+                precision: *precision,
+            })
+            .ok_or_else(|| {
+                BindError::at(
+                    format!("invalid {ty} value '{s}' (expected YYYY-MM-DD[ hh:mm:ss[.fff]])"),
+                    span,
+                )
+            }),
+        (Kind::Date, Literal::String(s)) => parse_date(s).map(Value::Date).ok_or_else(|| {
+            BindError::at(
+                format!("invalid Date value '{s}' (expected YYYY-MM-DD)"),
+                span,
+            )
+        }),
+        (Kind::Bool, Literal::Bool(b)) => Ok(Value::Bool(*b)),
+        _ => Err(mismatch()),
+    }
 }
 
 /// SELECT: `*` is every column of the table; a list must name existing columns, once each.
@@ -207,6 +536,9 @@ mod tests {
                     col("ts", "DateTime64(3)"),
                     col("user_id", "String"),
                     col("latency_ms", "UInt32"),
+                    col("coupon", "Nullable(String)"),
+                    col("paid", "Bool"),
+                    col("tags", "Array(String)"),
                     col("_partition", "UInt64"),
                     col("_offset", "UInt64"),
                 ]),
@@ -248,8 +580,11 @@ mod tests {
         let b = bind_sql("select * from events").await.unwrap();
         assert_eq!(b.table.clickhouse_table, "default.events");
         assert_eq!(b.table.topic, TopicId("events".into()));
-        assert_eq!(names(&b), ["ts", "user_id", "latency_ms"]);
-        assert_eq!(b.table.column(ColumnId(2)).ty, "UInt32");
+        assert_eq!(
+            names(&b),
+            ["ts", "user_id", "latency_ms", "coupon", "paid", "tags"]
+        );
+        assert_eq!(b.table.column(ColumnId(2)).ty, Type::parse("UInt32"));
     }
 
     #[tokio::test]
@@ -271,7 +606,7 @@ mod tests {
         );
         assert_eq!(
             bind_sql("select ts, nope from events").await.unwrap_err(),
-            "unknown column nope in table events (columns: ts, user_id, latency_ms) at 1:12"
+            "unknown column nope in table events (columns: ts, user_id, latency_ms, coupon, paid, tags) at 1:12"
         );
         // hidden bookkeeping columns are not part of the dialect table
         assert!(bind_sql("select _offset from events")
@@ -289,5 +624,99 @@ mod tests {
             .await
             .unwrap_err()
             .starts_with("unknown column TS"));
+    }
+
+    #[tokio::test]
+    async fn where_literals_are_coerced_to_the_column_type() {
+        let b =
+            bind_sql("select user_id from events where ts >= '2026-10-01' and latency_ms > 99.5")
+                .await
+                .unwrap();
+        let Some(BoundExpr::And(l, r)) = b.filter else {
+            panic!("{:?}", b.filter)
+        };
+        assert_eq!(
+            *l,
+            BoundExpr::Compare {
+                op: CmpOp::GtEq,
+                left: Box::new(BoundExpr::Column(ColumnId(0))),
+                right: Box::new(BoundExpr::Literal(Value::DateTime {
+                    ticks: parse_datetime("2026-10-01 00:00:00", 3).unwrap(),
+                    precision: 3
+                })),
+            }
+        );
+        assert!(
+            matches!(*r, BoundExpr::Compare { right, .. } if *right == BoundExpr::Literal(Value::Float(99.5)))
+        );
+    }
+
+    #[tokio::test]
+    async fn where_type_errors_point_at_the_problem() {
+        let e = |sql: &'static str| async move { bind_sql(sql).await.unwrap_err() };
+        assert_eq!(
+            e("select * from events where latency_ms > 'x'").await,
+            "cannot compare UInt32 with a string at 1:41"
+        );
+        assert_eq!(
+            e("select * from events where user_id = 1").await,
+            "cannot compare String with a number at 1:38"
+        );
+        assert_eq!(
+            e("select * from events where ts < '2026-13-01'").await,
+            "invalid DateTime64(3) value '2026-13-01' (expected YYYY-MM-DD[ hh:mm:ss[.fff]]) at 1:33"
+        );
+        assert_eq!(
+            e("select * from events where user_id = latency_ms").await,
+            "cannot compare String with UInt32 at 1:36"
+        );
+        assert_eq!(
+            e("select * from events where coupon = null").await,
+            "comparing with NULL is never true; use IS NULL at 1:35"
+        );
+        assert_eq!(
+            e("select * from events where coupon in ('a', null)").await,
+            "NULL in an IN list never matches; use IS NULL at 1:44"
+        );
+        assert_eq!(
+            e("select * from events where latency_ms").await,
+            "column latency_ms (UInt32) is not a condition; compare it with something at 1:28"
+        );
+        assert_eq!(
+            e("select * from events where 1").await,
+            "this value is not a condition at 1:28"
+        );
+        assert_eq!(
+            e("select * from events where paid > true").await,
+            "booleans can only be compared with = or != at 1:33"
+        );
+        assert_eq!(
+            e("select * from events where tags = 'x'").await,
+            "filtering on column tags of type Array(String) is not supported at 1:28"
+        );
+        assert_eq!(
+            e("select * from events where (user_id = 'a') = true").await,
+            "only columns and values can be compared at 1:37"
+        );
+        // FROM, then WHERE, then SELECT: the WHERE error is reported first
+        assert!(e("select nope from events where nope2 = 1")
+            .await
+            .starts_with("unknown column nope2"));
+    }
+
+    #[tokio::test]
+    async fn bool_columns_and_literals_are_conditions() {
+        let b = bind_sql("select * from events where paid and not false")
+            .await
+            .unwrap();
+        assert_eq!(
+            b.filter,
+            Some(BoundExpr::And(
+                Box::new(BoundExpr::Column(ColumnId(4))),
+                Box::new(BoundExpr::Not(Box::new(BoundExpr::Literal(Value::Bool(
+                    false
+                )))))
+            ))
+        );
     }
 }
