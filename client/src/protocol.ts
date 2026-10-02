@@ -20,11 +20,12 @@ export type ClientMessage =
   | { type: "unsubscribe"; id: string };
 
 /**
- * One change to a result. Only inserts exist so far; unknown ops must be rejected.
- * With ORDER BY, an insert has the `index` the row takes: the row there and every row after it
- * move one down. Without one, the row is appended.
+ * One change to a result; unknown ops must be rejected.
+ * - `insert`: with ORDER BY, at `index` (the row there and every row after it move one down);
+ *   without, appended.
+ * - `delete`: the row at `index` leaves the result (pushed out by LIMIT); the rows after it move up.
  */
-export type Change = { op: "insert"; row: Row; index?: number };
+export type Change = { op: "insert"; row: Row; index?: number } | { op: "delete"; index: number };
 
 /** One ORDER BY key the result is kept in. */
 export interface OrderTerm {
@@ -40,12 +41,18 @@ export interface SnapshotMessage {
   /** In order when `order` is present. */
   rows: Row[];
   order?: OrderTerm[];
+  /** The LIMIT: the result never has more rows at the end of a diff. */
+  limit?: number;
 }
 
 export interface DiffMessage {
   type: "diff";
   id: string;
-  /** Never empty. Applied in sequence: each index is into the list as the previous change left it. */
+  /**
+   * Never empty, and atomic: applied in sequence (each index is into the list as the previous
+   * change left it), and only the state after all of them is meaningful. In between, an insert
+   * and the delete it causes can briefly make one row more than the LIMIT.
+   */
   changes: Change[];
 }
 

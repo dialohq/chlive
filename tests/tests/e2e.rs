@@ -18,6 +18,8 @@ const CASES: &[(&str, &str, &[&str])] = &[
     ("ranges", "select latency_ms, amount from events where latency_ms >= 10 and latency_ms < 50 and amount <= 100.5", &[]),
     ("by_country_ts", "select ts, user_id, country from events where country in ('PL', 'DE', 'FR') order by country, ts desc", &["country", "ts"]),
     ("by_all", "select country, path, amount from events where amount > 0 order by all", &["country", "path", "amount"]),
+    ("top_latency", "select ts, user_id, latency_ms from events order by latency_ms desc limit 50", &["latency_ms"]),
+    ("window", "select ts, user_id, latency_ms from events where latency_ms > 100 limit 100", &[]),
 ];
 
 #[tokio::test]
@@ -70,6 +72,10 @@ async fn live_results_match_direct_queries() -> Result<()> {
             live.inserted,
             live.diffs
         );
+        if sql.contains(" limit ") {
+            check_limited(id, sql, keys, &live, &direct);
+            continue;
+        }
         assert!(live.inserted > 0, "{id}: no live inserts");
         if !keys.is_empty() {
             // the same keys in the same order as ClickHouse, the same rows in every tie group
@@ -198,4 +204,43 @@ async fn unsubscribe_stops_the_stream() -> Result<()> {
     assert_eq!(conn.result("kept").unwrap().inserted, 200);
     assert_eq!(conn.result("dropped").unwrap().rows.len(), before);
     Ok(())
+}
+
+/// LIMIT: never more rows than the limit (checked after every diff by the harness).
+/// - With ORDER BY, the same tie groups as ClickHouse's top N, except which rows of the last
+///   (boundary) group made it in, which is arbitrary in ClickHouse too.
+/// - Without, a window: full, every row matching, the streamed rows last.
+fn check_limited(id: &str, sql: &str, keys: &[&str], live: &LiveResult, direct: &[Row]) {
+    let limit: usize = sql
+        .rsplit(" limit ")
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(live.limit, Some(limit), "{id}");
+    if keys.is_empty() {
+        assert_eq!(live.rows.len(), limit, "{id}: window not full");
+        assert!(live.inserted > 0, "{id}: no live inserts");
+        assert!(
+            live.rows
+                .iter()
+                .all(|r| r["latency_ms"].as_u64().unwrap() > 100),
+            "{id}: a row that doesn't match"
+        );
+        return;
+    }
+    let boundary = |rows: &[Row]| {
+        let mut g = tie_groups(rows, keys);
+        if let Some((key, rows)) = g.last_mut() {
+            *rows = vec![format!("{key}: {} rows", rows.len())];
+        }
+        g
+    };
+    assert_eq!(live.rows.len(), direct.len(), "{id}: row count");
+    assert_eq!(
+        boundary(&live.rows),
+        boundary(direct),
+        "{id}: top {limit} differs from ClickHouse"
+    );
 }

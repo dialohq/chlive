@@ -13,7 +13,7 @@ use futures::stream::{self, BoxStream, Stream, StreamExt};
 use crate::binder::{bind, BindError, Catalog};
 use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
-use crate::order::OrderedState;
+use crate::order::{OrderedState, WindowState};
 use crate::parser::parse;
 use crate::plan::{plan, Plan, StreamPlan};
 use crate::rules::{HardcodedRules, NamingRules, TopicId};
@@ -165,11 +165,7 @@ impl Engine {
         let history = self.history.clone();
         let initial = stream::once(async move { Item::History(history.fetch(&history_sql).await) });
         let stream_plan = plan.stream.clone();
-        // With ORDER BY: the sort keys of the result so far, to place each new row.
-        let state = stream_plan
-            .order
-            .as_ref()
-            .map(|o| OrderedState::new(o.keys.clone()));
+        let state = ResultState::for_plan(&stream_plan);
         initial
             .chain(events.map(Item::Event))
             .scan(state, move |state, item| {
@@ -183,21 +179,45 @@ impl Engine {
     }
 }
 
-/// The history as one iteration; with ORDER BY, also seeds the sort state, in ClickHouse's
-/// order, and drops the hidden ORDER BY fields from the rows.
+/// What a subscription keeps about its result to place new rows.
+enum ResultState {
+    /// Unordered, unlimited: every row is appended.
+    Append,
+    /// LIMIT without ORDER BY: the latest N rows.
+    Window(WindowState),
+    /// ORDER BY (and maybe LIMIT): the sort keys of the result, in tie groups.
+    Ordered(OrderedState),
+}
+
+impl ResultState {
+    fn for_plan(plan: &StreamPlan) -> Self {
+        match (&plan.order, plan.limit) {
+            (Some(o), limit) => Self::Ordered(OrderedState::with_limit(o.keys.clone(), limit)),
+            (None, Some(n)) => Self::Window(WindowState::new(n)),
+            (None, None) => Self::Append,
+        }
+    }
+}
+
+/// The history as one iteration. Seeds the state: with ORDER BY the sort keys, in ClickHouse's
+/// order (dropping the hidden ORDER BY fields from the rows); with only a LIMIT the row count.
 fn history_iteration(
     plan: &StreamPlan,
-    state: &mut Option<OrderedState>,
+    state: &mut ResultState,
     rows: Result<Vec<Row>, HistoryError>,
 ) -> Result<Iteration, EngineError> {
     let mut rows = rows?;
-    if let (Some(order), Some(state)) = (&plan.order, state.as_mut()) {
-        for row in &mut rows {
-            let key = order
-                .history_key(row)
-                .map_err(|e| HistoryError::ClickHouse(format!("history row: {e}")))?;
-            state.push_history(key);
+    match (state, &plan.order) {
+        (ResultState::Ordered(state), Some(order)) => {
+            for row in &mut rows {
+                let key = order
+                    .history_key(row)
+                    .map_err(|e| HistoryError::ClickHouse(format!("history row: {e}")))?;
+                state.push_history(key);
+            }
         }
+        (ResultState::Window(w), _) => rows.iter().for_each(|_| w.push_history()),
+        _ => {}
     }
     Ok(Iteration {
         origin: Origin::History,
@@ -205,19 +225,34 @@ fn history_iteration(
     })
 }
 
-/// One event: decode by column types, filter, project and, with ORDER BY, place it.
-fn event_iteration(plan: &StreamPlan, state: &mut Option<OrderedState>, event: Event) -> Iteration {
+/// One event: decode by column types, filter, project, and place it. An insert and the delete
+/// it causes come in the same iteration, insert first, so they always land in the same diff.
+fn event_iteration(plan: &StreamPlan, state: &mut ResultState, event: Event) -> Iteration {
     let diffs = match plan.decode(&event.value) {
-        Ok(row) if plan.matches(&row) => {
-            let index = match (&plan.order, state.as_mut()) {
-                (Some(order), Some(state)) => Some(state.insert(order.event_key(&row))),
-                _ => None,
-            };
-            vec![Diff::Insert {
-                row: plan.project(&row),
-                index,
-            }]
-        }
+        Ok(row) if plan.matches(&row) => match state {
+            ResultState::Append => vec![Diff::insert(plan.project(&row))],
+            ResultState::Window(w) => match w.push() {
+                None => Vec::new(),
+                Some(false) => vec![Diff::insert(plan.project(&row))],
+                Some(true) => vec![Diff::insert(plan.project(&row)), Diff::Delete { index: 0 }],
+            },
+            ResultState::Ordered(s) => {
+                let order = plan.order.as_ref().expect("ordered plan");
+                match s.insert(order.event_key(&row)) {
+                    None => Vec::new(),
+                    Some(p) => {
+                        let mut diffs = vec![Diff::Insert {
+                            row: plan.project(&row),
+                            index: Some(p.index),
+                        }];
+                        if let Some(index) = p.evicts {
+                            diffs.push(Diff::Delete { index });
+                        }
+                        diffs
+                    }
+                }
+            }
+        },
         Ok(_) => Vec::new(),
         Err(e) => {
             // ClickHouse's ingestion skips this message too

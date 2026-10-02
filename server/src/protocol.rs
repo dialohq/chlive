@@ -6,9 +6,14 @@
 //! or an `error`, after which that subscription is over.
 //!
 //! With ORDER BY, the snapshot is in order and says so (`order`), and every insert carries the
-//! `index` the row takes: the row at that index and all after it move one down. Within one
-//! `diff`, changes apply in sequence; each index is into the list as the previous change left
-//! it. Without ORDER BY there is no index and rows are appended.
+//! `index` the row takes: the row at that index and all after it move one down. Without ORDER BY
+//! there is no index and rows are appended.
+//!
+//! With LIMIT (`limit` in the snapshot), a row pushed out is a `delete` of its index, right
+//! after the insert that pushed it. Each `diff` is atomic: its changes apply in sequence (each
+//! index is into the list as the previous change left it), and only the state after the whole
+//! diff is meaningful. In between, an insert and its delete can briefly make one row more than
+//! the LIMIT, so clients must not expose results mid-diff.
 
 use chlive_engine::diff::{Diff, Row};
 use chlive_engine::plan::OrderPlan;
@@ -33,6 +38,9 @@ pub enum ServerMsg {
         /// The ORDER BY the rows are kept in; absent when unordered.
         #[serde(skip_serializing_if = "Option::is_none")]
         order: Option<Vec<OrderTerm>>,
+        /// The LIMIT: the result never has more rows (at the end of each diff).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
     },
     /// Changes since the previous message, in order. Never empty.
     Diff { id: String, changes: Vec<Change> },
@@ -76,8 +84,8 @@ impl OrderTerm {
     }
 }
 
-/// One change to the result; mirrors the engine's [`Diff`]. Only inserts exist so far;
-/// clients must reject ops they don't know.
+/// One change to the result; mirrors the engine's [`Diff`]. Clients must reject ops they don't
+/// know.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Change {
@@ -87,12 +95,15 @@ pub enum Change {
         #[serde(skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
     },
+    /// The row at `index` leaves the result (pushed out by LIMIT); the rows after it move up.
+    Delete { index: usize },
 }
 
 impl From<Diff> for Change {
     fn from(d: Diff) -> Self {
         match d {
             Diff::Insert { row, index } => Change::Insert { row, index },
+            Diff::Delete { index } => Change::Delete { index },
         }
     }
 }
@@ -173,6 +184,7 @@ mod tests {
             }],
             rows: vec![row.clone()],
             order: None,
+            limit: None,
         };
         assert_eq!(
             serde_json::to_value(&snapshot).unwrap(),
@@ -188,13 +200,15 @@ mod tests {
                     index: Some(2),
                 }
                 .into(),
+                Diff::Delete { index: 0 }.into(),
             ],
         };
         assert_eq!(
             serde_json::to_value(&diff).unwrap(),
             json!({"type": "diff", "id": "s1", "changes": [
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}},
-                {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}, "index": 2}
+                {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}, "index": 2},
+                {"op": "delete", "index": 0}
             ]})
         );
         assert_eq!(

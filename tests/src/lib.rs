@@ -77,6 +77,8 @@ pub struct LiveResult {
     pub inserted: usize,
     pub diffs: usize,
     pub error: Option<(String, String)>,
+    /// From the snapshot; checked after every diff.
+    pub limit: Option<usize>,
     /// Anything after an error, or a second snapshot.
     pub protocol_violations: Vec<String>,
 }
@@ -94,6 +96,7 @@ impl LiveResult {
                 }
                 self.snapshot = true;
                 self.rows = rows(&msg["rows"]);
+                self.limit = msg["limit"].as_u64().map(|n| n as usize);
             }
             Some("diff") => {
                 if !self.snapshot {
@@ -114,10 +117,22 @@ impl LiveResult {
                             }
                             self.inserted += 1;
                         }
+                        Some("delete") => match change["index"].as_u64().map(|i| i as usize) {
+                            Some(i) if i < self.rows.len() => {
+                                self.rows.remove(i);
+                            }
+                            i => self
+                                .protocol_violations
+                                .push(format!("delete at {i:?} of {} rows", self.rows.len())),
+                        },
                         other => self
                             .protocol_violations
                             .push(format!("unknown op {other:?}")),
                     }
+                }
+                if let Some(n) = self.limit.filter(|n| self.rows.len() > *n) {
+                    self.protocol_violations
+                        .push(format!("{} rows after a diff, LIMIT {n}", self.rows.len()));
                 }
             }
             Some("error") => {

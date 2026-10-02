@@ -111,3 +111,17 @@ test("an unknown change op fails the subscription instead of being skipped", () 
   assert.deepEqual(last!.rows, [{ user_id: "h1" }]);
   client.close();
 });
+
+test("listeners never see more rows than the LIMIT", () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any });
+  const sizes: number[] = [];
+  client.subscribe("select user_id from events limit 2", (s) => sizes.push(s.rows.length));
+  FakeSocket.all[0].open();
+  FakeSocket.all[0].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "a" }, { user_id: "b" }], limit: 2 });
+  for (const u of ["c", "d", "e"]) {
+    FakeSocket.all[0].deliver({ type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: u } }, { op: "delete", index: 0 }] });
+  }
+  assert.deepEqual(sizes, [0, 2, 2, 2, 2]);
+  client.close();
+});

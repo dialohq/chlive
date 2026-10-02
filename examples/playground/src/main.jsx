@@ -3,12 +3,15 @@ import { createRoot } from "react-dom/client";
 import { useLiveQuery } from "@chlive/client/react";
 
 // Queries in the chlive dialect:
-// SELECT * | columns FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …]
+// SELECT * | columns FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
 const QUERY_PRESETS = [
   "select ts, user_id, country, path, latency_ms from events where latency_ms > 500",
   "select ts, user_id, country, latency_ms from events order by latency_ms desc",
   "select ts, user_id, country, path from events where country in ('PL', 'DE') order by country, ts desc",
   "select user_id, path, amount from events where amount > 0 order by all",
+  "select ts, user_id, country, latency_ms from events order by latency_ms desc limit 10",
+  "select * from events where country = 'PL' order by ts desc limit 15",
+  "select ts, user_id, path, latency_ms from events limit 20",
   "select * from events where country = 'PL'",
   "select ts, user_id, path, amount from events where amount > 0 and country in ('DE', 'FR')",
   "select ts, order_id, customer_id, amount from orders where amount > 100",
@@ -169,14 +172,17 @@ function Writer() {
 }
 
 function Result({ sql }) {
-  const { rows, columns, order, status, error, errorCode } = useLiveQuery(sql);
-  // ordered results as they are; unordered ones newest first
-  const shown = order ? rows.slice(0, SHOWN) : rows.slice(-SHOWN).reverse();
+  const { rows, columns, order, limit, status, error, errorCode } = useLiveQuery(sql);
+  // ordered or limited results as they are (a LIMIT window has its newest row last); unordered
+  // unlimited ones newest first
+  const asIs = order || limit !== undefined;
+  const shown = asIs ? rows.slice(0, SHOWN) : rows.slice(-SHOWN).reverse();
   return (
     <section>
       <p>
         <span className={`status ${status}`}>{status}</span> {rows.length} rows
-        {rows.length > SHOWN && (order ? ` (first ${SHOWN} shown)` : ` (newest ${SHOWN} shown)`)}
+        {rows.length > SHOWN && (asIs ? ` (first ${SHOWN} shown)` : ` (newest ${SHOWN} shown)`)}
+        {limit !== undefined && <small> · limit {limit}{order ? " (top)" : " (latest)"}</small>}
         {order && (
           <small>
             {" "}

@@ -10,6 +10,15 @@ pub struct Query {
     pub selection: Option<Expr>,
     /// The ORDER BY clause.
     pub order: Option<Order>,
+    /// `LIMIT n`.
+    pub limit: Option<Limit>,
+}
+
+/// `LIMIT n`; `span` is the number's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limit {
+    pub value: u64,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

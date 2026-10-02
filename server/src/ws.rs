@@ -223,6 +223,7 @@ async fn run(
         .collect();
     let mut columns = Some(columns);
     let order = subscription.plan.stream.order.as_ref().map(OrderTerm::of);
+    let subscription_limit = subscription.plan.stream.limit;
 
     let mut batches = subscription.ready_chunks(MAX_ITERATIONS_PER_MESSAGE);
     while let Some(batch) = batches.next().await {
@@ -239,11 +240,13 @@ async fn run(
                         rows: it
                             .diffs
                             .into_iter()
-                            .map(|d| match d {
-                                chlive_engine::diff::Diff::Insert { row, .. } => row,
+                            .filter_map(|d| match d {
+                                chlive_engine::diff::Diff::Insert { row, .. } => Some(row),
+                                chlive_engine::diff::Diff::Delete { .. } => None,
                             })
                             .collect(),
                         order: order.clone(),
+                        limit: subscription_limit,
                     });
                 }
                 Ok(it) => changes.extend(it.diffs.into_iter().map(Change::from)),

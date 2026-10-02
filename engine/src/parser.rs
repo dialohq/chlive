@@ -18,7 +18,7 @@
 //! ```
 
 use crate::ast::{CmpOp, ColumnRef, Expr, Literal, Projection, Query, TableRef};
-use crate::ast::{Direction, NullsOrder, Order, OrderItem};
+use crate::ast::{Direction, Limit, NullsOrder, Order, OrderItem};
 use crate::error::SyntaxError;
 use crate::lexer::{tokenize, Token, TokenKind};
 
@@ -82,12 +82,55 @@ impl Parser {
         } else {
             None
         };
+        let limit = if self.peek().kind == TokenKind::Keyword("LIMIT") {
+            self.next();
+            Some(self.limit()?)
+        } else {
+            None
+        };
         self.end()?;
         Ok(Query {
             projection,
             from,
             selection,
             order,
+            limit,
+        })
+    }
+
+    /// `LIMIT n`, a whole number; OFFSET, `LIMIT m, n`, WITH TIES and BY aren't supported yet.
+    fn limit(&mut self) -> Result<Limit, SyntaxError> {
+        let t = self.peek().clone();
+        let value = match &t.kind {
+            TokenKind::Number(n) => n.parse::<u64>().ok(),
+            _ => None,
+        };
+        let Some(value) = value else {
+            return Err(SyntaxError::new(
+                "LIMIT needs a non-negative whole number",
+                t.span,
+            ));
+        };
+        self.next();
+        let next = self.peek().clone();
+        if next.kind == TokenKind::Comma || self.at_word("OFFSET") {
+            return Err(SyntaxError::new("OFFSET is not supported yet", next.span));
+        }
+        if self.at_word("WITH") {
+            return Err(SyntaxError::new(
+                "LIMIT … WITH TIES is not supported yet",
+                next.span,
+            ));
+        }
+        if next.kind == TokenKind::Keyword("BY") {
+            return Err(SyntaxError::new(
+                "LIMIT … BY is not supported yet",
+                next.span,
+            ));
+        }
+        Ok(Limit {
+            value,
+            span: t.span,
         })
     }
 
@@ -443,7 +486,7 @@ impl Parser {
         let t = self.peek().clone();
         match t.kind {
             TokenKind::Eof => Ok(()),
-            TokenKind::Keyword(kw @ ("GROUP" | "HAVING" | "LIMIT" | "JOIN" | "UNION")) => Err(
+            TokenKind::Keyword(kw @ ("GROUP" | "HAVING" | "JOIN" | "UNION")) => Err(
                 SyntaxError::new(format!("{kw} is not supported yet"), t.span),
             ),
             TokenKind::Comma => Err(SyntaxError::new(
@@ -666,10 +709,6 @@ mod tests {
             "expected a table name, found end of input at 1:14"
         );
         assert_eq!(
-            error("select * from events limit 1"),
-            "LIMIT is not supported yet at 1:22"
-        );
-        assert_eq!(
             error("select * from db.events"),
             "qualified table names are not supported at 1:17"
         );
@@ -787,14 +826,58 @@ mod tests {
             error("select * from t order a"),
             "expected BY, found identifier `a` at 1:23"
         );
-        assert_eq!(
-            error("select * from t order by a limit 3"),
-            "LIMIT is not supported yet at 1:28"
-        );
         // ORDER BY comes after WHERE
         assert_eq!(
             error("select * from t order by a where b = 1"),
             "expected end of query, found WHERE at 1:28"
+        );
+    }
+
+    #[test]
+    fn limit_forms_and_rejections() {
+        let limit = |src: &str| parse(src).unwrap().limit.map(|l| l.value);
+        assert_eq!(limit("select * from t limit 10"), Some(10));
+        assert_eq!(
+            limit("select * from t where a = 1 order by a desc limit 0;"),
+            Some(0)
+        );
+        assert_eq!(limit("select * from t"), None);
+        assert_eq!(
+            error("select * from t limit -1"),
+            "LIMIT needs a non-negative whole number at 1:23"
+        );
+        assert_eq!(
+            error("select * from t limit 1.5"),
+            "LIMIT needs a non-negative whole number at 1:23"
+        );
+        assert_eq!(
+            error("select * from t limit n"),
+            "LIMIT needs a non-negative whole number at 1:23"
+        );
+        assert_eq!(
+            error("select * from t limit"),
+            "LIMIT needs a non-negative whole number at 1:22"
+        );
+        assert_eq!(
+            error("select * from t limit 1, 2"),
+            "OFFSET is not supported yet at 1:24"
+        );
+        assert_eq!(
+            error("select * from t limit 2 offset 1"),
+            "OFFSET is not supported yet at 1:25"
+        );
+        assert_eq!(
+            error("select * from t order by a limit 2 with ties"),
+            "LIMIT … WITH TIES is not supported yet at 1:36"
+        );
+        assert_eq!(
+            error("select * from t limit 2 by a"),
+            "LIMIT … BY is not supported yet at 1:25"
+        );
+        // LIMIT comes after ORDER BY
+        assert_eq!(
+            error("select * from t limit 2 order by a"),
+            "expected end of query, found ORDER at 1:25"
         );
     }
 }

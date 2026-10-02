@@ -68,11 +68,12 @@ impl HistorySource for FakeHistory {
             ]),
             s if s == slow => Ok(vec![row(json!({"user_id": "slow-history"}))]),
             // ordered by an unselected column: ClickHouse returns it under a hidden alias
-            s if s == slowest => Ok(vec![
+            s if s == slowest || s == format!("{slowest} LIMIT 3") => Ok(vec![
                 row(json!({"user_id": "h900", "__order_0": 900})),
                 row(json!({"user_id": "h500", "__order_0": 500})),
                 row(json!({"user_id": "h500b", "__order_0": 500})),
             ]),
+            s if s == format!("{slow} LIMIT 2") => Ok(vec![row(json!({"user_id": "h900"}))]),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -318,16 +319,99 @@ async fn order_by_places_each_new_row() {
         ]
     );
     // applying the indexes the way a client does gives the ordered result
-    let mut list: Vec<String> = Vec::new();
-    for it in &iterations {
+    assert_eq!(
+        names(&iterations),
+        ["e1000", "h900", "e700", "h500", "h500b", "e500"]
+    );
+}
+
+/// The result a client ends up with, as user ids; checks every iteration against `limit`.
+fn names_within(iterations: &[Iteration], limit: Option<usize>) -> Vec<String> {
+    let mut rows: Vec<Row> = Vec::new();
+    for it in iterations {
         for d in &it.diffs {
-            let Diff::Insert { row, index } = d;
-            let name = row["user_id"].as_str().unwrap().to_string();
-            match index {
-                Some(i) => list.insert(*i, name),
-                None => list.push(name),
-            }
+            d.apply(&mut rows).unwrap();
+        }
+        if let Some(n) = limit {
+            assert!(rows.len() <= n, "{} rows after {it}", rows.len());
         }
     }
-    assert_eq!(list, ["e1000", "h900", "e700", "h500", "h500b", "e500"]);
+    rows.iter()
+        .map(|r| r["user_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn names(iterations: &[Iteration]) -> Vec<String> {
+    names_within(iterations, None)
+}
+
+#[tokio::test]
+async fn limit_without_order_by_is_a_window_of_the_latest_rows() {
+    let mut source = MemorySource::new();
+    source
+        .push("requests", 0, r#"{"user_id": "h900", "latency_ms": 900}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "e1", "latency_ms": 200}"#)
+        .push("requests", 0, r#"{"user_id": "fast", "latency_ms": 5}"#)
+        .push("requests", 0, r#"{"user_id": "e2", "latency_ms": 300}"#)
+        .push("requests", 0, r#"{"user_id": "e3", "latency_ms": 400}"#);
+    let subscription = engine(source)
+        .subscribe("select user_id from requests where latency_ms > 100 limit 2")
+        .await
+        .unwrap();
+    assert!(
+        subscription.history_sql.ends_with(" LIMIT 2"),
+        "{}",
+        subscription.history_sql
+    );
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    let lines: Vec<String> = iterations[1..]
+        .iter()
+        .filter(|i| !i.diffs.is_empty())
+        .map(|i| i.to_string())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            // history had 1 row: not full yet
+            "requests/0:1 + {\"user_id\":\"e1\"}",
+            // full: append, then the first row goes, in the same iteration
+            "requests/0:3 + {\"user_id\":\"e2\"}\nrequests/0:3 - @0",
+            "requests/0:4 + {\"user_id\":\"e3\"}\nrequests/0:4 - @0",
+        ]
+    );
+    assert_eq!(names_within(&iterations, Some(2)), ["e2", "e3"]);
+}
+
+#[tokio::test]
+async fn order_by_with_limit_keeps_the_top_n() {
+    let mut source = MemorySource::new();
+    source
+        .push("requests", 0, r#"{"user_id": "h900", "latency_ms": 900}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "e100", "latency_ms": 150}"#) // past the end
+        .push("requests", 0, r#"{"user_id": "e500", "latency_ms": 500}"#) // ties with the last
+        .push("requests", 0, r#"{"user_id": "e700", "latency_ms": 700}"#) // pushes h500b out
+        .push("requests", 0, r#"{"user_id": "e1000", "latency_ms": 1000}"#); // pushes h500 out
+    let subscription = engine(source)
+        .subscribe(
+            "select user_id from requests where latency_ms > 100 order by latency_ms desc limit 3",
+        )
+        .await
+        .unwrap();
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    let lines: Vec<String> = iterations[1..]
+        .iter()
+        .filter(|i| !i.diffs.is_empty())
+        .map(|i| i.to_string())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "requests/0:3 + @1 {\"user_id\":\"e700\"}\nrequests/0:3 - @3",
+            "requests/0:4 + @0 {\"user_id\":\"e1000\"}\nrequests/0:4 - @3",
+        ]
+    );
+    assert_eq!(
+        names_within(&iterations, Some(3)),
+        ["e1000", "h900", "e700"]
+    );
 }

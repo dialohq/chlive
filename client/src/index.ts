@@ -12,6 +12,8 @@ export interface LiveState<R extends Row = Row> {
   columns: Column[];
   /** The ORDER BY the rows are in; absent for unordered queries (rows in arrival order). */
   order?: OrderTerm[];
+  /** The query's LIMIT, if any. `rows` never has more: listeners only see whole diffs applied. */
+  limit?: number;
   error?: string;
   errorCode?: string;
 }
@@ -151,7 +153,13 @@ export class LiveClient {
         this.emit(rec, { ...rec.state, status: "error", error: msg.message, errorCode: msg.code });
         return;
     }
-    this.emit(rec, { status: "live", rows: rec.store.rows(), columns: rec.store.columns, order: rec.store.order });
+    this.emit(rec, {
+      status: "live",
+      rows: rec.store.rows(),
+      columns: rec.store.columns,
+      order: rec.store.order,
+      limit: rec.store.limit,
+    });
   }
 
   private emit(rec: SubRecord, state: LiveState<any>): void {

@@ -346,6 +346,64 @@ async fn ordered_inserts_carry_their_index() {
     assert!(m["changes"][0].get("index").is_none(), "{m}");
 }
 
+#[tokio::test]
+async fn limit_sends_deletes_in_the_same_diff() {
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+    // without ORDER BY: a window of the latest row
+    c.subscribe("w", "select user_id from requests limit 1")
+        .await;
+    let snapshot = c.expect().await;
+    assert_eq!(snapshot["limit"], 1);
+    assert_eq!(snapshot["rows"], json!([{"user_id": "h1"}]));
+    let mut changes = Vec::new();
+    while changes.len() < 6 {
+        let m = c.expect().await;
+        changes.extend(m["changes"].as_array().unwrap().iter().cloned());
+    }
+    // each event: appended, then the first row deleted
+    for pair in changes.chunks(2) {
+        assert_eq!(pair[0]["op"], "insert");
+        assert!(pair[0].get("index").is_none());
+        assert_eq!(pair[1], json!({"op": "delete", "index": 0}));
+    }
+    assert_eq!(changes[4]["row"], json!({"user_id": "slower"}));
+
+    // with ORDER BY: the top 2
+    c.subscribe(
+        "t",
+        "select user_id, latency_ms from requests order by latency_ms desc limit 2",
+    )
+    .await;
+    assert_eq!(c.expect().await["limit"], 2);
+    let mut rows: Vec<Value> = vec![json!({"user_id": "h1", "latency_ms": 900})];
+    let mut seen = 0;
+    while seen < 3 {
+        let m = c.expect().await;
+        for ch in m["changes"].as_array().unwrap() {
+            match ch["op"].as_str().unwrap() {
+                "insert" => {
+                    rows.insert(ch["index"].as_u64().unwrap() as usize, ch["row"].clone());
+                    seen += 1;
+                }
+                "delete" => {
+                    rows.remove(ch["index"].as_u64().unwrap() as usize);
+                }
+                op => panic!("{op}"),
+            }
+        }
+        // the limit holds at the end of every diff
+        assert!(rows.len() <= 2, "{rows:?}");
+    }
+    assert_eq!(
+        rows,
+        [
+            json!({"user_id": "h1", "latency_ms": 900}),
+            json!({"user_id": "slower", "latency_ms": 700})
+        ]
+    );
+}
+
 /// A plain HTTP GET (no client library needed for one endpoint).
 async fn http_get(url: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

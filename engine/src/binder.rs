@@ -1,5 +1,5 @@
 //! Resolves a parsed query against the catalog, clause by clause in SQL's logical evaluation
-//! order: FROM, then WHERE, then SELECT, then ORDER BY. Everything after binding works with resolved identifiers, never
+//! order: FROM, then WHERE, then SELECT, then ORDER BY, then LIMIT. Everything after binding works with resolved identifiers, never
 //! with the names as written.
 
 use std::fmt;
@@ -62,6 +62,8 @@ pub struct BoundQuery {
     pub projection: Vec<ColumnId>,
     /// ORDER BY keys, most significant first; empty when unordered.
     pub order: Vec<OrderKey>,
+    /// LIMIT: at most this many rows.
+    pub limit: Option<u64>,
 }
 
 /// One ORDER BY key, with ClickHouse's defaults resolved: ascending, NULLS LAST.
@@ -181,6 +183,7 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
         filter,
         projection,
         order,
+        limit: query.limit.map(|l| l.value),
     })
 }
 

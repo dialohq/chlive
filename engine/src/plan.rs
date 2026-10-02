@@ -32,6 +32,7 @@ pub struct HistoryPlan {
     pub filter: Option<String>,
     /// `ORDER BY …`, with every key's direction and NULL placement explicit.
     pub order: Option<String>,
+    pub limit: Option<u64>,
     pub kafka: KafkaColumns,
 }
 
@@ -49,6 +50,9 @@ impl HistoryPlan {
         if let Some(order) = &self.order {
             sql.push(' ');
             sql.push_str(order);
+        }
+        if let Some(limit) = self.limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
         }
         sql
     }
@@ -76,6 +80,8 @@ pub struct StreamPlan {
     pub filter: Filter,
     /// With ORDER BY: how to place rows.
     pub order: Option<OrderPlan>,
+    /// LIMIT: with ORDER BY, the top N; without, a window of the latest N rows.
+    pub limit: Option<u64>,
 }
 
 /// ORDER BY for the stream: the keys, and where each key's value is found in a history row.
@@ -361,6 +367,17 @@ impl std::fmt::Display for Plan {
                 order.text
             )?;
         }
+        match (self.stream.limit, &self.stream.order) {
+            (Some(n), Some(_)) => write!(
+                f,
+                "\nlimit:   {n} (the top {n}: a row inserted inside them pushes the last one out)"
+            )?,
+            (Some(n), None) => write!(
+                f,
+                "\nlimit:   {n} (a window of the latest {n} rows: each new one pushes out the first)"
+            )?,
+            (None, _) => {}
+        }
         Ok(())
     }
 }
@@ -437,6 +454,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
         ),
         filter: bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
         order: order_sql,
+        limit: bound.limit,
         kafka: table.kafka.clone(),
     };
 
@@ -483,6 +501,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             columns: order_columns,
             hidden,
         }),
+        limit: bound.limit,
     };
     Plan {
         table: table.name.clone(),
@@ -528,6 +547,7 @@ mod tests {
             filter,
             projection: projection.iter().map(|i| ColumnId(*i)).collect(),
             order: Vec::new(),
+            limit: None,
         }
     }
 

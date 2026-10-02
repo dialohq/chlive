@@ -346,6 +346,22 @@ async fn history_and_stream_agree_on_order_by() {
             "select name, ts from events where flag order by n nulls first, ts desc",
             &["n", "ts"],
         ),
+        // LIMIT: the top N
+        ("select * from events order by score limit 4", &["score"]),
+        (
+            "select * from events order by n desc, score limit 5",
+            &["n", "score"],
+        ),
+        (
+            "select name from events order by score desc nulls first limit 3",
+            &["score"],
+        ),
+        (
+            "select * from events where flag order by ts desc limit 2",
+            &["ts"],
+        ),
+        ("select * from events order by label limit 6", &["label"]),
+        ("select * from events order by score limit 0", &["score"]),
     ];
 
     let mut source = MemorySource::new();
@@ -400,7 +416,9 @@ async fn history_and_stream_agree_on_order_by() {
         .diffs
         .iter()
         .map(|d| {
-            let Diff::Insert { row, .. } = d;
+            let Diff::Insert { row, .. } = d else {
+                panic!("history is inserts")
+            };
             (
                 row["name"].as_str().unwrap().to_string(),
                 serde_json::Value::Object(row.clone()),
@@ -421,23 +439,40 @@ async fn history_and_stream_agree_on_order_by() {
                 .map(|i| i.unwrap())
                 .collect()
                 .await;
-            let mut list: Vec<String> = Vec::new();
+            let limit = limit_of(&sql);
+            let mut rows = Vec::new();
             for it in &iterations {
                 for d in &it.diffs {
-                    let Diff::Insert { row, index } = d;
-                    let name = row["name"].as_str().unwrap().to_string();
-                    match (it.origin == Origin::History, index) {
-                        (true, None) => list.push(name),
-                        (false, Some(i)) => list.insert(*i, name),
-                        other => panic!("{database}: {sql}: unexpected insert {other:?}"),
+                    if it.origin == Origin::History {
+                        assert!(
+                            matches!(d, Diff::Insert { index: None, .. }),
+                            "{database}: {sql}: {d}"
+                        );
                     }
+                    d.apply(&mut rows)
+                        .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
+                }
+                if let Some(n) = limit {
+                    assert!(
+                        rows.len() <= n,
+                        "{database}: {sql}: {} rows after {it}",
+                        rows.len()
+                    );
                 }
             }
+            let list: Vec<String> = rows
+                .iter()
+                .map(|r| r["name"].as_str().unwrap().to_string())
+                .collect();
             lists.push((database, list));
         }
         let key = |name: &String| -> String {
             keys.iter()
-                .map(|k| by_name[name][*k].to_string())
+                .map(|k| match &by_name[name][*k] {
+                    // -0 ties with 0
+                    serde_json::Value::Number(n) if n.as_f64() == Some(0.0) => "0".to_string(),
+                    v => v.to_string(),
+                })
                 .collect::<Vec<_>>()
                 .join(" | ")
         };
@@ -455,17 +490,73 @@ async fn history_and_stream_agree_on_order_by() {
             }
             out
         };
+        // With LIMIT, which rows of the boundary tie group made it in is arbitrary (in ClickHouse
+        // too): compare that group by key and size only.
+        let comparable = |list: &Vec<String>| -> Vec<(String, Vec<String>)> {
+            let mut g = groups(list);
+            if limit_of(sql).is_some() {
+                if let Some((key, names)) = g.last_mut() {
+                    *names = vec![format!("{key}: {} rows", names.len())];
+                }
+            }
+            g
+        };
         let (_, reference) = &lists[0];
+        if let Some(n) = limit_of(sql) {
+            assert!(reference.len() <= n);
+        }
         for (database, list) in &lists[1..] {
+            assert_eq!(list.len(), reference.len(), "{database}: {sql}: row count");
             assert_eq!(
-                groups(list),
-                groups(reference),
+                comparable(list),
+                comparable(reference),
                 "{database} disagrees with ClickHouse on: {sql}\n  got      {list:?}\n  expected {reference:?}"
             );
         }
         eprintln!("{sql}: {}", reference.join(" "));
     }
+    // LIMIT without ORDER BY: a window of the latest rows. n = 3 matches n1 n3 n5 n9 n11.
+    let sql = "select name, n from events where n = 3 limit 3";
+    let mut lists = Vec::new();
+    for (database, engine) in &engines {
+        let iterations: Vec<_> = engine
+            .subscribe(sql)
+            .await
+            .unwrap()
+            .map(|i| i.unwrap())
+            .collect()
+            .await;
+        let mut rows = Vec::new();
+        for it in &iterations {
+            for d in &it.diffs {
+                d.apply(&mut rows).unwrap();
+            }
+            assert!(
+                rows.len() <= 3,
+                "{database}: {} rows after {it}",
+                rows.len()
+            );
+        }
+        assert!(rows.iter().all(|r| r["n"] == 3), "{database}: {rows:?}");
+        let names: Vec<String> = rows
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        eprintln!("{database}: {sql}: {}", names.join(" "));
+        lists.push(names);
+    }
+    // history: any 3; stream-only: the latest 3; split: its 2 streamed ones last
+    assert_eq!(lists[0].len(), 3);
+    assert_eq!(lists[1], ["n5", "n9", "n11"]);
+    assert_eq!(lists[2].len(), 3);
+    assert_eq!(lists[2][1..], ["n9", "n11"]);
+
     for (database, _) in &engines {
         exec(&format!("DROP DATABASE {database}")).await;
     }
+}
+
+fn limit_of(sql: &str) -> Option<usize> {
+    sql.split_once(" limit ")
+        .map(|(_, n)| n.trim().parse().unwrap())
 }

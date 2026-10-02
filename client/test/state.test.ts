@@ -28,8 +28,8 @@ test("unknown ops throw and leave the rows untouched", () => {
   const s = new ResultStore<{ n: number }>();
   s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }] });
   assert.throws(
-    () => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 2 } }, { op: "delete" } as any] }),
-    /unsupported change "delete"/,
+    () => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 2 } }, { op: "update" } as any] }),
+    /unsupported change "update"/,
   );
   assert.deepEqual(s.rows().map((r) => r.n), [1]);
 });
@@ -61,4 +61,18 @@ test("an index outside the list throws and leaves the rows untouched", () => {
     );
   }
   assert.deepEqual(s.rows().map((r) => r.n), [1]);
+});
+
+test("LIMIT: a diff's inserts and deletes apply together", () => {
+  const s = new ResultStore<{ n: number }>();
+  s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }, { n: 2 }], limit: 2 });
+  assert.equal(s.limit, 2);
+  // window: append, then the first row goes
+  s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 3 } }, { op: "delete", index: 0 }] });
+  assert.deepEqual(s.rows().map((r) => r.n), [2, 3]);
+  // top-N: insert inside, then the row pushed past the end goes
+  s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 9 }, index: 0 }, { op: "delete", index: 2 }] });
+  assert.deepEqual(s.rows().map((r) => r.n), [9, 2]);
+  assert.throws(() => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "delete", index: 2 }] }), /delete at index 2/);
+  assert.deepEqual(s.rows().map((r) => r.n), [9, 2]);
 });

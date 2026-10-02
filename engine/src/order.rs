@@ -31,26 +31,44 @@ impl KeyOrder {
     }
 }
 
-/// The tie groups of an ordered result.
+/// The tie groups of an ordered result, at most `limit` rows with LIMIT (the top N).
 #[derive(Debug, Clone)]
 pub struct OrderedState {
     order: KeyOrder,
     groups: Vec<(SortKey, usize)>,
     len: usize,
+    limit: Option<usize>,
+}
+
+/// Where a new row goes in an ordered result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// Insert the row here.
+    pub index: usize,
+    /// Then delete the row at this index (the last one, pushed past the LIMIT).
+    pub evicts: Option<usize>,
 }
 
 impl OrderedState {
     pub fn new(order: KeyOrder) -> Self {
+        Self::with_limit(order, None)
+    }
+
+    pub fn with_limit(order: KeyOrder, limit: Option<u64>) -> Self {
         Self {
             order,
             groups: Vec::new(),
             len: 0,
+            limit: limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
         }
     }
 
-    /// Append a row of the (already ordered) history. A key equal to the previous one joins its
-    /// tie group; anything else starts a new group.
+    /// Append a row of the (already ordered and limited) history. A key equal to the previous
+    /// one joins its tie group; anything else starts a new group.
     pub fn push_history(&mut self, key: SortKey) {
+        if self.is_full() {
+            return; // ClickHouse already applied the LIMIT
+        }
         match self.groups.last_mut() {
             Some((last, n)) if self.order.cmp(last, &key) == Ordering::Equal => *n += 1,
             _ => self.groups.push((key, 1)),
@@ -58,43 +76,60 @@ impl OrderedState {
         self.len += 1;
     }
 
-    /// Place a new row: returns its index in the result, after every row that sorts before it
-    /// or ties with it.
-    pub fn insert(&mut self, key: SortKey) -> usize {
-        let index;
-        // fast path: at or after the last group (e.g. ORDER BY ts with rising timestamps)
-        match self.groups.last_mut() {
-            None => {
-                self.groups.push((key, 1));
-                index = 0;
-            }
-            Some((last, n)) => match self.order.cmp(&key, last) {
-                Ordering::Equal => {
-                    *n += 1;
-                    index = self.len;
-                }
-                Ordering::Greater => {
-                    self.groups.push((key, 1));
-                    index = self.len;
-                }
-                Ordering::Less => {
-                    let order = &self.order;
-                    let at = self
-                        .groups
-                        .partition_point(|(g, _)| order.cmp(g, &key) == Ordering::Less);
-                    let before: usize = self.groups[..at].iter().map(|(_, n)| n).sum();
-                    if order.cmp(&self.groups[at].0, &key) == Ordering::Equal {
-                        self.groups[at].1 += 1;
-                        index = before + self.groups[at].1 - 1;
-                    } else {
-                        self.groups.insert(at, (key, 1));
-                        index = before;
-                    }
-                }
-            },
+    /// Place a new row after every row that sorts before it or ties with it. With a LIMIT and a
+    /// full result, a row that would land past the end is dropped (`None`, nothing changes), and
+    /// any other pushes the last row out.
+    pub fn insert(&mut self, key: SortKey) -> Option<Placement> {
+        let (at, existing, index) = self.locate(&key);
+        if self.is_full() && Some(index) >= self.limit {
+            return None;
+        }
+        if existing {
+            self.groups[at].1 += 1;
+        } else {
+            self.groups.insert(at, (key, 1));
         }
         self.len += 1;
-        index
+        let evicts = match self.limit {
+            Some(n) if self.len > n => {
+                let (_, count) = self.groups.last_mut().expect("not empty");
+                *count -= 1;
+                if *count == 0 {
+                    self.groups.pop();
+                }
+                self.len -= 1;
+                Some(n)
+            }
+            _ => None,
+        };
+        Some(Placement { index, evicts })
+    }
+
+    /// The group a key belongs at, whether it already exists, and the row index after the end
+    /// of its tie group.
+    fn locate(&self, key: &SortKey) -> (usize, bool, usize) {
+        // fast path: at or after the last group (e.g. ORDER BY ts with rising timestamps)
+        match self.groups.last() {
+            None => return (0, false, 0),
+            Some((last, _)) => match self.order.cmp(key, last) {
+                Ordering::Equal => return (self.groups.len() - 1, true, self.len),
+                Ordering::Greater => return (self.groups.len(), false, self.len),
+                Ordering::Less => {}
+            },
+        }
+        let at = self
+            .groups
+            .partition_point(|(g, _)| self.order.cmp(g, key) == Ordering::Less);
+        let before: usize = self.groups[..at].iter().map(|(_, n)| n).sum();
+        if self.order.cmp(&self.groups[at].0, key) == Ordering::Equal {
+            (at, true, before + self.groups[at].1)
+        } else {
+            (at, false, before)
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.limit.is_some_and(|n| self.len >= n)
     }
 
     /// Rows in the result.
@@ -109,6 +144,37 @@ impl OrderedState {
     /// Tie groups held (what the state costs).
     pub fn groups(&self) -> usize {
         self.groups.len()
+    }
+}
+
+/// LIMIT without ORDER BY: a window of the latest N rows. Only the row count is kept.
+#[derive(Debug, Clone)]
+pub struct WindowState {
+    len: u64,
+    limit: u64,
+}
+
+impl WindowState {
+    pub fn new(limit: u64) -> Self {
+        Self { len: 0, limit }
+    }
+
+    pub fn push_history(&mut self) {
+        self.len = (self.len + 1).min(self.limit);
+    }
+
+    /// A new row: `None` with `LIMIT 0` (it never shows), otherwise whether, after appending it,
+    /// the first row must be deleted.
+    pub fn push(&mut self) -> Option<bool> {
+        if self.limit == 0 {
+            return None;
+        }
+        if self.len < self.limit {
+            self.len += 1;
+            Some(false)
+        } else {
+            Some(true)
+        }
     }
 }
 
@@ -137,8 +203,12 @@ mod tests {
     /// Insert keys one by one into a list of labels, the way a client applies indexes.
     fn apply(state: &mut OrderedState, list: &mut Vec<String>, rows: &[(SortKey, &str)]) {
         for (key, label) in rows {
-            let i = state.insert(key.clone());
-            list.insert(i, label.to_string());
+            if let Some(p) = state.insert(key.clone()) {
+                list.insert(p.index, label.to_string());
+                if let Some(e) = p.evicts {
+                    list.remove(e);
+                }
+            }
         }
     }
 
@@ -207,5 +277,75 @@ mod tests {
             ],
         );
         assert_eq!(list, ["de5", "de5b", "pl50", "pl10", "pl1"]);
+    }
+
+    #[test]
+    fn top_n() {
+        // ORDER BY a DESC LIMIT 3, history 9 5 5
+        let mut s = OrderedState::with_limit(order(&[(true, false)]), Some(3));
+        let mut list: Vec<String> = Vec::new();
+        for (k, l) in [(9, "h9"), (5, "h5a"), (5, "h5b")] {
+            s.push_history(int(k));
+            list.push(l.into());
+        }
+        // past the end, and a tie with the last row: dropped, nothing changes
+        assert_eq!(s.insert(int(1)), None);
+        assert_eq!(s.insert(int(5)), None);
+        assert_eq!((s.len(), s.groups()), (3, 2));
+        // inside: inserted, then the last row (now at index N) is deleted
+        assert_eq!(
+            s.clone().insert(int(7)),
+            Some(Placement {
+                index: 1,
+                evicts: Some(3)
+            })
+        );
+        apply(
+            &mut s,
+            &mut list,
+            &[
+                (int(7), "e7"),
+                (int(10), "e10"),
+                (int(6), "e6"),
+                (int(8), "e8"),
+            ],
+        );
+        assert_eq!(list, ["e10", "h9", "e8"]);
+        // the state never holds more than N
+        assert_eq!((s.len(), s.groups()), (3, 3));
+    }
+
+    #[test]
+    fn limit_zero_and_short_history() {
+        let mut s = OrderedState::with_limit(order(&[(false, false)]), Some(0));
+        assert_eq!(s.insert(int(1)), None);
+        // history shorter than the limit: no evictions until full
+        let mut s = OrderedState::with_limit(order(&[(false, false)]), Some(2));
+        s.push_history(int(5));
+        assert_eq!(
+            s.insert(int(1)),
+            Some(Placement {
+                index: 0,
+                evicts: None
+            })
+        );
+        assert_eq!(
+            s.insert(int(3)),
+            Some(Placement {
+                index: 1,
+                evicts: Some(2)
+            })
+        );
+        assert_eq!(s.insert(int(9)), None);
+    }
+
+    #[test]
+    fn window() {
+        let mut w = WindowState::new(2);
+        w.push_history();
+        assert_eq!(w.push(), Some(false)); // now full
+        assert_eq!(w.push(), Some(true)); // append, then delete the first
+        assert_eq!(w.push(), Some(true));
+        assert_eq!(WindowState::new(0).push(), None);
     }
 }

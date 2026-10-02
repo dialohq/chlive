@@ -74,7 +74,7 @@ produce events '{"user_id": "u7", "latency_ms": 900}'  # one event per JSON argu
 
 **History and stream meet at a watermark.** At subscribe time the engine reads `max(_offset)` per `_partition` from the ClickHouse table. History is every row up to it (the history query gets `toInt64(_offset) <= multiIf(_partition = 0, W0, …)`), and each Kafka partition is consumed from the offset right after it. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. The table must have `_partition` and `_offset` columns; the binder says so if it doesn't.
 
-So far the dialect accepts `SELECT * | col, … FROM <table> [WHERE <condition>] [ORDER BY <order>]`. A condition can use:
+So far the dialect accepts `SELECT * | col, … FROM <table> [WHERE <condition>] [ORDER BY <order>] [LIMIT n]`. A condition can use:
 - comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), with `AND`, `OR`, `NOT` and parentheses;
 - `IS [NOT] NULL` and `[NOT] IN (…)`;
 - operands that are columns or literals: numbers, strings, `TRUE`/`FALSE`.
@@ -85,7 +85,12 @@ Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 - **Semantics match ClickHouse.** NULLs default to last in both directions; NaN sits between the values and the NULLs; strings compare by bytes; `-0` ties with `0`. The history query always spells out each key's direction and NULL placement.
 - **State.** Per subscription, the engine keeps only the ORDER BY values of the result, with equal keys merged into tie groups, never the rows. Order-only columns are fetched from ClickHouse under hidden aliases (`__order_0`, …) and stripped from the output.
 - **Placement.** The history arrives in ClickHouse's order. Each new matching row goes after the last row it ties with, and its insert carries that `index`. So the live list has the same sequence of keys as a fresh query; only the order of rows within a tie group can differ.
-- **Tested.** `engine/tests/clickhouse.rs` checks 14 orderings (NULL, NaN, ±inf, `-0`, byte-order strings, DateTime precision, Bool, duplicates, DESC, NULLS FIRST/LAST, several keys, `ALL`, an unselected column, with WHERE) in the same three setups as WHERE.
+- **Tested.** `engine/tests/clickhouse.rs` checks 20 orderings (6 of them with LIMIT) (NULL, NaN, ±inf, `-0`, byte-order strings, DateTime precision, Bool, duplicates, DESC, NULLS FIRST/LAST, several keys, `ALL`, an unselected column, with WHERE) in the same three setups as WHERE.
+
+**LIMIT n** (a whole number; OFFSET, `WITH TIES` and `LIMIT … BY` aren't supported yet) goes into the history query and bounds the result:
+- **With ORDER BY: the top N.** The state holds at most N sort keys. A new row placed inside the top N is inserted at its index, and the row pushed past the end is deleted (`delete @N`). A row placed at or past the end, including one tying with the last row, changes nothing and sends nothing. Which rows of the boundary tie group make it in is arbitrary, as it is in ClickHouse.
+- **Without ORDER BY: a window of the latest N rows.** History is whatever N rows ClickHouse returns. Each new matching row is appended, and once the window is full, the first row is deleted (`delete @0`). Only a row count is kept.
+- **Atomic diffs.** An insert and the delete it causes are in the same iteration, so always in the same `diff`. The result has at most N rows after every diff, and the client only ever exposes whole diffs.
 
 **WHERE runs in two places, which must agree on every row.** ClickHouse evaluates it for history; the engine evaluates it for each event.
 - **Typed decoding.** Each event's needed JSON fields are decoded by their ClickHouse column types, following ClickHouse's input rules: a quoted number is read as a number, and a DateTime string is parsed.
@@ -136,7 +141,9 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 ```
 
 - `snapshot` comes first and once; `diff`s follow, each with the changes of the events that were ready (never empty). Only `insert` exists so far; clients reject ops they don't know.
-- With an `index`, the row is inserted there: the row at that index and every row after it move one down. Without one, it's appended. Changes within a `diff` apply in sequence, each index into the list as the previous change left it.
+- With an `index`, the row is inserted there: the row at that index and every row after it move one down. Without one, it's appended.
+- `{"op": "delete", "index": k}` removes the row at `k`; the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes.
+- A `diff` is atomic: its changes apply in sequence, each index into the list as the previous change left it, and only the state after all of them is meaningful (in between, an insert and its delete can briefly make one row more than the LIMIT). The client applies a whole diff to one copy of the rows before its listeners see it.
 - Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`. After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
 
@@ -155,10 +162,10 @@ e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chliv
 The engine's dialect, for now:
 
 ```
-SELECT * | col, … FROM <table> [WHERE <condition>] [ORDER BY ALL | col [ASC|DESC] [NULLS FIRST|LAST], …]
+SELECT * | col, … FROM <table> [WHERE <condition>] [ORDER BY ALL | col [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
 ```
 
 - A table needs a ClickHouse table (with `_partition` and `_offset`) and a Kafka topic of the same name.
 - Conditions: comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN (…)` over columns and literals; see [Engine](#engine-custom-dialect).
-- Results only grow (inserts). With `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot.
-- No `LIMIT`, `GROUP BY`/aggregates, joins, functions or parameters yet, and no result-size cap.
+- With `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot. `LIMIT` keeps the top N (with `ORDER BY`) or the latest N (without), deleting the rows that fall out.
+- No OFFSET, `GROUP BY`/aggregates, joins, functions or parameters yet. Without `LIMIT`, results only grow.
