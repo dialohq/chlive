@@ -4,8 +4,14 @@
 //! The client subscribes with an id of its choosing (scoped to the connection) and a dialect
 //! query. The server answers with one `snapshot` (the history), then `diff`s as events arrive,
 //! or an `error`, after which that subscription is over.
+//!
+//! With ORDER BY, the snapshot is in order and says so (`order`), and every insert carries the
+//! `index` the row takes: the row at that index and all after it move one down. Within one
+//! `diff`, changes apply in sequence; each index is into the list as the previous change left
+//! it. Without ORDER BY there is no index and rows are appended.
 
 use chlive_engine::diff::{Diff, Row};
+use chlive_engine::plan::OrderPlan;
 use chlive_engine::EngineError;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +30,9 @@ pub enum ServerMsg {
         id: String,
         columns: Vec<Column>,
         rows: Vec<Row>,
+        /// The ORDER BY the rows are kept in; absent when unordered.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        order: Option<Vec<OrderTerm>>,
     },
     /// Changes since the previous message, in order. Never empty.
     Diff { id: String, changes: Vec<Change> },
@@ -44,18 +53,46 @@ pub struct Column {
     pub ty: String,
 }
 
+/// One ORDER BY key: `{"column": "ts", "direction": "desc", "nulls": "last"}`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OrderTerm {
+    pub column: String,
+    pub direction: &'static str,
+    pub nulls: &'static str,
+}
+
+impl OrderTerm {
+    pub fn of(plan: &OrderPlan) -> Vec<OrderTerm> {
+        plan.keys
+            .0
+            .iter()
+            .zip(&plan.columns)
+            .map(|(k, c)| OrderTerm {
+                column: c.name.clone(),
+                direction: if k.desc { "desc" } else { "asc" },
+                nulls: if k.nulls_first { "first" } else { "last" },
+            })
+            .collect()
+    }
+}
+
 /// One change to the result; mirrors the engine's [`Diff`]. Only inserts exist so far;
 /// clients must reject ops they don't know.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Change {
-    Insert { row: Row },
+    /// At `index` in an ordered result, appended otherwise.
+    Insert {
+        row: Row,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+    },
 }
 
 impl From<Diff> for Change {
     fn from(d: Diff) -> Self {
         match d {
-            Diff::Insert(row) => Change::Insert { row },
+            Diff::Insert { row, index } => Change::Insert { row, index },
         }
     }
 }
@@ -135,6 +172,7 @@ mod tests {
                 ty: "String".into(),
             }],
             rows: vec![row.clone()],
+            order: None,
         };
         assert_eq!(
             serde_json::to_value(&snapshot).unwrap(),
@@ -143,11 +181,21 @@ mod tests {
         );
         let diff = ServerMsg::Diff {
             id: "s1".into(),
-            changes: vec![Diff::Insert(row).into()],
+            changes: vec![
+                Diff::insert(row.clone()).into(),
+                Diff::Insert {
+                    row,
+                    index: Some(2),
+                }
+                .into(),
+            ],
         };
         assert_eq!(
             serde_json::to_value(&diff).unwrap(),
-            json!({"type": "diff", "id": "s1", "changes": [{"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}}]})
+            json!({"type": "diff", "id": "s1", "changes": [
+                {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}},
+                {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}, "index": 2}
+            ]})
         );
         assert_eq!(
             serde_json::to_value(ServerMsg::error(None, BAD_MESSAGE, "nope")).unwrap(),

@@ -11,12 +11,13 @@ use std::task::{Context, Poll};
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 
 use crate::binder::{bind, BindError, Catalog};
-use crate::diff::Diff;
+use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
+use crate::order::OrderedState;
 use crate::parser::parse;
-use crate::plan::{plan, Plan};
+use crate::plan::{plan, Plan, StreamPlan};
 use crate::rules::{HardcodedRules, NamingRules, TopicId};
-use crate::source::{EventSource, KafkaSource, SourceError, TopicStart};
+use crate::source::{Event, EventSource, KafkaSource, SourceError, TopicStart};
 use crate::watermark::Watermark;
 
 #[derive(Debug, thiserror::Error)]
@@ -155,46 +156,88 @@ impl Engine {
         &self,
         plan: &Plan,
         history_sql: String,
-        events: BoxStream<'static, crate::source::Event>,
+        events: BoxStream<'static, Event>,
     ) -> BoxStream<'static, Result<Iteration, EngineError>> {
+        enum Item {
+            History(Result<Vec<Row>, HistoryError>),
+            Event(Event),
+        }
         let history = self.history.clone();
-        let initial = stream::once(async move {
-            let rows = history.fetch(&history_sql).await?;
-            Ok(Iteration {
-                origin: Origin::History,
-                diffs: rows.into_iter().map(Diff::Insert).collect(),
-            })
-        });
+        let initial = stream::once(async move { Item::History(history.fetch(&history_sql).await) });
         let stream_plan = plan.stream.clone();
-        let events = events.map(move |event| {
-            // decode by column types, then filter, then project
-            let diffs = match stream_plan.decode(&event.value) {
-                Ok(row) if stream_plan.matches(&row) => {
-                    vec![Diff::Insert(stream_plan.project(&row))]
-                }
-                Ok(_) => Vec::new(),
-                Err(e) => {
-                    // ClickHouse's ingestion would reject this message too
-                    tracing::warn!(
-                        topic = %event.topic,
-                        partition = event.partition,
-                        offset = event.offset,
-                        error = %e,
-                        "skipping event"
-                    );
-                    Vec::new()
-                }
-            };
-            Ok(Iteration {
-                origin: Origin::Event {
-                    topic: event.topic,
-                    partition: event.partition,
-                    offset: event.offset,
-                },
-                diffs,
+        // With ORDER BY: the sort keys of the result so far, to place each new row.
+        let state = stream_plan
+            .order
+            .as_ref()
+            .map(|o| OrderedState::new(o.keys.clone()));
+        initial
+            .chain(events.map(Item::Event))
+            .scan(state, move |state, item| {
+                let iteration = match item {
+                    Item::History(rows) => history_iteration(&stream_plan, state, rows),
+                    Item::Event(event) => Ok(event_iteration(&stream_plan, state, event)),
+                };
+                futures::future::ready(Some(iteration))
             })
-        });
-        initial.chain(events).boxed()
+            .boxed()
+    }
+}
+
+/// The history as one iteration; with ORDER BY, also seeds the sort state, in ClickHouse's
+/// order, and drops the hidden ORDER BY fields from the rows.
+fn history_iteration(
+    plan: &StreamPlan,
+    state: &mut Option<OrderedState>,
+    rows: Result<Vec<Row>, HistoryError>,
+) -> Result<Iteration, EngineError> {
+    let mut rows = rows?;
+    if let (Some(order), Some(state)) = (&plan.order, state.as_mut()) {
+        for row in &mut rows {
+            let key = order
+                .history_key(row)
+                .map_err(|e| HistoryError::ClickHouse(format!("history row: {e}")))?;
+            state.push_history(key);
+        }
+    }
+    Ok(Iteration {
+        origin: Origin::History,
+        diffs: rows.into_iter().map(Diff::insert).collect(),
+    })
+}
+
+/// One event: decode by column types, filter, project and, with ORDER BY, place it.
+fn event_iteration(plan: &StreamPlan, state: &mut Option<OrderedState>, event: Event) -> Iteration {
+    let diffs = match plan.decode(&event.value) {
+        Ok(row) if plan.matches(&row) => {
+            let index = match (&plan.order, state.as_mut()) {
+                (Some(order), Some(state)) => Some(state.insert(order.event_key(&row))),
+                _ => None,
+            };
+            vec![Diff::Insert {
+                row: plan.project(&row),
+                index,
+            }]
+        }
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            // ClickHouse's ingestion skips this message too
+            tracing::warn!(
+                topic = %event.topic,
+                partition = event.partition,
+                offset = event.offset,
+                error = %e,
+                "skipping event"
+            );
+            Vec::new()
+        }
+    };
+    Iteration {
+        origin: Origin::Event {
+            topic: event.topic,
+            partition: event.partition,
+            offset: event.offset,
+        },
+        diffs,
     }
 }
 

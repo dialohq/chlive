@@ -18,6 +18,7 @@
 //! ```
 
 use crate::ast::{CmpOp, ColumnRef, Expr, Literal, Projection, Query, TableRef};
+use crate::ast::{Direction, NullsOrder, Order, OrderItem};
 use crate::error::SyntaxError;
 use crate::lexer::{tokenize, Token, TokenKind};
 
@@ -74,12 +75,122 @@ impl Parser {
         } else {
             None
         };
+        let order = if self.peek().kind == TokenKind::Keyword("ORDER") {
+            self.next();
+            self.keyword("BY")?;
+            Some(self.order()?)
+        } else {
+            None
+        };
         self.end()?;
         Ok(Query {
             projection,
             from,
             selection,
+            order,
         })
+    }
+
+    /// Is the next token the (unreserved) word `word`? ASC, DESC, NULLS, FIRST, LAST and ALL
+    /// are only special here, so they stay usable as column names elsewhere.
+    fn at_word(&self, word: &str) -> bool {
+        matches!(&self.peek().kind, TokenKind::Ident(w) if w.eq_ignore_ascii_case(word))
+    }
+
+    /// `ALL [dir] [nulls]` or `item (, item)*`.
+    fn order(&mut self) -> Result<Order, SyntaxError> {
+        if self.at_word("ALL") {
+            let span = self.next().span;
+            let (direction, nulls) = self.order_modifiers()?;
+            if self.peek().kind == TokenKind::Comma {
+                return Err(SyntaxError::new(
+                    "ORDER BY ALL can't be combined with other columns",
+                    self.peek().span,
+                ));
+            }
+            return Ok(Order::All {
+                direction,
+                nulls,
+                span,
+            });
+        }
+        let mut items = vec![self.order_item()?];
+        while self.peek().kind == TokenKind::Comma {
+            self.next();
+            items.push(self.order_item()?);
+        }
+        Ok(Order::Items(items))
+    }
+
+    fn order_item(&mut self) -> Result<OrderItem, SyntaxError> {
+        let t = self.peek().clone();
+        match &t.kind {
+            TokenKind::Number(_) => {
+                return Err(SyntaxError::new(
+                    "ordering by position is not supported yet; name the column",
+                    t.span,
+                ))
+            }
+            TokenKind::Ident(_) => {}
+            TokenKind::Eof | TokenKind::Semicolon => return Err(self.expected("a column name")),
+            _ => {
+                return Err(SyntaxError::new(
+                    "ordering by expressions is not supported yet; name a column",
+                    t.span,
+                ))
+            }
+        }
+        let column = self.column()?;
+        match self.peek().kind {
+            TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash => {
+                return Err(SyntaxError::new(
+                    "ordering by expressions is not supported yet; name a column",
+                    self.peek().span,
+                ))
+            }
+            _ => {}
+        }
+        let (direction, nulls) = self.order_modifiers()?;
+        Ok(OrderItem {
+            column,
+            direction,
+            nulls,
+        })
+    }
+
+    fn order_modifiers(&mut self) -> Result<(Option<Direction>, Option<NullsOrder>), SyntaxError> {
+        let direction = if self.at_word("ASC") {
+            self.next();
+            Some(Direction::Asc)
+        } else if self.at_word("DESC") {
+            self.next();
+            Some(Direction::Desc)
+        } else {
+            None
+        };
+        let nulls = if self.at_word("NULLS") {
+            self.next();
+            if self.at_word("FIRST") {
+                self.next();
+                Some(NullsOrder::First)
+            } else if self.at_word("LAST") {
+                self.next();
+                Some(NullsOrder::Last)
+            } else {
+                return Err(self.expected("FIRST or LAST"));
+            }
+        } else {
+            None
+        };
+        for word in ["COLLATE", "WITH"] {
+            if self.at_word(word) {
+                return Err(SyntaxError::new(
+                    format!("{word} in ORDER BY is not supported"),
+                    self.peek().span,
+                ));
+            }
+        }
+        Ok((direction, nulls))
     }
 
     fn or_expr(&mut self) -> Result<Expr, SyntaxError> {
@@ -332,12 +443,9 @@ impl Parser {
         let t = self.peek().clone();
         match t.kind {
             TokenKind::Eof => Ok(()),
-            TokenKind::Keyword(
-                kw @ ("GROUP" | "HAVING" | "ORDER" | "LIMIT" | "JOIN" | "UNION"),
-            ) => Err(SyntaxError::new(
-                format!("{kw} is not supported yet"),
-                t.span,
-            )),
+            TokenKind::Keyword(kw @ ("GROUP" | "HAVING" | "LIMIT" | "JOIN" | "UNION")) => Err(
+                SyntaxError::new(format!("{kw} is not supported yet"), t.span),
+            ),
             TokenKind::Comma => Err(SyntaxError::new(
                 "selecting from multiple tables is not supported",
                 t.span,
@@ -350,6 +458,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Span;
 
     fn table(src: &str) -> String {
         parse(src)
@@ -575,6 +684,117 @@ mod tests {
         assert_eq!(
             error("select *\nfrom from"),
             "expected a table name, found FROM at 2:6"
+        );
+    }
+
+    fn order(src: &str) -> Order {
+        parse(src)
+            .unwrap_or_else(|e| panic!("{}", e.render(src)))
+            .order
+            .expect("an ORDER BY")
+    }
+
+    #[test]
+    fn order_by_forms() {
+        let item = |name: &str, d, n| OrderItem {
+            column: ColumnRef {
+                name: name.into(),
+                span: Span::default(),
+            },
+            direction: d,
+            nulls: n,
+        };
+        let strip = |o: Order| match o {
+            Order::Items(items) => Order::Items(
+                items
+                    .into_iter()
+                    .map(|mut i| {
+                        i.column.span = Span::default();
+                        i
+                    })
+                    .collect(),
+            ),
+            Order::All {
+                direction, nulls, ..
+            } => Order::All {
+                direction,
+                nulls,
+                span: Span::default(),
+            },
+        };
+        assert_eq!(
+            strip(order(
+                "select * from t where a > 1 order by a, b desc, c asc nulls first, d NULLS LAST"
+            )),
+            Order::Items(vec![
+                item("a", None, None),
+                item("b", Some(Direction::Desc), None),
+                item("c", Some(Direction::Asc), Some(NullsOrder::First)),
+                item("d", None, Some(NullsOrder::Last)),
+            ])
+        );
+        assert_eq!(
+            strip(order("SELECT a FROM t ORDER BY ALL DESC NULLS FIRST;")),
+            Order::All {
+                direction: Some(Direction::Desc),
+                nulls: Some(NullsOrder::First),
+                span: Span::default()
+            }
+        );
+        // the ORDER BY words aren't reserved: they're still column names elsewhere
+        assert_eq!(
+            strip(order("select first, last, desc from t order by last desc")),
+            Order::Items(vec![item("last", Some(Direction::Desc), None)])
+        );
+        assert!(parse("select * from t").unwrap().order.is_none());
+    }
+
+    #[test]
+    fn order_by_rejections() {
+        assert_eq!(
+            error("select * from t order by 1"),
+            "ordering by position is not supported yet; name the column at 1:26"
+        );
+        assert_eq!(
+            error("select * from t order by a + 1"),
+            "ordering by expressions is not supported yet; name a column at 1:28"
+        );
+        assert_eq!(
+            error("select * from t order by f(a)"),
+            "expressions are not supported yet; list column names at 1:26"
+        );
+        assert_eq!(
+            error("select * from t order by a nulls"),
+            "expected FIRST or LAST, found end of input at 1:33"
+        );
+        assert_eq!(
+            error("select * from t order by a collate 'de'"),
+            "COLLATE in ORDER BY is not supported at 1:28"
+        );
+        assert_eq!(
+            error("select * from t order by a with fill"),
+            "WITH in ORDER BY is not supported at 1:28"
+        );
+        assert_eq!(
+            error("select * from t order by all, a"),
+            "ORDER BY ALL can't be combined with other columns at 1:29"
+        );
+        assert_eq!(
+            error("select * from t order by a,"),
+            "expected a column name, found end of input at 1:28"
+        );
+        assert_eq!(
+            error("select * from t order a"),
+            "expected BY, found identifier `a` at 1:23"
+        );
+        assert_eq!(
+            error("select * from t order by a limit 3"),
+            "LIMIT is not supported yet at 1:28"
+        );
+        // ORDER BY comes after WHERE
+        assert_eq!(
+            error("select * from t order by a where b = 1"),
+            "expected end of query, found WHERE at 1:28"
         );
     }
 }

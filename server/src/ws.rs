@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::protocol::{Change, ClientMsg, Column, ServerMsg, BAD_MESSAGE, DUPLICATE_ID};
+use crate::protocol::{Change, ClientMsg, Column, OrderTerm, ServerMsg, BAD_MESSAGE, DUPLICATE_ID};
 
 /// Iterations already waiting are sent together, in one `diff`, up to this many.
 const MAX_ITERATIONS_PER_MESSAGE: usize = 256;
@@ -222,6 +222,7 @@ async fn run(
         })
         .collect();
     let mut columns = Some(columns);
+    let order = subscription.plan.stream.order.as_ref().map(OrderTerm::of);
 
     let mut batches = subscription.ready_chunks(MAX_ITERATIONS_PER_MESSAGE);
     while let Some(batch) = batches.next().await {
@@ -234,13 +235,15 @@ async fn run(
                     out.push(ServerMsg::Snapshot {
                         id: id.clone(),
                         columns: columns.take().unwrap_or_default(),
+                        // the history, already in order
                         rows: it
                             .diffs
                             .into_iter()
                             .map(|d| match d {
-                                chlive_engine::diff::Diff::Insert(row) => row,
+                                chlive_engine::diff::Diff::Insert { row, .. } => row,
                             })
                             .collect(),
+                        order: order.clone(),
                     });
                 }
                 Ok(it) => changes.extend(it.diffs.into_iter().map(Change::from)),

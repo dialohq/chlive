@@ -1,10 +1,10 @@
 //! Resolves a parsed query against the catalog, clause by clause in SQL's logical evaluation
-//! order: FROM, then WHERE, then SELECT. Everything after binding works with resolved identifiers, never
+//! order: FROM, then WHERE, then SELECT, then ORDER BY. Everything after binding works with resolved identifiers, never
 //! with the names as written.
 
 use std::fmt;
 
-use crate::ast::{CmpOp, Expr, Literal, Projection, Query};
+use crate::ast::{CmpOp, Direction, Expr, Literal, NullsOrder, Order, Projection, Query};
 use crate::error::{render_at, Span};
 use crate::history::{HistoryError, HistorySource};
 use crate::rules::{KafkaColumns, NamingRules, TopicId};
@@ -60,6 +60,16 @@ pub struct BoundQuery {
     pub filter: Option<BoundExpr>,
     /// Output columns, in output order.
     pub projection: Vec<ColumnId>,
+    /// ORDER BY keys, most significant first; empty when unordered.
+    pub order: Vec<OrderKey>,
+}
+
+/// One ORDER BY key, with ClickHouse's defaults resolved: ascending, NULLS LAST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderKey {
+    pub column: ColumnId,
+    pub desc: bool,
+    pub nulls_first: bool,
 }
 
 /// A typed expression. Literals are already coerced to the type they are compared with.
@@ -162,11 +172,77 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
         None => None,
     };
     let projection = bind_select(query, &table)?;
+    let order = match &query.order {
+        Some(order) => bind_order(order, &table, &projection)?,
+        None => Vec::new(),
+    };
     Ok(BoundQuery {
         table,
         filter,
         projection,
+        order,
     })
+}
+
+/// ORDER BY: columns of the table, selected or not; `ALL` is the SELECT list, in SELECT order
+/// (as in ClickHouse). Without NULLS FIRST/LAST, NULLs go last in both directions (ClickHouse's
+/// default).
+fn bind_order(
+    order: &Order,
+    table: &BoundTable,
+    projection: &[ColumnId],
+) -> Result<Vec<OrderKey>, BindError> {
+    let key = |id: ColumnId, d: Option<Direction>, n: Option<NullsOrder>, span: Span| {
+        let col = table.column(id);
+        if col.ty.kind == Kind::Other {
+            return Err(BindError::at(
+                format!(
+                    "ordering by column {} of type {} is not supported",
+                    col.name, col.ty
+                ),
+                span,
+            ));
+        }
+        Ok(OrderKey {
+            column: id,
+            desc: d == Some(Direction::Desc),
+            nulls_first: n == Some(NullsOrder::First),
+        })
+    };
+    match order {
+        Order::All {
+            direction,
+            nulls,
+            span,
+        } => projection
+            .iter()
+            .map(|id| key(*id, *direction, *nulls, *span))
+            .collect(),
+        Order::Items(items) => items
+            .iter()
+            .map(|item| {
+                let id = resolve_column(table, &item.column.name, item.column.span)?;
+                key(id, item.direction, item.nulls, item.column.span)
+            })
+            .collect(),
+    }
+}
+
+fn resolve_column(table: &BoundTable, name: &str, span: Span) -> Result<ColumnId, BindError> {
+    match table.columns.iter().find(|c| c.name == name) {
+        Some(c) => Ok(c.id),
+        None => {
+            let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+            Err(BindError::at(
+                format!(
+                    "unknown column {name} in table {} (columns: {})",
+                    table.name,
+                    names.join(", ")
+                ),
+                span,
+            ))
+        }
+    }
 }
 
 /// FROM: the table must exist in ClickHouse, have an event stream (a Kafka topic), and record
@@ -515,25 +591,14 @@ fn bind_select(query: &Query, table: &BoundTable) -> Result<Vec<ColumnId>, BindE
         Projection::Columns(refs) => {
             let mut ids: Vec<ColumnId> = Vec::with_capacity(refs.len());
             for r in refs {
-                let Some(col) = table.columns.iter().find(|c| c.name == r.name) else {
-                    let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
-                    return Err(BindError::at(
-                        format!(
-                            "unknown column {} in table {} (columns: {})",
-                            r.name,
-                            table.name,
-                            names.join(", ")
-                        ),
-                        r.span,
-                    ));
-                };
-                if ids.contains(&col.id) {
+                let id = resolve_column(table, &r.name, r.span)?;
+                if ids.contains(&id) {
                     return Err(BindError::at(
                         format!("column {} is selected twice", r.name),
                         r.span,
                     ));
                 }
-                ids.push(col.id);
+                ids.push(id);
             }
             Ok(ids)
         }
@@ -749,6 +814,55 @@ mod tests {
                     false
                 )))))
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn order_by_resolves_keys_and_defaults() {
+        let k = |c: usize, desc, nulls_first| OrderKey {
+            column: ColumnId(c),
+            desc,
+            nulls_first,
+        };
+        // unselected columns are allowed; NULLS LAST is the default in both directions
+        let b =
+            bind_sql("select user_id from events order by latency_ms desc, coupon nulls first, ts")
+                .await
+                .unwrap();
+        assert_eq!(
+            b.order,
+            [k(2, true, false), k(3, false, true), k(0, false, false)]
+        );
+        // ALL is the SELECT list, in SELECT order, not the table's columns
+        let b = bind_sql("select latency_ms, ts from events order by all desc")
+            .await
+            .unwrap();
+        assert_eq!(b.order, [k(2, true, false), k(0, true, false)]);
+        assert!(bind_sql("select * from events")
+            .await
+            .unwrap()
+            .order
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn order_by_errors() {
+        assert_eq!(
+            bind_sql("select * from events order by nope").await.unwrap_err(),
+            "unknown column nope in table events (columns: ts, user_id, latency_ms, coupon, paid, tags) at 1:31"
+        );
+        assert_eq!(
+            bind_sql("select ts from events order by tags")
+                .await
+                .unwrap_err(),
+            "ordering by column tags of type Array(String) is not supported at 1:32"
+        );
+        // ALL over a SELECT * that includes an unorderable column
+        assert_eq!(
+            bind_sql("select * from events order by all")
+                .await
+                .unwrap_err(),
+            "ordering by column tags of type Array(String) is not supported at 1:31"
         );
     }
 }

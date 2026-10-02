@@ -33,3 +33,32 @@ test("unknown ops throw and leave the rows untouched", () => {
   );
   assert.deepEqual(s.rows().map((r) => r.n), [1]);
 });
+
+test("ordered inserts land at their index, applied in sequence", () => {
+  const s = new ResultStore<{ n: number }>();
+  const order = [{ column: "n", direction: "desc" as const, nulls: "last" as const }];
+  s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 9 }, { n: 5 }, { n: 1 }], order });
+  assert.deepEqual(s.order, order);
+  s.applyDiff({
+    type: "diff",
+    id: "a",
+    changes: [
+      { op: "insert", row: { n: 10 }, index: 0 }, // 10 9 5 1
+      { op: "insert", row: { n: 7 }, index: 2 }, // 10 9 7 5 1
+      { op: "insert", row: { n: 0 }, index: 5 }, // ... 1 0: the end
+    ],
+  });
+  assert.deepEqual(s.rows().map((r) => r.n), [10, 9, 7, 5, 1, 0]);
+});
+
+test("an index outside the list throws and leaves the rows untouched", () => {
+  const s = new ResultStore<{ n: number }>();
+  s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }] });
+  for (const index of [3, -1, 0.5]) {
+    assert.throws(
+      () => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 2 }, index: 0 }, { op: "insert", row: { n: 3 }, index }] }),
+      /insert at index/,
+    );
+  }
+  assert.deepEqual(s.rows().map((r) => r.n), [1]);
+});

@@ -47,6 +47,10 @@ impl HistorySource for FakeHistory {
         let slow = format!(
             "SELECT user_id FROM default.requests WHERE (latency_ms > 100) AND ({REQUESTS_BOUND})"
         );
+        let slowest = format!(
+            "SELECT user_id, latency_ms AS __order_0 FROM default.requests \
+             WHERE (latency_ms > 100) AND ({REQUESTS_BOUND}) ORDER BY latency_ms DESC NULLS LAST"
+        );
         match sql {
             "SELECT _partition AS p, max(_offset) AS o FROM default.events GROUP BY p" => {
                 Ok(vec![row(json!({"p": 0, "o": 1}))])
@@ -63,6 +67,12 @@ impl HistorySource for FakeHistory {
                 row(json!({"user_id": "u2"})),
             ]),
             s if s == slow => Ok(vec![row(json!({"user_id": "slow-history"}))]),
+            // ordered by an unselected column: ClickHouse returns it under a hidden alias
+            s if s == slowest => Ok(vec![
+                row(json!({"user_id": "h900", "__order_0": 900})),
+                row(json!({"user_id": "h500", "__order_0": 500})),
+                row(json!({"user_id": "h500b", "__order_0": 500})),
+            ]),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -112,8 +122,8 @@ async fn history_up_to_the_watermark_then_events_after_it() {
     assert_eq!(
         history.diffs,
         [
-            Diff::Insert(row(json!({"ts": "h1", "user_id": "u1"}))),
-            Diff::Insert(row(json!({"ts": "h2", "user_id": "u2"})))
+            Diff::insert(row(json!({"ts": "h1", "user_id": "u1"}))),
+            Diff::insert(row(json!({"ts": "h2", "user_id": "u2"})))
         ]
     );
 
@@ -134,15 +144,15 @@ async fn history_up_to_the_watermark_then_events_after_it() {
         [
             (
                 at(0, 2),
-                vec![Diff::Insert(row(json!({"ts": "e1", "user_id": "u3"})))]
+                vec![Diff::insert(row(json!({"ts": "e1", "user_id": "u3"})))]
             ),
             (
                 at(0, 4),
-                vec![Diff::Insert(row(json!({"ts": "e2", "user_id": ""})))]
+                vec![Diff::insert(row(json!({"ts": "e2", "user_id": ""})))]
             ),
             (
                 at(1, 0),
-                vec![Diff::Insert(row(json!({"ts": "e3", "user_id": "u4"})))]
+                vec![Diff::insert(row(json!({"ts": "e3", "user_id": "u4"})))]
             ),
         ]
     );
@@ -272,4 +282,52 @@ async fn where_filters_events_by_typed_values() {
             "requests/0:3 + {\"user_id\":\"as-text\"}",
         ]
     );
+}
+
+#[tokio::test]
+async fn order_by_places_each_new_row() {
+    let mut source = MemorySource::new();
+    source
+        .push("requests", 0, r#"{"user_id": "h900", "latency_ms": 900}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "e1000", "latency_ms": 1000}"#)
+        .push("requests", 0, r#"{"user_id": "e500", "latency_ms": 500}"#)
+        .push("requests", 0, r#"{"user_id": "fast", "latency_ms": 50}"#)
+        .push("requests", 0, r#"{"user_id": "e700", "latency_ms": "700"}"#);
+    let subscription = engine(source)
+        .subscribe("select user_id from requests where latency_ms > 100 order by latency_ms desc")
+        .await
+        .unwrap();
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    // history comes in ClickHouse's order, without the hidden sort field
+    assert_eq!(
+        iterations[0].to_string(),
+        "+ {\"user_id\":\"h900\"}\n+ {\"user_id\":\"h500\"}\n+ {\"user_id\":\"h500b\"}\nhistory: 3 rows"
+    );
+    let lines: Vec<String> = iterations[1..]
+        .iter()
+        .filter(|i| !i.diffs.is_empty())
+        .map(|i| i.to_string())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "requests/0:1 + @0 {\"user_id\":\"e1000\"}",
+            // a tie goes after the last row it ties with (h500, h500b)
+            "requests/0:2 + @4 {\"user_id\":\"e500\"}",
+            "requests/0:4 + @2 {\"user_id\":\"e700\"}",
+        ]
+    );
+    // applying the indexes the way a client does gives the ordered result
+    let mut list: Vec<String> = Vec::new();
+    for it in &iterations {
+        for d in &it.diffs {
+            let Diff::Insert { row, index } = d;
+            let name = row["user_id"].as_str().unwrap().to_string();
+            match index {
+                Some(i) => list.insert(*i, name),
+                None => list.push(name),
+            }
+        }
+    }
+    assert_eq!(list, ["e1000", "h900", "e700", "h500", "h500b", "e500"]);
 }

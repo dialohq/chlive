@@ -1,4 +1,4 @@
-import type { ClientMessage, Column, Row, ServerMessage } from "./protocol.ts";
+import type { ClientMessage, Column, OrderTerm, Row, ServerMessage } from "./protocol.ts";
 import { ResultStore } from "./state.ts";
 
 export type * from "./protocol.ts";
@@ -10,6 +10,8 @@ export interface LiveState<R extends Row = Row> {
   status: Status;
   rows: R[];
   columns: Column[];
+  /** The ORDER BY the rows are in; absent for unordered queries (rows in arrival order). */
+  order?: OrderTerm[];
   error?: string;
   errorCode?: string;
 }
@@ -149,7 +151,7 @@ export class LiveClient {
         this.emit(rec, { ...rec.state, status: "error", error: msg.message, errorCode: msg.code });
         return;
     }
-    this.emit(rec, { status: "live", rows: rec.store.rows(), columns: rec.store.columns });
+    this.emit(rec, { status: "live", rows: rec.store.rows(), columns: rec.store.columns, order: rec.store.order });
   }
 
   private emit(rec: SubRecord, state: LiveState<any>): void {

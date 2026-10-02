@@ -8,6 +8,39 @@ pub struct Query {
     pub from: TableRef,
     /// The WHERE condition.
     pub selection: Option<Expr>,
+    /// The ORDER BY clause.
+    pub order: Option<Order>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullsOrder {
+    First,
+    Last,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Order {
+    /// `ORDER BY ALL`: every selected column, in SELECT order. `span` is the `ALL`'s.
+    All {
+        direction: Option<Direction>,
+        nulls: Option<NullsOrder>,
+        span: Span,
+    },
+    Items(Vec<OrderItem>),
+}
+
+/// `column [ASC|DESC] [NULLS FIRST|LAST]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderItem {
+    pub column: ColumnRef,
+    pub direction: Option<Direction>,
+    pub nulls: Option<NullsOrder>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

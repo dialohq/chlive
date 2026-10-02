@@ -1,7 +1,7 @@
 use std::fmt;
 
 /// Byte range in the query text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
     pub start: usize,
     pub end: usize,

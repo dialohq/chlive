@@ -19,20 +19,33 @@ export type ClientMessage =
   | { type: "subscribe"; id: string; sql: string }
   | { type: "unsubscribe"; id: string };
 
-/** One change to a result. Only inserts exist so far; unknown ops must be rejected. */
-export type Change = { op: "insert"; row: Row };
+/**
+ * One change to a result. Only inserts exist so far; unknown ops must be rejected.
+ * With ORDER BY, an insert has the `index` the row takes: the row there and every row after it
+ * move one down. Without one, the row is appended.
+ */
+export type Change = { op: "insert"; row: Row; index?: number };
+
+/** One ORDER BY key the result is kept in. */
+export interface OrderTerm {
+  column: string;
+  direction: "asc" | "desc";
+  nulls: "first" | "last";
+}
 
 export interface SnapshotMessage {
   type: "snapshot";
   id: string;
   columns: Column[];
+  /** In order when `order` is present. */
   rows: Row[];
+  order?: OrderTerm[];
 }
 
 export interface DiffMessage {
   type: "diff";
   id: string;
-  /** In order; never empty. */
+  /** Never empty. Applied in sequence: each index is into the list as the previous change left it. */
   changes: Change[];
 }
 

@@ -275,7 +275,10 @@ impl Value {
                     .map(Json::Number)
                     .unwrap_or(Json::Null)
             }
-            Value::Float(_) => Json::Null,
+            // as ClickHouse renders them with output_format_json_quote_denormals=1
+            Value::Float(f) if f.is_nan() => Json::String("nan".into()),
+            Value::Float(f) if *f > 0.0 => Json::String("inf".into()),
+            Value::Float(_) => Json::String("-inf".into()),
             Value::String(s) => Json::String(s.clone()),
             Value::DateTime { ticks, precision } => {
                 Json::String(format_datetime(*ticks, *precision))
@@ -314,6 +317,36 @@ impl Value {
             (Date(a), Date(b)) => Some(a.cmp(b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             _ => None,
+        }
+    }
+
+    /// ORDER BY's total order, matching ClickHouse: NULL and NaN are never compared by value;
+    /// with NULLS LAST they come after every value, NaN first, then NULL (with NULLS FIRST:
+    /// NULL, NaN, then the values), whatever the direction. `desc` reverses only the values.
+    /// `-0.0` equals `0.0`.
+    pub fn sort_cmp(&self, other: &Value, desc: bool, nulls_first: bool) -> Ordering {
+        // 0: a value, 1: NaN, 2: NULL; mirrored for NULLS FIRST
+        let rank = |v: &Value| {
+            let r = match v {
+                Value::Null => 2,
+                Value::Float(f) if f.is_nan() => 1,
+                _ => 0,
+            };
+            if nulls_first {
+                2 - r
+            } else {
+                r
+            }
+        };
+        let (ra, rb) = (rank(self), rank(other));
+        if ra != rb || ra != if nulls_first { 2 } else { 0 } {
+            return ra.cmp(&rb);
+        }
+        let ord = self.compare(other).unwrap_or(Ordering::Equal);
+        if desc {
+            ord.reverse()
+        } else {
+            ord
         }
     }
 
@@ -592,5 +625,58 @@ mod tests {
             .to_clickhouse_sql(),
             "toDateTime64('2026-10-01 12:00:00.000', 3)"
         );
+    }
+
+    #[test]
+    fn sort_order_matches_clickhouse() {
+        // ClickHouse: values, then NaN, then NULL (NULLS LAST, the default for ASC and DESC);
+        // NULL, NaN, then values with NULLS FIRST; -0 ties with 0
+        let vals = [
+            Value::Float(1.0),
+            Value::Null,
+            Value::Float(f64::NAN),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Float(0.0),
+            Value::Float(f64::INFINITY),
+            Value::Int(-1),
+        ];
+        let sorted = |desc, nulls_first| {
+            let mut v = vals.to_vec();
+            v.sort_by(|a, b| a.sort_cmp(b, desc, nulls_first));
+            v.iter()
+                .map(|v| v.to_json().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(sorted(false, false), r#""-inf" -1 0 1 "inf" "nan" null"#);
+        assert_eq!(sorted(true, false), r#""inf" 1 0 -1 "-inf" "nan" null"#);
+        assert_eq!(sorted(false, true), r#"null "nan" "-inf" -1 0 1 "inf""#);
+        assert_eq!(sorted(true, true), r#"null "nan" "inf" 1 0 -1 "-inf""#);
+        assert_eq!(
+            Value::Float(-0.0).sort_cmp(&Value::Float(0.0), false, false),
+            Ordering::Equal
+        );
+        // strings by bytes: '' < 'B' < 'Z' < 'a' < 'aa' < 'é'
+        let mut s: Vec<Value> = ["a", "B", "", "é", "Z", "aa"]
+            .iter()
+            .map(|s| Value::String(s.to_string()))
+            .collect();
+        s.sort_by(|a, b| a.sort_cmp(b, false, false));
+        let s: Vec<String> = s.iter().map(|v| v.to_json().to_string()).collect();
+        assert_eq!(s.join(" "), r#""" "B" "Z" "a" "aa" "é""#);
+        assert_eq!(
+            Value::Bool(false).sort_cmp(&Value::Bool(true), false, false),
+            Ordering::Less
+        );
+        // DateTimes of different precision compare by instant
+        let a = Value::DateTime {
+            ticks: 1_000,
+            precision: 3,
+        };
+        let b = Value::DateTime {
+            ticks: 1,
+            precision: 0,
+        };
+        assert_eq!(a.sort_cmp(&b, false, false), Ordering::Equal);
     }
 }

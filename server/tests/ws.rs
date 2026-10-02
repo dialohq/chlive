@@ -301,6 +301,51 @@ async fn unsubscribe_stops_the_subscription() {
     assert_eq!(debug().await, json!([]));
 }
 
+#[tokio::test]
+async fn ordered_inserts_carry_their_index() {
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe(
+        "s1",
+        "select user_id, latency_ms from requests order by latency_ms desc",
+    )
+    .await;
+    let snapshot = c.expect().await;
+    assert_eq!(
+        snapshot["order"],
+        json!([{"column": "latency_ms", "direction": "desc", "nulls": "last"}])
+    );
+    assert_eq!(
+        snapshot["rows"],
+        json!([{"user_id": "h1", "latency_ms": 900}])
+    );
+    let mut changes = Vec::new();
+    while changes.len() < 3 {
+        let m = c.expect().await;
+        changes.extend(m["changes"].as_array().unwrap().iter().cloned());
+    }
+    // 5 goes after 900; 500 between them; 700 after 900 again
+    let placed: Vec<(String, u64)> = changes
+        .iter()
+        .map(|c| {
+            (
+                c["row"]["user_id"].as_str().unwrap().to_string(),
+                c["index"].as_u64().expect("an index"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        placed,
+        [("fast".into(), 1), ("slow".into(), 1), ("slower".into(), 1)]
+    );
+    // unordered: no index, no order
+    c.subscribe("s2", "select user_id from requests").await;
+    let snapshot = c.expect().await;
+    assert!(snapshot.get("order").is_none());
+    let m = c.expect().await;
+    assert!(m["changes"][0].get("index").is_none(), "{m}");
+}
+
 /// A plain HTTP GET (no client library needed for one endpoint).
 async fn http_get(url: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

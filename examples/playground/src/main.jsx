@@ -2,9 +2,13 @@ import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { useLiveQuery } from "@chlive/client/react";
 
-// Queries in the chlive dialect: SELECT * | columns FROM table [WHERE condition].
+// Queries in the chlive dialect:
+// SELECT * | columns FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …]
 const QUERY_PRESETS = [
   "select ts, user_id, country, path, latency_ms from events where latency_ms > 500",
+  "select ts, user_id, country, latency_ms from events order by latency_ms desc",
+  "select ts, user_id, country, path from events where country in ('PL', 'DE') order by country, ts desc",
+  "select user_id, path, amount from events where amount > 0 order by all",
   "select * from events where country = 'PL'",
   "select ts, user_id, path, amount from events where amount > 0 and country in ('DE', 'FR')",
   "select ts, order_id, customer_id, amount from orders where amount > 100",
@@ -36,6 +40,9 @@ const TOPICS = Object.keys(RANDOM);
 const WRITE_PRESETS = {
   events: [
     ["Slow checkout", () => ({ ts: now(), user_id: "u-slow", country: "PL", path: "/checkout", latency_ms: 1200, amount: 0 })],
+    ["Slowest ever (top of latency desc)", () => ({ ts: now(), user_id: "u-slowest", country: "DE", path: "/checkout", latency_ms: 99999, amount: 0 })],
+    ["Mid latency (lands mid-list)", () => ({ ts: now(), user_id: "u-mid", country: "PL", path: "/search", latency_ms: 250, amount: 0 })],
+    ["Old timestamp (bottom of ts desc)", () => ({ ts: "2020-01-01 00:00:00.000", user_id: "u-old", country: "DE", path: "/", latency_ms: 10, amount: 0 })],
     ["Paid order in DE", () => ({ ts: now(), user_id: "u-buyer", country: "DE", path: "/checkout", latency_ms: 140, amount: 59.9 })],
     ["Numbers as strings", () => ({ ts: now(), user_id: "u-text", country: "FR", path: "/", latency_ms: "750", amount: "19.99" })],
     ["Missing keys (zero values)", () => ({ user_id: "u-partial" })],
@@ -162,13 +169,20 @@ function Writer() {
 }
 
 function Result({ sql }) {
-  const { rows, columns, status, error, errorCode } = useLiveQuery(sql);
-  const newest = rows.slice(-SHOWN).reverse();
+  const { rows, columns, order, status, error, errorCode } = useLiveQuery(sql);
+  // ordered results as they are; unordered ones newest first
+  const shown = order ? rows.slice(0, SHOWN) : rows.slice(-SHOWN).reverse();
   return (
     <section>
       <p>
         <span className={`status ${status}`}>{status}</span> {rows.length} rows
-        {rows.length > SHOWN && ` (newest ${SHOWN} shown)`}
+        {rows.length > SHOWN && (order ? ` (first ${SHOWN} shown)` : ` (newest ${SHOWN} shown)`)}
+        {order && (
+          <small>
+            {" "}
+            · ordered by {order.map((o) => `${o.column} ${o.direction}${o.nulls === "first" ? " nulls first" : ""}`).join(", ")}
+          </small>
+        )}
       </p>
       {error && (
         <pre className="error">
@@ -186,8 +200,8 @@ function Result({ sql }) {
           </tr>
         </thead>
         <tbody>
-          {newest.map((r, i) => (
-            <tr key={rows.length - i}>
+          {shown.map((r, i) => (
+            <tr key={i}>
               {columns.map((c) => (
                 <td key={c.name}>{String(r[c.name] ?? "")}</td>
               ))}

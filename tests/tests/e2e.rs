@@ -7,13 +7,17 @@ use anyhow::Result;
 use chlive_e2e::*;
 
 /// Dialect queries over `events`, covering numbers, strings, IN, NOT and AND/OR.
-const CASES: &[(&str, &str)] = &[
-    ("all", "select * from events"),
-    ("slow", "select ts, user_id, latency_ms from events where latency_ms > 500"),
-    ("pl_checkout", "select user_id, path, amount from events where country = 'PL' and path = '/checkout'"),
-    ("paid_eu", "select user_id, country, amount from events where amount > 0 and country in ('DE', 'FR', 'PL')"),
-    ("not_us", "select country from events where not (country = 'US' or country = 'CA')"),
-    ("ranges", "select latency_ms, amount from events where latency_ms >= 10 and latency_ms < 50 and amount <= 100.5"),
+/// (id, query, its ORDER BY columns): numbers, strings, IN, NOT, AND/OR, and ORDER BY.
+const CASES: &[(&str, &str, &[&str])] = &[
+    ("all", "select * from events", &[]),
+    ("slow", "select ts, user_id, latency_ms from events where latency_ms > 500", &[]),
+    ("pl_checkout", "select user_id, path, amount from events where country = 'PL' and path = '/checkout'", &[]),
+    ("paid_eu", "select user_id, country, amount from events where amount > 0 and country in ('DE', 'FR', 'PL')", &[]),
+    ("by_latency", "select ts, user_id, latency_ms from events where latency_ms > 200 order by latency_ms desc", &["latency_ms"]),
+    ("not_us", "select country from events where not (country = 'US' or country = 'CA')", &[]),
+    ("ranges", "select latency_ms, amount from events where latency_ms >= 10 and latency_ms < 50 and amount <= 100.5", &[]),
+    ("by_country_ts", "select ts, user_id, country from events where country in ('PL', 'DE', 'FR') order by country, ts desc", &["country", "ts"]),
+    ("by_all", "select country, path, amount from events where amount > 0 order by all", &["country", "path", "amount"]),
 ];
 
 #[tokio::test]
@@ -30,7 +34,7 @@ async fn live_results_match_direct_queries() -> Result<()> {
     // Half the queries subscribe before the events, half while they're being produced, so
     // their watermarks land in the middle of the stream.
     let (before, during) = CASES.split_at(CASES.len() / 2);
-    for (id, sql) in before {
+    for (id, sql, _) in before {
         conn.subscribe(id, sql);
     }
     conn.wait_ready(
@@ -40,7 +44,7 @@ async fn live_results_match_direct_queries() -> Result<()> {
     .await?;
     let producing = tokio::spawn(async move { producer.produce(3000, Some(2000.0)).await });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    for (id, sql) in during {
+    for (id, sql, _) in during {
         conn.subscribe(id, sql);
     }
     let produced = producing.await??;
@@ -51,7 +55,7 @@ async fn live_results_match_direct_queries() -> Result<()> {
     .await?;
     settle(&conn, &produced).await?;
 
-    for (id, sql) in CASES {
+    for (id, sql, keys) in CASES {
         let live = conn.result(id).unwrap();
         assert!(live.error.is_none(), "{id}: {:?}", live.error);
         assert!(
@@ -67,6 +71,22 @@ async fn live_results_match_direct_queries() -> Result<()> {
             live.diffs
         );
         assert!(live.inserted > 0, "{id}: no live inserts");
+        if !keys.is_empty() {
+            // the same keys in the same order as ClickHouse, the same rows in every tie group
+            let (l, d) = (tie_groups(&live.rows, keys), tie_groups(&direct, keys));
+            if l != d {
+                let at = l
+                    .iter()
+                    .zip(&d)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(l.len().min(d.len()));
+                panic!(
+                    "{id}: order differs from ClickHouse at tie group {at}: live {:?}, ClickHouse {:?}",
+                    l.get(at),
+                    d.get(at)
+                );
+            }
+        }
         let (live, direct) = (multiset(&live.rows), multiset(&direct));
         if live != direct {
             let missing: Vec<_> = direct

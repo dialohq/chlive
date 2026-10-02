@@ -59,6 +59,9 @@ impl ClickHouseHttp {
             .query(&[
                 ("default_format", "JSONEachRow"),
                 ("output_format_json_quote_64bit_integers", "0"),
+                // NaN and ±inf as "nan"/"inf"/"-inf" rather than null, so they read back as
+                // floats (see `Value::to_json`)
+                ("output_format_json_quote_denormals", "1"),
             ])
             .body(sql.to_string())
             .send()

@@ -104,8 +104,14 @@ impl LiveResult {
                 for change in msg["changes"].as_array().expect("changes") {
                     match change["op"].as_str() {
                         Some("insert") => {
-                            self.rows
-                                .push(change["row"].as_object().expect("row").clone());
+                            let row = change["row"].as_object().expect("row").clone();
+                            match change["index"].as_u64().map(|i| i as usize) {
+                                None => self.rows.push(row),
+                                Some(i) if i <= self.rows.len() => self.rows.insert(i, row),
+                                Some(i) => self
+                                    .protocol_violations
+                                    .push(format!("insert at {i} of {} rows", self.rows.len())),
+                            }
                             self.inserted += 1;
                         }
                         other => self
@@ -290,4 +296,23 @@ pub fn multiset(rows: &[Row]) -> Vec<String> {
         .collect();
     v.sort();
     v
+}
+
+/// An ordered result as tie groups: each run of equal `keys` values, in order, with its rows
+/// sorted. Two results with the same groups agree on the order up to the order within ties.
+pub fn tie_groups(rows: &[Row], keys: &[&str]) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for row in rows {
+        let key: Vec<String> = keys.iter().map(|k| row[*k].to_string()).collect();
+        let key = key.join(" | ");
+        let text = serde_json::to_string(row).unwrap();
+        match out.last_mut() {
+            Some((last, rows)) if *last == key => rows.push(text),
+            _ => out.push((key, vec![text])),
+        }
+    }
+    for (_, rows) in &mut out {
+        rows.sort();
+    }
+    out
 }

@@ -27,6 +27,7 @@ pub mod engine;
 pub mod error;
 pub mod history;
 pub mod lexer;
+pub mod order;
 pub mod parser;
 pub mod plan;
 pub mod rules;

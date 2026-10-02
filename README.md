@@ -74,12 +74,18 @@ produce events '{"user_id": "u7", "latency_ms": 900}'  # one event per JSON argu
 
 **History and stream meet at a watermark.** At subscribe time the engine reads `max(_offset)` per `_partition` from the ClickHouse table. History is every row up to it (the history query gets `toInt64(_offset) <= multiIf(_partition = 0, W0, …)`), and each Kafka partition is consumed from the offset right after it. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. The table must have `_partition` and `_offset` columns; the binder says so if it doesn't.
 
-So far the dialect accepts `SELECT * | col, … FROM <table> [WHERE <condition>]`. A condition can use:
+So far the dialect accepts `SELECT * | col, … FROM <table> [WHERE <condition>] [ORDER BY <order>]`. A condition can use:
 - comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), with `AND`, `OR`, `NOT` and parentheses;
 - `IS [NOT] NULL` and `[NOT] IN (…)`;
 - operands that are columns or literals: numbers, strings, `TRUE`/`FALSE`.
 
 Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
+
+**ORDER BY** takes columns (selected or not), each with `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST`, or `ALL`, which sorts by the SELECT list in SELECT order, as in ClickHouse. Positions, expressions, `COLLATE` and `WITH FILL` aren't supported yet. The order is **managed**:
+- **Semantics match ClickHouse.** NULLs default to last in both directions; NaN sits between the values and the NULLs; strings compare by bytes; `-0` ties with `0`. The history query always spells out each key's direction and NULL placement.
+- **State.** Per subscription, the engine keeps only the ORDER BY values of the result, with equal keys merged into tie groups, never the rows. Order-only columns are fetched from ClickHouse under hidden aliases (`__order_0`, …) and stripped from the output.
+- **Placement.** The history arrives in ClickHouse's order. Each new matching row goes after the last row it ties with, and its insert carries that `index`. So the live list has the same sequence of keys as a fresh query; only the order of rows within a tie group can differ.
+- **Tested.** `engine/tests/clickhouse.rs` checks 14 orderings (NULL, NaN, ±inf, `-0`, byte-order strings, DateTime precision, Bool, duplicates, DESC, NULLS FIRST/LAST, several keys, `ALL`, an unselected column, with WHERE) in the same three setups as WHERE.
 
 **WHERE runs in two places, which must agree on every row.** ClickHouse evaluates it for history; the engine evaluates it for each event.
 - **Typed decoding.** Each event's needed JSON fields are decoded by their ClickHouse column types, following ClickHouse's input rules: a quoted number is read as a number, and a DateTime string is parsed.
@@ -123,10 +129,14 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 // server → client
 {"type": "snapshot", "id": "s1", "columns": [{"name": "user_id", "type": "String"}, …], "rows": [{"user_id": "u1", "latency_ms": 340}, …]}
 {"type": "diff", "id": "s1", "changes": [{"op": "insert", "row": {…}}, …]}
+// with ORDER BY: the snapshot is in order and says so, and inserts carry their index
+{"type": "snapshot", "id": "s2", "columns": […], "rows": […], "order": [{"column": "latency_ms", "direction": "desc", "nulls": "last"}]}
+{"type": "diff", "id": "s2", "changes": [{"op": "insert", "row": {…}, "index": 2}, …]}
 {"type": "error", "id": "s1", "code": "INVALID_QUERY", "message": "unknown column nope in table events (…) at 1:8"}
 ```
 
 - `snapshot` comes first and once; `diff`s follow, each with the changes of the events that were ready (never empty). Only `insert` exists so far; clients reject ops they don't know.
+- With an `index`, the row is inserted there: the row at that index and every row after it move one down. Without one, it's appended. Changes within a `diff` apply in sequence, each index into the list as the previous change left it.
 - Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`. After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
 
@@ -145,9 +155,10 @@ e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chliv
 The engine's dialect, for now:
 
 ```
-SELECT * | col, … FROM <table> [WHERE <condition>]
+SELECT * | col, … FROM <table> [WHERE <condition>] [ORDER BY ALL | col [ASC|DESC] [NULLS FIRST|LAST], …]
 ```
 
 - A table needs a ClickHouse table (with `_partition` and `_offset`) and a Kafka topic of the same name.
 - Conditions: comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN (…)` over columns and literals; see [Engine](#engine-custom-dialect).
-- Results only grow (inserts); there's no `ORDER BY`, `LIMIT`, `GROUP BY`/aggregates, joins, functions or parameters yet, and no result-size cap. Rows arrive in Kafka order per partition after the snapshot.
+- Results only grow (inserts). With `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot.
+- No `LIMIT`, `GROUP BY`/aggregates, joins, functions or parameters yet, and no result-size cap.

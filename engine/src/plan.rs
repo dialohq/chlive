@@ -1,12 +1,13 @@
 //! From a bound query to what to run: the ClickHouse query for history, and for the stream:
 //! which topics to consume, which keys of their events to decode (and as which types), which
-//! events are relevant, and how to turn them into result rows.
+//! events are relevant, how to turn them into result rows and, with ORDER BY, where they go.
 
 use std::cmp::Ordering;
 
 use crate::ast::CmpOp;
-use crate::binder::{BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId};
+use crate::binder::{BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId, OrderKey};
 use crate::diff::Row;
+use crate::order::{KeyOrder, SortKey};
 use crate::rules::{quote_ident, KafkaColumns, TopicId};
 use crate::types::{decode, DecodeError, Type, Value};
 use crate::watermark::Watermark;
@@ -29,6 +30,8 @@ pub struct HistoryPlan {
     pub select: String,
     /// The WHERE condition, rendered for ClickHouse.
     pub filter: Option<String>,
+    /// `ORDER BY …`, with every key's direction and NULL placement explicit.
+    pub order: Option<String>,
     pub kafka: KafkaColumns,
 }
 
@@ -37,12 +40,17 @@ impl HistoryPlan {
     pub fn sql(&self, watermark: Option<&Watermark>) -> String {
         let bound =
             watermark.map(|w| w.history_predicate(&self.kafka.partition, &self.kafka.offset));
-        match (&self.filter, bound) {
+        let mut sql = match (&self.filter, bound) {
             (None, None) => self.select.clone(),
             (Some(f), None) => format!("{} WHERE {f}", self.select),
             (None, Some(b)) => format!("{} WHERE {b}", self.select),
             (Some(f), Some(b)) => format!("{} WHERE ({f}) AND ({b})", self.select),
+        };
+        if let Some(order) = &self.order {
+            sql.push(' ');
+            sql.push_str(order);
         }
+        sql
     }
 }
 
@@ -66,6 +74,55 @@ pub struct StreamPlan {
     pub output: Vec<(String, ColumnId)>,
     /// Which events are relevant to the query.
     pub filter: Filter,
+    /// With ORDER BY: how to place rows.
+    pub order: Option<OrderPlan>,
+}
+
+/// ORDER BY for the stream: the keys, and where each key's value is found in a history row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderPlan {
+    pub keys: KeyOrder,
+    pub columns: Vec<OrderColumn>,
+    /// Hidden history fields (`__order_<i>`) that carry ORDER BY values of columns that aren't
+    /// selected; removed from history rows before they are output.
+    pub hidden: Vec<String>,
+    /// The ORDER BY in dialect syntax, for `explain`.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderColumn {
+    pub id: ColumnId,
+    /// The column's dialect name.
+    pub name: String,
+    /// The field holding this column in a history row: its output name, or a hidden alias.
+    pub history_field: String,
+    pub ty: Type,
+}
+
+impl OrderPlan {
+    /// The sort key of a history row (as ClickHouse rendered it), removing hidden fields.
+    pub fn history_key(&self, row: &mut Row) -> Result<SortKey, RowDecodeError> {
+        let key = self
+            .columns
+            .iter()
+            .map(|c| {
+                decode(row.get(&c.history_field), &c.ty).map_err(|error| RowDecodeError {
+                    column: c.history_field.clone(),
+                    error,
+                })
+            })
+            .collect();
+        for h in &self.hidden {
+            row.remove(h);
+        }
+        key
+    }
+
+    /// The sort key of a decoded event.
+    pub fn event_key(&self, row: &DecodedRow) -> SortKey {
+        self.columns.iter().map(|c| row[c.id.0].clone()).collect()
+    }
 }
 
 /// Decides whether an event is relevant to the query.
@@ -294,16 +351,33 @@ impl std::fmt::Display for Plan {
         )?;
         writeln!(f, "keys:    {}", keys.join(", "))?;
         match &self.stream.filter {
-            Filter::All => write!(f, "filter:  all events"),
-            Filter::Where { text, .. } => write!(f, "filter:  {text}"),
+            Filter::All => write!(f, "filter:  all events")?,
+            Filter::Where { text, .. } => write!(f, "filter:  {text}")?,
         }
+        if let Some(order) = &self.stream.order {
+            write!(
+                f,
+                "\norder:   {} (a new row goes after the last row it ties with)",
+                order.text
+            )?;
+        }
+        Ok(())
     }
+}
+
+/// `ASC NULLS LAST` etc.: always explicit, so ClickHouse and the stream can't disagree.
+fn order_modifiers(k: &OrderKey) -> String {
+    format!(
+        "{} NULLS {}",
+        if k.desc { "DESC" } else { "ASC" },
+        if k.nulls_first { "FIRST" } else { "LAST" }
+    )
 }
 
 pub fn plan(bound: &BoundQuery) -> Plan {
     let table = &bound.table;
     let columns: Vec<BoundColumn> = bound.output().cloned().collect();
-    let select_list: Vec<String> = columns
+    let mut select_list: Vec<String> = columns
         .iter()
         .map(|c| {
             if c.clickhouse == c.name {
@@ -313,6 +387,47 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             }
         })
         .collect();
+
+    // ORDER BY: an ordered column that isn't selected is fetched under a hidden alias, so the
+    // history rows carry every sort value.
+    let mut order_columns = Vec::new();
+    let mut hidden = Vec::new();
+    for k in &bound.order {
+        let c = table.column(k.column);
+        let history_field = if bound.projection.contains(&k.column) {
+            c.name.clone()
+        } else if let Some(existing) = order_columns
+            .iter()
+            .find(|o: &&OrderColumn| o.id == k.column)
+        {
+            existing.history_field.clone()
+        } else {
+            let alias = format!("__order_{}", hidden.len());
+            select_list.push(format!("{} AS {alias}", quote_ident(&c.clickhouse)));
+            hidden.push(alias.clone());
+            alias
+        };
+        order_columns.push(OrderColumn {
+            id: k.column,
+            name: c.name.clone(),
+            history_field,
+            ty: c.ty.clone(),
+        });
+    }
+    let order_sql = (!bound.order.is_empty()).then(|| {
+        let keys: Vec<String> = bound
+            .order
+            .iter()
+            .map(|k| {
+                format!(
+                    "{} {}",
+                    quote_ident(&table.column(k.column).clickhouse),
+                    order_modifiers(k)
+                )
+            })
+            .collect();
+        format!("ORDER BY {}", keys.join(", "))
+    });
     let history = HistoryPlan {
         table: table.clickhouse_table.clone(),
         select: format!(
@@ -321,13 +436,19 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             table.clickhouse_table
         ),
         filter: bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
+        order: order_sql,
         kafka: table.kafka.clone(),
     };
 
-    // Columns to decode: the output's, then the filter's that aren't output.
+    // Columns to decode: the output's, then the filter's and ORDER BY's that aren't output.
     let mut needed: Vec<ColumnId> = bound.projection.clone();
     if let Some(filter) = &bound.filter {
         filter.columns(&mut needed);
+    }
+    for k in &bound.order {
+        if !needed.contains(&k.column) {
+            needed.push(k.column);
+        }
     }
     let stream = StreamPlan {
         topics: vec![table.topic.clone()],
@@ -351,6 +472,17 @@ pub fn plan(bound: &BoundQuery) -> Plan {
                 text: to_dialect(expr, table),
             },
         },
+        order: (!bound.order.is_empty()).then(|| OrderPlan {
+            keys: KeyOrder(bound.order.clone()),
+            text: bound
+                .order
+                .iter()
+                .map(|k| format!("{} {}", table.column(k.column).name, order_modifiers(k)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            columns: order_columns,
+            hidden,
+        }),
     };
     Plan {
         table: table.name.clone(),
@@ -395,6 +527,7 @@ mod tests {
             table: table(),
             filter,
             projection: projection.iter().map(|i| ColumnId(*i)).collect(),
+            order: Vec::new(),
         }
     }
 
@@ -543,5 +676,79 @@ mod tests {
             err.to_string(),
             r#"column latency_ms: cannot read "slow" as UInt32"#
         );
+    }
+
+    fn ordered(
+        projection: &[usize],
+        filter: Option<BoundExpr>,
+        order: &[(usize, bool, bool)],
+    ) -> BoundQuery {
+        let mut b = bound(projection, filter);
+        b.order = order
+            .iter()
+            .map(|(c, desc, nulls_first)| OrderKey {
+                column: ColumnId(*c),
+                desc: *desc,
+                nulls_first: *nulls_first,
+            })
+            .collect();
+        b
+    }
+
+    #[test]
+    fn order_by_in_history_and_stream() {
+        // ORDER BY latency_ms DESC (not selected), user_id (selected), latency_ms again
+        let f = BoundExpr::IsNull {
+            expr: col(3),
+            negated: true,
+        };
+        let p = plan(&ordered(
+            &[1],
+            Some(f),
+            &[(2, true, false), (1, false, true), (2, false, false)],
+        ));
+        assert_eq!(
+            p.history.sql(None),
+            "SELECT user_id, latency_ms AS __order_0 FROM default.events WHERE coupon IS NOT NULL \
+             ORDER BY latency_ms DESC NULLS LAST, user_id ASC NULLS FIRST, latency_ms ASC NULLS LAST"
+        );
+        // the bound goes before ORDER BY
+        let w = Watermark(std::collections::BTreeMap::from([(0, 7)]));
+        assert!(p
+            .history
+            .sql(Some(&w))
+            .ends_with("AND (toInt64(_offset) <= multiIf(_partition = 0, 7, -1)) ORDER BY latency_ms DESC NULLS LAST, user_id ASC NULLS FIRST, latency_ms ASC NULLS LAST"));
+        // order-only columns are decoded, but not output
+        assert_eq!(
+            p.stream.required_keys(),
+            ["user_id", "coupon", "latency_ms"]
+        );
+        let order = p.stream.order.as_ref().unwrap();
+        assert_eq!(order.hidden, ["__order_0"]);
+
+        // a history row: its key comes from output and hidden fields; hidden ones are removed
+        let mut h = row(json!({"user_id": "a", "__order_0": 120}));
+        assert_eq!(
+            order.history_key(&mut h).unwrap(),
+            [Value::Int(120), Value::String("a".into()), Value::Int(120)]
+        );
+        assert_eq!(serde_json::to_string(&h).unwrap(), r#"{"user_id":"a"}"#);
+
+        let e = p
+            .stream
+            .decode(&row(
+                json!({"user_id": "b", "latency_ms": "75", "coupon": "X"}),
+            ))
+            .unwrap();
+        assert_eq!(
+            order.event_key(&e),
+            [Value::Int(75), Value::String("b".into()), Value::Int(75)]
+        );
+        assert_eq!(
+            p.to_string().lines().last().unwrap(),
+            "order:   latency_ms DESC NULLS LAST, user_id ASC NULLS FIRST, latency_ms ASC NULLS LAST \
+             (a new row goes after the last row it ties with)"
+        );
+        assert!(plan(&bound(&[1], None)).stream.order.is_none());
     }
 }
