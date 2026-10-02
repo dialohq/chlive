@@ -14,6 +14,17 @@
       .status.live { background: #d4f5d4; }
       .status.error { background: #f8d4d4; }
       .error { color: #b00; white-space: pre-wrap; }
+      .ok { color: #070; }
+      /* narrow: the writer above the (long) result; wide: the writer beside it, sticky */
+      .panes { display: grid; gap: 8px 32px; grid-template-areas: "writer" "query"; }
+      .panes .query { grid-area: query; min-width: 0; }
+      .panes .writer { grid-area: writer; }
+      @media (min-width: 1100px) {
+        .panes { grid-template-columns: minmax(0, 1fr) 460px; grid-template-areas: "query writer"; align-items: start; }
+        .panes .writer { position: sticky; top: 16px; }
+      }
+      .writer button { margin: 2px 4px 2px 0; }
+      h2 { font-size: 16px; margin: 8px 0; }
     </style>
   </head>
   <body>

@@ -28,7 +28,7 @@ writeShellApplication {
     name=${name}
     docker rm -f "$name" >/dev/null 2>&1 || true
     # The HTTP proxy batches produce requests for 100 ms by default; disable that so a
-    # single write from the simple example is acknowledged (and visible) immediately.
+    # single write from the playground example is acknowledged (and visible) immediately.
     # The port is published as itself, so one listener advertised as 127.0.0.1:${kafka}
     # works both from the host (ClickHouse, chlive-server, tests) and inside the container
     # (the HTTP proxy's own client, rpk).

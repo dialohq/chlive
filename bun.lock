@@ -19,8 +19,8 @@
         "react",
       ],
     },
-    "examples/simple": {
-      "name": "chlive-simple",
+    "examples/playground": {
+      "name": "chlive-playground",
       "dependencies": {
         "@chlive/client": "*",
         "react": "^19.1.0",
@@ -209,7 +209,7 @@
 
     "caniuse-lite": ["caniuse-lite@1.0.30001814", "", {}, "sha512-/Uaf1lAzr59XcMpW0o96WoEfr+VXK2OX4U9AgFoiSHsVJ4HppnIFUjtYzsyDH2+tgANaQb2/oxYGwCPapN1FpA=="],
 
-    "chlive-simple": ["chlive-simple@workspace:examples/simple"],
+    "chlive-playground": ["chlive-playground@workspace:examples/playground"],
 
     "convert-source-map": ["convert-source-map@2.0.0", "", {}, "sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg=="],
 

@@ -5,6 +5,8 @@
 -- Assumptions:
 --  * one Kafka message = one row (JSONEachRow), MV is a pure passthrough adding _partition/_offset
 --  * plain append-only MergeTree
+--  * a message that can't be parsed (e.g. "latency_ms": "fast") is skipped, not retried
+--    forever; chlive-engine skips the same messages, so history and stream still agree
 DROP VIEW IF EXISTS default.events_mv;
 DROP TABLE IF EXISTS default.events_queue;
 CREATE TABLE default.events_queue (
@@ -13,7 +15,7 @@ CREATE TABLE default.events_queue (
 ) ENGINE = Kafka
 SETTINGS kafka_broker_list = '127.0.0.1:9092', kafka_topic_list = 'events',
          kafka_group_name = 'ch-main', kafka_format = 'JSONEachRow',
-         kafka_num_consumers = 3;
+         kafka_num_consumers = 3, kafka_skip_broken_messages = 1000;
 
 CREATE TABLE IF NOT EXISTS default.events (
   ts DateTime64(3), user_id String, country LowCardinality(String),
@@ -32,7 +34,7 @@ CREATE TABLE default.customers_queue (
 ) ENGINE = Kafka
 SETTINGS kafka_broker_list = '127.0.0.1:9092', kafka_topic_list = 'customers',
          kafka_group_name = 'ch-main-customers', kafka_format = 'JSONEachRow',
-         kafka_num_consumers = 3;
+         kafka_num_consumers = 3, kafka_skip_broken_messages = 1000;
 
 CREATE TABLE IF NOT EXISTS default.customers (
   ts DateTime64(3), customer_id String, name String, country LowCardinality(String),
@@ -49,7 +51,7 @@ CREATE TABLE default.orders_queue (
 ) ENGINE = Kafka
 SETTINGS kafka_broker_list = '127.0.0.1:9092', kafka_topic_list = 'orders',
          kafka_group_name = 'ch-main-orders', kafka_format = 'JSONEachRow',
-         kafka_num_consumers = 3;
+         kafka_num_consumers = 3, kafka_skip_broken_messages = 1000;
 
 CREATE TABLE IF NOT EXISTS default.orders (
   ts DateTime64(3), order_id String, customer_id String, amount Float64,

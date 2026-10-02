@@ -27,7 +27,7 @@
         let
           # Ports and names shared by the dnvr processes below. They are also the built-in defaults
           # of chlive-server, chlive-engine, the tests, scripts/schema.sql and
-          # examples/simple/vite.config.js, which must agree with them.
+          # examples/playground/vite.config.js, which must agree with them.
           settings = {
             kafkaPort = 9092; # Redpanda Kafka API (its standard port), published to the host
             pandaproxyPort = 8082; # Redpanda HTTP proxy (its standard port; the example's writes)
@@ -36,7 +36,7 @@
               httpPort = 18123;
               tcpPort = 19000; # native protocol (`ch`)
             };
-            simplePort = 5174;
+            playgroundPort = 5174;
             topics = [
               "events"
               "customers"
@@ -193,11 +193,11 @@
                   '';
                 };
 
-                simple = {
+                playground = {
                   command = ''
                     cd "$DNVR_ROOT"
                     [ -d node_modules ] || bun install
-                    exec bun --bun run --cwd examples/simple dev --port ${toString settings.simplePort} --strictPort
+                    exec bun --bun run --cwd examples/playground dev --port ${toString settings.playgroundPort} --strictPort
                   '';
                 };
               };

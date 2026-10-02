@@ -20,7 +20,7 @@ dnvr up          # starts everything in a tmux dashboard
 | `schema` → clickhouse, redpanda | applies `scripts/schema.sql` (Kafka-engine tables, MVs, the `chlive_ro` user) | |
 | `seed` → schema | runs `scripts/seed.sql` if ClickHouse has fewer than `$SEED_COUNT` events: generated, backdated events produced to Kafka from ClickHouse | |
 | `server` → schema | chlive-server: WebSocket over chlive-engine, as `chlive_ro`, on its default ports | `:8080` (`/live`, `/debug/subscriptions`, `/healthz`) |
-| `simple` | the example query playground | <http://localhost:5174> |
+| `playground` | the example query playground | <http://localhost:5174> |
 
 Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `engine` (the engine CLI), `e2e` (the tests that need the stack), and `reset-data` (wipe Redpanda and ClickHouse data together, since Kafka offsets and ClickHouse's `_offset`s must match; run it with the group stopped).
 
@@ -28,11 +28,12 @@ State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 
 ### Example: query playground
 
-`examples/simple` (plain React, Bun workspace) is served by the `simple` process at <http://localhost:5174>:
+`examples/playground` (plain React, Bun workspace) is served by the `playground` process at <http://localhost:5174>. Two panes:
 
-- a query box with presets over `events`, `orders` and `customers`; ⌘/Ctrl+Enter runs it;
-- the live result, newest rows first, with its status, row count and the engine's positioned error (e.g. `unknown column latency in table events (…) at 1:17`);
-- buttons that write 1 or 50 random rows to each topic **straight to Kafka** through Redpanda's HTTP proxy (`127.0.0.1:8082`, proxied as `/kafka`), so you can watch each write travel Kafka → server → UI.
+- **Live query:** a query box with presets over `events`, `orders` and `customers` (⌘/Ctrl+Enter runs it), and the live result: newest rows first, with its status, row count and the engine's positioned error (e.g. `unknown column latency in table events (…) at 1:17`).
+- **Write to Kafka:** pick a topic, write JSON by hand (one object, an array, or JSON lines) or start from a preset: a slow checkout, numbers as strings, missing keys (zero values), an unreadable value that both ClickHouse and the engine skip, a batch, a big order, a customer rename… Each write reports the partition and offset it landed at; `Random` and `50 random` write generated rows.
+
+Writes go **straight to Kafka** through Redpanda's HTTP proxy (`127.0.0.1:8082`, proxied as `/kafka`), so you can watch each one travel Kafka → server → UI.
 
 ## How it works
 
@@ -58,7 +59,7 @@ Kafka ──▶ ClickHouse (Kafka engine + MV adds _partition/_offset)
 | `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka; also a CLI that prints each iteration's diffs |
 | `server/` | `chlive-server` (Rust): the WebSocket protocol over the engine |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
-| `examples/` | example apps; `examples/simple`, the query playground |
+| `examples/` | example apps; `examples/playground`, the query playground |
 | `tests/` | end-to-end tests (`chlive-e2e`): the server over the full stack, with a small Kafka producer |
 
 ## Engine (custom dialect)
