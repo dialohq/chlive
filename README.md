@@ -4,7 +4,7 @@ A minimal **query-driven live sync layer** for a Kafka → ClickHouse analytics 
 
 ## Quickstart
 
-Everything except Redpanda comes from the nix flake: the Rust and Bun toolchains, and **ClickHouse 26.7.2** (packaged in `nix/packages/clickhouse.nix`, because nixpkgs has another version). Redpanda runs in **Docker**, so Docker must be running. Local services run through [dnvr](https://github.com/dialohq/dnvr). There are two dev shells: `default`, the full stack described here, and `engine`, a smaller stack for working on the engine (see [Engine](#engine-custom-dialect)).
+Everything except Redpanda comes from the nix flake: the Rust and Bun toolchains, and **ClickHouse 26.7.2** (packaged in `nix/packages/clickhouse.nix`, because nixpkgs has another version). Redpanda runs in **Docker**, so Docker must be running. Local services run through [dnvr](https://github.com/dialohq/dnvr). One dev shell runs the whole stack, for the server, the engine and the examples alike.
 
 ```sh
 nix develop      # or `direnv allow` once (run `direnv reload` after flake changes)
@@ -15,16 +15,16 @@ dnvr up          # starts everything in a tmux dashboard
 
 | process | what | where |
 |---|---|---|
-| `redpanda` | Redpanda in Docker (container `chlive-redpanda`, volume `chlive-redpanda`); creates topics `events`, `customers`, `orders` (3 partitions each) | Kafka `127.0.0.1:19092`, HTTP proxy `127.0.0.1:18082` |
+| `redpanda` | Redpanda in Docker (container `chlive-redpanda`, volume `chlive-redpanda`); creates topics `events`, `customers`, `orders` (3 partitions each) | Kafka `127.0.0.1:9092`, HTTP proxy `127.0.0.1:8082` |
 | `clickhouse` | ClickHouse 26.7.2 (dnvr's clickhouse preset) | HTTP `127.0.0.1:18123`, native `127.0.0.1:19000` |
 | `schema` → clickhouse, redpanda | applies `scripts/schema.sql` (Kafka-engine tables, MVs, the `chlive_ro` user) | |
 | `seed` → schema | runs `scripts/seed.sql` if ClickHouse has fewer than `$SEED_COUNT` events: generated, backdated events produced to Kafka from ClickHouse | |
-| `server` → schema | chlive-server: WebSocket over chlive-engine, as `chlive_ro` | `:8080` (`/live`, `/debug/subscriptions`, `/healthz`) |
+| `server` → schema | chlive-server: WebSocket over chlive-engine, as `chlive_ro`, on its default ports | `:8080` (`/live`, `/debug/subscriptions`, `/healthz`) |
 | `simple` | the example query playground | <http://localhost:5174> |
 
-Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic), `e2e` (end-to-end tests), and `reset-data` (wipe Redpanda and ClickHouse data together, since Kafka offsets and ClickHouse's `_offset`s must match; run it with the group stopped).
+Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `engine` (the engine CLI), `e2e` (the tests that need the stack), and `reset-data` (wipe Redpanda and ClickHouse data together, since Kafka offsets and ClickHouse's `_offset`s must match; run it with the group stopped).
 
-State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume. The ports avoid the defaults (8123/9000/9092), so the stack can run next to another local ClickHouse or Kafka.
+State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume. Redpanda uses its standard ports (Kafka 9092, HTTP proxy 8082) and the server listens on 8080; ClickHouse uses 18123/19000 rather than 8123/9000, so it can run next to another local ClickHouse. These are the built-in defaults of the server, the engine CLI, the tests and the example, so nothing needs configuring; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_KAFKA` and `CHLIVE_LISTEN` override them.
 
 ### Example: query playground
 
@@ -32,7 +32,7 @@ State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 
 - a query box with presets over `events`, `orders` and `customers`; ⌘/Ctrl+Enter runs it;
 - the live result, newest rows first, with its status, row count and the engine's positioned error (e.g. `unknown column latency in table events (…) at 1:17`);
-- buttons that write 1 or 50 random rows to each topic **straight to Kafka** through Redpanda's HTTP proxy (`127.0.0.1:18082`, proxied as `/kafka`), so you can watch each write travel Kafka → server → UI.
+- buttons that write 1 or 50 random rows to each topic **straight to Kafka** through Redpanda's HTTP proxy (`127.0.0.1:8082`, proxied as `/kafka`), so you can watch each write travel Kafka → server → UI.
 
 ## How it works
 
@@ -54,7 +54,7 @@ Kafka ──▶ ClickHouse (Kafka engine + MV adds _partition/_offset)
 |---|---|
 | `flake.nix` | the dnvr dev shells: toolchain, env, the local stacks' processes (Redpanda in Docker, ClickHouse 26.7.2, schema, seed, server, examples) and scripts |
 | `nix/packages/` | custom derivations: `clickhouse.nix` (26.7.2), `redpanda.nix` (the Docker-run Redpanda process) |
-| `scripts/` | `schema.sql` (tables, Kafka ingestion, read-only user) and `seed.sql` (historical events via Kafka); `engine/` has the same pair for the engine shell |
+| `scripts/` | `schema.sql` (tables, Kafka ingestion, read-only user) and `seed.sql` (historical events via Kafka); |
 | `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka; also a CLI that prints each iteration's diffs |
 | `server/` | `chlive-server` (Rust): the WebSocket protocol over the engine |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
@@ -63,19 +63,13 @@ Kafka ──▶ ClickHouse (Kafka engine + MV adds _partition/_offset)
 
 ## Engine (custom dialect)
 
-The engine has its own dev shell: its own ClickHouse and Redpanda, with ClickHouse ingesting the `events` topic like the full stack, and 10 seed events (`scripts/engine/`) produced through Kafka:
+The engine is a library (used by the server) with a CLI that prints each iteration's diffs. With `dnvr up` running:
 
 ```sh
-nix develop .#engine
-dnvr up                                     # engine-redpanda (Kafka 29092), engine-clickhouse (HTTP 28123, native 29000), engine-schema, engine-seed
 engine --explain "select * from events"     # plan: ClickHouse SQL, topics, keys, filter
-engine "select * from events"               # history (10 rows), then live events until Ctrl-C
-produce events '{"user_id": "u7", "latency_ms": 120}'   # one event per JSON argument (or JSON lines on stdin)
-engine-test                                 # all engine tests, including the ClickHouse and Kafka ones
-reset-data                                  # with `dnvr up` stopped: wipe the engine shell's Redpanda and ClickHouse together
+engine "select * from events where latency_ms > 500"   # history, then live events until Ctrl-C
+produce events '{"user_id": "u7", "latency_ms": 900}'  # one event per JSON argument
 ```
-
-Its process names, ports, Redpanda container and volume differ from the default shell's, so the two never share data and can run at the same time. In either shell, the engine uses that shell's ClickHouse and Kafka via `CHLIVE_CLICKHOUSE_URL` and `CHLIVE_KAFKA`; the default shell has `produce` too.
 
 **History and stream meet at a watermark.** At subscribe time the engine reads `max(_offset)` per `_partition` from the ClickHouse table. History is every row up to it (the history query gets `toInt64(_offset) <= multiIf(_partition = 0, W0, …)`), and each Kafka partition is consumed from the offset right after it. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. The table must have `_partition` and `_offset` columns; the binder says so if it doesn't.
 
@@ -140,11 +134,10 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 ```sh
 cargo test --workspace     # engine (lexer, parser, binder, planner, types, watermark), server protocol over a real WebSocket
 bun run test               # client state + reconnect/resubscribe (bun test)
-e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-e2e, against `dnvr up`
-engine-test                # in the engine shell: the engine against its ClickHouse and Redpanda
+e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chlive-e2e, against `dnvr up`
 ```
 
-The e2e tests subscribe over WebSocket while producing events, and check that each live result (snapshot plus inserts) equals the same query run directly on ClickHouse once everything is ingested. They count rows across the whole `events` table, so don't produce other events (e.g. with the playground's buttons) while they run.
+`e2e` runs the engine's ClickHouse and Kafka tests, then the server end to end. The latter subscribe over WebSocket while producing events, and check that each live result (snapshot plus inserts) equals the same query run directly on ClickHouse once everything is ingested. They count rows across the whole `events` table, so don't produce other events (e.g. with the playground's buttons) while they run.
 
 ## Supported queries
 

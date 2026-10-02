@@ -47,7 +47,7 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// The stack of the shell the tests run in (CHLIVE_CLICKHOUSE_URL, CHLIVE_KAFKA), as the
+/// The dev shell's stack (or CHLIVE_CLICKHOUSE_URL / CHLIVE_KAFKA), as the
 /// server's read-only ClickHouse user.
 pub fn config() -> Config {
     Config {
@@ -56,7 +56,7 @@ pub fn config() -> Config {
         user: "chlive_ro".into(),
         password: "chlive_ro".into(),
         database: "default".into(),
-        kafka_brokers: std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:19092".into()),
+        kafka_brokers: std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:9092".into()),
     }
 }
 

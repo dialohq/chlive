@@ -1,5 +1,5 @@
-//! Against the engine shell's Redpanda and ClickHouse, which ingests the `events` topic into
-//! `default.events` (via CHLIVE_KAFKA and CHLIVE_CLICKHOUSE_URL); runs only with CHLIVE_E2E=1.
+//! Against the dev shell's Redpanda and ClickHouse, which ingests the `events` topic into
+//! `default.events` (or CHLIVE_KAFKA / CHLIVE_CLICKHOUSE_URL); runs only with CHLIVE_E2E=1.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -9,11 +9,11 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::ClientConfig;
 
 fn clickhouse_url() -> String {
-    std::env::var("CHLIVE_CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:28123".into())
+    std::env::var("CHLIVE_CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:18123".into())
 }
 
 fn brokers() -> String {
-    std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:29092".into())
+    std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:9092".into())
 }
 
 async fn count(path: &str) -> u64 {
@@ -23,7 +23,7 @@ async fn count(path: &str) -> u64 {
         .body(sql)
         .send()
         .await
-        .expect("ClickHouse reachable (is `dnvr up` running in the engine shell?)")
+        .expect("ClickHouse reachable (is `dnvr up` running?)")
         .text()
         .await
         .unwrap();
@@ -46,14 +46,14 @@ async fn produce(producer: &FutureProducer, path: &str, run: &str, ids: std::ops
             )
             .await
             .map_err(|(e, _)| e)
-            .expect("produced (is the engine shell's Redpanda up?)");
+            .expect("produced (is `dnvr up` running?)");
     }
 }
 
 #[tokio::test]
 async fn every_event_exactly_once_across_the_watermark() {
     if std::env::var_os("CHLIVE_E2E").is_none() {
-        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up` in the engine shell)");
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
         return;
     }
     let run = SystemTime::now()

@@ -1,4 +1,4 @@
-//! Against a real ClickHouse (either dev shell's, via CHLIVE_CLICKHOUSE_URL); runs only with
+//! Against a real ClickHouse (the dev shell's, or CHLIVE_CLICKHOUSE_URL); runs only with
 //! CHLIVE_E2E=1. Uses its own small table instead of the seeded `default.events`.
 
 use chlive_engine::diff::Diff;

@@ -17,7 +17,7 @@ export default defineConfig({
     proxy: {
       "/live": { target: "ws://127.0.0.1:8080", ws: true },
       // Redpanda's HTTP proxy (dnvr `redpanda` process): writes go straight to Kafka
-      "/kafka": { target: "http://127.0.0.1:18082", rewrite: (p) => p.replace(/^\/kafka/, "") },
+      "/kafka": { target: "http://127.0.0.1:8082", rewrite: (p) => p.replace(/^\/kafka/, "") },
     },
   },
 });

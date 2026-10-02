@@ -1,7 +1,7 @@
-# A Redpanda (Kafka API + HTTP proxy) dnvr process in Docker; `docker` comes from the host.
-# `name` is both the container and its data volume, so each dev shell can run its own Redpanda
-# next to the other's. Reset the volume together with the ClickHouse that ingests it
-# (`reset-data`): Kafka offsets and ClickHouse's _offset watermarks must match.
+# The `redpanda` dnvr process: Redpanda (Kafka API + HTTP proxy) in Docker; `docker` comes from
+# the host. `name` is both the container and its data volume. Reset the volume together with
+# the ClickHouse that ingests it (`reset-data`): Kafka offsets and ClickHouse's _offset
+# watermarks must match.
 {
   lib,
   writeShellApplication,
@@ -29,8 +29,9 @@ writeShellApplication {
     docker rm -f "$name" >/dev/null 2>&1 || true
     # The HTTP proxy batches produce requests for 100 ms by default; disable that so a
     # single write from the simple example is acknowledged (and visible) immediately.
-    # The proxy's own Kafka client uses the in-container listener on 9092 (not
-    # published); the host (main ClickHouse, chlive-server, tests) uses ${kafka}.
+    # The port is published as itself, so one listener advertised as 127.0.0.1:${kafka}
+    # works both from the host (ClickHouse, chlive-server, tests) and inside the container
+    # (the HTTP proxy's own client, rpk).
     docker run --rm --name "$name" \
       -p 127.0.0.1:${kafka}:${kafka} \
       -p 127.0.0.1:${proxy}:${proxy} \
@@ -39,20 +40,20 @@ writeShellApplication {
       redpandadata/redpanda:v25.2.1 -c '
         rpk redpanda config set pandaproxy_client.produce_batch_delay_ms 0 &&
         exec /entrypoint.sh redpanda start --mode dev-container --smp 1 \
-          --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:${kafka} \
-          --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:${kafka} \
+          --kafka-addr 0.0.0.0:${kafka} \
+          --advertise-kafka-addr 127.0.0.1:${kafka} \
           --pandaproxy-addr 0.0.0.0:${proxy} \
           --advertise-pandaproxy-addr 127.0.0.1:${proxy}' &
     pid=$!
     trap 'docker stop -t 10 "$name" >/dev/null 2>&1 || true; wait $pid 2>/dev/null || true' EXIT INT TERM
 
-    until docker exec "$name" rpk cluster health 2>/dev/null | grep -qE 'Healthy:.+true'; do
+    until docker exec "$name" rpk cluster health -X brokers=127.0.0.1:${kafka} 2>/dev/null | grep -qE 'Healthy:.+true'; do
       kill -0 $pid 2>/dev/null || { echo "[redpanda] exited before becoming ready" >&2; exit 1; }
       sleep 1
     done
     topics=(${lib.escapeShellArgs topics})
     for t in "''${topics[@]}"; do
-      docker exec "$name" rpk topic create "$t" -p 3 -r 1 >/dev/null 2>&1 || true
+      docker exec "$name" rpk topic create -X brokers=127.0.0.1:${kafka} "$t" -p 3 -r 1 >/dev/null 2>&1 || true
     done
     dnvr-state set bootstrap 127.0.0.1:${kafka}
     # readiness key: topics exist

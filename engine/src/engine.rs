@@ -42,7 +42,7 @@ pub struct Config {
     pub password: String,
     /// ClickHouse database that dialect tables map to.
     pub database: String,
-    /// Kafka bootstrap servers, e.g. `127.0.0.1:19092`.
+    /// Kafka bootstrap servers, e.g. `127.0.0.1:9092`.
     pub kafka_brokers: String,
 }
 
@@ -53,7 +53,7 @@ impl Default for Config {
             user: "default".into(),
             password: String::new(),
             database: "default".into(),
-            kafka_brokers: "127.0.0.1:19092".into(),
+            kafka_brokers: "127.0.0.1:9092".into(),
         }
     }
 }
