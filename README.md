@@ -33,6 +33,9 @@ State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 - **Live query:** a query box with presets over `events`, `orders` and `customers` (⌘/Ctrl+Enter runs it), and the live result: newest rows first, with its status, row count and the engine's positioned error (e.g. `unknown column latency in table events (…) at 1:17`).
 - **Write to Kafka:** pick a topic, write JSON by hand (one object, an array, or JSON lines) or start from a preset: a slow checkout, numbers as strings, missing keys (zero values), an unreadable value that both ClickHouse and the engine skip, a batch, a big order, a customer rename… Each write reports the partition and offset it landed at; `Random` and `50 random` write generated rows.
 
+- **Client state** (under the query): what `@chlive/client` holds for the subscription, from `state.stats`: its wire id and how often it was (re)subscribed, the rows in state against the LIMIT and how many are rendered, counts of diffs, inserts and deletes and bytes received, the live insert rate, how long the last message took to apply, and a log of the last 30 messages (e.g. `diff: 2 changes · + -@0`); click one for its JSON.
+- **Generator:** a loop that writes generated rows to a topic, then sleeps, until stopped. Pick the rows per write, the interval, and how rows are drawn: uniform, spiky latency, Poland only, lots of ties, big spenders, past timestamps, ever-rising latency, or big orders.
+
 Writes go **straight to Kafka** through Redpanda's HTTP proxy (`127.0.0.1:8082`, proxied as `/kafka`), so you can watch each one travel Kafka → server → UI.
 
 ## How it works
@@ -121,7 +124,7 @@ import { useLiveQuery } from "@chlive/client/react";
 const { rows, columns, status, error, errorCode } = useLiveQuery(sql);
 ```
 
-`status` is `loading`, `live` or `error`. One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes, and the new snapshot replaces the old rows.
+`status` is `loading`, `live` or `error`. `stats` has per-subscription counters for debugging (snapshots, diffs, inserts, deletes, bytes, the last message and how long it took to apply). One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes, and the new snapshot replaces the old rows.
 
 ### Protocol
 

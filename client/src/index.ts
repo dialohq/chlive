@@ -16,6 +16,28 @@ export interface LiveState<R extends Row = Row> {
   limit?: number;
   error?: string;
   errorCode?: string;
+  /** What this subscription has received so far; for debugging and dev tools. */
+  stats: SubscriptionStats;
+}
+
+/** Counters and the latest message of one subscription. A new object whenever it changes. */
+export interface SubscriptionStats {
+  /** The id on the wire (`s1`, `s2`, …). */
+  id: string;
+  /** `subscribe` messages sent: 1, plus one per reconnect. */
+  subscribes: number;
+  snapshots: number;
+  diffs: number;
+  inserts: number;
+  deletes: number;
+  /** Bytes of JSON received for this subscription. */
+  bytes: number;
+  /** The last message received for it, as parsed. */
+  lastMessage?: ServerMessage;
+  /** `Date.now()` when it arrived. */
+  lastMessageAt?: number;
+  /** How long applying it to the rows took, in milliseconds. */
+  lastApplyMs?: number;
 }
 
 export type Listener<R extends Row = Row> = (state: LiveState<R>) => void;
@@ -38,6 +60,7 @@ interface SubRecord {
   sql: string;
   store: ResultStore<any>;
   state: LiveState<any>;
+  stats: SubscriptionStats;
   listener: Listener<any>;
 }
 
@@ -67,13 +90,14 @@ export class LiveClient {
     const rec: SubRecord = {
       sql,
       store: new ResultStore<R>(),
-      state: { status: "loading", rows: [], columns: [] },
+      state: { status: "loading", rows: [], columns: [], stats: newStats(id) },
+      stats: newStats(id),
       listener,
     };
     this.subs.set(id, rec);
     listener(rec.state);
     this.ensureConnected();
-    this.send({ type: "subscribe", id, sql });
+    if (this.send({ type: "subscribe", id, sql })) this.countSubscribe(rec);
     let active = true;
     return {
       unsubscribe: () => {
@@ -94,9 +118,15 @@ export class LiveClient {
     this.ws = null;
   }
 
-  private send(msg: ClientMessage): void {
-    // While disconnected, subscriptions are (re)sent from `onopen`.
-    if (this.ws?.readyState === OPEN) this.ws.send(JSON.stringify(msg));
+  /** Whether it was sent. While disconnected, subscriptions are (re)sent from `onopen`. */
+  private send(msg: ClientMessage): boolean {
+    if (this.ws?.readyState !== OPEN) return false;
+    this.ws.send(JSON.stringify(msg));
+    return true;
+  }
+
+  private countSubscribe(rec: SubRecord): void {
+    rec.stats = { ...rec.stats, subscribes: rec.stats.subscribes + 1 };
   }
 
   private ensureConnected(): void {
@@ -108,9 +138,13 @@ export class LiveClient {
       this.backoff = this.opts.minBackoffMs;
       for (const [id, rec] of this.subs) {
         ws.send(JSON.stringify({ type: "subscribe", id, sql: rec.sql } satisfies ClientMessage));
+        this.countSubscribe(rec);
       }
     };
-    ws.onmessage = (ev: MessageEvent) => this.onMessage(JSON.parse(String(ev.data)) as ServerMessage);
+    ws.onmessage = (ev: MessageEvent) => {
+      const text = String(ev.data);
+      this.onMessage(JSON.parse(text) as ServerMessage, text.length);
+    };
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
@@ -134,38 +168,60 @@ export class LiveClient {
     }, delay);
   }
 
-  private onMessage(msg: ServerMessage): void {
+  private onMessage(msg: ServerMessage, bytes: number): void {
     const rec = msg.id ? this.subs.get(msg.id) : undefined;
     if (!rec) return;
-    switch (msg.type) {
-      case "snapshot":
-        rec.store.applySnapshot(msg);
-        break;
-      case "diff":
-        try {
+    const started = performance.now();
+    const stats: SubscriptionStats = {
+      ...rec.stats,
+      bytes: rec.stats.bytes + bytes,
+      lastMessage: msg,
+      lastMessageAt: Date.now(),
+    };
+    try {
+      switch (msg.type) {
+        case "snapshot":
+          rec.store.applySnapshot(msg);
+          stats.snapshots++;
+          break;
+        case "diff":
           rec.store.applyDiff(msg);
-        } catch (e) {
-          this.emit(rec, { ...rec.state, status: "error", error: String(e), errorCode: "CLIENT_ERROR" });
+          stats.diffs++;
+          for (const c of msg.changes) {
+            if (c.op === "insert") stats.inserts++;
+            else if (c.op === "delete") stats.deletes++;
+          }
+          break;
+        case "error":
+          rec.stats = stats;
+          this.emit(rec, { ...rec.state, status: "error", error: msg.message, errorCode: msg.code });
           return;
-        }
-        break;
-      case "error":
-        this.emit(rec, { ...rec.state, status: "error", error: msg.message, errorCode: msg.code });
-        return;
+      }
+    } catch (e) {
+      rec.stats = stats;
+      this.emit(rec, { ...rec.state, status: "error", error: String(e), errorCode: "CLIENT_ERROR" });
+      return;
     }
+    stats.lastApplyMs = performance.now() - started;
+    rec.stats = stats;
     this.emit(rec, {
       status: "live",
       rows: rec.store.rows(),
       columns: rec.store.columns,
       order: rec.store.order,
       limit: rec.store.limit,
+      stats,
     });
   }
 
   private emit(rec: SubRecord, state: LiveState<any>): void {
-    rec.state = state;
-    rec.listener(state);
+    rec.state = { ...state, stats: rec.stats };
+    rec.listener(rec.state);
   }
+}
+
+function newStats(id: string): SubscriptionStats {
+  return { id, subscribes: 0, snapshots: 0, diffs: 0, inserts: 0, deletes: 0, bytes: 0 };
 }
 
 /** `ws(s)://<current host>/live` in a browser. */

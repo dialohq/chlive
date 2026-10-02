@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { useLiveQuery } from "@chlive/client/react";
 
@@ -38,6 +38,41 @@ const RANDOM = {
   customers: () => ({ ts: now(), customer_id: customer(), name: pick(["Ada", "Linus", "Grace", "Alan", "Barbara"]), country: pick(["PL", "DE", "US"]) }),
 };
 const TOPICS = Object.keys(RANDOM);
+const rand = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo));
+const money = (lo, hi) => Math.round((lo + Math.random() * (hi - lo)) * 100) / 100;
+
+// How the generator draws rows, per topic.
+const GENERATORS = {
+  events: {
+    Uniform: RANDOM.events,
+    "Spiky latency (2% are 2–20 s)": () => ({
+      ...RANDOM.events(),
+      latency_ms: Math.random() < 0.02 ? rand(2000, 20000) : rand(20, 200),
+    }),
+    "Poland only": () => ({ ...RANDOM.events(), country: "PL" }),
+    "Lots of ties (latency 100/200/300)": () => ({
+      ...RANDOM.events(),
+      country: pick(["PL", "DE"]),
+      latency_ms: pick([100, 200, 300]),
+    }),
+    "Big spenders (amount 50–500)": () => ({ ...RANDOM.events(), amount: money(50, 500) }),
+    "Random past timestamps (last 30 days)": () => ({
+      ...RANDOM.events(),
+      ts: new Date(Date.now() - Math.random() * 30 * 86400e3).toISOString().replace("T", " ").replace("Z", ""),
+    }),
+    "Rising latency (each one slower)": (() => {
+      let n = 0;
+      return () => ({ ...RANDOM.events(), latency_ms: 1000 + n++ });
+    })(),
+  },
+  orders: {
+    Uniform: RANDOM.orders,
+    "Big orders (500–5000)": () => ({ ...RANDOM.orders(), amount: money(500, 5000) }),
+  },
+  customers: {
+    Uniform: RANDOM.customers,
+  },
+};
 
 // Messages to write by hand, per topic. Functions, so `ts` is the time the preset is picked.
 const WRITE_PRESETS = {
@@ -171,8 +206,195 @@ function Writer() {
   );
 }
 
+/** A loop: write a batch of generated rows, sleep, repeat — until stopped. */
+function Generator() {
+  const [topic, setTopic] = useState("events");
+  const [kind, setKind] = useState("Uniform");
+  const [batch, setBatch] = useState(1);
+  const [intervalMs, setIntervalMs] = useState(500);
+  const [running, setRunning] = useState(false);
+  const [stats, setStats] = useState({ written: 0, ticks: 0, errors: 0, lastError: null });
+  // the loop reads the latest settings through a ref, so they can change while it runs
+  const settings = useRef({ topic, kind, batch, intervalMs });
+  settings.current = { topic, kind, batch, intervalMs };
+
+  useEffect(() => {
+    if (!running) return;
+    let stopped = false;
+    let timer;
+    const tick = async () => {
+      const { topic, kind, batch, intervalMs } = settings.current;
+      const make = GENERATORS[topic][kind] ?? GENERATORS[topic].Uniform;
+      const n = Math.max(1, Number(batch) || 1);
+      try {
+        await write(topic, Array.from({ length: n }, make));
+        setStats((s) => ({ ...s, written: s.written + n, ticks: s.ticks + 1 }));
+      } catch (e) {
+        setStats((s) => ({ ...s, ticks: s.ticks + 1, errors: s.errors + 1, lastError: e.message }));
+      }
+      if (!stopped) timer = setTimeout(tick, Math.max(0, Number(intervalMs) || 0));
+    };
+    tick();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [running]);
+
+  const perSecond = (Math.max(1, Number(batch) || 1) * 1000) / Math.max(10, Number(intervalMs) || 0);
+  return (
+    <section className="generator">
+      <h2>Generator</h2>
+      <p>
+        <select
+          value={topic}
+          onChange={(e) => {
+            setTopic(e.target.value);
+            setKind("Uniform");
+          }}
+        >
+          {TOPICS.map((t) => (
+            <option key={t}>{t}</option>
+          ))}
+        </select>{" "}
+        <select value={kind} onChange={(e) => setKind(e.target.value)}>
+          {Object.keys(GENERATORS[topic]).map((k) => (
+            <option key={k}>{k}</option>
+          ))}
+        </select>
+      </p>
+      <p>
+        <label>
+          rows per write <input type="number" min={1} value={batch} onChange={(e) => setBatch(e.target.value)} />
+        </label>{" "}
+        <label>
+          every <input type="number" min={0} step={50} value={intervalMs} onChange={(e) => setIntervalMs(e.target.value)} /> ms
+        </label>{" "}
+        <small>(≈ {perSecond.toFixed(perSecond < 10 ? 1 : 0)} rows/s)</small>
+      </p>
+      <p>
+        <button className={running ? "stop" : "start"} onClick={() => setRunning((r) => !r)}>
+          {running ? "■ Stop" : "▶ Start"}
+        </button>{" "}
+        <small>
+          {stats.written} written in {stats.ticks} writes
+          {stats.errors > 0 && <span className="error"> · {stats.errors} failed: {stats.lastError}</span>}
+        </small>
+      </p>
+    </section>
+  );
+}
+
+const ago = (t, now) => (t === undefined ? "—" : `${(Math.max(0, now - t) / 1000).toFixed(1)} s ago`);
+const kb = (n) => (n < 10_000 ? `${n} B` : n < 10_000_000 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
+
+/** One line about a message: its type, and for a diff its changes, e.g. `+@3 -@10`. */
+function summarize(msg) {
+  if (msg.type === "snapshot") return `snapshot: ${msg.rows.length} rows`;
+  if (msg.type === "error") return `error ${msg.code}`;
+  const ops = msg.changes.map((c) =>
+    c.op === "insert" ? (c.index === undefined ? "+" : `+@${c.index}`) : c.op === "delete" ? `-@${c.index}` : c.op,
+  );
+  const shown = ops.length > 12 ? [...ops.slice(0, 12), `… ${ops.length - 12} more`] : ops;
+  return `diff: ${msg.changes.length} change${msg.changes.length === 1 ? "" : "s"} · ${shown.join(" ")}`;
+}
+
+const LOG = 30;
+const RATE_WINDOW_MS = 5000;
+
+/** What the client holds for this subscription, and what arrived lately. */
+function Debug({ state, sql, shown }) {
+  const { stats, rows, status, limit, order, columns } = state;
+  const [log, setLog] = useState([]); // newest first
+  const [open, setOpen] = useState(null); // index into log
+  const [now, setNow] = useState(Date.now());
+  const samples = useRef([]); // [time, inserts total]
+
+  useEffect(() => {
+    if (!stats.lastMessage) return;
+    const at = stats.lastMessageAt;
+    setLog((l) => [{ at, msg: stats.lastMessage, applyMs: stats.lastApplyMs, rows: rows.length }, ...l].slice(0, LOG));
+    samples.current = [...samples.current, [at, stats.inserts]].filter(([t]) => at - t <= RATE_WINDOW_MS);
+  }, [stats.lastMessage]);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(t);
+  }, []);
+
+  const recent = samples.current.filter(([t]) => now - t <= RATE_WINDOW_MS);
+  const rate =
+    recent.length > 1 ? ((recent.at(-1)[1] - recent[0][1]) * 1000) / Math.max(1, now - recent[0][0]) : 0;
+  const changesPerDiff = stats.diffs ? ((stats.inserts + stats.deletes) / stats.diffs).toFixed(1) : "—";
+  const opened = open !== null ? log[open] : null;
+
+  return (
+    <details className="debug" open>
+      <summary>Client state</summary>
+      <table className="kv">
+        <tbody>
+          <tr>
+            <th>subscription</th>
+            <td>
+              {stats.id} · {status} · subscribed {stats.subscribes}× ({stats.snapshots} snapshot{stats.snapshots === 1 ? "" : "s"})
+            </td>
+          </tr>
+          <tr>
+            <th>rows in state</th>
+            <td>
+              <b>{rows.length}</b>
+              {limit !== undefined && ` / limit ${limit}`} · {shown} rendered · {columns.length} columns
+              {order ? ` · ordered by ${order.map((o) => `${o.column} ${o.direction}`).join(", ")}` : " · unordered"}
+            </td>
+          </tr>
+          <tr>
+            <th>received</th>
+            <td>
+              {stats.diffs} diffs · {stats.inserts} inserts · {stats.deletes} deletes · {changesPerDiff} changes/diff ·{" "}
+              {kb(stats.bytes)}
+            </td>
+          </tr>
+          <tr>
+            <th>live rate</th>
+            <td>{rate.toFixed(1)} inserts/s (last 5 s)</td>
+          </tr>
+          <tr>
+            <th>last message</th>
+            <td>
+              {ago(stats.lastMessageAt, now)}
+              {stats.lastApplyMs !== undefined && ` · applied in ${stats.lastApplyMs.toFixed(2)} ms`}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        <small>Last {LOG} messages, newest first; click one for its JSON.</small>
+      </p>
+      <ol className="log">
+        {log.map((e, i) => (
+          <li key={e.at + ":" + i} className={open === i ? "open" : ""} onClick={() => setOpen(open === i ? null : i)}>
+            <code>{new Date(e.at).toISOString().slice(11, 23)}</code> {summarize(e.msg)}{" "}
+            <small>
+              → {e.rows} rows{e.applyMs !== undefined && `, ${e.applyMs.toFixed(2)} ms`}
+            </small>
+          </li>
+        ))}
+      </ol>
+      {opened && <pre className="json">{truncate(JSON.stringify(opened.msg, null, 2), 20000)}</pre>}
+      <p>
+        <small>
+          sql: <code>{sql}</code>
+        </small>
+      </p>
+    </details>
+  );
+}
+
+const truncate = (s, n) => (s.length > n ? s.slice(0, n) + `\n… ${s.length - n} more characters` : s);
+
 function Result({ sql }) {
-  const { rows, columns, order, limit, status, error, errorCode } = useLiveQuery(sql);
+  const state = useLiveQuery(sql);
+  const { rows, columns, order, limit, status, error, errorCode } = state;
   // ordered or limited results as they are (a LIMIT window has its newest row last); unordered
   // unlimited ones newest first
   const asIs = order || limit !== undefined;
@@ -195,6 +417,7 @@ function Result({ sql }) {
           {errorCode}: {error}
         </pre>
       )}
+      <Debug state={state} sql={sql} shown={shown.length} />
       <table>
         <thead>
           <tr>
@@ -257,7 +480,10 @@ createRoot(document.getElementById("root")).render(
     <h1>chlive playground</h1>
     <div className="panes">
       <Query />
-      <Writer />
+      <div className="side">
+        <Writer />
+        <Generator />
+      </div>
     </div>
   </>,
 );

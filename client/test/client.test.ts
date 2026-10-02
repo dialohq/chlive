@@ -125,3 +125,29 @@ test("listeners never see more rows than the LIMIT", () => {
   assert.deepEqual(sizes, [0, 2, 2, 2, 2]);
   client.close();
 });
+
+test("stats count what arrived, per subscription", async () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", minBackoffMs: 5, WebSocket: FakeSocket as any });
+  let last: LiveState | undefined;
+  client.subscribe(SQL, (s) => (last = s));
+  const ws = FakeSocket.all[0];
+  ws.open();
+  ws.deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "a" }], limit: 2 });
+  const diff = { type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: "b" } }] };
+  ws.deliver(diff);
+  ws.deliver({ type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: "c" } }, { op: "delete", index: 0 }] });
+  const s = last!.stats;
+  assert.equal(s.id, "s1");
+  assert.deepEqual([s.subscribes, s.snapshots, s.diffs, s.inserts, s.deletes], [1, 1, 2, 2, 1]);
+  assert.equal(s.lastMessage?.type, "diff");
+  assert.ok(s.bytes > JSON.stringify(diff).length);
+  assert.ok(s.lastApplyMs! >= 0);
+  // a reconnect resubscribes, and counts it
+  ws.close();
+  await tick(20);
+  FakeSocket.all[1].open();
+  FakeSocket.all[1].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [] });
+  assert.deepEqual([last!.stats.subscribes, last!.stats.snapshots], [2, 2]);
+  client.close();
+});

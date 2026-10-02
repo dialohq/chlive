@@ -19,7 +19,12 @@ function useClient(explicit?: LiveClient): LiveClient {
   return fallbackClient;
 }
 
-const LOADING: LiveState<never> = { status: "loading", rows: [], columns: [] };
+const LOADING: LiveState<never> = {
+  status: "loading",
+  rows: [],
+  columns: [],
+  stats: { id: "", subscribes: 0, snapshots: 0, diffs: 0, inserts: 0, deletes: 0, bytes: 0 },
+};
 
 /** Subscribe to a live query. Resubscribes when `sql` changes and unsubscribes on unmount. */
 export function useLiveQuery<R extends Row = Row>(sql: string, opts: { client?: LiveClient } = {}): LiveState<R> {
