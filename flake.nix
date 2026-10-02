@@ -52,16 +52,34 @@
             name = "chlive-redpanda";
             inherit (settings) kafkaPort pandaproxyPort topics;
           };
-          # `produce <topic> '<json>' …`, or JSON lines on stdin: one Kafka message per line.
+
+          # `produce <topic> '<json>' …`, or JSON on stdin: one Kafka message per JSON value, written
+          # with a plain POST to Redpanda's HTTP proxy (the same endpoint the playground uses).
           produceScript = {
-            description = "Produce JSON events to a topic: `produce events '{\"user_id\": \"u1\"}'` (or lines on stdin)";
+            description = "Produce JSON events to a topic: `produce events '{\"user_id\": \"u1\"}'` (or JSON lines on stdin)";
             text = ''
               topic="''${1:?usage: produce <topic> [json …] (or JSON lines on stdin)}"
               shift
-              if [ "$#" -gt 0 ]; then
-                printf '%s\n' "$@" | docker exec -i chlive-redpanda rpk topic produce "$topic"
-              else
-                docker exec -i chlive-redpanda rpk topic produce "$topic"
+              # every JSON value (one per argument, or any number on stdin) becomes {"value": …}
+              if ! records=$(if [ "$#" -gt 0 ]; then printf '%s\n' "$@"; else cat; fi \
+                | ${pkgs.jq}/bin/jq -cs '{records: map({value: .})}'); then
+                echo "produce: not valid JSON; nothing was written" >&2
+                exit 1
+              fi
+              if ! resp=$(${pkgs.curl}/bin/curl -sS --fail-with-body \
+                -H 'Content-Type: application/vnd.kafka.json.v2+json' \
+                --data-binary "$records" \
+                "http://127.0.0.1:${toString settings.pandaproxyPort}/topics/$topic"); then
+                echo "produce to $topic failed: $resp" >&2
+                exit 1
+              fi
+              # The proxy answers 200 even when records fail; each then has a Kafka error code
+              # (3: unknown topic).
+              printf '%s' "$resp" | ${pkgs.jq}/bin/jq -r '.offsets[]
+                | if .error_code then "failed: Kafka error \(.error_code)\(if .error_code == 3 then " (unknown topic)" else "" end)"
+                  else "produced to partition \(.partition) at offset \(.offset)" end'
+              if printf '%s' "$resp" | ${pkgs.jq}/bin/jq -e 'any(.offsets[]; .error_code)' >/dev/null; then
+                exit 1
               fi
             '';
           };
