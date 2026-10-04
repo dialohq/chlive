@@ -44,12 +44,13 @@ pub trait EventSource: Send + Sync {
     /// The topic's partitions, or `None` if the topic doesn't exist.
     async fn partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError>;
 
-    /// The next offset to be written in each partition, if known. A resume cursor at or past it
-    /// comes from different data (the topic was recreated).
-    async fn end_offsets(
+    /// Per partition, the first offset still kept and the next to be written, if known. A resume
+    /// cursor at or past the end comes from different data (the topic was recreated); one that
+    /// needs offsets before the start can't be resumed (they were deleted by retention).
+    async fn offset_bounds(
         &self,
         _topic: &TopicId,
-    ) -> Result<Option<BTreeMap<i32, i64>>, SourceError> {
+    ) -> Result<Option<BTreeMap<i32, (i64, i64)>>, SourceError> {
         Ok(None)
     }
 
@@ -109,10 +110,10 @@ impl EventSource for KafkaSource {
         .map_err(|e| SourceError(e.to_string()))?
     }
 
-    async fn end_offsets(
+    async fn offset_bounds(
         &self,
         topic: &TopicId,
-    ) -> Result<Option<BTreeMap<i32, i64>>, SourceError> {
+    ) -> Result<Option<BTreeMap<i32, (i64, i64)>>, SourceError> {
         let Some(partitions) = self.partitions(topic).await? else {
             return Ok(None);
         };
@@ -120,14 +121,14 @@ impl EventSource for KafkaSource {
         let name = topic.0.clone();
         tokio::task::spawn_blocking(move || {
             let consumer: BaseConsumer = config.create().map_err(|e| SourceError(e.to_string()))?;
-            let mut ends = BTreeMap::new();
+            let mut bounds = BTreeMap::new();
             for p in partitions {
-                let (_, high) = consumer
+                let (low, high) = consumer
                     .fetch_watermarks(&name, p, Duration::from_secs(10))
                     .map_err(|e| SourceError(format!("fetching offsets: {e}")))?;
-                ends.insert(p, high);
+                bounds.insert(p, (low, high));
             }
-            Ok(Some(ends))
+            Ok(Some(bounds))
         })
         .await
         .map_err(|e| SourceError(e.to_string()))?
@@ -217,13 +218,13 @@ impl EventSource for MemorySource {
         Ok(self.topics.get(topic).map(|p| p.keys().copied().collect()))
     }
 
-    async fn end_offsets(
+    async fn offset_bounds(
         &self,
         topic: &TopicId,
-    ) -> Result<Option<BTreeMap<i32, i64>>, SourceError> {
+    ) -> Result<Option<BTreeMap<i32, (i64, i64)>>, SourceError> {
         Ok(self.topics.get(topic).map(|p| {
             p.iter()
-                .map(|(part, msgs)| (*part, msgs.len() as i64))
+                .map(|(part, msgs)| (*part, (0, msgs.len() as i64)))
                 .collect()
         }))
     }

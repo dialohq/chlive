@@ -65,7 +65,6 @@ pub struct Engine {
     rules: Arc<dyn NamingRules>,
     history: Arc<dyn HistorySource>,
     source: Arc<dyn EventSource>,
-    resume_wait: Duration,
 }
 
 impl Engine {
@@ -90,15 +89,7 @@ impl Engine {
             rules: Arc::new(rules),
             history: Arc::new(history),
             source: Arc::new(source),
-            resume_wait: Duration::from_secs(10),
         }
-    }
-
-    /// How long a resume of an ordered or limited query waits for ClickHouse to ingest up to a
-    /// client that is ahead of it, before falling back to a full snapshot (default 10 s).
-    pub fn with_resume_wait(mut self, wait: Duration) -> Self {
-        self.resume_wait = wait;
-        self
     }
 
     /// Parse, bind and plan a query without running it.
@@ -131,10 +122,11 @@ impl Engine {
     /// the cursor `since` (a token from an earlier [`Iteration::at`], see [`crate::cursor`]).
     /// The first iteration is then a [`Origin::CatchUp`] with only what the client is missing:
     /// - ClickHouse's rows after the cursor and up to the current watermark `W`;
-    /// - with ORDER BY, placed by the sort keys of the client's result, which are read from
-    ///   ClickHouse up to the cursor; with LIMIT alone, by the client's row count;
-    /// - and the stream continues from `max(cursor, W)`, so nothing is missed or repeated even
-    ///   when the client streamed further than ClickHouse has ingested.
+    /// - with ORDER BY, placed by the sort keys of the client's result, read from ClickHouse up
+    ///   to the cursor and, where the client is ahead of ClickHouse, from Kafka (its events
+    ///   between `W` and the cursor, read first and not sent again); with LIMIT alone, by the
+    ///   client's row count, likewise;
+    /// - and the stream continues from `max(cursor, W)`, so nothing is missed or repeated.
     ///
     /// An invalid cursor (another plan, or past the end of the topic, e.g. it was recreated)
     /// gives a normal subscription from history ([`Subscription::resumed`] is false).
@@ -145,40 +137,29 @@ impl Engine {
     ) -> Result<Subscription, EngineError> {
         let plan = self.explain(sql).await?;
         let kafka = &plan.history.kafka;
-        let fetch_watermark = || {
-            Watermark::fetch(
-                self.history.as_ref(),
-                &plan.history.table,
-                &kafka.partition,
-                &kafka.offset,
-            )
-        };
-        let mut watermark = fetch_watermark().await?;
-        let mut resume_from = match since {
-            Some(token) => self.resumable(&plan, token).await?,
+        let watermark = Watermark::fetch(
+            self.history.as_ref(),
+            &plan.history.table,
+            &kafka.partition,
+            &kafka.offset,
+        )
+        .await?;
+        // With ORDER BY or LIMIT the server rebuilds the client's state, which needs every row
+        // the client holds; without, there's nothing to rebuild.
+        let stateful = plan.stream.order.is_some() || plan.stream.limit.is_some();
+        let resume_from = match since {
+            Some(token) => self.resumable(&plan, token, &watermark, stateful).await?,
             None => None,
         };
-        // With ORDER BY or LIMIT, resuming rebuilds the client's state from ClickHouse up to its
-        // cursor, so ClickHouse must have everything the client has: when the client streamed
-        // further than ClickHouse has ingested, wait for it (or start over).
-        let stateful = plan.stream.order.is_some() || plan.stream.limit.is_some();
-        if let (Some(cursor), true) = (&resume_from, stateful) {
-            let deadline = tokio::time::Instant::now() + self.resume_wait;
-            while cursor.0.iter().any(|(p, o)| watermark.get(*p) < *o) {
-                if tokio::time::Instant::now() >= deadline {
-                    tracing::info!(cursor = %cursor.describe(), watermark = %watermark.describe(),
-                        "ClickHouse is behind the resume cursor; starting over");
-                    resume_from = None;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                watermark = fetch_watermark().await?;
-            }
-        }
-        let (start, first, history_sql) = match &resume_from {
+        let (begin, at, first, history_sql) = match &resume_from {
             None => {
                 let sql = plan.history.sql(Some(&watermark));
-                (watermark.clone(), First::History(sql.clone()), sql)
+                (
+                    watermark.clone(),
+                    watermark.clone(),
+                    First::History(sql.clone()),
+                    sql,
+                )
             }
             Some(cursor) => {
                 let catch_up = plan.history.catch_up_sql(cursor, &watermark);
@@ -187,13 +168,33 @@ impl Engine {
                     (None, Some(_)) => Seed::Count(plan.history.count_sql(cursor)),
                     (None, None) => Seed::Nothing,
                 };
+                // Where the client is ahead of ClickHouse (it streamed events ClickHouse hasn't
+                // ingested yet), those events are re-read from Kafka to rebuild the state: the
+                // stream starts right after ClickHouse there, and its events up to the cursor
+                // are the client's own (`ahead`), never sent again.
+                let ahead = Watermark(if stateful {
+                    cursor
+                        .0
+                        .iter()
+                        .filter(|(p, o)| **o > watermark.get(**p))
+                        .map(|(p, o)| (*p, *o))
+                        .collect()
+                } else {
+                    Default::default()
+                });
+                let mut begin = cursor.max(&watermark);
+                for p in ahead.0.keys() {
+                    begin.0.insert(*p, watermark.get(*p));
+                }
                 // nothing to fetch where ClickHouse isn't past the client
                 let behind = watermark.0.iter().all(|(p, w)| *w <= cursor.get(*p));
                 (
+                    begin,
                     cursor.max(&watermark),
                     First::CatchUp {
                         seed,
                         rows: (!behind).then(|| catch_up.clone()),
+                        ahead,
                     },
                     catch_up,
                 )
@@ -210,7 +211,7 @@ impl Engine {
                 topic: topic.clone(),
                 partitions: partitions
                     .into_iter()
-                    .map(|p| (p, start.start(p)))
+                    .map(|p| (p, begin.start(p)))
                     .collect(),
             });
         }
@@ -224,7 +225,7 @@ impl Engine {
             .source
             .subscribe(&starts, &plan.stream.required_keys())
             .await?;
-        let iterations = self.iterations(&plan, first, start.clone(), events);
+        let iterations = self.iterations(&plan, first, at, events);
         Ok(Subscription {
             plan,
             watermark,
@@ -234,20 +235,41 @@ impl Engine {
         })
     }
 
-    /// The cursor in `token`, if this plan can resume from it.
-    async fn resumable(&self, plan: &Plan, token: &str) -> Result<Option<Watermark>, EngineError> {
+    /// The cursor in `token`, if this plan can resume from it: one of ours for this plan, and
+    /// every offset to be read again still in the topic. Past its end means the topic was
+    /// recreated; before its start, retention deleted what's needed.
+    async fn resumable(
+        &self,
+        plan: &Plan,
+        token: &str,
+        watermark: &Watermark,
+        stateful: bool,
+    ) -> Result<Option<Watermark>, EngineError> {
         let Some(cursor) = cursor::decode(plan, token) else {
             tracing::info!("resume cursor is for another plan or malformed; starting over");
             return Ok(None);
         };
         for topic in &plan.stream.topics {
-            if let Some(ends) = self.source.end_offsets(topic).await? {
-                if cursor
-                    .0
-                    .iter()
-                    .any(|(p, o)| *o >= ends.get(p).copied().unwrap_or(0))
-                {
-                    tracing::info!(cursor = %cursor.describe(), "resume cursor is past the end of {topic}; starting over");
+            let Some(bounds) = self.source.offset_bounds(topic).await? else {
+                continue;
+            };
+            for (p, c) in &cursor.0 {
+                let (low, high) = bounds.get(p).copied().unwrap_or((0, 0));
+                let w = watermark.get(*p);
+                // the first offset the resume reads from Kafka in this partition
+                let first = if stateful && *c > w {
+                    w + 1
+                } else {
+                    (*c).max(w) + 1
+                };
+                if *c >= high || first < low {
+                    tracing::info!(
+                        cursor = %cursor.describe(),
+                        partition = p,
+                        low,
+                        high,
+                        "resume cursor doesn't fit {topic} (recreated, or deleted by retention); starting over"
+                    );
                     return Ok(None);
                 }
             }
@@ -259,20 +281,30 @@ impl Engine {
         &self,
         plan: &Plan,
         first: First,
-        start: Watermark,
+        at: Watermark,
         events: BoxStream<'static, Event>,
     ) -> BoxStream<'static, Result<Iteration, EngineError>> {
         enum Item {
             History(Result<Vec<Row>, HistoryError>),
-            CatchUp(Result<(Option<Vec<Row>>, Vec<Row>), HistoryError>),
+            CatchUp(
+                Result<(Option<Vec<Row>>, Vec<Row>), HistoryError>,
+                Vec<Event>,
+            ),
             Event(Event),
+            Failed(EngineError),
         }
         let history = self.history.clone();
-        let initial = stream::once(async move {
+        // the first items, then the rest of the stream
+        let items = async move {
             match first {
-                First::History(sql) => Item::History(history.fetch(&sql).await),
-                First::CatchUp { seed, rows } => Item::CatchUp(
-                    async {
+                First::History(sql) => {
+                    let rows = history.fetch(&sql).await;
+                    stream::iter([Item::History(rows)])
+                        .chain(events.map(Item::Event))
+                        .boxed()
+                }
+                First::CatchUp { seed, rows, ahead } => {
+                    let fetched = async {
                         let seed = match seed {
                             Seed::Keys(sql) | Seed::Count(sql) => Some(history.fetch(&sql).await?),
                             Seed::Nothing => None,
@@ -283,24 +315,78 @@ impl Engine {
                         };
                         Ok((seed, rows))
                     }
-                    .await,
-                ),
+                    .await;
+                    let mut events = events;
+                    match read_ahead(&mut events, &ahead).await {
+                        Ok((own, held)) => stream::iter([Item::CatchUp(fetched, own)])
+                            .chain(stream::iter(held).map(Item::Event))
+                            .chain(events.map(Item::Event))
+                            .boxed(),
+                        Err(e) => stream::iter([Item::Failed(e)]).boxed(),
+                    }
+                }
             }
-        });
+        };
         let stream_plan = plan.stream.clone();
-        let state = (ResultState::for_plan(&stream_plan), start);
-        initial
-            .chain(events.map(Item::Event))
+        let state = (ResultState::for_plan(&stream_plan), at);
+        stream::once(items)
+            .flatten()
             .scan(state, move |(state, at), item| {
                 let iteration = match item {
                     Item::History(rows) => history_iteration(&stream_plan, state, at, rows),
-                    Item::CatchUp(fetched) => catch_up_iteration(&stream_plan, state, at, fetched),
+                    Item::CatchUp(fetched, own) => {
+                        catch_up_iteration(&stream_plan, state, at, fetched, own)
+                    }
                     Item::Event(event) => Ok(event_iteration(&stream_plan, state, at, event)),
+                    Item::Failed(e) => Err(e),
                 };
                 futures::future::ready(Some(iteration))
             })
             .boxed()
     }
+}
+
+/// How long a resume may take to re-read the client's own events from Kafka.
+const READ_AHEAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resume, for partitions where the client is ahead of ClickHouse: read the stream until each
+/// reaches the client's cursor. Returns the client's own events (up to its cursor, to rebuild the
+/// state from) and the later ones read meanwhile (to be sent after the catch-up, in order).
+async fn read_ahead(
+    events: &mut BoxStream<'static, Event>,
+    ahead: &Watermark,
+) -> Result<(Vec<Event>, Vec<Event>), EngineError> {
+    let mut pending = ahead.0.clone();
+    let (mut own, mut held) = (Vec::new(), Vec::new());
+    let deadline = tokio::time::Instant::now() + READ_AHEAD_TIMEOUT;
+    while !pending.is_empty() {
+        let event = match tokio::time::timeout_at(deadline, events.next()).await {
+            Ok(Some(e)) => e,
+            Ok(None) => break, // a finite source (tests) ended
+            Err(_) => {
+                return Err(SourceError(format!(
+                    "re-reading the client's events from Kafka timed out (still waiting for {})",
+                    Watermark(pending).describe()
+                ))
+                .into())
+            }
+        };
+        match ahead.0.get(&event.partition) {
+            Some(upto) if event.offset <= *upto => {
+                if event.offset == *upto {
+                    pending.remove(&event.partition);
+                }
+                own.push(event);
+            }
+            Some(_) => {
+                // past the cursor (offsets can skip): this partition is done
+                pending.remove(&event.partition);
+                held.push(event);
+            }
+            None => held.push(event),
+        }
+    }
+    Ok((own, held))
 }
 
 /// What a subscription fetches first.
@@ -309,7 +395,12 @@ enum First {
     History(String),
     /// Resume: what to seed the state with, and the rows the client is missing (`None` when
     /// ClickHouse has nothing past the client's cursor).
-    CatchUp { seed: Seed, rows: Option<String> },
+    CatchUp {
+        seed: Seed,
+        rows: Option<String>,
+        /// Per partition, the client's cursor where it is ahead of ClickHouse.
+        ahead: Watermark,
+    },
 }
 
 enum Seed {
@@ -402,6 +493,7 @@ fn catch_up_iteration(
     state: &mut ResultState,
     at: &Watermark,
     fetched: Result<(Option<Vec<Row>>, Vec<Row>), HistoryError>,
+    own: Vec<Event>,
 ) -> Result<Iteration, EngineError> {
     let (seed, mut rows) = fetched?;
     match (&mut *state, &plan.order, seed) {
@@ -419,6 +511,15 @@ fn catch_up_iteration(
             *state = ResultState::Window(WindowState::with_len(plan.limit.unwrap_or(0), n));
         }
         _ => {}
+    }
+    // the client's own events that ClickHouse doesn't have yet: into the state, not sent
+    for event in own {
+        if let Ok(row) = plan.decode(&event.value) {
+            if plan.matches(&row) {
+                let key = plan.order.as_ref().map(|o| o.event_key(&row));
+                state.place(plan.project(&row), key);
+            }
+        }
     }
     if plan.order.is_none() && plan.limit.is_some() {
         rows.reverse(); // fetched latest first
@@ -464,7 +565,8 @@ fn event_iteration(
             Vec::new()
         }
     };
-    at.0.insert(event.partition, event.offset);
+    let position = at.0.entry(event.partition).or_insert(event.offset);
+    *position = (*position).max(event.offset);
     Iteration {
         origin: Origin::Event {
             topic: event.topic,

@@ -630,7 +630,6 @@ async fn resume_matches_a_fresh_subscription() {
             ClickHouseHttp::new(&url(), "default", ""),
             source,
         )
-        .with_resume_wait(std::time::Duration::from_millis(300))
     }
 
     /// Run a subscription to the end, applying it to `rows`; returns its last cursor token.
@@ -703,17 +702,17 @@ async fn resume_matches_a_fresh_subscription() {
     };
 
     // (ClickHouse, topic) before; then ClickHouse after, with the whole topic
-    for (k1, k2, later_in_clickhouse) in [(4, 7, 12), (4, 7, 4), (0, 5, 9), (6, 6, 12)] {
+    // (4, 7, 4) and (0, 7, 0): the client is ahead of ClickHouse, which (in the last case) has
+    // nothing at all, so the whole state is rebuilt from Kafka
+    for (k1, k2, later_in_clickhouse) in [(4, 7, 12), (4, 7, 4), (0, 5, 9), (6, 6, 12), (0, 7, 0)] {
         for (sql, keys) in CASES {
             let mut cached = Vec::new();
             let (_, token, _) = run(&setup(k1, k2).await, sql, None, &mut cached).await;
             let engine = setup(later_in_clickhouse, EVENTS.len()).await;
             let (resumed, _, changes) = run(&engine, sql, Some(&token), &mut cached).await;
-            // A client ahead of ClickHouse resumes unordered queries; for ordered or limited
-            // ones, ClickHouse (static here) never catches up, so it starts over.
-            let client_ahead = later_in_clickhouse < k2;
-            let stateful = !keys.is_empty() || sql.contains(" limit ");
-            assert_eq!(resumed, !(client_ahead && stateful), "{sql}: resumed");
+            // always a resume, also when the client is ahead of ClickHouse (its events are
+            // then re-read from Kafka)
+            assert!(resumed, "{sql}: did not resume");
             let mut fresh = Vec::new();
             run(&engine, sql, None, &mut fresh).await;
             let (got, want) = (names(&cached), names(&fresh));
