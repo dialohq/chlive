@@ -744,3 +744,148 @@ async fn resume_matches_a_fresh_subscription() {
     }
     exec(&format!("DROP DATABASE {DB}")).await;
 }
+
+/// GROUP BY / aggregates (chDB): the result built from the snapshot plus inserts and updates
+/// by id equals ClickHouse's own GROUP BY over all events, whether the events came through
+/// history, the stream, or half and half.
+#[tokio::test]
+async fn aggregates_match_clickhouse() {
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    let countries = ["PL", "DE", "US", "FR"];
+    let events: Vec<String> = (0..40)
+        .map(|i| {
+            let score = if i % 5 == 0 {
+                "null".to_string()
+            } else {
+                format!("{}", (i * 7 % 13) as f64 / 4.0)
+            };
+            format!(
+                r#"{{"ts":"2026-10-0{} 12:00:{:02}.{:03}","name":"n{}","country":"{}","score":{score},"n":{},"amount":{},"flag":{}}}"#,
+                1 + i % 3,
+                i % 60,
+                i * 37 % 1000,
+                i,
+                countries[i % 4],
+                i as i64 - 15,
+                (i * 13 % 50) as f64 * 1.25,
+                i % 3 == 0
+            )
+        })
+        .collect();
+    const CASES: &[&str] = &[
+        "select count() from events",
+        "select country, count() as n from events group by country",
+        "select country, flag, count(), sum(n), avg(amount) from events group by country, flag",
+        "select country, min(ts), max(ts), min(name), max(name), min(n), max(amount) from events where n > -10 group by country",
+        "select country, count(score), sum(score), avg(score), min(score), max(score) from events group by country",
+        "select count() as c, sum(amount) from events group by country",
+        "select sum(amount), avg(n), min(flag), max(country) from events where flag",
+        "select flag from events group by flag",
+    ];
+    let mut engines = Vec::new();
+    for (database, in_clickhouse) in [
+        ("chlive_engine_agg_history", events.len()),
+        ("chlive_engine_agg_stream", 0),
+        ("chlive_engine_agg_split", events.len() / 2),
+    ] {
+        exec(&format!("DROP DATABASE IF EXISTS {database}")).await;
+        exec(&format!("CREATE DATABASE {database}")).await;
+        exec(&format!(
+            "CREATE TABLE {database}.events (ts DateTime64(3), name String, \
+             country LowCardinality(String), score Nullable(Float64), n Int32, amount Float64, \
+             flag Bool, _partition UInt64, _offset UInt64) ENGINE = MergeTree ORDER BY tuple()"
+        ))
+        .await;
+        if in_clickhouse > 0 {
+            let rows: String = events[..in_clickhouse]
+                .iter()
+                .enumerate()
+                .map(|(o, e)| format!("{{\"_partition\":0,\"_offset\":{o},{}\n", &e[1..]))
+                .collect();
+            exec(&format!(
+                "INSERT INTO {database}.events FORMAT JSONEachRow\n{rows}"
+            ))
+            .await;
+        }
+        let mut source = MemorySource::new();
+        for e in &events {
+            source.push("events", 0, e.as_str());
+        }
+        let engine = Engine::new(
+            HardcodedRules {
+                database: database.into(),
+            },
+            ClickHouseHttp::new(&url(), "default", ""),
+            source,
+        )
+        .with_max_batch(7);
+        engines.push((database, engine));
+    }
+    let direct = ClickHouseHttp::new(&url(), "default", "");
+    // rows as comparable text: floats to 9 significant digits (ClickHouse adds in parallel)
+    let canon = |rows: &[chlive_engine::diff::Row]| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|(k, v)| match v.as_f64() {
+                        Some(f) if !v.is_i64() && !v.is_u64() => format!("{k}={f:.9e}"),
+                        _ => format!("{k}={v}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    for sql in CASES {
+        use chlive_engine::history::HistorySource;
+        let want = direct
+            .fetch(&sql.replace("from events", "from chlive_engine_agg_history.events"))
+            .await
+            .unwrap();
+        for (database, engine) in &engines {
+            let iterations: Vec<_> = engine
+                .subscribe(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|i| i.unwrap_or_else(|e| panic!("{database}: {sql}: {e}")))
+                .collect()
+                .await;
+            let mut list = chlive_engine::diff::ResultList::default();
+            let (mut inserts, mut updates) = (0, 0);
+            for it in &iterations {
+                for d in &it.diffs {
+                    match d {
+                        Diff::Insert { .. } => inserts += 1,
+                        Diff::Update { .. } => updates += 1,
+                        Diff::Delete { .. } => panic!("{sql}: a delete"),
+                    }
+                    list.apply(d)
+                        .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
+                }
+            }
+            let mut ids: Vec<_> = list.ids.iter().map(|i| i.clone().expect("an id")).collect();
+            ids.sort();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                list.rows.len(),
+                "{database}: {sql}: ids not unique"
+            );
+            assert_eq!(canon(&list.rows), canon(&want), "{database}: {sql}");
+            eprintln!(
+                "{database:>28}: {sql}: {} groups, {inserts} inserts, {updates} updates",
+                list.rows.len()
+            );
+        }
+    }
+    for (database, _) in &engines {
+        exec(&format!("DROP DATABASE {database}")).await;
+    } // the only test here using chDB: close it, or the test process crashes on exit
+    chlive_engine::chdb::shutdown();
+}

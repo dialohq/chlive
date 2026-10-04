@@ -23,10 +23,15 @@ export type ClientMessage =
 /**
  * One change to a result; unknown ops must be rejected.
  * - `insert`: with ORDER BY, at `index` (the row there and every row after it move one down);
- *   without, appended.
+ *   without, appended. Rows of aggregated results carry an `id` (their group's key, e.g.
+ *   `["PL"]`) that updates refer to.
  * - `delete`: the row at `index` leaves the result (pushed out by LIMIT); the rows after it move up.
+ * - `update`: the row with this `id` has these new values (only the columns that changed).
  */
-export type Change = { op: "insert"; row: Row; index?: number } | { op: "delete"; index: number };
+export type Change =
+  | { op: "insert"; row: Row; index?: number; id?: string }
+  | { op: "delete"; index: number }
+  | { op: "update"; id: string; set: Row };
 
 /** One ORDER BY key the result is kept in. */
 export interface OrderTerm {
@@ -46,6 +51,8 @@ export interface SnapshotMessage {
   limit?: number;
   /** An opaque cursor: how far this result is complete. Resume from it with `since`. */
   at: string;
+  /** Aggregated results: each row's id (its group's key), in row order. */
+  ids?: string[];
 }
 
 /** Instead of a snapshot, when resuming from `since`: the client's rows are still valid; the

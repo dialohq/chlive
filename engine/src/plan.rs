@@ -5,10 +5,13 @@
 use std::cmp::Ordering;
 
 use crate::ast::CmpOp;
-use crate::binder::{BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId, OrderKey};
+use crate::binder::{
+    AggExpr, Aggregation, BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId, OrderKey,
+};
 use crate::diff::Row;
 use crate::order::{KeyOrder, SortKey};
 use crate::rules::{quote_ident, KafkaColumns, TopicId};
+use crate::types::quote_string;
 use crate::types::{decode, DecodeError, Type, Value};
 use crate::watermark::Watermark;
 
@@ -19,6 +22,199 @@ pub struct Plan {
     pub columns: Vec<BoundColumn>,
     pub history: HistoryPlan,
     pub stream: StreamPlan,
+    /// With GROUP BY or aggregates: how chDB keeps and merges the per-group states.
+    pub aggregate: Option<AggregatePlan>,
+}
+
+/// GROUP BY and aggregates, run in chDB: main ClickHouse computes the history's aggregate
+/// states (`countState()`, …) into a chDB table; each batch of events adds its own states; the
+/// `-Merge` functions finalize. Grouping keys are always kept, as `__k0…`, for row ids.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregatePlan {
+    /// Output columns: name and type, in SELECT order.
+    pub columns: Vec<(String, Type)>,
+    /// How many grouping keys (none: one global group).
+    pub keys: usize,
+    /// `country AS __k0, countState() AS s0, avgState(latency_ms) AS s1`
+    state_select: String,
+    /// `__k0, __k1`, empty for a global aggregate.
+    group_by: String,
+    /// `__k0, __k1, __k0 AS \`country\`, countMerge(s0) AS \`count()\``
+    merge_select: String,
+    /// `country, path`: the keys in a batch's rows.
+    batch_keys: String,
+    /// What a batch's rows carry: the keys and arguments, by ClickHouse name.
+    pub batch_columns: Vec<(ColumnId, String)>,
+    /// `'country LowCardinality(String), latency_ms UInt32'`, for `format()`.
+    structure: String,
+    source_table: String,
+    filter: Option<String>,
+    pub kafka: KafkaColumns,
+}
+
+impl AggregatePlan {
+    /// Create the chDB table with the history's states, computed by main ClickHouse up to
+    /// `bound` (`remote` is the `remote(…)` table function for it).
+    pub fn create_sql(&self, table: &str, remote: &str, bound: &str) -> String {
+        let order = if self.keys == 0 {
+            "tuple()".to_string()
+        } else {
+            format!("({})", self.group_by)
+        };
+        let filter = match &self.filter {
+            Some(f) => format!("({f}) AND ({bound})"),
+            None => bound.to_string(),
+        };
+        format!(
+            "CREATE TABLE {table} ENGINE = AggregatingMergeTree ORDER BY {order} \
+             SETTINGS allow_nullable_key = 1 AS SELECT {} FROM {remote} WHERE {filter}{}",
+            self.state_select,
+            self.group_by_clause()
+        )
+    }
+
+    /// The `remote()` reading `source_table` from main ClickHouse.
+    pub fn remote(&self, address: &str, user: &str, password: &str) -> String {
+        format!(
+            "remote({}, {}, {}, {})",
+            quote_string(address),
+            self.source_table,
+            quote_string(user),
+            quote_string(password)
+        )
+    }
+
+    /// Every group's finalized values.
+    pub fn snapshot_sql(&self, table: &str) -> String {
+        format!(
+            "SELECT {} FROM {table}{}",
+            self.merge_select,
+            self.group_by_clause()
+        )
+    }
+
+    /// Add a batch's states (`rows`: JSONEachRow of `batch_columns`).
+    pub fn insert_sql(&self, table: &str, rows: &str) -> String {
+        format!(
+            "INSERT INTO {table} SELECT {} FROM {}{}",
+            self.state_select,
+            self.format(rows),
+            self.group_by_clause()
+        )
+    }
+
+    /// The finalized values of the groups a batch touched.
+    pub fn touched_sql(&self, table: &str, rows: &str) -> String {
+        if self.keys == 0 {
+            return self.snapshot_sql(table);
+        }
+        format!(
+            "SELECT {} FROM {table} WHERE ({}) IN (SELECT {} FROM {}){}",
+            self.merge_select,
+            self.group_by,
+            self.batch_keys,
+            self.format(rows),
+            self.group_by_clause()
+        )
+    }
+
+    fn format(&self, rows: &str) -> String {
+        format!(
+            "format(JSONEachRow, {}, {})",
+            quote_string(&self.structure),
+            quote_string(rows)
+        )
+    }
+
+    fn group_by_clause(&self) -> String {
+        if self.keys == 0 {
+            String::new()
+        } else {
+            format!(" GROUP BY {}", self.group_by)
+        }
+    }
+}
+
+/// The column of a batch's rows when the aggregates read none (e.g. a global `count()`).
+pub const PLACEHOLDER: &str = "__one";
+
+fn backquote(name: &str) -> String {
+    format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
+}
+
+fn aggregate_plan(agg: &Aggregation, table: &BoundTable, filter: Option<String>) -> AggregatePlan {
+    let col = |id: ColumnId| quote_ident(&table.column(id).clickhouse);
+    let mut state = Vec::new();
+    let mut merge = Vec::new();
+    for (i, k) in agg.keys.iter().enumerate() {
+        state.push(format!("{} AS __k{i}", col(*k)));
+        merge.push(format!("__k{i}"));
+    }
+    let mut batch_columns: Vec<(ColumnId, String)> = agg
+        .keys
+        .iter()
+        .map(|k| (*k, table.column(*k).clickhouse.clone()))
+        .collect();
+    let mut states = 0;
+    for item in &agg.items {
+        match &item.expr {
+            AggExpr::Key(id) => {
+                let k = agg
+                    .keys
+                    .iter()
+                    .position(|k| k == id)
+                    .expect("a grouping key");
+                merge.push(format!("__k{k} AS {}", backquote(&item.name)));
+            }
+            AggExpr::Call { func, arg } => {
+                let f = func.name();
+                let arg_sql = arg.map(col).unwrap_or_default();
+                state.push(format!("{f}State({arg_sql}) AS s{states}"));
+                merge.push(format!("{f}Merge(s{states}) AS {}", backquote(&item.name)));
+                states += 1;
+                if let Some(a) = arg {
+                    if !batch_columns.iter().any(|(id, _)| id == a) {
+                        batch_columns.push((*a, table.column(*a).clickhouse.clone()));
+                    }
+                }
+            }
+        }
+    }
+    let structure = if batch_columns.is_empty() {
+        // e.g. a global count(): rows with no columns; `format()` needs one
+        format!("{PLACEHOLDER} UInt8")
+    } else {
+        batch_columns
+            .iter()
+            .map(|(id, name)| format!("{} {}", quote_ident(name), table.column(*id).ty.clickhouse))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    AggregatePlan {
+        columns: agg
+            .items
+            .iter()
+            .map(|i| (i.name.clone(), i.ty.clone()))
+            .collect(),
+        keys: agg.keys.len(),
+        state_select: state.join(", "),
+        group_by: (0..agg.keys.len())
+            .map(|i| format!("__k{i}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        merge_select: merge.join(", "),
+        batch_keys: agg
+            .keys
+            .iter()
+            .map(|k| col(*k))
+            .collect::<Vec<_>>()
+            .join(", "),
+        batch_columns,
+        structure,
+        source_table: table.clickhouse_table.clone(),
+        filter,
+        kafka: table.kafka.clone(),
+    }
 }
 
 /// The history query. Its upper bound, the [`Watermark`], is only known when subscribing.
@@ -165,7 +361,7 @@ impl OrderPlan {
             })
             .collect();
         for h in &self.hidden {
-            row.remove(h);
+            row.shift_remove(h);
         }
         key
     }
@@ -389,7 +585,24 @@ impl std::fmt::Display for Plan {
             .collect();
         writeln!(f, "table:   {}", self.table)?;
         writeln!(f, "columns: {}", columns.join(", "))?;
-        writeln!(f, "history: {}", self.history.sql(None))?;
+        if let Some(a) = &self.aggregate {
+            let names: Vec<String> = a.columns.iter().map(|(n, t)| format!("{n} {t}")).collect();
+            writeln!(f, "output:  {}", names.join(", "))?;
+            writeln!(
+                f,
+                "history: {}",
+                a.create_sql("<chdb table>", "remote(<main>)", "<watermark bound>")
+            )?;
+            writeln!(f, "merge:   {}", a.snapshot_sql("<chdb table>"))?;
+            let batch: Vec<&str> = a.batch_columns.iter().map(|(_, n)| n.as_str()).collect();
+            writeln!(
+                f,
+                "batches: their {} into chDB as states; touched groups read back merged",
+                batch.join(", ")
+            )?;
+        } else {
+            writeln!(f, "history: {}", self.history.sql(None))?;
+        }
         writeln!(
             f,
             "         up to max({}) per {}, read when subscribing",
@@ -536,6 +749,20 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             needed.push(k.column);
         }
     }
+    let aggregate = bound.aggregation.as_ref().map(|a| {
+        aggregate_plan(
+            a,
+            table,
+            bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
+        )
+    });
+    if let Some(a) = &aggregate {
+        for (id, _) in &a.batch_columns {
+            if !needed.contains(id) {
+                needed.push(*id);
+            }
+        }
+    }
     let stream = StreamPlan {
         topics: vec![table.topic.clone()],
         columns: needed
@@ -576,6 +803,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
         columns,
         history,
         stream,
+        aggregate,
     }
 }
 
@@ -616,6 +844,7 @@ mod tests {
             projection: projection.iter().map(|i| ColumnId(*i)).collect(),
             order: Vec::new(),
             limit: None,
+            aggregation: None,
         }
     }
 

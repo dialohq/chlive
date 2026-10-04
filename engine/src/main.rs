@@ -30,6 +30,13 @@ struct Cli {
     /// Kafka bootstrap servers (default: the dev shell's Redpanda)
     #[arg(long, env = "CHLIVE_KAFKA", default_value = "127.0.0.1:9092")]
     kafka: String,
+    /// ClickHouse's native protocol address, for aggregates (chDB reads states with remote())
+    #[arg(
+        long,
+        env = "CHLIVE_CLICKHOUSE_NATIVE",
+        default_value = "127.0.0.1:19000"
+    )]
+    clickhouse_native: String,
     /// Print the plan instead of running it
     #[arg(long)]
     explain: bool,
@@ -44,24 +51,40 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    let (query, explain) = (cli.query.clone(), cli.explain);
     let engine = Engine::connect(Config {
         clickhouse_url: cli.clickhouse_url,
         user: cli.user,
         password: cli.password,
         database: cli.database,
         kafka_brokers: cli.kafka,
+        clickhouse_native: cli.clickhouse_native,
     });
 
-    if cli.explain {
-        println!("{}", engine.explain(&cli.query).await?);
+    let result = run(&engine, &query, explain).await;
+    // with chDB open (aggregates), the process must close it before exiting
+    chlive_engine::chdb::shutdown();
+    result
+}
+
+async fn run(engine: &Engine, query: &str, explain: bool) -> Result<()> {
+    if explain {
+        println!("{}", engine.explain(query).await?);
         return Ok(());
     }
-    let mut subscription = engine.subscribe(&cli.query).await?;
-    while let Some(iteration) = subscription.next().await {
-        let iteration = iteration?;
-        if !iteration.diffs.is_empty() {
-            println!("{iteration}");
+    let mut subscription = engine.subscribe(query).await?;
+    loop {
+        tokio::select! {
+            next = subscription.next() => match next {
+                Some(iteration) => {
+                    let iteration = iteration?;
+                    if !iteration.diffs.is_empty() {
+                        println!("{iteration}");
+                    }
+                }
+                None => return Ok(()),
+            },
+            _ = tokio::signal::ctrl_c() => return Ok(()),
         }
     }
-    Ok(())
 }

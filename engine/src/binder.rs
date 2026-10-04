@@ -4,7 +4,9 @@
 
 use std::fmt;
 
-use crate::ast::{CmpOp, Direction, Expr, Literal, NullsOrder, Order, Projection, Query};
+use crate::ast::{
+    CallArg, CmpOp, Direction, Expr, Literal, NullsOrder, Order, Projection, Query, SelectExpr,
+};
 use crate::error::{render_at, Span};
 use crate::history::{HistoryError, HistorySource};
 use crate::rules::{KafkaColumns, NamingRules, TopicId};
@@ -64,6 +66,59 @@ pub struct BoundQuery {
     pub order: Vec<OrderKey>,
     /// LIMIT: at most this many rows.
     pub limit: Option<u64>,
+    /// With GROUP BY or aggregate functions: the groups and what to compute per group. Then
+    /// `projection` is empty and the output is `aggregation.items`.
+    pub aggregation: Option<Aggregation>,
+}
+
+/// GROUP BY and aggregate functions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Aggregation {
+    /// The grouping columns (none: one global group).
+    pub keys: Vec<ColumnId>,
+    /// The output columns, in SELECT order.
+    pub items: Vec<AggItem>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggItem {
+    /// Output name: the alias, or ClickHouse's default (`count()`, `avg(latency_ms)`).
+    pub name: String,
+    /// Its type, as ClickHouse gives it.
+    pub ty: Type,
+    pub expr: AggExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggExpr {
+    /// A grouping column.
+    Key(ColumnId),
+    /// `func(arg)`; `count()` has no argument.
+    Call {
+        func: AggFunc,
+        arg: Option<ColumnId>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggFunc {
+    pub fn name(self) -> &'static str {
+        match self {
+            AggFunc::Count => "count",
+            AggFunc::Sum => "sum",
+            AggFunc::Avg => "avg",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+        }
+    }
 }
 
 /// One ORDER BY key, with ClickHouse's defaults resolved: ascending, NULLS LAST.
@@ -173,6 +228,32 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
         Some(expr) => Some(bind_where(expr, &table)?),
         None => None,
     };
+    if let Some(aggregation) = bind_aggregation(query, &table)? {
+        if let Some(order) = &query.order {
+            let span = match order {
+                Order::All { span, .. } => *span,
+                Order::Items(items) => items[0].column.span,
+            };
+            return Err(BindError::at(
+                "ORDER BY with GROUP BY or aggregates is not supported yet",
+                span,
+            ));
+        }
+        if let Some(limit) = &query.limit {
+            return Err(BindError::at(
+                "LIMIT with GROUP BY or aggregates is not supported yet",
+                limit.span,
+            ));
+        }
+        return Ok(BoundQuery {
+            table,
+            filter,
+            projection: Vec::new(),
+            order: Vec::new(),
+            limit: None,
+            aggregation: Some(aggregation),
+        });
+    }
     let projection = bind_select(query, &table)?;
     let order = match &query.order {
         Some(order) => bind_order(order, &table, &projection)?,
@@ -184,7 +265,201 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
         projection,
         order,
         limit: query.limit.map(|l| l.value),
+        aggregation: None,
     })
+}
+
+/// GROUP BY and aggregate functions, if the query has either. Selected columns must be grouping
+/// columns; aggregates take one column (`count` also none, or `*`).
+fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregation>, BindError> {
+    let has_calls = matches!(&query.projection, Projection::Items(items)
+        if items.iter().any(|i| matches!(i.expr, SelectExpr::Call { .. })));
+    let Some((group_refs, group_span)) = query
+        .group_by
+        .as_ref()
+        .map(|(k, s)| (k.as_slice(), Some(*s)))
+        .or(has_calls.then_some((&[][..], None)))
+    else {
+        if let Projection::Items(items) = &query.projection {
+            if items.iter().any(|i| i.alias.is_some()) {
+                return Err(BindError::at(
+                    "aliases are only supported with aggregates yet",
+                    query.from.span,
+                ));
+            }
+        }
+        return Ok(None);
+    };
+    let mut keys = Vec::new();
+    for k in group_refs {
+        let id = resolve_column(table, &k.name, k.span)?;
+        if table.column(id).ty.kind == Kind::Other {
+            return Err(BindError::at(
+                format!(
+                    "grouping by column {} of type {} is not supported",
+                    k.name,
+                    table.column(id).ty
+                ),
+                k.span,
+            ));
+        }
+        if !keys.contains(&id) {
+            keys.push(id);
+        }
+    }
+    let items: Vec<(SelectExpr, Option<String>)> = match &query.projection {
+        Projection::Wildcard => {
+            return Err(BindError::at(
+                "SELECT * can't be used with GROUP BY; list the columns and aggregates",
+                group_span.unwrap_or(query.from.span),
+            ))
+        }
+        Projection::Columns(cols) => cols
+            .iter()
+            .map(|c| (SelectExpr::Column(c.clone()), None))
+            .collect(),
+        Projection::Items(items) => items
+            .iter()
+            .map(|i| (i.expr.clone(), i.alias.clone()))
+            .collect(),
+    };
+    let mut out: Vec<AggItem> = Vec::new();
+    for (expr, alias) in items {
+        let (default_name, ty, expr, span) = match expr {
+            SelectExpr::Column(c) => {
+                let id = resolve_column(table, &c.name, c.span)?;
+                if !keys.contains(&id) {
+                    return Err(BindError::at(
+                        format!(
+                            "column {} must be in GROUP BY or inside an aggregate function",
+                            c.name
+                        ),
+                        c.span,
+                    ));
+                }
+                let col = table.column(id);
+                (col.name.clone(), col.ty.clone(), AggExpr::Key(id), c.span)
+            }
+            SelectExpr::Call { name, arg, span } => {
+                let func = match name.to_ascii_lowercase().as_str() {
+                    "count" => AggFunc::Count,
+                    "sum" => AggFunc::Sum,
+                    "avg" => AggFunc::Avg,
+                    "min" => AggFunc::Min,
+                    "max" => AggFunc::Max,
+                    _ => {
+                        return Err(BindError::at(
+                            format!(
+                                "unknown function {name} (supported: count, sum, avg, min, max)"
+                            ),
+                            span,
+                        ))
+                    }
+                };
+                let arg = match (func, arg) {
+                    (AggFunc::Count, CallArg::None | CallArg::Star) => None,
+                    (_, CallArg::Column(c)) => Some((resolve_column(table, &c.name, c.span)?, c)),
+                    (f, _) => {
+                        return Err(BindError::at(
+                            format!("{}() needs a column", f.name()),
+                            span,
+                        ))
+                    }
+                };
+                let ty = result_type(func, arg.as_ref().map(|(id, c)| (table.column(*id), c)))?;
+                let default_name = match &arg {
+                    None => format!("{}()", func.name()),
+                    Some((id, _)) => format!("{}({})", func.name(), table.column(*id).name),
+                };
+                (
+                    default_name,
+                    ty,
+                    AggExpr::Call {
+                        func,
+                        arg: arg.map(|(id, _)| id),
+                    },
+                    span,
+                )
+            }
+        };
+        let name = alias.unwrap_or(default_name);
+        if out.iter().any(|o| o.name == name) {
+            return Err(BindError::at(
+                format!("duplicate output column {name}; name it with AS"),
+                span,
+            ));
+        }
+        out.push(AggItem { name, ty, expr });
+    }
+    Ok(Some(Aggregation { keys, items: out }))
+}
+
+/// An aggregate's result type, as ClickHouse gives it: `count` UInt64; `sum` the widest integer
+/// or Float64 of the argument's kind; `avg` Float64; `min`/`max` the argument's type (without
+/// LowCardinality); NULL-able when the argument is.
+fn result_type(
+    func: AggFunc,
+    arg: Option<(&BoundColumn, &crate::ast::ColumnRef)>,
+) -> Result<Type, BindError> {
+    let Some((col, c)) = arg else {
+        return Ok(Type::parse("UInt64"));
+    };
+    let nullable = |t: &str| {
+        if col.ty.nullable {
+            format!("Nullable({t})")
+        } else {
+            t.to_string()
+        }
+    };
+    let numeric = matches!(col.ty.kind, Kind::Int { .. } | Kind::Float);
+    let base = match func {
+        AggFunc::Count => return Ok(Type::parse("UInt64")),
+        AggFunc::Sum | AggFunc::Avg if !numeric => {
+            return Err(BindError::at(
+                format!(
+                    "{}() needs a number; column {} is {}",
+                    func.name(),
+                    col.name,
+                    col.ty
+                ),
+                c.span,
+            ))
+        }
+        AggFunc::Sum => match col.ty.kind {
+            Kind::Int { signed: true, .. } => "Int64".to_string(),
+            Kind::Int { signed: false, .. } => "UInt64".to_string(),
+            _ => "Float64".to_string(),
+        },
+        AggFunc::Avg => "Float64".to_string(),
+        AggFunc::Min | AggFunc::Max => {
+            if col.ty.kind == Kind::Other {
+                return Err(BindError::at(
+                    format!(
+                        "{}() of column {} of type {} is not supported",
+                        func.name(),
+                        col.name,
+                        col.ty
+                    ),
+                    c.span,
+                ));
+            }
+            // the bare type: no LowCardinality, no Nullable (re-added below)
+            let mut t = col.ty.clickhouse.as_str();
+            for wrapper in ["LowCardinality(", "Nullable("] {
+                if let Some(inner) = t.strip_prefix(wrapper).and_then(|s| s.strip_suffix(')')) {
+                    t = inner;
+                }
+            }
+            if let Some(inner) = t
+                .strip_prefix("Nullable(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                t = inner;
+            }
+            t.to_string()
+        }
+    };
+    Ok(Type::parse(&nullable(&base)))
 }
 
 /// ORDER BY: columns of the table, selected or not; `ALL` is the SELECT list, in SELECT order
@@ -591,6 +866,7 @@ fn coerce(lit: &Literal, span: Span, ty: &Type) -> Result<Value, BindError> {
 fn bind_select(query: &Query, table: &BoundTable) -> Result<Vec<ColumnId>, BindError> {
     match &query.projection {
         Projection::Wildcard => Ok(table.columns.iter().map(|c| c.id).collect()),
+        Projection::Items(_) => unreachable!("lists with functions or aliases are aggregations"),
         Projection::Columns(refs) => {
             let mut ids: Vec<ColumnId> = Vec::with_capacity(refs.len());
             for r in refs {
@@ -866,6 +1142,104 @@ mod tests {
                 .await
                 .unwrap_err(),
             "ordering by column tags of type Array(String) is not supported at 1:31"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregation() {
+        let b = bind_sql("select user_id, count() as n, avg(latency_ms), sum(latency_ms), min(ts), max(coupon), count(coupon) from events group by user_id")
+            .await
+            .unwrap();
+        let a = b.aggregation.unwrap();
+        assert_eq!(a.keys, [ColumnId(1)]);
+        let names: Vec<(&str, &str)> = a
+            .items
+            .iter()
+            .map(|i| (i.name.as_str(), i.ty.clickhouse.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("user_id", "String"),
+                ("n", "UInt64"),
+                ("avg(latency_ms)", "Float64"),
+                ("sum(latency_ms)", "UInt64"),
+                ("min(ts)", "DateTime64(3)"),
+                ("max(coupon)", "Nullable(String)"),
+                ("count(coupon)", "UInt64"),
+            ]
+        );
+        assert!(b.projection.is_empty());
+        // a global aggregate; a key that isn't selected
+        let a = bind_sql("select count() from events")
+            .await
+            .unwrap()
+            .aggregation
+            .unwrap();
+        assert!(a.keys.is_empty());
+        let a = bind_sql("select count() from events group by user_id")
+            .await
+            .unwrap()
+            .aggregation
+            .unwrap();
+        assert_eq!(a.keys, [ColumnId(1)]);
+        assert!(bind_sql("select ts from events")
+            .await
+            .unwrap()
+            .aggregation
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn aggregation_errors() {
+        let e = |sql: &'static str| async move { bind_sql(sql).await.unwrap_err() };
+        assert_eq!(
+            e("select ts, count() from events group by user_id").await,
+            "column ts must be in GROUP BY or inside an aggregate function at 1:8"
+        );
+        assert_eq!(
+            e("select ts, count() from events").await,
+            "column ts must be in GROUP BY or inside an aggregate function at 1:8"
+        );
+        assert_eq!(
+            e("select * from events group by ts").await,
+            "SELECT * can't be used with GROUP BY; list the columns and aggregates at 1:22"
+        );
+        assert_eq!(
+            e("select median(ts) from events").await,
+            "unknown function median (supported: count, sum, avg, min, max) at 1:8"
+        );
+        assert_eq!(
+            e("select sum(user_id) from events").await,
+            "sum() needs a number; column user_id is String at 1:12"
+        );
+        assert_eq!(
+            e("select avg() from events").await,
+            "avg() needs a column at 1:8"
+        );
+        assert_eq!(
+            e("select max(tags) from events").await,
+            "max() of column tags of type Array(String) is not supported at 1:12"
+        );
+        assert_eq!(
+            e("select count(), count() from events").await,
+            "duplicate output column count(); name it with AS at 1:17"
+        );
+        assert_eq!(
+            e("select count() from events order by ts").await,
+            "ORDER BY with GROUP BY or aggregates is not supported yet at 1:37"
+        );
+        assert_eq!(
+            e("select count() from events limit 5").await,
+            "LIMIT with GROUP BY or aggregates is not supported yet at 1:34"
+        );
+        assert_eq!(
+            e("select ts as t from events").await,
+            "aliases are only supported with aggregates yet at 1:21"
+        );
+        assert_eq!(
+            e("select count() from events group by tags").await,
+            "grouping by column tags of type Array(String) is not supported at 1:37"
         );
     }
 }

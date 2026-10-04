@@ -3,21 +3,25 @@
 //! A subscription yields the history from ClickHouse first, then one [`Iteration`] per event of
 //! the topics the query needs, each carrying the diffs it produced.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::stream::{self, BoxStream, Stream, StreamExt};
+use serde_json::Value;
 
 use crate::binder::{bind, BindError, Catalog};
+use crate::chdb::{Chdb, ChdbError};
 use crate::cursor;
 use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
 use crate::order::{OrderedState, SortKey, WindowState};
 use crate::parser::parse;
-use crate::plan::{plan, Plan, StreamPlan};
+use crate::plan::{plan, AggregatePlan, Plan, StreamPlan};
 use crate::rules::{HardcodedRules, NamingRules, TopicId};
 use crate::source::{Event, EventSource, KafkaSource, SourceError, TopicStart};
 use crate::watermark::Watermark;
@@ -34,6 +38,9 @@ pub enum EngineError {
     History(#[from] HistoryError),
     #[error(transparent)]
     Source(#[from] SourceError),
+    /// Aggregating (chDB) failed.
+    #[error(transparent)]
+    Aggregate(#[from] ChdbError),
 }
 
 /// Everything [`Engine::connect`] needs for the standard setup: ClickHouse over HTTP, Kafka,
@@ -47,6 +54,8 @@ pub struct Config {
     pub database: String,
     /// Kafka bootstrap servers, e.g. `127.0.0.1:9092`.
     pub kafka_brokers: String,
+    /// ClickHouse's native protocol address, for chDB's `remote()` (aggregates).
+    pub clickhouse_native: String,
 }
 
 impl Default for Config {
@@ -57,6 +66,7 @@ impl Default for Config {
             password: String::new(),
             database: "default".into(),
             kafka_brokers: "127.0.0.1:9092".into(),
+            clickhouse_native: "127.0.0.1:19000".into(),
         }
     }
 }
@@ -65,6 +75,15 @@ pub struct Engine {
     rules: Arc<dyn NamingRules>,
     history: Arc<dyn HistorySource>,
     source: Arc<dyn EventSource>,
+    native: Native,
+    max_batch: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Native {
+    address: String,
+    user: String,
+    password: String,
 }
 
 impl Engine {
@@ -77,6 +96,25 @@ impl Engine {
             ClickHouseHttp::new(&config.clickhouse_url, &config.user, &config.password),
             KafkaSource::new(&config.kafka_brokers),
         )
+        .with_clickhouse_native(&config.clickhouse_native, &config.user, &config.password)
+    }
+
+    /// Where chDB reads aggregate states from main ClickHouse (`remote()`, native protocol);
+    /// default `127.0.0.1:19000` as `default` without a password.
+    pub fn with_clickhouse_native(mut self, address: &str, user: &str, password: &str) -> Self {
+        self.native = Native {
+            address: address.into(),
+            user: user.into(),
+            password: password.into(),
+        };
+        self
+    }
+
+    /// At most this many events are aggregated together (default 1000). Events that arrive
+    /// together are batched up to it; 1 means one chDB round trip per event.
+    pub fn with_max_batch(mut self, n: usize) -> Self {
+        self.max_batch = n.max(1);
+        self
     }
 
     /// Any naming rules, history and event source, e.g. fakes in tests.
@@ -89,6 +127,12 @@ impl Engine {
             rules: Arc::new(rules),
             history: Arc::new(history),
             source: Arc::new(source),
+            native: Native {
+                address: "127.0.0.1:19000".into(),
+                user: "default".into(),
+                password: String::new(),
+            },
+            max_batch: 1000,
         }
     }
 
@@ -144,6 +188,10 @@ impl Engine {
             &kafka.offset,
         )
         .await?;
+        if let Some(aggregate) = plan.aggregate.clone() {
+            // aggregates always start from history (no resume yet)
+            return self.subscribe_aggregate(plan, aggregate, watermark).await;
+        }
         // With ORDER BY or LIMIT the server rebuilds the client's state, which needs every row
         // the client holds; without, there's nothing to rebuild.
         let stateful = plan.stream.order.is_some() || plan.stream.limit.is_some();
@@ -231,6 +279,80 @@ impl Engine {
             watermark,
             history_sql,
             resumed: resume_from.is_some(),
+            iterations,
+        })
+    }
+
+    /// GROUP BY / aggregates: chDB keeps each group's aggregate states in a table of its own
+    /// (dropped with the subscription). History: main ClickHouse computes the states up to the
+    /// watermark (`remote()`). Then, per batch of events: their states are added, and the groups
+    /// they touched are read back finalized (`-Merge`) and compared with what was sent.
+    async fn subscribe_aggregate(
+        &self,
+        plan: Plan,
+        aggregate: AggregatePlan,
+        watermark: Watermark,
+    ) -> Result<Subscription, EngineError> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let chdb = Chdb::shared()?;
+        let table = format!(
+            "chlive_agg_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+        );
+        let remote = aggregate.remote(
+            &self.native.address,
+            &self.native.user,
+            &self.native.password,
+        );
+        let bound =
+            watermark.history_predicate(&aggregate.kafka.partition, &aggregate.kafka.offset);
+        let create = aggregate.create_sql(&table, &remote, &bound);
+        let mut starts = Vec::new();
+        for topic in &plan.stream.topics {
+            let partitions = self
+                .source
+                .partitions(topic)
+                .await?
+                .ok_or_else(|| SourceError(format!("topic {topic} disappeared")))?;
+            starts.push(TopicStart {
+                topic: topic.clone(),
+                partitions: partitions
+                    .into_iter()
+                    .map(|p| (p, watermark.start(p)))
+                    .collect(),
+            });
+        }
+        tracing::info!(table, create = %create.replace(&self.native.password, "***"), "subscribed (aggregate)");
+        let events = self
+            .source
+            .subscribe(&starts, &plan.stream.required_keys())
+            .await?;
+        let run = AggregateRun {
+            table: Arc::new(ChdbTable {
+                chdb: chdb.clone(),
+                name: table,
+            }),
+            chdb,
+            create: Some(create.clone()),
+            aggregate,
+            stream: plan.stream.clone(),
+            events: events.ready_chunks(self.max_batch).boxed(),
+            sent: HashMap::new(),
+            at: watermark.clone(),
+            batches: 0,
+            failed: false,
+        };
+        let iterations = stream::unfold(run, |mut run| async move {
+            let next = run.step().await?;
+            Some((next, run))
+        })
+        .boxed();
+        Ok(Subscription {
+            plan,
+            watermark,
+            history_sql: create,
+            resumed: false,
             iterations,
         })
     }
@@ -389,6 +511,175 @@ async fn read_ahead(
     Ok((own, held))
 }
 
+/// A chDB table that goes away with its subscription.
+struct ChdbTable {
+    chdb: Chdb,
+    name: String,
+}
+
+impl Drop for ChdbTable {
+    fn drop(&mut self) {
+        let (chdb, sql) = (
+            self.chdb.clone(),
+            format!("DROP TABLE IF EXISTS {}", self.name),
+        );
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                if let Err(e) = chdb.exec(sql).await {
+                    tracing::warn!(error = %e, "dropping an aggregate table");
+                }
+            });
+        }
+    }
+}
+
+/// A running aggregate subscription (see [`Engine::subscribe_aggregate`]).
+struct AggregateRun {
+    chdb: Chdb,
+    table: Arc<ChdbTable>,
+    /// The history's `CREATE TABLE … AS SELECT … FROM remote(…)`, until it has run.
+    create: Option<String>,
+    aggregate: AggregatePlan,
+    stream: StreamPlan,
+    events: BoxStream<'static, Vec<Event>>,
+    /// Every group's row as last sent, by id.
+    sent: HashMap<String, Row>,
+    at: Watermark,
+    batches: u64,
+    failed: bool,
+}
+
+/// Merged state rows pile up in the chDB table until merged; force that every this many batches.
+const OPTIMIZE_EVERY: u64 = 1000;
+
+impl AggregateRun {
+    async fn step(&mut self) -> Option<Result<Iteration, EngineError>> {
+        if self.failed {
+            return None;
+        }
+        let result = match self.create.take() {
+            Some(create) => self.history(create).await,
+            None => {
+                let batch = self.events.next().await?;
+                self.batch(batch).await
+            }
+        };
+        self.failed = result.is_err();
+        Some(result)
+    }
+
+    async fn history(&mut self, create: String) -> Result<Iteration, EngineError> {
+        self.chdb.exec(create).await?;
+        let rows = self
+            .chdb
+            .rows(self.aggregate.snapshot_sql(&self.table.name))
+            .await?;
+        Ok(Iteration {
+            origin: Origin::History,
+            diffs: self.diffs(rows),
+            at: self.at.clone(),
+        })
+    }
+
+    async fn batch(&mut self, events: Vec<Event>) -> Result<Iteration, EngineError> {
+        let last = events.last().expect("a non-empty batch");
+        let origin = Origin::Event {
+            topic: last.topic.clone(),
+            partition: last.partition,
+            offset: last.offset,
+        };
+        let mut lines = String::new();
+        for event in &events {
+            let position = self.at.0.entry(event.partition).or_insert(event.offset);
+            *position = (*position).max(event.offset);
+            match self.stream.decode(&event.value) {
+                Ok(row) if self.stream.matches(&row) => {
+                    let mut object: Row = self
+                        .aggregate
+                        .batch_columns
+                        .iter()
+                        .map(|(id, name)| (name.clone(), row[id.0].to_json()))
+                        .collect();
+                    if object.is_empty() {
+                        object.insert(crate::plan::PLACEHOLDER.into(), Value::from(1));
+                    }
+                    lines.push_str(&Value::Object(object).to_string());
+                    lines.push('\n');
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    topic = %event.topic,
+                    partition = event.partition,
+                    offset = event.offset,
+                    error = %e,
+                    "skipping event"
+                ),
+            }
+        }
+        if lines.is_empty() {
+            return Ok(Iteration {
+                origin,
+                diffs: Vec::new(),
+                at: self.at.clone(),
+            });
+        }
+        let table = &self.table.name;
+        self.chdb
+            .exec(self.aggregate.insert_sql(table, &lines))
+            .await?;
+        let rows = self
+            .chdb
+            .rows(self.aggregate.touched_sql(table, &lines))
+            .await?;
+        self.batches += 1;
+        if self.batches.is_multiple_of(OPTIMIZE_EVERY) {
+            self.chdb
+                .exec(format!("OPTIMIZE TABLE {table} FINAL"))
+                .await?;
+        }
+        Ok(Iteration {
+            origin,
+            diffs: self.diffs(rows),
+            at: self.at.clone(),
+        })
+    }
+
+    /// Finalized group rows (with their keys as `__k0…`) into inserts for new groups and
+    /// updates of the columns that changed.
+    fn diffs(&mut self, rows: Vec<Row>) -> Vec<Diff> {
+        let mut diffs = Vec::new();
+        for mut row in rows {
+            let key: Vec<Value> = (0..self.aggregate.keys)
+                .map(|i| row.shift_remove(&format!("__k{i}")).unwrap_or(Value::Null))
+                .collect();
+            let id = Value::Array(key).to_string();
+            match self.sent.get_mut(&id) {
+                None => {
+                    self.sent.insert(id.clone(), row.clone());
+                    diffs.push(Diff::Insert {
+                        row,
+                        index: None,
+                        id: Some(id),
+                    });
+                }
+                Some(old) => {
+                    let set: Row = row
+                        .into_iter()
+                        .filter(|(k, v)| old.get(k) != Some(v))
+                        .collect();
+                    if !set.is_empty() {
+                        for (k, v) in &set {
+                            old.insert(k.clone(), v.clone());
+                        }
+                        diffs.push(Diff::Update { id, set });
+                    }
+                }
+            }
+        }
+        diffs
+    }
+}
+
 /// What a subscription fetches first.
 enum First {
     /// The whole result up to the watermark.
@@ -446,6 +737,7 @@ impl ResultState {
                     let mut diffs = vec![Diff::Insert {
                         row,
                         index: Some(p.index),
+                        id: None,
                     }];
                     if let Some(index) = p.evicts {
                         diffs.push(Diff::Delete { index });

@@ -239,14 +239,24 @@ async fn run(
     *entry.watermark.lock().unwrap() = Some(subscription.watermark.describe());
     entry.resumed.store(subscription.resumed, Ordering::Relaxed);
     let plan = subscription.plan.clone();
-    let columns: Vec<Column> = plan
-        .columns
-        .iter()
-        .map(|c| Column {
-            name: c.name.clone(),
-            ty: c.ty.clickhouse.clone(),
-        })
-        .collect();
+    let columns: Vec<Column> = match &plan.aggregate {
+        Some(a) => a
+            .columns
+            .iter()
+            .map(|(name, ty)| Column {
+                name: name.clone(),
+                ty: ty.clickhouse.clone(),
+            })
+            .collect(),
+        None => plan
+            .columns
+            .iter()
+            .map(|c| Column {
+                name: c.name.clone(),
+                ty: c.ty.clickhouse.clone(),
+            })
+            .collect(),
+    };
     let order = plan.stream.order.as_ref().map(OrderTerm::of);
     let limit = plan.stream.limit;
     let mut columns = Some(columns);
@@ -275,6 +285,14 @@ async fn run(
         for iteration in batch {
             match iteration {
                 Ok(it) if it.origin == Origin::History => {
+                    let ids: Vec<String> = it
+                        .diffs
+                        .iter()
+                        .filter_map(|d| match d {
+                            chlive_engine::diff::Diff::Insert { id, .. } => id.clone(),
+                            _ => None,
+                        })
+                        .collect();
                     out.push(ServerMsg::Snapshot {
                         id: id.clone(),
                         columns: columns.take().unwrap_or_default(),
@@ -284,12 +302,13 @@ async fn run(
                             .into_iter()
                             .filter_map(|d| match d {
                                 chlive_engine::diff::Diff::Insert { row, .. } => Some(row),
-                                chlive_engine::diff::Diff::Delete { .. } => None,
+                                _ => None,
                             })
                             .collect(),
                         order: order.clone(),
                         limit,
                         at: cursor::encode(&plan, &it.at),
+                        ids: plan.aggregate.is_some().then_some(ids),
                     });
                     sent_at = Some(it.at);
                 }

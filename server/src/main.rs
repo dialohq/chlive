@@ -32,6 +32,13 @@ struct Cli {
     /// Kafka bootstrap servers (default: the dev shell's Redpanda)
     #[arg(long, env = "CHLIVE_KAFKA", default_value = "127.0.0.1:9092")]
     kafka: String,
+    /// ClickHouse's native protocol address, for aggregates (chDB reads states with remote())
+    #[arg(
+        long,
+        env = "CHLIVE_CLICKHOUSE_NATIVE",
+        default_value = "127.0.0.1:19000"
+    )]
+    clickhouse_native: String,
 }
 
 #[tokio::main]
@@ -49,6 +56,7 @@ async fn main() -> Result<()> {
         password: cli.password,
         database: cli.database,
         kafka_brokers: cli.kafka,
+        clickhouse_native: cli.clickhouse_native,
     });
     let server = chlive_server::start(&cli.listen, engine).await?;
     info!(addr = %server.addr, "listening (WebSocket at /live)");
@@ -56,5 +64,7 @@ async fn main() -> Result<()> {
         r = async { server.wait().await } => r?,
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
     }
+    // with chDB open (aggregates), the process must close it before exiting
+    chlive_engine::chdb::shutdown();
     Ok(())
 }

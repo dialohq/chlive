@@ -28,8 +28,8 @@ test("unknown ops throw and leave the rows untouched", () => {
   const s = new ResultStore<{ n: number }>();
   s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }] });
   assert.throws(
-    () => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 2 } }, { op: "update" } as any] }),
-    /unsupported change "update"/,
+    () => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 2 } }, { op: "move" } as any] }),
+    /unsupported change "move"/,
   );
   assert.deepEqual(s.rows().map((r) => r.n), [1]);
 });
@@ -75,4 +75,39 @@ test("LIMIT: a diff's inserts and deletes apply together", () => {
   assert.deepEqual(s.rows().map((r) => r.n), [9, 2]);
   assert.throws(() => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "delete", index: 2 }] }), /delete at index 2/);
   assert.deepEqual(s.rows().map((r) => r.n), [9, 2]);
+});
+
+test("aggregated results: rows by id, updated in place", () => {
+  const s = new ResultStore<{ country: string; n: number; avg?: number }>();
+  s.applySnapshot({
+    type: "snapshot",
+    id: "a",
+    columns,
+    rows: [{ country: "PL", n: 1, avg: 10 }, { country: "DE", n: 2, avg: 5 }],
+    ids: ['["PL"]', '["DE"]'],
+    at: "c1",
+  });
+  const before = s.rows();
+  s.applyDiff({
+    type: "diff",
+    id: "a",
+    at: "c2",
+    changes: [
+      { op: "update", id: '["DE"]', set: { n: 3, avg: 6 } },
+      { op: "insert", row: { country: "FR", n: 1, avg: 2 }, id: '["FR"]' },
+      { op: "update", id: '["FR"]', set: { n: 2 } }, // a group inserted in this same diff
+    ],
+  });
+  assert.deepEqual(s.rows(), [
+    { country: "PL", n: 1, avg: 10 },
+    { country: "DE", n: 3, avg: 6 },
+    { country: "FR", n: 2, avg: 2 },
+  ]);
+  assert.deepEqual(before[1], { country: "DE", n: 2, avg: 5 }, "earlier rows are not mutated");
+  assert.deepEqual(s.ids(), ['["PL"]', '["DE"]', '["FR"]']);
+  assert.throws(
+    () => s.applyDiff({ type: "diff", id: "a", at: "c3", changes: [{ op: "update", id: '["XX"]', set: { n: 1 } }] }),
+    /update of unknown row \["XX"\]/,
+  );
+  assert.equal(s.rows()[2].n, 2);
 });

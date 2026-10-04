@@ -47,6 +47,9 @@
           };
 
           clickhouse = pkgs.callPackage ./nix/packages/clickhouse.nix { };
+          # chDB (ClickHouse as a library), embedded in the engine to merge aggregate states;
+          # built from the same ClickHouse version as ./clickhouse.nix.
+          libchdb = pkgs.callPackage ./nix/packages/libchdb.nix { };
           redpanda = pkgs.callPackage ./nix/packages/redpanda.nix {
             inherit dnvrState;
             name = "chlive-redpanda";
@@ -110,6 +113,10 @@
             rustfmt
             rust-analyzer
 
+            # chdb-rust links libchdb; its bindgen needs libclang
+            libchdb
+            llvmPackages.libclang
+
             # native deps for the rdkafka crate (dynamic-linking feature)
             pkg-config
             rdkafka
@@ -126,13 +133,18 @@
           ];
           toolchainEnv = {
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            # chdb-rust links against these instead of downloading an engine at build time;
+            # build.rs files embed CHDB_LIB_DIR as an rpath.
+            CHDB_LIB_DIR = "${libchdb}/lib";
+            CHDB_INCLUDE_DIR = "${libchdb}/include";
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
 
         in
         {
           formatter = pkgs.nixfmt;
           packages = {
-            inherit clickhouse redpanda;
+            inherit clickhouse redpanda libchdb;
           };
 
           dnvr.shells.default =

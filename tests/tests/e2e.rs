@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chlive_e2e::*;
+use chlive_engine::history::HistorySource;
 
 /// Dialect queries over `events`, covering numbers, strings, IN, NOT and AND/OR.
 /// (id, query, its ORDER BY columns): numbers, strings, IN, NOT, AND/OR, and ORDER BY.
@@ -160,9 +161,9 @@ async fn rejections_over_websocket() -> Result<()> {
         ),
         (
             "group",
-            "select country from events group by country",
+            "select country, count() from events group by country having count() > 1",
             "SYNTAX_ERROR",
-            "GROUP is not supported yet",
+            "HAVING is not supported yet",
         ),
     ];
     for (id, sql, _, _) in &cases {
@@ -340,5 +341,76 @@ async fn resume_after_being_away() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// GROUP BY over the full stack (chDB in the server): after events arrive live, the result
+/// built from the snapshot plus inserts and updates equals ClickHouse's GROUP BY.
+#[tokio::test]
+async fn live_aggregates_match_direct_queries() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let server = start_server().await?;
+    let producer = producer()?;
+    const QUERIES: &[(&str, &str)] = &[
+        ("total", "select count() as n, sum(amount), avg(latency_ms) from events"),
+        ("by_country", "select country, count() as n, avg(latency_ms) as avg_latency, max(latency_ms) from events group by country"),
+        ("pl_paths", "select path, count(), min(ts), max(amount) from events where country = 'PL' group by path"),
+    ];
+    let conn = LiveConn::connect(&server).await?;
+    for (id, sql) in QUERIES {
+        conn.subscribe(id, sql);
+    }
+    conn.wait_ready(
+        &QUERIES.iter().map(|q| q.0).collect::<Vec<_>>(),
+        Duration::from_secs(60),
+    )
+    .await?;
+    let produced = producer.produce(2000, Some(2000.0)).await?;
+    settle(&conn, &produced).await?;
+    // floats to 9 significant digits: ClickHouse adds in parallel, in no particular order
+    let canon = |rows: &[Row]| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|(k, v)| match v.as_f64() {
+                        Some(f) if !v.is_i64() && !v.is_u64() => format!("{k}={f:.9e}"),
+                        _ => format!("{k}={v}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    for (id, sql) in QUERIES {
+        let live = conn.result(id).unwrap();
+        assert!(live.error.is_none(), "{id}: {:?}", live.error);
+        assert!(
+            live.protocol_violations.is_empty(),
+            "{id}: {:?}",
+            live.protocol_violations
+        );
+        assert!(live.updated > 0, "{id}: no updates");
+        let direct = clickhouse()
+            .fetch(&sql.replace("from events", "from default.events"))
+            .await?;
+        eprintln!(
+            "{id:>10}: {} groups, {} updates",
+            live.rows.len(),
+            live.updated
+        );
+        assert_eq!(canon(&live.rows), canon(&direct), "{id}");
+    }
+    drop(conn);
+    server.stop();
+    // the only test here using chDB: close it, or the test process crashes on exit
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    chlive_engine::chdb::shutdown();
     Ok(())
 }

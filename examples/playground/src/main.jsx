@@ -17,7 +17,11 @@ document.addEventListener("visibilitychange", () => document.hidden && client.fl
 
 // Queries in the chlive dialect:
 // SELECT * | columns FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
+// SELECT keys, count() | count(c) | sum(c) | avg(c) | min(c) | max(c) [AS name], … FROM table [WHERE …] [GROUP BY keys]
 const QUERY_PRESETS = [
+  "select country, count() as n, avg(latency_ms) as avg_latency from events group by country",
+  "select count() as events, sum(amount) as revenue, max(latency_ms) from events",
+  "select path, min(latency_ms), max(latency_ms), sum(amount) from events where country = 'PL' group by path",
   "select ts, user_id, country, path, latency_ms from events where latency_ms > 500",
   "select ts, user_id, country, latency_ms from events order by latency_ms desc",
   "select ts, user_id, country, path from events where country in ('PL', 'DE') order by country, ts desc",
@@ -309,7 +313,17 @@ function summarize(msg) {
   if (msg.type === "progress") return "progress: cursor moved (no matching events)";
   if (msg.type !== "diff") return msg.type;
   const ops = msg.changes.map((c) =>
-    c.op === "insert" ? (c.index === undefined ? "+" : `+@${c.index}`) : c.op === "delete" ? `-@${c.index}` : c.op,
+    c.op === "insert"
+      ? c.index !== undefined
+        ? `+@${c.index}`
+        : c.id !== undefined
+          ? `+${c.id}`
+          : "+"
+      : c.op === "delete"
+        ? `-@${c.index}`
+        : c.op === "update"
+          ? `~${c.id}`
+          : c.op,
   );
   const shown = ops.length > 12 ? [...ops.slice(0, 12), `… ${ops.length - 12} more`] : ops;
   return `diff: ${msg.changes.length} change${msg.changes.length === 1 ? "" : "s"} · ${shown.join(" ")}`;

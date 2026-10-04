@@ -17,8 +17,8 @@
 //! literal    := number | '-' number | string | TRUE | FALSE | NULL
 //! ```
 
+use crate::ast::{CallArg, Direction, Limit, NullsOrder, Order, OrderItem, SelectExpr, SelectItem};
 use crate::ast::{CmpOp, ColumnRef, Expr, Literal, Projection, Query, TableRef};
-use crate::ast::{Direction, Limit, NullsOrder, Order, OrderItem};
 use crate::error::SyntaxError;
 use crate::lexer::{tokenize, Token, TokenKind};
 
@@ -75,6 +75,18 @@ impl Parser {
         } else {
             None
         };
+        let group_by = if self.peek().kind == TokenKind::Keyword("GROUP") {
+            let span = self.next().span;
+            self.keyword("BY")?;
+            let mut keys = vec![self.group_key()?];
+            while self.peek().kind == TokenKind::Comma {
+                self.next();
+                keys.push(self.group_key()?);
+            }
+            Some((keys, span))
+        } else {
+            None
+        };
         let order = if self.peek().kind == TokenKind::Keyword("ORDER") {
             self.next();
             self.keyword("BY")?;
@@ -93,9 +105,105 @@ impl Parser {
             projection,
             from,
             selection,
+            group_by,
             order,
             limit,
         })
+    }
+
+    fn group_key(&mut self) -> Result<ColumnRef, SyntaxError> {
+        let t = self.peek().clone();
+        match &t.kind {
+            TokenKind::Number(_) => Err(SyntaxError::new(
+                "grouping by position is not supported yet; name the column",
+                t.span,
+            )),
+            TokenKind::Ident(w) if w.eq_ignore_ascii_case("ALL") => Err(SyntaxError::new(
+                "GROUP BY ALL is not supported yet; name the columns",
+                t.span,
+            )),
+            TokenKind::Ident(_) => {
+                let c = self.column()?;
+                match self.peek().kind {
+                    TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash => {
+                        Err(SyntaxError::new(
+                            "grouping by expressions is not supported yet; name a column",
+                            self.peek().span,
+                        ))
+                    }
+                    _ => Ok(c),
+                }
+            }
+            TokenKind::Eof | TokenKind::Semicolon => Err(self.expected("a column name")),
+            _ => Err(SyntaxError::new(
+                "grouping by expressions is not supported yet; name a column",
+                t.span,
+            )),
+        }
+    }
+
+    /// `column` or `name(arg)`, then an optional `AS alias`.
+    fn select_item(&mut self) -> Result<SelectItem, SyntaxError> {
+        let t = self.peek().clone();
+        let expr = match (&t.kind, &self.tokens.get(self.pos + 1).map(|t| &t.kind)) {
+            (TokenKind::Ident(name), Some(TokenKind::LParen)) => {
+                self.next();
+                self.next();
+                let arg = match self.peek().kind.clone() {
+                    TokenKind::RParen => CallArg::None,
+                    TokenKind::Star => {
+                        self.next();
+                        CallArg::Star
+                    }
+                    TokenKind::Ident(_) => {
+                        if self.tokens.get(self.pos + 1).map(|t| &t.kind)
+                            == Some(&TokenKind::LParen)
+                        {
+                            return Err(SyntaxError::new(
+                                "nested functions are not supported yet",
+                                self.peek().span,
+                            ));
+                        }
+                        CallArg::Column(self.column()?)
+                    }
+                    _ => {
+                        return Err(SyntaxError::new(
+                            "function arguments other than a column are not supported yet",
+                            self.peek().span,
+                        ))
+                    }
+                };
+                if self.peek().kind == TokenKind::Comma {
+                    return Err(SyntaxError::new(
+                        "functions with more than one argument are not supported yet",
+                        self.peek().span,
+                    ));
+                }
+                if self.peek().kind != TokenKind::RParen {
+                    return Err(self.expected("`)`"));
+                }
+                self.next();
+                SelectExpr::Call {
+                    name: name.clone(),
+                    arg,
+                    span: t.span,
+                }
+            }
+            _ => SelectExpr::Column(self.column()?),
+        };
+        let alias = if self.peek().kind == TokenKind::Keyword("AS") {
+            self.next();
+            match self.peek().kind.clone() {
+                TokenKind::Ident(a) => {
+                    self.next();
+                    Some(a)
+                }
+                _ => return Err(self.expected("an alias")),
+            }
+        } else {
+            None
+        };
+        Ok(SelectItem { expr, alias })
     }
 
     /// `LIMIT n`, a whole number; OFFSET, `LIMIT m, n`, WITH TIES and BY aren't supported yet.
@@ -425,7 +533,7 @@ impl Parser {
             }
             return Ok(Projection::Wildcard);
         }
-        let mut columns = vec![self.column()?];
+        let mut items = vec![self.select_item()?];
         while self.peek().kind == TokenKind::Comma {
             self.next();
             if self.peek().kind == TokenKind::Star {
@@ -434,9 +542,24 @@ impl Parser {
                     self.peek().span,
                 ));
             }
-            columns.push(self.column()?);
+            items.push(self.select_item()?);
         }
-        Ok(Projection::Columns(columns))
+        // a plain column list stays one (no functions, no aliases)
+        if items
+            .iter()
+            .all(|i| i.alias.is_none() && matches!(i.expr, SelectExpr::Column(_)))
+        {
+            return Ok(Projection::Columns(
+                items
+                    .into_iter()
+                    .map(|i| match i.expr {
+                        SelectExpr::Column(c) => c,
+                        SelectExpr::Call { .. } => unreachable!(),
+                    })
+                    .collect(),
+            ));
+        }
+        Ok(Projection::Items(items))
     }
 
     fn column(&mut self) -> Result<ColumnRef, SyntaxError> {
@@ -486,9 +609,10 @@ impl Parser {
         let t = self.peek().clone();
         match t.kind {
             TokenKind::Eof => Ok(()),
-            TokenKind::Keyword(kw @ ("GROUP" | "HAVING" | "JOIN" | "UNION")) => Err(
-                SyntaxError::new(format!("{kw} is not supported yet"), t.span),
-            ),
+            TokenKind::Keyword(kw @ ("HAVING" | "JOIN" | "UNION")) => Err(SyntaxError::new(
+                format!("{kw} is not supported yet"),
+                t.span,
+            )),
             TokenKind::Comma => Err(SyntaxError::new(
                 "selecting from multiple tables is not supported",
                 t.span,
@@ -532,7 +656,7 @@ mod tests {
             .projection
         {
             Projection::Columns(cols) => cols.into_iter().map(|c| c.name).collect(),
-            Projection::Wildcard => panic!("expected a column list"),
+            Projection::Wildcard | Projection::Items(_) => panic!("expected a column list"),
         }
     }
 
@@ -573,8 +697,8 @@ mod tests {
             "cannot mix * with column names at 1:12"
         );
         assert_eq!(
-            error("select count(ts) from events"),
-            "expressions are not supported yet; list column names at 1:8"
+            error("select count(lower(ts)) from events"),
+            "nested functions are not supported yet at 1:14"
         );
         assert_eq!(
             error("select e.ts from events"),
@@ -878,6 +1002,65 @@ mod tests {
         assert_eq!(
             error("select * from t limit 2 order by a"),
             "expected end of query, found ORDER at 1:25"
+        );
+    }
+
+    #[test]
+    fn group_by_and_calls() {
+        let q = parse("select country, count() as n, avg(latency_ms), count(*) from t where a = 1 group by country, path").unwrap();
+        let (keys, _) = q.group_by.unwrap();
+        assert_eq!(
+            keys.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(),
+            ["country", "path"]
+        );
+        let Projection::Items(items) = q.projection else {
+            panic!("items")
+        };
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[1].alias.as_deref(), Some("n"));
+        assert!(
+            matches!(&items[1].expr, SelectExpr::Call { name, arg: CallArg::None, .. } if name == "count")
+        );
+        assert!(
+            matches!(&items[2].expr, SelectExpr::Call { arg: CallArg::Column(c), .. } if c.name == "latency_ms")
+        );
+        assert!(matches!(
+            &items[3].expr,
+            SelectExpr::Call {
+                arg: CallArg::Star,
+                ..
+            }
+        ));
+        // a plain list stays a column list
+        assert!(matches!(
+            parse("select a, b from t group by a, b")
+                .unwrap()
+                .projection,
+            Projection::Columns(_)
+        ));
+        assert_eq!(
+            error("select count() from t group by 1"),
+            "grouping by position is not supported yet; name the column at 1:32"
+        );
+        assert_eq!(
+            error("select count() from t group by all"),
+            "GROUP BY ALL is not supported yet; name the columns at 1:32"
+        );
+        assert_eq!(
+            error("select sum(a, b) from t"),
+            "functions with more than one argument are not supported yet at 1:13"
+        );
+        assert_eq!(
+            error("select sum(1) from t"),
+            "function arguments other than a column are not supported yet at 1:12"
+        );
+        assert_eq!(
+            error("select count() as from t"),
+            "expected an alias, found FROM at 1:19"
+        );
+        assert_eq!(
+            error("select count() from t group by a having count() > 1"),
+            "HAVING is not supported yet at 1:34"
         );
     }
 }

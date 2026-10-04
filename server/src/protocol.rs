@@ -57,6 +57,9 @@ pub enum ServerMsg {
         limit: Option<u64>,
         /// The cursor of this result.
         at: String,
+        /// Aggregated results: each row's id (its group's key), in row order.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<String>>,
     },
     /// Instead of a snapshot, when resuming from `since`: the client's rows are still valid;
     /// the diffs that follow bring them up to date.
@@ -122,21 +125,27 @@ impl OrderTerm {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Change {
-    /// At `index` in an ordered result, appended otherwise.
+    /// At `index` in an ordered result, appended otherwise. Rows of aggregated results have an
+    /// `id` (their group's key, e.g. `["PL"]`) that updates refer to.
     Insert {
         row: Row,
         #[serde(skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     /// The row at `index` leaves the result (pushed out by LIMIT); the rows after it move up.
     Delete { index: usize },
+    /// The row with this `id` has these new values (only the columns that changed).
+    Update { id: String, set: Row },
 }
 
 impl From<Diff> for Change {
     fn from(d: Diff) -> Self {
         match d {
-            Diff::Insert { row, index } => Change::Insert { row, index },
+            Diff::Insert { row, index, id } => Change::Insert { row, index, id },
             Diff::Delete { index } => Change::Delete { index },
+            Diff::Update { id, set } => Change::Update { id, set },
         }
     }
 }
@@ -152,6 +161,7 @@ pub fn error_code(e: &EngineError) -> &'static str {
         EngineError::Bind(_) => "INVALID_QUERY",
         EngineError::History(_) => "HISTORY_FAILED",
         EngineError::Source(_) => "STREAM_FAILED",
+        EngineError::Aggregate(_) => "AGGREGATE_FAILED",
     }
 }
 
@@ -225,6 +235,7 @@ mod tests {
             order: None,
             limit: None,
             at: "c".into(),
+            ids: None,
         };
         assert_eq!(
             serde_json::to_value(&snapshot).unwrap(),
@@ -236,8 +247,14 @@ mod tests {
             changes: vec![
                 Diff::insert(row.clone()).into(),
                 Diff::Insert {
-                    row,
+                    row: row.clone(),
                     index: Some(2),
+                    id: None,
+                }
+                .into(),
+                Diff::Update {
+                    id: "[\"PL\"]".into(),
+                    set: row,
                 }
                 .into(),
                 Diff::Delete { index: 0 }.into(),
@@ -249,6 +266,7 @@ mod tests {
             json!({"type": "diff", "id": "s1", "changes": [
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}},
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}, "index": 2},
+                {"op": "update", "id": "[\"PL\"]", "set": {"user_id": "u1", "latency_ms": 10}},
                 {"op": "delete", "index": 0}
             ], "at": "c2"})
         );

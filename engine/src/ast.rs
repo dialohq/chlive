@@ -8,6 +8,8 @@ pub struct Query {
     pub from: TableRef,
     /// The WHERE condition.
     pub selection: Option<Expr>,
+    /// `GROUP BY col, …`; `span` is the `GROUP`'s.
+    pub group_by: Option<(Vec<ColumnRef>, Span)>,
     /// The ORDER BY clause.
     pub order: Option<Order>,
     /// `LIMIT n`.
@@ -58,6 +60,32 @@ pub enum Projection {
     Wildcard,
     /// `a, b, …`: these columns, in this order.
     Columns(Vec<ColumnRef>),
+    /// A list with function calls or aliases, e.g. `country, count() AS n, avg(latency_ms)`.
+    Items(Vec<SelectItem>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectItem {
+    pub expr: SelectExpr,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectExpr {
+    Column(ColumnRef),
+    /// `name(arg)`, `name()` or `name(*)`; `span` is the name's.
+    Call {
+        name: String,
+        arg: CallArg,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallArg {
+    None,
+    Star,
+    Column(ColumnRef),
 }
 
 #[derive(Debug, Clone, PartialEq)]

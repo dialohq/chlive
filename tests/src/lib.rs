@@ -57,6 +57,8 @@ pub fn config() -> Config {
         password: "chlive_ro".into(),
         database: "default".into(),
         kafka_brokers: std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:9092".into()),
+        clickhouse_native: std::env::var("CHLIVE_CLICKHOUSE_NATIVE")
+            .unwrap_or_else(|_| "127.0.0.1:19000".into()),
     }
 }
 
@@ -73,6 +75,9 @@ pub fn producer() -> Result<producer::Producer> {
 pub struct LiveResult {
     pub snapshot: bool,
     pub rows: Vec<Row>,
+    /// Row ids (aggregated results), parallel to `rows`.
+    pub ids: Vec<Option<String>>,
+    pub updated: usize,
     /// Rows that came as inserts after the snapshot.
     pub inserted: usize,
     pub diffs: usize,
@@ -100,6 +105,10 @@ impl LiveResult {
                 }
                 self.snapshot = true;
                 self.rows = rows(&msg["rows"]);
+                self.ids = match msg["ids"].as_array() {
+                    Some(ids) => ids.iter().map(|i| i.as_str().map(str::to_string)).collect(),
+                    None => vec![None; self.rows.len()],
+                };
                 self.limit = msg["limit"].as_u64().map(|n| n as usize);
                 self.at = msg["at"].as_str().map(str::to_string);
             }
@@ -122,17 +131,39 @@ impl LiveResult {
                         Some("insert") => {
                             let row = change["row"].as_object().expect("row").clone();
                             match change["index"].as_u64().map(|i| i as usize) {
-                                None => self.rows.push(row),
-                                Some(i) if i <= self.rows.len() => self.rows.insert(i, row),
+                                None => {
+                                    self.rows.push(row);
+                                    self.ids.push(change["id"].as_str().map(str::to_string));
+                                }
+                                Some(i) if i <= self.rows.len() => {
+                                    self.rows.insert(i, row);
+                                    self.ids
+                                        .insert(i, change["id"].as_str().map(str::to_string));
+                                }
                                 Some(i) => self
                                     .protocol_violations
                                     .push(format!("insert at {i} of {} rows", self.rows.len())),
                             }
                             self.inserted += 1;
                         }
+                        Some("update") => {
+                            let id = change["id"].as_str();
+                            match self.ids.iter().position(|x| x.as_deref() == id) {
+                                Some(i) => {
+                                    for (k, v) in change["set"].as_object().expect("set") {
+                                        self.rows[i].insert(k.clone(), v.clone());
+                                    }
+                                    self.updated += 1;
+                                }
+                                None => self
+                                    .protocol_violations
+                                    .push(format!("update of unknown row {id:?}")),
+                            }
+                        }
                         Some("delete") => match change["index"].as_u64().map(|i| i as usize) {
                             Some(i) if i < self.rows.len() => {
                                 self.rows.remove(i);
+                                self.ids.remove(i);
                             }
                             i => self
                                 .protocol_violations
@@ -227,6 +258,7 @@ impl LiveConn {
         self.results.lock().unwrap().insert(
             id.to_string(),
             LiveResult {
+                ids: vec![None; rows.len()],
                 rows,
                 ..Default::default()
             },

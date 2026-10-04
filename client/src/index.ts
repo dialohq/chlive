@@ -368,6 +368,7 @@ export class LiveClient {
       limit: rec.store.limit,
       at,
       savedAt: Date.now(),
+      ids: rec.store.ids().some((id) => id !== undefined) ? rec.store.ids() : undefined,
     };
     rec.saved = true;
     this.queue(rec, (cache) => cache.save(rec.sql, result));
