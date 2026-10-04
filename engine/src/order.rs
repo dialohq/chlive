@@ -163,6 +163,14 @@ impl WindowState {
         self.len = (self.len + 1).min(self.limit);
     }
 
+    /// Resume: a window already holding `len` rows.
+    pub fn with_len(limit: u64, len: u64) -> Self {
+        Self {
+            len: len.min(limit),
+            limit,
+        }
+    }
+
     /// A new row: `None` with `LIMIT 0` (it never shows), otherwise whether, after appending it,
     /// the first row must be deleted.
     pub fn push(&mut self) -> Option<bool> {

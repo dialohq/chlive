@@ -74,6 +74,9 @@ impl HistorySource for FakeHistory {
                 row(json!({"user_id": "h500b", "__order_0": 500})),
             ]),
             s if s == format!("{slow} LIMIT 2") => Ok(vec![row(json!({"user_id": "h900"}))]),
+            s if s == format!("SELECT user_id FROM default.requests WHERE {REQUESTS_BOUND}") => {
+                Ok(vec![row(json!({"user_id": "slow-history"}))])
+            }
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -414,4 +417,47 @@ async fn order_by_with_limit_keeps_the_top_n() {
         names_within(&iterations, Some(3)),
         ["e1000", "h900", "e700"]
     );
+}
+
+#[tokio::test]
+async fn resume_falls_back_to_a_snapshot_when_the_topic_was_recreated() {
+    let sql = "select user_id from requests";
+    let mut source = MemorySource::new();
+    source
+        .push(
+            "requests",
+            0,
+            r#"{"user_id": "slow-history", "latency_ms": 900}"#,
+        )
+        .push("requests", 0, r#"{"user_id": "e1", "latency_ms": 200}"#)
+        .push("requests", 0, r#"{"user_id": "e2", "latency_ms": 300}"#);
+    let subscription = engine(source).subscribe(sql).await.unwrap();
+    let plan = subscription.plan.clone();
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    let token = chlive_engine::cursor::encode(&plan, &iterations.last().unwrap().at);
+    assert!(token.contains(r#""o":{"0":2}"#), "{token}");
+
+    // the same topic, still there: resumes (nothing new)
+    let mut same = MemorySource::new();
+    same.push("requests", 0, r#"{"user_id": "x"}"#)
+        .push("requests", 0, r#"{"user_id": "e1"}"#)
+        .push("requests", 0, r#"{"user_id": "e2"}"#);
+    assert!(
+        engine(same)
+            .subscribe_from(sql, Some(&token))
+            .await
+            .unwrap()
+            .resumed
+    );
+
+    // recreated: only one message now, so the cursor is past its end
+    let mut recreated = MemorySource::new();
+    recreated.push("requests", 0, r#"{"user_id": "new"}"#);
+    let s = engine(recreated)
+        .subscribe_from(sql, Some(&token))
+        .await
+        .unwrap();
+    assert!(!s.resumed);
+    let first = s.map(|i| i.unwrap()).collect::<Vec<_>>().await.remove(0);
+    assert_eq!(first.origin, Origin::History);
 }

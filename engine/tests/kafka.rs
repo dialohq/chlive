@@ -110,7 +110,7 @@ async fn every_event_exactly_once_across_the_watermark() {
             .map(|d| d.to_string())
             .collect::<Vec<_>>();
         match iteration.origin {
-            Origin::History => history.extend(ids),
+            Origin::History | Origin::CatchUp => history.extend(ids),
             Origin::Event { .. } => stream.extend(ids),
         }
         if quiet_until.is_none() && history.len() + stream.len() >= 9 {

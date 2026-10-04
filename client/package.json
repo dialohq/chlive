@@ -7,22 +7,41 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-    "./react": { "types": "./dist/react.d.ts", "default": "./dist/react.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "default": "./dist/react.js"
+    },
+    "./cache": {
+      "types": "./dist/cache/index.d.ts",
+      "default": "./dist/cache/index.js"
+    }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "bun --bun tsc -p tsconfig.json",
     "typecheck": "bun --bun tsc -p tsconfig.json --noEmit",
     "test": "bun test"
   },
   "peerDependencies": {
-    "react": ">=18"
+    "react": ">=18",
+    "@sqlite.org/sqlite-wasm": ">=3.50"
   },
   "peerDependenciesMeta": {
-    "react": { "optional": true }
+    "react": {
+      "optional": true
+    },
+    "@sqlite.org/sqlite-wasm": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@sqlite.org/sqlite-wasm": "^3.53.4-build2",
     "@types/react": "^19.0.0",
     "typescript": "^5.9.0"
   }

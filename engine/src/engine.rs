@@ -7,13 +7,15 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 
 use crate::binder::{bind, BindError, Catalog};
+use crate::cursor;
 use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
-use crate::order::{OrderedState, WindowState};
+use crate::order::{OrderedState, SortKey, WindowState};
 use crate::parser::parse;
 use crate::plan::{plan, Plan, StreamPlan};
 use crate::rules::{HardcodedRules, NamingRules, TopicId};
@@ -63,6 +65,7 @@ pub struct Engine {
     rules: Arc<dyn NamingRules>,
     history: Arc<dyn HistorySource>,
     source: Arc<dyn EventSource>,
+    resume_wait: Duration,
 }
 
 impl Engine {
@@ -87,7 +90,15 @@ impl Engine {
             rules: Arc::new(rules),
             history: Arc::new(history),
             source: Arc::new(source),
+            resume_wait: Duration::from_secs(10),
         }
+    }
+
+    /// How long a resume of an ordered or limited query waits for ClickHouse to ingest up to a
+    /// client that is ahead of it, before falling back to a full snapshot (default 10 s).
+    pub fn with_resume_wait(mut self, wait: Duration) -> Self {
+        self.resume_wait = wait;
+        self
     }
 
     /// Parse, bind and plan a query without running it.
@@ -113,16 +124,81 @@ impl Engine {
     /// and each partition is consumed from right after it. So every event is in exactly one of
     /// them, wherever ClickHouse's ingestion is at.
     pub async fn subscribe(&self, sql: &str) -> Result<Subscription, EngineError> {
+        self.subscribe_from(sql, None).await
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but for a client that already holds the result up to
+    /// the cursor `since` (a token from an earlier [`Iteration::at`], see [`crate::cursor`]).
+    /// The first iteration is then a [`Origin::CatchUp`] with only what the client is missing:
+    /// - ClickHouse's rows after the cursor and up to the current watermark `W`;
+    /// - with ORDER BY, placed by the sort keys of the client's result, which are read from
+    ///   ClickHouse up to the cursor; with LIMIT alone, by the client's row count;
+    /// - and the stream continues from `max(cursor, W)`, so nothing is missed or repeated even
+    ///   when the client streamed further than ClickHouse has ingested.
+    ///
+    /// An invalid cursor (another plan, or past the end of the topic, e.g. it was recreated)
+    /// gives a normal subscription from history ([`Subscription::resumed`] is false).
+    pub async fn subscribe_from(
+        &self,
+        sql: &str,
+        since: Option<&str>,
+    ) -> Result<Subscription, EngineError> {
         let plan = self.explain(sql).await?;
         let kafka = &plan.history.kafka;
-        let watermark = Watermark::fetch(
-            self.history.as_ref(),
-            &plan.history.table,
-            &kafka.partition,
-            &kafka.offset,
-        )
-        .await?;
-        let history_sql = plan.history.sql(Some(&watermark));
+        let fetch_watermark = || {
+            Watermark::fetch(
+                self.history.as_ref(),
+                &plan.history.table,
+                &kafka.partition,
+                &kafka.offset,
+            )
+        };
+        let mut watermark = fetch_watermark().await?;
+        let mut resume_from = match since {
+            Some(token) => self.resumable(&plan, token).await?,
+            None => None,
+        };
+        // With ORDER BY or LIMIT, resuming rebuilds the client's state from ClickHouse up to its
+        // cursor, so ClickHouse must have everything the client has: when the client streamed
+        // further than ClickHouse has ingested, wait for it (or start over).
+        let stateful = plan.stream.order.is_some() || plan.stream.limit.is_some();
+        if let (Some(cursor), true) = (&resume_from, stateful) {
+            let deadline = tokio::time::Instant::now() + self.resume_wait;
+            while cursor.0.iter().any(|(p, o)| watermark.get(*p) < *o) {
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::info!(cursor = %cursor.describe(), watermark = %watermark.describe(),
+                        "ClickHouse is behind the resume cursor; starting over");
+                    resume_from = None;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                watermark = fetch_watermark().await?;
+            }
+        }
+        let (start, first, history_sql) = match &resume_from {
+            None => {
+                let sql = plan.history.sql(Some(&watermark));
+                (watermark.clone(), First::History(sql.clone()), sql)
+            }
+            Some(cursor) => {
+                let catch_up = plan.history.catch_up_sql(cursor, &watermark);
+                let seed = match (&plan.stream.order, plan.stream.limit) {
+                    (Some(_), _) => Seed::Keys(plan.history.keys_sql(cursor).expect("ordered")),
+                    (None, Some(_)) => Seed::Count(plan.history.count_sql(cursor)),
+                    (None, None) => Seed::Nothing,
+                };
+                // nothing to fetch where ClickHouse isn't past the client
+                let behind = watermark.0.iter().all(|(p, w)| *w <= cursor.get(*p));
+                (
+                    cursor.max(&watermark),
+                    First::CatchUp {
+                        seed,
+                        rows: (!behind).then(|| catch_up.clone()),
+                    },
+                    catch_up,
+                )
+            }
+        };
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
             let partitions = self
@@ -134,49 +210,114 @@ impl Engine {
                 topic: topic.clone(),
                 partitions: partitions
                     .into_iter()
-                    .map(|p| (p, watermark.start(p)))
+                    .map(|p| (p, start.start(p)))
                     .collect(),
             });
         }
-        tracing::info!(history = %history_sql, watermark = %watermark.describe(), "subscribed");
+        tracing::info!(
+            history = %history_sql,
+            watermark = %watermark.describe(),
+            resumed_from = %resume_from.as_ref().map(Watermark::describe).unwrap_or_default(),
+            "subscribed"
+        );
         let events = self
             .source
             .subscribe(&starts, &plan.stream.required_keys())
             .await?;
-        let iterations = self.iterations(&plan, history_sql.clone(), events);
+        let iterations = self.iterations(&plan, first, start.clone(), events);
         Ok(Subscription {
             plan,
             watermark,
             history_sql,
+            resumed: resume_from.is_some(),
             iterations,
         })
+    }
+
+    /// The cursor in `token`, if this plan can resume from it.
+    async fn resumable(&self, plan: &Plan, token: &str) -> Result<Option<Watermark>, EngineError> {
+        let Some(cursor) = cursor::decode(plan, token) else {
+            tracing::info!("resume cursor is for another plan or malformed; starting over");
+            return Ok(None);
+        };
+        for topic in &plan.stream.topics {
+            if let Some(ends) = self.source.end_offsets(topic).await? {
+                if cursor
+                    .0
+                    .iter()
+                    .any(|(p, o)| *o >= ends.get(p).copied().unwrap_or(0))
+                {
+                    tracing::info!(cursor = %cursor.describe(), "resume cursor is past the end of {topic}; starting over");
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(cursor))
     }
 
     fn iterations(
         &self,
         plan: &Plan,
-        history_sql: String,
+        first: First,
+        start: Watermark,
         events: BoxStream<'static, Event>,
     ) -> BoxStream<'static, Result<Iteration, EngineError>> {
         enum Item {
             History(Result<Vec<Row>, HistoryError>),
+            CatchUp(Result<(Option<Vec<Row>>, Vec<Row>), HistoryError>),
             Event(Event),
         }
         let history = self.history.clone();
-        let initial = stream::once(async move { Item::History(history.fetch(&history_sql).await) });
+        let initial = stream::once(async move {
+            match first {
+                First::History(sql) => Item::History(history.fetch(&sql).await),
+                First::CatchUp { seed, rows } => Item::CatchUp(
+                    async {
+                        let seed = match seed {
+                            Seed::Keys(sql) | Seed::Count(sql) => Some(history.fetch(&sql).await?),
+                            Seed::Nothing => None,
+                        };
+                        let rows = match rows {
+                            Some(sql) => history.fetch(&sql).await?,
+                            None => Vec::new(),
+                        };
+                        Ok((seed, rows))
+                    }
+                    .await,
+                ),
+            }
+        });
         let stream_plan = plan.stream.clone();
-        let state = ResultState::for_plan(&stream_plan);
+        let state = (ResultState::for_plan(&stream_plan), start);
         initial
             .chain(events.map(Item::Event))
-            .scan(state, move |state, item| {
+            .scan(state, move |(state, at), item| {
                 let iteration = match item {
-                    Item::History(rows) => history_iteration(&stream_plan, state, rows),
-                    Item::Event(event) => Ok(event_iteration(&stream_plan, state, event)),
+                    Item::History(rows) => history_iteration(&stream_plan, state, at, rows),
+                    Item::CatchUp(fetched) => catch_up_iteration(&stream_plan, state, at, fetched),
+                    Item::Event(event) => Ok(event_iteration(&stream_plan, state, at, event)),
                 };
                 futures::future::ready(Some(iteration))
             })
             .boxed()
     }
+}
+
+/// What a subscription fetches first.
+enum First {
+    /// The whole result up to the watermark.
+    History(String),
+    /// Resume: what to seed the state with, and the rows the client is missing (`None` when
+    /// ClickHouse has nothing past the client's cursor).
+    CatchUp { seed: Seed, rows: Option<String> },
+}
+
+enum Seed {
+    /// ORDER BY: the sort keys of the client's result.
+    Keys(String),
+    /// LIMIT alone: the client's row count.
+    Count(String),
+    Nothing,
 }
 
 /// What a subscription keeps about its result to place new rows.
@@ -197,6 +338,36 @@ impl ResultState {
             (None, None) => Self::Append,
         }
     }
+
+    /// Where a new row goes: an insert (at an index with ORDER BY) and the delete it causes, or
+    /// nothing when it falls outside a LIMIT. `key` is its sort key with ORDER BY.
+    fn place(&mut self, row: Row, key: Option<SortKey>) -> Vec<Diff> {
+        match self {
+            ResultState::Append => vec![Diff::insert(row)],
+            ResultState::Window(w) => match w.push() {
+                None => Vec::new(),
+                Some(false) => vec![Diff::insert(row)],
+                Some(true) => vec![Diff::insert(row), Diff::Delete { index: 0 }],
+            },
+            ResultState::Ordered(s) => match s.insert(key.expect("a sort key")) {
+                None => Vec::new(),
+                Some(p) => {
+                    let mut diffs = vec![Diff::Insert {
+                        row,
+                        index: Some(p.index),
+                    }];
+                    if let Some(index) = p.evicts {
+                        diffs.push(Diff::Delete { index });
+                    }
+                    diffs
+                }
+            },
+        }
+    }
+}
+
+fn bad_history_row(e: impl std::fmt::Display) -> EngineError {
+    HistoryError::ClickHouse(format!("history row: {e}")).into()
 }
 
 /// The history as one iteration. Seeds the state: with ORDER BY the sort keys, in ClickHouse's
@@ -204,16 +375,14 @@ impl ResultState {
 fn history_iteration(
     plan: &StreamPlan,
     state: &mut ResultState,
+    at: &Watermark,
     rows: Result<Vec<Row>, HistoryError>,
 ) -> Result<Iteration, EngineError> {
     let mut rows = rows?;
     match (state, &plan.order) {
         (ResultState::Ordered(state), Some(order)) => {
             for row in &mut rows {
-                let key = order
-                    .history_key(row)
-                    .map_err(|e| HistoryError::ClickHouse(format!("history row: {e}")))?;
-                state.push_history(key);
+                state.push_history(order.history_key(row).map_err(bad_history_row)?);
             }
         }
         (ResultState::Window(w), _) => rows.iter().for_each(|_| w.push_history()),
@@ -222,37 +391,66 @@ fn history_iteration(
     Ok(Iteration {
         origin: Origin::History,
         diffs: rows.into_iter().map(Diff::insert).collect(),
+        at: at.clone(),
+    })
+}
+
+/// Resume: seed the state as the client's result was at its cursor, then place the rows it is
+/// missing, exactly as new events would be.
+fn catch_up_iteration(
+    plan: &StreamPlan,
+    state: &mut ResultState,
+    at: &Watermark,
+    fetched: Result<(Option<Vec<Row>>, Vec<Row>), HistoryError>,
+) -> Result<Iteration, EngineError> {
+    let (seed, mut rows) = fetched?;
+    match (&mut *state, &plan.order, seed) {
+        (ResultState::Ordered(s), Some(order), Some(mut keys)) => {
+            for k in &mut keys {
+                s.push_history(order.history_key(k).map_err(bad_history_row)?);
+            }
+        }
+        (ResultState::Window(_), _, Some(count)) => {
+            let n = count
+                .first()
+                .and_then(|r| r.get("n"))
+                .and_then(|n| n.as_u64())
+                .ok_or_else(|| bad_history_row("no row count"))?;
+            *state = ResultState::Window(WindowState::with_len(plan.limit.unwrap_or(0), n));
+        }
+        _ => {}
+    }
+    if plan.order.is_none() && plan.limit.is_some() {
+        rows.reverse(); // fetched latest first
+    }
+    let mut diffs = Vec::new();
+    for mut row in rows {
+        let key = match &plan.order {
+            Some(order) => Some(order.history_key(&mut row).map_err(bad_history_row)?),
+            None => None,
+        };
+        diffs.extend(state.place(row, key));
+    }
+    Ok(Iteration {
+        origin: Origin::CatchUp,
+        diffs,
+        at: at.clone(),
     })
 }
 
 /// One event: decode by column types, filter, project, and place it. An insert and the delete
 /// it causes come in the same iteration, insert first, so they always land in the same diff.
-fn event_iteration(plan: &StreamPlan, state: &mut ResultState, event: Event) -> Iteration {
+fn event_iteration(
+    plan: &StreamPlan,
+    state: &mut ResultState,
+    at: &mut Watermark,
+    event: Event,
+) -> Iteration {
     let diffs = match plan.decode(&event.value) {
-        Ok(row) if plan.matches(&row) => match state {
-            ResultState::Append => vec![Diff::insert(plan.project(&row))],
-            ResultState::Window(w) => match w.push() {
-                None => Vec::new(),
-                Some(false) => vec![Diff::insert(plan.project(&row))],
-                Some(true) => vec![Diff::insert(plan.project(&row)), Diff::Delete { index: 0 }],
-            },
-            ResultState::Ordered(s) => {
-                let order = plan.order.as_ref().expect("ordered plan");
-                match s.insert(order.event_key(&row)) {
-                    None => Vec::new(),
-                    Some(p) => {
-                        let mut diffs = vec![Diff::Insert {
-                            row: plan.project(&row),
-                            index: Some(p.index),
-                        }];
-                        if let Some(index) = p.evicts {
-                            diffs.push(Diff::Delete { index });
-                        }
-                        diffs
-                    }
-                }
-            }
-        },
+        Ok(row) if plan.matches(&row) => {
+            let key = plan.order.as_ref().map(|o| o.event_key(&row));
+            state.place(plan.project(&row), key)
+        }
         Ok(_) => Vec::new(),
         Err(e) => {
             // ClickHouse's ingestion skips this message too
@@ -266,6 +464,7 @@ fn event_iteration(plan: &StreamPlan, state: &mut ResultState, event: Event) -> 
             Vec::new()
         }
     };
+    at.0.insert(event.partition, event.offset);
     Iteration {
         origin: Origin::Event {
             topic: event.topic,
@@ -273,6 +472,7 @@ fn event_iteration(plan: &StreamPlan, state: &mut ResultState, event: Event) -> 
             offset: event.offset,
         },
         diffs,
+        at: at.clone(),
     }
 }
 
@@ -281,8 +481,11 @@ pub struct Subscription {
     pub plan: Plan,
     /// Where history ends and the stream begins.
     pub watermark: Watermark,
-    /// The history query as run: the plan's, bounded by the watermark.
+    /// The history query as run: the plan's, bounded by the watermark (or, when resumed, the
+    /// catch-up query).
     pub history_sql: String,
+    /// Whether this resumed from a client's cursor (the first iteration is then a catch-up).
+    pub resumed: bool,
     iterations: BoxStream<'static, Result<Iteration, EngineError>>,
 }
 
@@ -299,6 +502,8 @@ impl Stream for Subscription {
 pub enum Origin {
     /// The initial result, from ClickHouse.
     History,
+    /// Resume: what the client is missing since its cursor, from ClickHouse.
+    CatchUp,
     /// One event of a subscribed topic.
     Event {
         topic: TopicId,
@@ -312,6 +517,10 @@ pub struct Iteration {
     pub origin: Origin,
     /// Empty when the event was not relevant to the query.
     pub diffs: Vec<Diff>,
+    /// The cursor after this iteration: per partition, the offset up to which the result is
+    /// complete (whether events matched or not). Resume from it with [`cursor::encode`] and
+    /// [`Engine::subscribe_from`].
+    pub at: Watermark,
 }
 
 /// One line per diff: `+ {row}` for the history (followed by `history: N rows`), and
@@ -324,6 +533,12 @@ impl fmt::Display for Iteration {
                     writeln!(f, "{d}")?;
                 }
                 write!(f, "history: {} rows", self.diffs.len())
+            }
+            Origin::CatchUp => {
+                for d in &self.diffs {
+                    writeln!(f, "{d}")?;
+                }
+                write!(f, "caught up: {} changes", self.diffs.len())
             }
             Origin::Event {
                 topic,

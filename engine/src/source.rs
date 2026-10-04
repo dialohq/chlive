@@ -44,6 +44,15 @@ pub trait EventSource: Send + Sync {
     /// The topic's partitions, or `None` if the topic doesn't exist.
     async fn partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError>;
 
+    /// The next offset to be written in each partition, if known. A resume cursor at or past it
+    /// comes from different data (the topic was recreated).
+    async fn end_offsets(
+        &self,
+        _topic: &TopicId,
+    ) -> Result<Option<BTreeMap<i32, i64>>, SourceError> {
+        Ok(None)
+    }
+
     /// Events of exactly these topics and partitions, from the given offsets on; each decoded
     /// keeping only `keys`. Undecodable messages are skipped with a warning.
     async fn subscribe(
@@ -95,6 +104,30 @@ impl EventSource for KafkaSource {
                 .iter()
                 .find(|t| t.name() == name && t.error().is_none() && !t.partitions().is_empty())
                 .map(|t| t.partitions().iter().map(|p| p.id()).collect()))
+        })
+        .await
+        .map_err(|e| SourceError(e.to_string()))?
+    }
+
+    async fn end_offsets(
+        &self,
+        topic: &TopicId,
+    ) -> Result<Option<BTreeMap<i32, i64>>, SourceError> {
+        let Some(partitions) = self.partitions(topic).await? else {
+            return Ok(None);
+        };
+        let config = self.config();
+        let name = topic.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let consumer: BaseConsumer = config.create().map_err(|e| SourceError(e.to_string()))?;
+            let mut ends = BTreeMap::new();
+            for p in partitions {
+                let (_, high) = consumer
+                    .fetch_watermarks(&name, p, Duration::from_secs(10))
+                    .map_err(|e| SourceError(format!("fetching offsets: {e}")))?;
+                ends.insert(p, high);
+            }
+            Ok(Some(ends))
         })
         .await
         .map_err(|e| SourceError(e.to_string()))?
@@ -182,6 +215,17 @@ impl MemorySource {
 impl EventSource for MemorySource {
     async fn partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
         Ok(self.topics.get(topic).map(|p| p.keys().copied().collect()))
+    }
+
+    async fn end_offsets(
+        &self,
+        topic: &TopicId,
+    ) -> Result<Option<BTreeMap<i32, i64>>, SourceError> {
+        Ok(self.topics.get(topic).map(|p| {
+            p.iter()
+                .map(|(part, msgs)| (*part, msgs.len() as i64))
+                .collect()
+        }))
     }
 
     async fn subscribe(

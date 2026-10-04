@@ -14,6 +14,12 @@
 //! index is into the list as the previous change left it), and only the state after the whole
 //! diff is meaningful. In between, an insert and its delete can briefly make one row more than
 //! the LIMIT, so clients must not expose results mid-diff.
+//!
+//! Resuming: every `snapshot`, `diff` and `progress` carries `at`, an opaque cursor: how far the
+//! result is complete. A client that kept a result (e.g. in an offline cache) subscribes with
+//! `since: <at>` and, if the server can resume from it, gets `resume` instead of a snapshot: its
+//! rows are still valid, and the diffs that follow bring them up to date. Otherwise it gets a
+//! normal `snapshot` that replaces them.
 
 use chlive_engine::diff::{Diff, Row};
 use chlive_engine::plan::OrderPlan;
@@ -23,8 +29,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ClientMsg {
-    Subscribe { id: String, sql: String },
-    Unsubscribe { id: String },
+    Subscribe {
+        id: String,
+        sql: String,
+        /// The `at` of a result the client already holds, to resume from it.
+        #[serde(default)]
+        since: Option<String>,
+    },
+    Unsubscribe {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -41,9 +55,28 @@ pub enum ServerMsg {
         /// The LIMIT: the result never has more rows (at the end of each diff).
         #[serde(skip_serializing_if = "Option::is_none")]
         limit: Option<u64>,
+        /// The cursor of this result.
+        at: String,
+    },
+    /// Instead of a snapshot, when resuming from `since`: the client's rows are still valid;
+    /// the diffs that follow bring them up to date.
+    Resume {
+        id: String,
+        columns: Vec<Column>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        order: Option<Vec<OrderTerm>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
     },
     /// Changes since the previous message, in order. Never empty.
-    Diff { id: String, changes: Vec<Change> },
+    Diff {
+        id: String,
+        changes: Vec<Change>,
+        /// The cursor after these changes.
+        at: String,
+    },
+    /// The cursor moved without changes to the result (events that didn't match).
+    Progress { id: String, at: String },
     Error {
         /// Absent when the message can't be attributed to a subscription.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,9 +189,15 @@ mod tests {
             m,
             ClientMsg::Subscribe {
                 id: "s1".into(),
-                sql: "select * from events".into()
+                sql: "select * from events".into(),
+                since: None,
             }
         );
+        let m: ClientMsg = serde_json::from_value(
+            json!({"type": "subscribe", "id": "s1", "sql": "x", "since": "{\"v\":1}"}),
+        )
+        .unwrap();
+        assert!(matches!(m, ClientMsg::Subscribe { since: Some(t), .. } if t == "{\"v\":1}"));
         let m: ClientMsg =
             serde_json::from_value(json!({"type": "unsubscribe", "id": "s1"})).unwrap();
         assert_eq!(m, ClientMsg::Unsubscribe { id: "s1".into() });
@@ -185,11 +224,12 @@ mod tests {
             rows: vec![row.clone()],
             order: None,
             limit: None,
+            at: "c".into(),
         };
         assert_eq!(
             serde_json::to_value(&snapshot).unwrap(),
             json!({"type": "snapshot", "id": "s1", "columns": [{"name": "user_id", "type": "String"}],
-                   "rows": [{"user_id": "u1", "latency_ms": 10}]})
+                   "rows": [{"user_id": "u1", "latency_ms": 10}], "at": "c"})
         );
         let diff = ServerMsg::Diff {
             id: "s1".into(),
@@ -202,6 +242,7 @@ mod tests {
                 .into(),
                 Diff::Delete { index: 0 }.into(),
             ],
+            at: "c2".into(),
         };
         assert_eq!(
             serde_json::to_value(&diff).unwrap(),
@@ -209,7 +250,25 @@ mod tests {
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}},
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}, "index": 2},
                 {"op": "delete", "index": 0}
-            ]})
+            ], "at": "c2"})
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMsg::Progress {
+                id: "s1".into(),
+                at: "c3".into()
+            })
+            .unwrap(),
+            json!({"type": "progress", "id": "s1", "at": "c3"})
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMsg::Resume {
+                id: "s1".into(),
+                columns: vec![],
+                order: None,
+                limit: Some(5)
+            })
+            .unwrap(),
+            json!({"type": "resume", "id": "s1", "columns": [], "limit": 5})
         );
         assert_eq!(
             serde_json::to_value(ServerMsg::error(None, BAD_MESSAGE, "nope")).unwrap(),

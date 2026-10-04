@@ -124,7 +124,7 @@ import { useLiveQuery } from "@chlive/client/react";
 const { rows, columns, status, error, errorCode } = useLiveQuery(sql);
 ```
 
-`status` is `loading`, `live` or `error`. `stats` has per-subscription counters for debugging (snapshots, diffs, inserts, deletes, bytes, the last message and how long it took to apply). One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes, and the new snapshot replaces the old rows.
+`status` is `loading`, `cached` (rows from the offline cache, being caught up), `live` or `error`. `stats` has per-subscription counters for debugging (snapshots, diffs, inserts, deletes, bytes, the last message and how long it took to apply). One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes, and the new snapshot replaces the old rows.
 
 ### Protocol
 
@@ -147,14 +147,37 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 - With an `index`, the row is inserted there: the row at that index and every row after it move one down. Without one, it's appended.
 - `{"op": "delete", "index": k}` removes the row at `k`; the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes.
 - A `diff` is atomic: its changes apply in sequence, each index into the list as the previous change left it, and only the state after all of them is meaningful (in between, an insert and its delete can briefly make one row more than the LIMIT). The client applies a whole diff to one copy of the rows before its listeners see it.
+- **Resuming.** `snapshot`, `diff` and `{"type": "progress", "id", "at"}` carry `at`, an opaque cursor: how far the result is complete, per Kafka partition, counting events that didn't match. A client that kept a result subscribes with `"since": <at>`; the server answers `{"type": "resume", "id", "columns", "order"?, "limit"?}` instead of a snapshot (the client's rows are still valid), then diffs with only what was missed. If it can't resume (another query or schema, a topic recreated since, …), it sends a normal `snapshot`.
 - Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`. After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
+
+### Offline cache
+
+`@chlive/client/cache` keeps results between sessions in SQLite (sqlite-wasm) on OPFS, in a dedicated worker, using the `opfs-sahpool` VFS, so no COOP/COEP headers are needed:
+
+```ts
+import { createOpfsCache } from "@chlive/client/cache";
+const cache = createOpfsCache({ budgetBytes: 2 * 1024 ** 3 }); // the default budget
+const live = new LiveClient({ url, cache });
+addEventListener("pagehide", () => { live.flush(); cache.close(); });
+```
+
+- **On subscribe**, the cached result (if any) is shown at once (`status: "cached"`, with `cachedAt`), and the subscription is sent with `since` = its cursor. The server resumes and sends only what was missed; reconnects resume the same way.
+- **On the server** (`Engine::subscribe_from`), resuming from cursor `C` with ClickHouse at watermark `W`:
+  - ClickHouse's rows with `C < offset ≤ W` come as the catch-up, then the stream continues from `max(C, W)`.
+  - With ORDER BY, the sort keys of the client's whole result (everything up to `C`) are read from ClickHouse first, so the catch-up's inserts and deletes have the right indexes; with LIMIT alone, its row count.
+  - When the client is ahead of ClickHouse (it streamed events ClickHouse hasn't ingested yet), an unordered query just continues from `C`; an ordered or limited one waits up to 10 s for ClickHouse to catch up, or starts over with a snapshot.
+- **What's stored:** per query (the SQL text, for now), its rows as JSON chunks, its metadata, the cursor and when it was last used. Each write is one transaction: snapshots and ordered diffs are saved in full (batched, about 1 s), append-only diffs are appended, and `progress` moves the cursor.
+- **GC:** above the budget, the least recently used queries are evicted.
+- **MVP limits:** one tab holds the database at a time; other tabs run without a cache (the playground shows why). Keys are query strings, not shapes yet.
+
+The playground uses it: the "Client state" panel shows a hit or miss, whether the server resumed and how big the catch-up was, the cursor, and the store's size, with a "Clear cache" button.
 
 ## Tests
 
 ```sh
 cargo test --workspace     # engine (lexer, parser, binder, planner, types, watermark), server protocol over a real WebSocket
-bun run test               # client state + reconnect/resubscribe (bun test)
+bun run test               # client state, reconnect/resume, the cache store on bun:sqlite (bun test)
 e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chlive-e2e, against `dnvr up`
 ```
 

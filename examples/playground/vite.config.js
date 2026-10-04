@@ -9,9 +9,13 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: /^@chlive\/client\/react$/, replacement: src("react.ts") },
+      { find: /^@chlive\/client\/cache$/, replacement: src("cache/index.ts") },
       { find: /^@chlive\/client$/, replacement: src("index.ts") },
     ],
   },
+  // sqlite-wasm loads its .wasm next to itself; pre-bundling would break that
+  optimizeDeps: { exclude: ["@sqlite.org/sqlite-wasm"] },
+  worker: { format: "es" },
   server: {
     port: 5174,
     proxy: {

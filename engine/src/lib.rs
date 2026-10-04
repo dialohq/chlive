@@ -22,6 +22,7 @@
 
 pub mod ast;
 pub mod binder;
+pub mod cursor;
 pub mod diff;
 pub mod engine;
 pub mod error;

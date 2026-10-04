@@ -1,7 +1,7 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 
-import { LiveClient, type LiveState } from "../src/index.ts";
+import { type CachedResult, LiveClient, type LiveState, type ResultCache } from "../src/index.ts";
 
 /** Minimal in-memory WebSocket double. */
 class FakeSocket {
@@ -149,5 +149,102 @@ test("stats count what arrived, per subscription", async () => {
   FakeSocket.all[1].open();
   FakeSocket.all[1].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [] });
   assert.deepEqual([last!.stats.subscribes, last!.stats.snapshots], [2, 2]);
+  client.close();
+});
+
+/** A ResultCache in memory, recording calls. */
+function memoryCache(initial: Record<string, CachedResult> = {}) {
+  const data = new Map(Object.entries(initial));
+  const calls: string[] = [];
+  const cache: ResultCache = {
+    load: async (k) => (calls.push(`load ${k}`), data.get(k)),
+    save: async (k, r) => void (calls.push(`save ${r.rows.length}@${r.at}`), data.set(k, r)),
+    append: async (k, rows, at) => {
+      calls.push(`append ${rows.length}@${at}`);
+      const r = data.get(k)!;
+      data.set(k, { ...r, rows: [...r.rows, ...rows], at });
+    },
+    setCursor: async (k, at) => {
+      calls.push(`cursor ${at}`);
+      data.set(k, { ...data.get(k)!, at });
+    },
+    remove: async (k) => void data.delete(k),
+  };
+  return { cache, data, calls };
+}
+
+test("a cached result shows first, resumes from its cursor, and is kept up to date", async () => {
+  FakeSocket.all = [];
+  const { cache, data, calls } = memoryCache({
+    [SQL]: { rows: [{ user_id: "a" }], columns: COLUMNS, at: "c1", savedAt: 42 },
+  });
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, saveDelayMs: 5 });
+  const states: LiveState[] = [];
+  client.subscribe(SQL, (s) => states.push(s));
+  const ws = FakeSocket.all[0];
+  ws.open();
+  assert.deepEqual(ws.sent, [], "not subscribed before the cache is read");
+  await tick(1);
+  assert.equal(states.at(-1)!.status, "cached");
+  assert.equal(states.at(-1)!.cachedAt, 42);
+  assert.deepEqual(states.at(-1)!.rows, [{ user_id: "a" }]);
+  assert.deepEqual(ws.sent, [{ type: "subscribe", id: "s1", sql: SQL, since: "c1" }]);
+
+  // resumed: the rows stay; the catch-up and later diffs apply on top, appends go straight in
+  ws.deliver({ type: "resume", id: "s1", columns: COLUMNS });
+  assert.equal(states.at(-1)!.status, "live");
+  assert.deepEqual(states.at(-1)!.rows, [{ user_id: "a" }]);
+  ws.deliver({ type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: "b" } }], at: "c2" });
+  ws.deliver({ type: "progress", id: "s1", at: "c3" });
+  await tick(10);
+  assert.deepEqual(states.at(-1)!.rows, [{ user_id: "a" }, { user_id: "b" }]);
+  const cs = states.at(-1)!.stats.cache!;
+  assert.deepEqual([cs.hit, cs.loadedRows, cs.resumed, cs.catchUp], [true, 1, true, 1]);
+  assert.deepEqual(calls, [`load ${SQL}`, "append 1@c2", "cursor c3"]);
+  assert.deepEqual(data.get(SQL)!.rows.length, 2);
+
+  // a reconnect resumes from where it is now
+  ws.close();
+  await tick(600);
+  FakeSocket.all[1].open();
+  assert.deepEqual(FakeSocket.all[1].sent, [{ type: "subscribe", id: "s1", sql: SQL, since: "c3" }]);
+  client.close();
+});
+
+test("a snapshot instead of a resume replaces the cached rows, and is saved in full", async () => {
+  FakeSocket.all = [];
+  const { cache, data, calls } = memoryCache({
+    [SQL]: { rows: [{ user_id: "old" }], columns: COLUMNS, at: "stale", savedAt: 1 },
+  });
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, saveDelayMs: 5 });
+  let last: LiveState | undefined;
+  client.subscribe(SQL, (s) => (last = s));
+  FakeSocket.all[0].open();
+  await tick(1);
+  FakeSocket.all[0].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "x" }], at: "c9" });
+  assert.deepEqual(last!.rows, [{ user_id: "x" }]);
+  assert.equal(last!.stats.cache!.resumed, false);
+  // ordered changes mean a full save (batched)
+  FakeSocket.all[0].deliver({ type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: "w" }, index: 0 }], at: "c10" });
+  await tick(20);
+  assert.deepEqual(calls, [`load ${SQL}`, "save 2@c10"]);
+  assert.deepEqual(data.get(SQL)!.rows, [{ user_id: "w" }, { user_id: "x" }]);
+  client.close();
+});
+
+test("a cache miss subscribes without since, then saves the snapshot", async () => {
+  FakeSocket.all = [];
+  const { cache, calls } = memoryCache();
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, saveDelayMs: 5 });
+  let last: LiveState | undefined;
+  client.subscribe(SQL, (s) => (last = s));
+  FakeSocket.all[0].open();
+  await tick(1);
+  assert.deepEqual(FakeSocket.all[0].sent, [{ type: "subscribe", id: "s1", sql: SQL }]);
+  assert.equal(last!.status, "loading");
+  FakeSocket.all[0].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "a" }], at: "c1" });
+  await tick(20);
+  assert.equal(last!.stats.cache!.hit, false);
+  assert.deepEqual(calls, [`load ${SQL}`, "save 1@c1"]);
   client.close();
 });

@@ -33,6 +33,8 @@ pub struct HistoryPlan {
     /// `ORDER BY …`, with every key's direction and NULL placement explicit.
     pub order: Option<String>,
     pub limit: Option<u64>,
+    /// With ORDER BY: `SELECT <sort columns> FROM …`, the keys a resume rebuilds the order from.
+    pub keys_select: Option<String>,
     pub kafka: KafkaColumns,
 }
 
@@ -41,17 +43,60 @@ impl HistoryPlan {
     pub fn sql(&self, watermark: Option<&Watermark>) -> String {
         let bound =
             watermark.map(|w| w.history_predicate(&self.kafka.partition, &self.kafka.offset));
+        self.build(&self.select, bound, self.order.as_deref(), self.limit)
+    }
+
+    /// Resume: the sort keys of the result up to `at` (with ORDER BY), in order.
+    pub fn keys_sql(&self, at: &Watermark) -> Option<String> {
+        let select = self.keys_select.as_ref()?;
+        let bound = at.history_predicate(&self.kafka.partition, &self.kafka.offset);
+        Some(self.build(select, Some(bound), self.order.as_deref(), self.limit))
+    }
+
+    /// Resume: how many rows the result had up to `at`, at most the LIMIT (`n`).
+    pub fn count_sql(&self, at: &Watermark) -> String {
+        let bound = at.history_predicate(&self.kafka.partition, &self.kafka.offset);
+        let inner = self.build(
+            &format!("SELECT 1 FROM {}", self.table),
+            Some(bound),
+            None,
+            self.limit,
+        );
+        format!("SELECT count() AS n FROM ({inner})")
+    }
+
+    /// Resume: the rows after `from` and up to `to`. With ORDER BY and LIMIT only the top N of
+    /// them can matter; with LIMIT alone only the latest N (by offset, then reversed).
+    pub fn catch_up_sql(&self, from: &Watermark, to: &Watermark) -> String {
+        let range = from.range_predicate(to, &self.kafka.partition, &self.kafka.offset);
+        match (&self.order, self.limit) {
+            (Some(order), limit) => self.build(&self.select, Some(range), Some(order), limit),
+            (None, Some(n)) => {
+                let latest = format!("ORDER BY toInt64({}) DESC", quote_ident(&self.kafka.offset));
+                self.build(&self.select, Some(range), Some(&latest), Some(n))
+            }
+            (None, None) => self.build(&self.select, Some(range), None, None),
+        }
+    }
+
+    fn build(
+        &self,
+        select: &str,
+        bound: Option<String>,
+        order: Option<&str>,
+        limit: Option<u64>,
+    ) -> String {
         let mut sql = match (&self.filter, bound) {
-            (None, None) => self.select.clone(),
-            (Some(f), None) => format!("{} WHERE {f}", self.select),
-            (None, Some(b)) => format!("{} WHERE {b}", self.select),
-            (Some(f), Some(b)) => format!("{} WHERE ({f}) AND ({b})", self.select),
+            (None, None) => select.to_string(),
+            (Some(f), None) => format!("{select} WHERE {f}"),
+            (None, Some(b)) => format!("{select} WHERE {b}"),
+            (Some(f), Some(b)) => format!("{select} WHERE ({f}) AND ({b})"),
         };
-        if let Some(order) = &self.order {
+        if let Some(order) = order {
             sql.push(' ');
             sql.push_str(order);
         }
-        if let Some(limit) = self.limit {
+        if let Some(limit) = limit {
             sql.push_str(&format!(" LIMIT {limit}"));
         }
         sql
@@ -455,6 +500,29 @@ pub fn plan(bound: &BoundQuery) -> Plan {
         filter: bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
         order: order_sql,
         limit: bound.limit,
+        keys_select: (!order_columns.is_empty()).then(|| {
+            let mut fields: Vec<String> = Vec::new();
+            for o in &order_columns {
+                let c = table.column(o.id);
+                let field = if o.history_field == c.clickhouse {
+                    quote_ident(&c.clickhouse)
+                } else {
+                    format!(
+                        "{} AS {}",
+                        quote_ident(&c.clickhouse),
+                        quote_ident(&o.history_field)
+                    )
+                };
+                if !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
+            format!(
+                "SELECT {} FROM {}",
+                fields.join(", "),
+                table.clickhouse_table
+            )
+        }),
         kafka: table.kafka.clone(),
     };
 
@@ -770,5 +838,76 @@ mod tests {
              (a new row goes after the last row it ties with)"
         );
         assert!(plan(&bound(&[1], None)).stream.order.is_none());
+    }
+
+    #[test]
+    fn resume_queries() {
+        let c = Watermark(std::collections::BTreeMap::from([(0, 5)]));
+        let w = Watermark(std::collections::BTreeMap::from([(0, 9), (1, 2)]));
+        // ordered + limited, ordered by an unselected column
+        let f = BoundExpr::IsNull {
+            expr: col(3),
+            negated: true,
+        };
+        let mut b = ordered(&[1], Some(f), &[(2, true, false), (1, false, false)]);
+        b.limit = Some(10);
+        let p = plan(&b);
+        assert_eq!(
+            p.history.keys_sql(&c).unwrap(),
+            "SELECT latency_ms AS __order_0, user_id FROM default.events WHERE (coupon IS NOT NULL) \
+             AND (toInt64(_offset) <= multiIf(_partition = 0, 5, -1)) \
+             ORDER BY latency_ms DESC NULLS LAST, user_id ASC NULLS LAST LIMIT 10"
+        );
+        assert_eq!(
+            p.history.catch_up_sql(&c, &w),
+            "SELECT user_id, latency_ms AS __order_0 FROM default.events WHERE (coupon IS NOT NULL) \
+             AND (toInt64(_offset) > multiIf(_partition = 0, 5, -1) \
+             AND toInt64(_offset) <= multiIf(_partition = 0, 9, _partition = 1, 2, -1)) \
+             ORDER BY latency_ms DESC NULLS LAST, user_id ASC NULLS LAST LIMIT 10"
+        );
+        // LIMIT alone: the client's row count, and the latest rows
+        let mut b = bound(&[1], None);
+        b.limit = Some(3);
+        let p = plan(&b);
+        assert!(p.history.keys_sql(&c).is_none());
+        assert_eq!(
+            p.history.count_sql(&c),
+            "SELECT count() AS n FROM (SELECT 1 FROM default.events \
+             WHERE toInt64(_offset) <= multiIf(_partition = 0, 5, -1) LIMIT 3)"
+        );
+        assert!(p
+            .history
+            .catch_up_sql(&c, &w)
+            .ends_with(" ORDER BY toInt64(_offset) DESC LIMIT 3"));
+        // unordered: just the range
+        let p = plan(&bound(&[1], None));
+        assert_eq!(
+            p.history.catch_up_sql(&c, &w),
+            "SELECT user_id FROM default.events WHERE toInt64(_offset) > multiIf(_partition = 0, 5, -1) \
+             AND toInt64(_offset) <= multiIf(_partition = 0, 9, _partition = 1, 2, -1)"
+        );
+    }
+
+    #[test]
+    fn cursor_tokens() {
+        use crate::cursor;
+        let p = plan(&bound(&[1], None));
+        let at = Watermark(std::collections::BTreeMap::from([(0, 5), (2, -1)]));
+        let token = cursor::encode(&p, &at);
+        assert_eq!(cursor::decode(&p, &token), Some(at.clone()));
+        // another query (another plan) can't use it
+        let other = plan(&bound(&[0, 1], None));
+        assert_ne!(cursor::fingerprint(&p), cursor::fingerprint(&other));
+        assert_eq!(cursor::decode(&other, &token), None);
+        assert_eq!(cursor::decode(&p, "garbage"), None);
+        assert_eq!(
+            cursor::decode(&p, &token.replace("\"v\":1", "\"v\":2")),
+            None
+        );
+        // stable across runs: a hash of the plan, not of memory addresses
+        assert_eq!(
+            cursor::fingerprint(&p),
+            cursor::fingerprint(&plan(&bound(&[1], None)))
+        );
     }
 }

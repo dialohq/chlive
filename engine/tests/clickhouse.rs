@@ -560,3 +560,188 @@ fn limit_of(sql: &str) -> Option<usize> {
     sql.split_once(" limit ")
         .map(|(_, n)| n.trim().parse().unwrap())
 }
+
+/// Resume: a client holds a result and its cursor; later it resumes with only what it missed.
+/// Its list (cached rows + catch-up + stream) must equal a fresh subscription's, both when
+/// ClickHouse has caught up past the client and when the client is ahead of ClickHouse.
+#[tokio::test]
+async fn resume_matches_a_fresh_subscription() {
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    const EVENTS: &[&str] = &[
+        r#"{"ts":"2026-10-01 12:00:00.000","name":"n1","score":1.5,"n":3,"flag":true}"#,
+        r#"{"ts":"2026-10-01 12:00:01.250","name":"n2","score":null,"n":-2,"flag":false}"#,
+        r#"{"ts":"2026-10-01 12:00:02","name":"n3","score":7,"n":3,"flag":true}"#,
+        r#"{"ts":"2026-10-01 12:00:00.000","name":"n4","score":-0.0,"n":0,"flag":false}"#,
+        r#"{"ts":"2026-10-01 12:00:04.500","name":"n5","score":0,"n":3,"flag":false}"#,
+        r#"{"ts":"2026-10-01 12:00:05.000","name":"n6","score":9.5,"n":10,"flag":true}"#,
+        r#"{"ts":"2026-10-01 12:00:06.000","name":"n7","score":-1e3,"n":-2,"flag":false}"#,
+        r#"{"ts":"2026-10-01 12:00:07.000","name":"n8","score":1.5,"n":7,"flag":true}"#,
+        r#"{"ts":"2026-10-01 12:00:08.000","name":"n9","n":3,"flag":true}"#,
+        r#"{"ts":"2026-10-01 12:00:09.000","name":"n10","score":4,"n":0,"flag":false}"#,
+        r#"{"ts":"2026-10-01 12:00:00.000","name":"n11","score":1.5,"n":3,"flag":true}"#,
+        r#"{"ts":"2026-09-30 23:59:59.999","name":"n12","score":2,"n":100,"flag":false}"#,
+    ];
+    // (query, ORDER BY columns)
+    const CASES: &[(&str, &[&str])] = &[
+        ("select * from events", &[]),
+        ("select name, n from events where n = 3 or flag", &[]),
+        ("select * from events order by score desc", &["score"]),
+        (
+            "select name, score from events where n >= 0 order by n, score nulls first",
+            &["n", "score"],
+        ),
+        ("select * from events order by score limit 3", &["score"]),
+        ("select name from events order by n desc limit 4", &["n"]),
+        ("select name, n from events where n = 3 limit 2", &[]),
+    ];
+    const DB: &str = "chlive_engine_resume";
+
+    // ClickHouse holds the first `in_clickhouse` events, the topic the first `in_topic`
+    async fn setup(in_clickhouse: usize, in_topic: usize) -> Engine {
+        exec(&format!("DROP DATABASE IF EXISTS {DB}")).await;
+        exec(&format!("CREATE DATABASE {DB}")).await;
+        exec(&format!(
+            "CREATE TABLE {DB}.events (ts DateTime64(3), name String, score Nullable(Float64), \
+             n Int32, flag Bool, _partition UInt64, _offset UInt64) ENGINE = MergeTree ORDER BY tuple()"
+        ))
+        .await;
+        if in_clickhouse > 0 {
+            let rows: String = EVENTS[..in_clickhouse]
+                .iter()
+                .enumerate()
+                .map(|(o, e)| format!("{{\"_partition\":0,\"_offset\":{o},{}\n", &e[1..]))
+                .collect();
+            exec(&format!(
+                "INSERT INTO {DB}.events FORMAT JSONEachRow\n{rows}"
+            ))
+            .await;
+        }
+        let mut source = MemorySource::new();
+        for e in &EVENTS[..in_topic] {
+            source.push("events", 0, *e);
+        }
+        Engine::new(
+            HardcodedRules {
+                database: DB.into(),
+            },
+            ClickHouseHttp::new(&url(), "default", ""),
+            source,
+        )
+        .with_resume_wait(std::time::Duration::from_millis(300))
+    }
+
+    /// Run a subscription to the end, applying it to `rows`; returns its last cursor token.
+    async fn run(
+        engine: &Engine,
+        sql: &str,
+        since: Option<&str>,
+        rows: &mut Vec<chlive_engine::diff::Row>,
+    ) -> (bool, String, usize) {
+        let subscription = engine.subscribe_from(sql, since).await.unwrap();
+        let resumed = subscription.resumed;
+        let plan = subscription.plan.clone();
+        let iterations: Vec<_> = subscription.map(|i| i.unwrap()).collect().await;
+        if !resumed {
+            rows.clear();
+        }
+        let mut changes = 0;
+        for it in &iterations {
+            if it.origin != Origin::History {
+                changes += it.diffs.len();
+            }
+            for d in &it.diffs {
+                d.apply(rows).unwrap();
+            }
+        }
+        let at = iterations.last().unwrap().at.clone();
+        (resumed, chlive_engine::cursor::encode(&plan, &at), changes)
+    }
+
+    fn names(rows: &[chlive_engine::diff::Row]) -> Vec<String> {
+        rows.iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    let full: std::collections::HashMap<String, serde_json::Value> = EVENTS
+        .iter()
+        .map(|e| {
+            let v: serde_json::Value = serde_json::from_str(e).unwrap();
+            (v["name"].as_str().unwrap().to_string(), v)
+        })
+        .collect();
+    // tie groups by the ORDER BY columns (as written in the events; -0 ties with 0); the last
+    // group only by key and size when there's a LIMIT
+    let groups = |list: &[String], keys: &[&str], limited: bool| -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for name in list {
+            let k: Vec<String> = keys
+                .iter()
+                .map(|k| match &full[name][*k] {
+                    serde_json::Value::Number(n) if n.as_f64() == Some(0.0) => "0".into(),
+                    v => v.to_string(),
+                })
+                .collect();
+            let k = k.join("|");
+            match out.last_mut() {
+                Some((last, ns)) if *last == k => ns.push(name.clone()),
+                _ => out.push((k, vec![name.clone()])),
+            }
+        }
+        for (_, ns) in &mut out {
+            ns.sort();
+        }
+        if limited {
+            if let Some((k, ns)) = out.last_mut() {
+                *ns = vec![format!("{k}: {}", ns.len())];
+            }
+        }
+        out
+    };
+
+    // (ClickHouse, topic) before; then ClickHouse after, with the whole topic
+    for (k1, k2, later_in_clickhouse) in [(4, 7, 12), (4, 7, 4), (0, 5, 9), (6, 6, 12)] {
+        for (sql, keys) in CASES {
+            let mut cached = Vec::new();
+            let (_, token, _) = run(&setup(k1, k2).await, sql, None, &mut cached).await;
+            let engine = setup(later_in_clickhouse, EVENTS.len()).await;
+            let (resumed, _, changes) = run(&engine, sql, Some(&token), &mut cached).await;
+            // A client ahead of ClickHouse resumes unordered queries; for ordered or limited
+            // ones, ClickHouse (static here) never catches up, so it starts over.
+            let client_ahead = later_in_clickhouse < k2;
+            let stateful = !keys.is_empty() || sql.contains(" limit ");
+            assert_eq!(resumed, !(client_ahead && stateful), "{sql}: resumed");
+            let mut fresh = Vec::new();
+            run(&engine, sql, None, &mut fresh).await;
+            let (got, want) = (names(&cached), names(&fresh));
+            let label = format!("{sql} [CH {k1}/topic {k2} -> CH {later_in_clickhouse}/topic 12]");
+            let limit = sql
+                .split_once(" limit ")
+                .map(|(_, n)| n.parse::<usize>().unwrap());
+            if keys.is_empty() && limit.is_some() {
+                // a window: the latest rows, which a fresh history can't reproduce exactly
+                assert_eq!(got.len(), want.len(), "{label}: {got:?} vs {want:?}");
+            } else if keys.is_empty() {
+                let (mut g, mut w) = (got.clone(), want.clone());
+                g.sort();
+                w.sort();
+                assert_eq!(g, w, "{label}");
+            } else {
+                assert_eq!(
+                    groups(&got, keys, limit.is_some()),
+                    groups(&want, keys, limit.is_some()),
+                    "{label}\n  resumed {got:?}\n  fresh   {want:?}"
+                );
+            }
+            eprintln!(
+                "{label}: {} changes on resume -> {}",
+                changes,
+                got.join(" ")
+            );
+        }
+    }
+    exec(&format!("DROP DATABASE {DB}")).await;
+}

@@ -79,6 +79,10 @@ pub struct LiveResult {
     pub error: Option<(String, String)>,
     /// From the snapshot; checked after every diff.
     pub limit: Option<usize>,
+    /// Whether the server resumed (instead of a snapshot).
+    pub resumed: bool,
+    /// The last cursor received.
+    pub at: Option<String>,
     /// Anything after an error, or a second snapshot.
     pub protocol_violations: Vec<String>,
 }
@@ -97,8 +101,17 @@ impl LiveResult {
                 self.snapshot = true;
                 self.rows = rows(&msg["rows"]);
                 self.limit = msg["limit"].as_u64().map(|n| n as usize);
+                self.at = msg["at"].as_str().map(str::to_string);
             }
+            Some("resume") => {
+                // the rows we hold stay; diffs follow
+                self.snapshot = true;
+                self.resumed = true;
+                self.limit = msg["limit"].as_u64().map(|n| n as usize);
+            }
+            Some("progress") => self.at = msg["at"].as_str().map(str::to_string),
             Some("diff") => {
+                self.at = msg["at"].as_str().map(str::to_string);
                 if !self.snapshot {
                     self.protocol_violations
                         .push("diff before the snapshot".into());
@@ -206,6 +219,19 @@ impl LiveConn {
 
     pub fn subscribe(&self, id: &str, sql: &str) {
         let msg = json!({"type": "subscribe", "id": id, "sql": sql});
+        self.tx.send(msg.to_string()).expect("socket open");
+    }
+
+    /// Resume a result we hold (`rows`, complete up to the cursor `since`).
+    pub fn resume(&self, id: &str, sql: &str, since: &str, rows: Vec<Row>) {
+        self.results.lock().unwrap().insert(
+            id.to_string(),
+            LiveResult {
+                rows,
+                ..Default::default()
+            },
+        );
+        let msg = json!({"type": "subscribe", "id": id, "sql": sql, "since": since});
         self.tx.send(msg.to_string()).expect("socket open");
     }
 

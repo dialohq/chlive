@@ -7,14 +7,17 @@
 //! with it its Kafka consumer. A slow client fills the channel, which pauses its subscriptions.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use chlive_engine::cursor;
+use chlive_engine::watermark::Watermark;
 use chlive_engine::{Engine, Origin};
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -28,6 +31,9 @@ use crate::protocol::{Change, ClientMsg, Column, OrderTerm, ServerMsg, BAD_MESSA
 const MAX_ITERATIONS_PER_MESSAGE: usize = 256;
 /// Messages buffered per connection before its subscriptions pause.
 const OUTBOX: usize = 256;
+/// At most this often, a `progress` tells a client how far its result is complete when only
+/// events that didn't match arrived.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct AppState {
@@ -59,6 +65,8 @@ struct Entry {
     sql: String,
     /// Set once subscribed: where history ends and the stream begins.
     watermark: Mutex<Option<String>>,
+    /// Whether it resumed from the client's cursor rather than starting with a snapshot.
+    resumed: AtomicBool,
     rows_sent: AtomicU64,
 }
 
@@ -69,6 +77,7 @@ struct DebugEntry {
     id: String,
     sql: String,
     watermark: Option<String>,
+    resumed: bool,
     rows_sent: u64,
 }
 
@@ -95,6 +104,7 @@ impl Registry {
                 id: id.clone(),
                 sql: e.sql.clone(),
                 watermark: e.watermark.lock().unwrap().clone(),
+                resumed: e.resumed.load(Ordering::Relaxed),
                 rows_sent: e.rows_sent.load(Ordering::Relaxed),
             })
             .collect()
@@ -144,7 +154,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64) {
             }
         };
         match msg {
-            ClientMsg::Subscribe { id, sql } => {
+            ClientMsg::Subscribe { id, sql, since } => {
                 if subscriptions.get(&id).is_some_and(|t| !t.is_finished()) {
                     let _ = tx
                         .send(ServerMsg::error(
@@ -159,15 +169,19 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64) {
                 let entry = Arc::new(Entry {
                     sql: sql.clone(),
                     watermark: Mutex::new(None),
+                    resumed: AtomicBool::new(false),
                     rows_sent: AtomicU64::new(0),
                 });
                 s.registry.insert(conn, &id, entry.clone());
                 let task = tokio::spawn(run(
                     s.engine.clone(),
                     s.registry.clone(),
-                    conn,
-                    id.clone(),
-                    sql,
+                    Request {
+                        conn,
+                        id: id.clone(),
+                        sql,
+                        since,
+                    },
                     entry,
                     tx.clone(),
                 ));
@@ -193,16 +207,27 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64) {
 }
 
 /// One subscription: subscribe, send the snapshot, then a diff per batch of ready iterations.
-async fn run(
-    engine: Arc<Engine>,
-    registry: Arc<Registry>,
+/// What a client asked for.
+struct Request {
     conn: u64,
     id: String,
     sql: String,
+    since: Option<String>,
+}
+
+async fn run(
+    engine: Arc<Engine>,
+    registry: Arc<Registry>,
+    Request {
+        conn,
+        id,
+        sql,
+        since,
+    }: Request,
     entry: Arc<Entry>,
     tx: mpsc::Sender<ServerMsg>,
 ) {
-    let subscription = match engine.subscribe(&sql).await {
+    let subscription = match engine.subscribe_from(&sql, since.as_deref()).await {
         Ok(s) => s,
         Err(e) => {
             debug!(conn, id, error = %e, "subscribe failed");
@@ -212,8 +237,9 @@ async fn run(
         }
     };
     *entry.watermark.lock().unwrap() = Some(subscription.watermark.describe());
-    let columns: Vec<Column> = subscription
-        .plan
+    entry.resumed.store(subscription.resumed, Ordering::Relaxed);
+    let plan = subscription.plan.clone();
+    let columns: Vec<Column> = plan
         .columns
         .iter()
         .map(|c| Column {
@@ -221,14 +247,30 @@ async fn run(
             ty: c.ty.clickhouse.clone(),
         })
         .collect();
+    let order = plan.stream.order.as_ref().map(OrderTerm::of);
+    let limit = plan.stream.limit;
     let mut columns = Some(columns);
-    let order = subscription.plan.stream.order.as_ref().map(OrderTerm::of);
-    let subscription_limit = subscription.plan.stream.limit;
+    if subscription.resumed {
+        let resume = ServerMsg::Resume {
+            id: id.clone(),
+            columns: columns.take().unwrap_or_default(),
+            order: order.clone(),
+            limit,
+        };
+        if tx.send(resume).await.is_err() {
+            return;
+        }
+    }
 
+    // The cursor last sent, and when a `progress` last went out.
+    let mut sent_at: Option<Watermark> = None;
+    let mut last_progress = Instant::now() - PROGRESS_EVERY;
     let mut batches = subscription.ready_chunks(MAX_ITERATIONS_PER_MESSAGE);
     while let Some(batch) = batches.next().await {
         let mut changes: Vec<Change> = Vec::new();
         let mut out = Vec::new();
+        let mut at: Option<Watermark> = None;
+        let mut catch_up = false;
         let mut failed = false;
         for iteration in batch {
             match iteration {
@@ -246,16 +288,23 @@ async fn run(
                             })
                             .collect(),
                         order: order.clone(),
-                        limit: subscription_limit,
+                        limit,
+                        at: cursor::encode(&plan, &it.at),
                     });
+                    sent_at = Some(it.at);
                 }
-                Ok(it) => changes.extend(it.diffs.into_iter().map(Change::from)),
+                Ok(it) => {
+                    catch_up |= it.origin == Origin::CatchUp;
+                    changes.extend(it.diffs.into_iter().map(Change::from));
+                    at = Some(it.at);
+                }
                 Err(e) => {
                     warn!(conn, id, error = %e, "subscription failed");
-                    if !changes.is_empty() {
+                    if let (false, Some(a)) = (changes.is_empty(), &at) {
                         out.push(ServerMsg::Diff {
                             id: id.clone(),
                             changes: std::mem::take(&mut changes),
+                            at: cursor::encode(&plan, a),
                         });
                     }
                     out.push(ServerMsg::engine_error(&id, &e));
@@ -264,17 +313,31 @@ async fn run(
                 }
             }
         }
-        if !changes.is_empty() {
-            out.push(ServerMsg::Diff {
-                id: id.clone(),
-                changes,
-            });
+        if let (false, Some(a)) = (failed, at) {
+            if !changes.is_empty() {
+                out.push(ServerMsg::Diff {
+                    id: id.clone(),
+                    changes,
+                    at: cursor::encode(&plan, &a),
+                });
+                sent_at = Some(a);
+            } else if sent_at.as_ref() != Some(&a)
+                && (catch_up || last_progress.elapsed() >= PROGRESS_EVERY)
+            {
+                // only non-matching events: tell the client how far it is anyway, now and then
+                out.push(ServerMsg::Progress {
+                    id: id.clone(),
+                    at: cursor::encode(&plan, &a),
+                });
+                last_progress = Instant::now();
+                sent_at = Some(a);
+            }
         }
         for msg in out {
             let rows = match &msg {
                 ServerMsg::Snapshot { rows, .. } => rows.len(),
                 ServerMsg::Diff { changes, .. } => changes.len(),
-                ServerMsg::Error { .. } => 0,
+                _ => 0,
             };
             entry.rows_sent.fetch_add(rows as u64, Ordering::Relaxed);
             if tx.send(msg).await.is_err() {

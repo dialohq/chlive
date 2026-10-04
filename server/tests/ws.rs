@@ -164,8 +164,11 @@ async fn snapshot_then_inserts_of_matching_events() {
         "select user_id, latency_ms from requests where latency_ms > 100",
     )
     .await;
+    let mut snapshot = c.expect().await;
+    assert!(snapshot["at"].is_string(), "{snapshot}");
+    snapshot.as_object_mut().unwrap().remove("at");
     assert_eq!(
-        c.expect().await,
+        snapshot,
         json!({"type": "snapshot", "id": "s1",
                "columns": [{"name": "user_id", "type": "String"}, {"name": "latency_ms", "type": "UInt32"}],
                "rows": [{"user_id": "h1", "latency_ms": 900}]})
@@ -402,6 +405,64 @@ async fn limit_sends_deletes_in_the_same_diff() {
             json!({"user_id": "slower", "latency_ms": 700})
         ]
     );
+}
+
+#[tokio::test]
+async fn resume_from_a_cursor_sends_only_what_is_missing() {
+    let server = server().await;
+    let sql = "select user_id from requests";
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s1", sql).await;
+    let snapshot = c.expect().await;
+    let at_snapshot = snapshot["at"].as_str().unwrap().to_string();
+    assert_eq!(c.inserts("s1", 3).await.len(), 3);
+    drop(c);
+
+    // a client holding just the history (h1) gets the three events, and no snapshot
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "r1", "sql": sql, "since": at_snapshot}))
+        .await;
+    let resume = c.expect().await;
+    assert_eq!(
+        resume,
+        json!({"type": "resume", "id": "r1", "columns": [{"name": "user_id", "type": "String"}]})
+    );
+    let mut users = Vec::new();
+    let mut last_at = String::new();
+    while users.len() < 3 {
+        let m = c.expect().await;
+        assert_eq!(m["type"], "diff", "{m}");
+        last_at = m["at"].as_str().unwrap().to_string();
+        users.extend(
+            m["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|ch| ch["row"]["user_id"].as_str().unwrap().to_string()),
+        );
+    }
+    assert_eq!(users, ["fast", "slow", "slower"]);
+    drop(c);
+
+    // a client that is up to date: resume, then just a progress with its cursor
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "r2", "sql": sql, "since": last_at}))
+        .await;
+    assert_eq!(c.expect().await["type"], "resume");
+    let m = c.expect().await;
+    assert_eq!(
+        (m["type"].as_str(), m["at"].as_str()),
+        (Some("progress"), Some(last_at.as_str()))
+    );
+    assert_eq!(c.next().await, None);
+
+    // a cursor for another query, or garbage: a normal snapshot
+    for since in [last_at.as_str(), "garbage"] {
+        c.send(json!({"type": "subscribe", "id": since, "sql": "select user_id, latency_ms from requests", "since": since}))
+            .await;
+        assert_eq!(c.expect().await["type"], "snapshot");
+        let _ = c.inserts(since, 3).await;
+    }
 }
 
 /// A plain HTTP GET (no client library needed for one endpoint).

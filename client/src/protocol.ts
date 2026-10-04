@@ -16,7 +16,8 @@ export interface Column {
 }
 
 export type ClientMessage =
-  | { type: "subscribe"; id: string; sql: string }
+  /** `since`: the `at` of a result the client already holds (e.g. cached), to resume from it. */
+  | { type: "subscribe"; id: string; sql: string; since?: string }
   | { type: "unsubscribe"; id: string };
 
 /**
@@ -43,6 +44,25 @@ export interface SnapshotMessage {
   order?: OrderTerm[];
   /** The LIMIT: the result never has more rows at the end of a diff. */
   limit?: number;
+  /** An opaque cursor: how far this result is complete. Resume from it with `since`. */
+  at: string;
+}
+
+/** Instead of a snapshot, when resuming from `since`: the client's rows are still valid; the
+ * diffs that follow bring them up to date. */
+export interface ResumeMessage {
+  type: "resume";
+  id: string;
+  columns: Column[];
+  order?: OrderTerm[];
+  limit?: number;
+}
+
+/** The cursor moved without changes to the result (events that didn't match). */
+export interface ProgressMessage {
+  type: "progress";
+  id: string;
+  at: string;
 }
 
 export interface DiffMessage {
@@ -54,6 +74,8 @@ export interface DiffMessage {
    * and the delete it causes can briefly make one row more than the LIMIT.
    */
   changes: Change[];
+  /** The cursor after these changes. */
+  at: string;
 }
 
 /**
@@ -68,4 +90,4 @@ export interface ErrorMessage {
   message: string;
 }
 
-export type ServerMessage = SnapshotMessage | DiffMessage | ErrorMessage;
+export type ServerMessage = SnapshotMessage | ResumeMessage | DiffMessage | ProgressMessage | ErrorMessage;

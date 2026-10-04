@@ -244,3 +244,101 @@ fn check_limited(id: &str, sql: &str, keys: &[&str], live: &LiveResult, direct: 
         "{id}: top {limit} differs from ClickHouse"
     );
 }
+
+/// Offline cache, end to end: keep a result and its cursor, go away while events arrive, come
+/// back with `since`: the server resumes, sends only what was missed, and the result equals the
+/// query on ClickHouse.
+#[tokio::test]
+async fn resume_after_being_away() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let server = start_server().await?;
+    let producer = producer()?;
+    const QUERIES: &[(&str, &str, &[&str])] = &[
+        (
+            "pl",
+            "select ts, user_id, latency_ms from events where country = 'PL'",
+            &[],
+        ),
+        (
+            "top",
+            "select ts, user_id, latency_ms from events order by latency_ms desc limit 30",
+            &["latency_ms"],
+        ),
+        (
+            "ordered",
+            "select user_id, country from events where latency_ms > 800 order by country",
+            &["country"],
+        ),
+    ];
+
+    // a first session: subscribe, take in some live events, remember where we are
+    let conn = LiveConn::connect(&server).await?;
+    for (id, sql, _) in QUERIES {
+        conn.subscribe(id, sql);
+    }
+    conn.wait_ready(
+        &QUERIES.iter().map(|q| q.0).collect::<Vec<_>>(),
+        Duration::from_secs(60),
+    )
+    .await?;
+    let produced = producer.produce(300, None).await?;
+    settle(&conn, &produced).await?;
+    let kept: Vec<_> = QUERIES.iter().map(|q| conn.result(q.0).unwrap()).collect();
+    drop(conn);
+
+    // away: more events arrive
+    let produced = producer.produce(600, None).await?;
+
+    // back: resume each query from its cursor
+    let conn = LiveConn::connect(&server).await?;
+    for ((id, sql, _), r) in QUERIES.iter().zip(&kept) {
+        conn.resume(id, sql, r.at.as_deref().expect("a cursor"), r.rows.clone());
+    }
+    conn.wait_ready(
+        &QUERIES.iter().map(|q| q.0).collect::<Vec<_>>(),
+        Duration::from_secs(60),
+    )
+    .await?;
+    settle(&conn, &produced).await?;
+    for ((id, sql, keys), before) in QUERIES.iter().zip(&kept) {
+        let live = conn.result(id).unwrap();
+        assert!(live.error.is_none(), "{id}: {:?}", live.error);
+        assert!(
+            live.protocol_violations.is_empty(),
+            "{id}: {:?}",
+            live.protocol_violations
+        );
+        assert!(live.resumed, "{id}: got a snapshot instead of a resume");
+        let direct = direct(sql).await?;
+        eprintln!(
+            "{id:>8}: {} rows kept, {} changes on resume, {} rows now (ClickHouse {})",
+            before.rows.len(),
+            live.inserted,
+            live.rows.len(),
+            direct.len()
+        );
+        if keys.is_empty() {
+            assert_eq!(multiset(&live.rows), multiset(&direct), "{id}");
+        } else if sql.contains(" limit ") {
+            let boundary = |rows: &[Row]| {
+                let mut g = tie_groups(rows, keys);
+                if let Some((k, rows)) = g.last_mut() {
+                    *rows = vec![format!("{k}: {}", rows.len())];
+                }
+                g
+            };
+            assert_eq!(boundary(&live.rows), boundary(&direct), "{id}");
+        } else {
+            assert_eq!(
+                tie_groups(&live.rows, keys),
+                tie_groups(&direct, keys),
+                "{id}"
+            );
+        }
+    }
+    Ok(())
+}

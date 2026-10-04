@@ -1,6 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { useLiveQuery } from "@chlive/client/react";
+import { defaultUrl, LiveClient } from "@chlive/client";
+import { LiveClientProvider, useLiveQuery } from "@chlive/client/react";
+import { createOpfsCache } from "@chlive/client/cache";
+
+// Results are cached in SQLite on OPFS: a reload shows them at once, then resumes from their cursor.
+const cache = createOpfsCache();
+const client = new LiveClient({ url: defaultUrl(), cache });
+// save pending results before the page goes away
+addEventListener("pagehide", () => {
+  client.flush();
+  // let the next page (e.g. after a reload) open the database right away
+  setTimeout(() => cache.close(), 0);
+});
+document.addEventListener("visibilitychange", () => document.hidden && client.flush());
 
 // Queries in the chlive dialect:
 // SELECT * | columns FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
@@ -292,6 +305,9 @@ const kb = (n) => (n < 10_000 ? `${n} B` : n < 10_000_000 ? `${(n / 1024).toFixe
 function summarize(msg) {
   if (msg.type === "snapshot") return `snapshot: ${msg.rows.length} rows`;
   if (msg.type === "error") return `error ${msg.code}`;
+  if (msg.type === "resume") return "resume: cached rows are valid, catching up";
+  if (msg.type === "progress") return "progress: cursor moved (no matching events)";
+  if (msg.type !== "diff") return msg.type;
   const ops = msg.changes.map((c) =>
     c.op === "insert" ? (c.index === undefined ? "+" : `+@${c.index}`) : c.op === "delete" ? `-@${c.index}` : c.op,
   );
@@ -358,6 +374,7 @@ function Debug({ state, sql, shown }) {
             <th>live rate</th>
             <td>{rate.toFixed(1)} inserts/s (last 5 s)</td>
           </tr>
+          <CacheRows stats={stats} />
           <tr>
             <th>last message</th>
             <td>
@@ -387,6 +404,80 @@ function Debug({ state, sql, shown }) {
         </small>
       </p>
     </details>
+  );
+}
+
+/** The cursor token's offsets, for reading: `p0:123 p1:98`. */
+function describeCursor(at) {
+  if (!at) return "—";
+  try {
+    const offsets = JSON.parse(at).o ?? {};
+    return Object.entries(offsets).map(([p, o]) => `p${p}:${o}`).join(" ") || "(empty)";
+  } catch {
+    return at;
+  }
+}
+
+/** What the offline cache did for this subscription, and how full it is. */
+function CacheRows({ stats }) {
+  const [store, setStore] = useState(null);
+  useEffect(() => {
+    let live = true;
+    const read = () => cache.stats().then((s) => live && setStore(s ?? null));
+    read();
+    const t = setInterval(read, 2000);
+    return () => {
+      live = false;
+      clearInterval(t);
+    };
+  }, []);
+  const c = stats.cache;
+  const mb = (n) => `${(n / 1048576).toFixed(1)} MB`;
+  return (
+    <>
+      <tr>
+        <th>cache</th>
+        <td>
+          {cache.unavailable ? (
+            <span className="error">unavailable: {cache.unavailable}</span>
+          ) : !c ? (
+            "reading…"
+          ) : (
+            <>
+              {c.hit
+                ? `hit: ${c.loadedRows} rows from ${new Date(c.savedAt).toLocaleTimeString()} in ${c.loadMs.toFixed(0)} ms`
+                : `miss (${c.loadMs.toFixed(0)} ms)`}
+              {c.resumed === true && ` · resumed, catch-up ${c.catchUp ?? "…"} changes`}
+              {c.resumed === false && " · full snapshot instead"}
+              {` · ${c.saves} writes`}
+              {c.lastSaveMs !== undefined && ` (last ${c.lastSaveMs.toFixed(1)} ms)`}
+            </>
+          )}
+        </td>
+      </tr>
+      <tr>
+        <th>cursor</th>
+        <td>
+          <code>{describeCursor(stats.at)}</code>
+        </td>
+      </tr>
+      <tr>
+        <th>cache store</th>
+        <td>
+          {store
+            ? `${store.queries} queries · ${store.rows} rows · ${mb(store.bytes)} of ${mb(store.budgetBytes)}`
+            : "—"}{" "}
+          <button
+            onClick={async () => {
+              await cache.clear();
+              setStore(await cache.stats());
+            }}
+          >
+            Clear cache
+          </button>
+        </td>
+      </tr>
+    </>
   );
 }
 
@@ -476,7 +567,7 @@ function Query() {
 }
 
 createRoot(document.getElementById("root")).render(
-  <>
+  <LiveClientProvider client={client}>
     <h1>chlive playground</h1>
     <div className="panes">
       <Query />
@@ -485,5 +576,5 @@ createRoot(document.getElementById("root")).render(
         <Generator />
       </div>
     </div>
-  </>,
+  </LiveClientProvider>,
 );

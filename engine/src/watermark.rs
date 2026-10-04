@@ -71,6 +71,43 @@ impl Watermark {
         format!("toInt64({o}) <= {threshold}")
     }
 
+    /// ClickHouse condition selecting the rows after `self` and at or below `upper`, per
+    /// partition: what a client at `self` is missing of what ClickHouse has up to `upper`.
+    /// Empty for a partition where `upper` isn't past `self`.
+    pub fn range_predicate(
+        &self,
+        upper: &Watermark,
+        partition_column: &str,
+        offset_column: &str,
+    ) -> String {
+        let p = quote_ident(partition_column);
+        let o = quote_ident(offset_column);
+        let lower: Vec<String> = self
+            .0
+            .iter()
+            .map(|(part, off)| format!("{p} = {part}, {off}"))
+            .collect();
+        let lower = if lower.is_empty() {
+            "-1".to_string()
+        } else {
+            format!("multiIf({}, -1)", lower.join(", "))
+        };
+        format!(
+            "toInt64({o}) > {lower} AND {}",
+            upper.history_predicate(partition_column, offset_column)
+        )
+    }
+
+    /// Per partition, the further of the two.
+    pub fn max(&self, other: &Watermark) -> Watermark {
+        let mut out = self.0.clone();
+        for (p, o) in &other.0 {
+            let e = out.entry(*p).or_insert(*o);
+            *e = (*e).max(*o);
+        }
+        Watermark(out)
+    }
+
     /// For logs and explain: `{0: 120, 1: 98}`.
     pub fn describe(&self) -> String {
         let parts: Vec<String> = self.0.iter().map(|(p, o)| format!("{p}: {o}")).collect();
@@ -107,5 +144,20 @@ mod tests {
                 assert_ne!(in_history, in_stream, "partition {p} offset {o}");
             }
         }
+    }
+
+    #[test]
+    fn range_and_max() {
+        let lower = Watermark(BTreeMap::from([(0, 5), (1, 9)]));
+        let upper = Watermark(BTreeMap::from([(0, 8), (1, 7), (2, 3)]));
+        assert_eq!(
+            lower.range_predicate(&upper, "_partition", "_offset"),
+            "toInt64(_offset) > multiIf(_partition = 0, 5, _partition = 1, 9, -1) \
+             AND toInt64(_offset) <= multiIf(_partition = 0, 8, _partition = 1, 7, _partition = 2, 3, -1)"
+        );
+        assert_eq!(
+            lower.max(&upper),
+            Watermark(BTreeMap::from([(0, 8), (1, 9), (2, 3)]))
+        );
     }
 }
