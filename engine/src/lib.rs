@@ -20,6 +20,7 @@
 //! history from ClickHouse and then one iteration per event of the subscribed topics. History
 //! and events meet at a per-partition offset [`watermark`], so each event is in exactly one.
 
+pub mod aggregate;
 pub mod ast;
 pub mod binder;
 pub mod chdb;
@@ -38,5 +39,5 @@ pub mod types;
 pub mod watermark;
 
 pub use binder::{BoundColumn, BoundExpr, BoundQuery};
-pub use engine::{Config, Engine, EngineError, Iteration, Origin, Subscription};
+pub use engine::{Aggregates, Config, Engine, EngineError, Iteration, Origin, Subscription};
 pub use plan::Plan;

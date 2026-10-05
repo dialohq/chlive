@@ -151,13 +151,15 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 - Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`. After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
 
-### GROUP BY and aggregates (chDB, on `feat/group-by-chdb`)
+### GROUP BY and aggregates (on `feat/group-by-chdb`)
 
-`SELECT keys, count() | count(c) | sum(c) | avg(c) | min(c) | max(c) [AS name], … FROM t [WHERE …] [GROUP BY keys]`, with ClickHouse's result types and output names. Not yet: ORDER BY, LIMIT or HAVING with aggregates, other functions, and resuming aggregates (they start from a snapshot).
+`SELECT keys, agg(c) [AS name], … FROM t [WHERE …] [GROUP BY keys]`, with ClickHouse's result types and output names. Functions: `count()`, `count(c)`, `sum`, `avg`, `min`, `max` (native), and `uniq`, `uniqExact`, `median`, `any`, `anyLast` (chDB). Not yet: ORDER BY, LIMIT or HAVING with aggregates, expressions as arguments, and resuming aggregates (they start from a snapshot).
 
-- **How:** chDB (ClickHouse as a library) runs inside the engine. Main ClickHouse computes the history's aggregate states (`countState()`, `avgState(x)`, …) with `remote()` into a chDB table per subscription; each batch of events (up to 1000 that arrived together) adds its states, and the groups it touched are read back finalized with `…Merge` and compared with what was sent.
+- **Native** when every aggregate in the query has a native implementation (`engine/src/aggregate/`: the `AggregateFunction` and `AggregateState` traits). ClickHouse computes the parts of each group's state over HTTP (`avg(x)` → `sum(x)`, `count(x)`), and the engine keeps the states in memory and updates them per event. `--explain` says which way a query runs.
+- **chDB** (ClickHouse as a library, inside the engine) otherwise. Main ClickHouse computes the history's aggregate states (`uniqExactState(x)`, …) with `remote()` into a chDB table per subscription; each batch of events (up to 1000 that arrived together) adds its states, and the groups it touched are read back finalized with `…Merge`. `Engine::with_aggregates(Aggregates::ChdbOnly)` runs every query this way (tests and the benchmark use it to check both agree with ClickHouse).
+- Either way, the groups touched by a batch are compared with what was sent.
 - **Rows have ids**, their group's key as JSON (`["PL"]`, `[]` for a global aggregate). The snapshot carries `ids`; new groups are `insert`s with an `id`; changed ones `{"op": "update", "id", "set": {…}}` with only the changed columns.
-- **Cost:** see [docs/bench/group-by-chdb.md](docs/bench/group-by-chdb.md): ~2–5 ms per batch in chDB, so ~500 events/s one at a time, ~200–500 k/s in batches of 1000.
+- **Cost:** see [docs/bench/group-by.md](docs/bench/group-by.md). Natively ~1 M events/s per subscription one at a time, up to several M/s batched. chDB costs ~2–5 ms per batch, so ~500 events/s one at a time and ~150–500 k/s in batches of 1000.
 - Binaries call `chlive_engine::chdb::shutdown()` before exiting: with chDB open, its exit handlers crash the process.
 
 ### Offline cache

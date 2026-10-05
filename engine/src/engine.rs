@@ -3,7 +3,6 @@
 //! A subscription yields the history from ClickHouse first, then one [`Iteration`] per event of
 //! the topics the query needs, each carrying the diffs it produced.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -12,8 +11,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::stream::{self, BoxStream, Stream, StreamExt};
-use serde_json::Value;
 
+use crate::aggregate::chdb_run::{AggregateRun, ChdbTable};
+use crate::aggregate::native_run::NativeRun;
+use crate::aggregate::GroupDiffer;
 use crate::binder::{bind, BindError, Catalog};
 use crate::chdb::{Chdb, ChdbError};
 use crate::cursor;
@@ -77,6 +78,18 @@ pub struct Engine {
     source: Arc<dyn EventSource>,
     native: Native,
     max_batch: usize,
+    aggregates: Aggregates,
+}
+
+/// Which backend runs aggregate queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Aggregates {
+    /// Native states in the engine when every aggregate has a native implementation; chDB
+    /// otherwise.
+    #[default]
+    Auto,
+    /// Always chDB (ClickHouse's `-State`/`-Merge`), e.g. to compare the two.
+    ChdbOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -133,7 +146,14 @@ impl Engine {
                 password: String::new(),
             },
             max_batch: 1000,
+            aggregates: Aggregates::Auto,
         }
+    }
+
+    /// Which backend runs aggregate queries (default: native when possible).
+    pub fn with_aggregates(mut self, aggregates: Aggregates) -> Self {
+        self.aggregates = aggregates;
+        self
     }
 
     /// Parse, bind and plan a query without running it.
@@ -293,21 +313,8 @@ impl Engine {
         aggregate: AggregatePlan,
         watermark: Watermark,
     ) -> Result<Subscription, EngineError> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let chdb = Chdb::shared()?;
-        let table = format!(
-            "chlive_agg_{}_{}",
-            std::process::id(),
-            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
-        );
-        let remote = aggregate.remote(
-            &self.native.address,
-            &self.native.user,
-            &self.native.password,
-        );
         let bound =
             watermark.history_predicate(&aggregate.kafka.partition, &aggregate.kafka.offset);
-        let create = aggregate.create_sql(&table, &remote, &bound);
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
             let partitions = self
@@ -323,35 +330,76 @@ impl Engine {
                     .collect(),
             });
         }
-        tracing::info!(table, create = %create.replace(&self.native.password, "***"), "subscribed (aggregate)");
         let events = self
             .source
             .subscribe(&starts, &plan.stream.required_keys())
-            .await?;
-        let run = AggregateRun {
-            table: Arc::new(ChdbTable {
-                chdb: chdb.clone(),
-                name: table,
-            }),
-            chdb,
-            create: Some(create.clone()),
-            aggregate,
-            stream: plan.stream.clone(),
-            events: events.ready_chunks(self.max_batch).boxed(),
-            sent: HashMap::new(),
-            at: watermark.clone(),
-            batches: 0,
-            failed: false,
+            .await?
+            .ready_chunks(self.max_batch)
+            .boxed();
+        let native_sql = match self.aggregates {
+            Aggregates::Auto => aggregate.native_history_sql(&bound),
+            Aggregates::ChdbOnly => None,
         };
-        let iterations = stream::unfold(run, |mut run| async move {
-            let next = run.step().await?;
-            Some((next, run))
-        })
-        .boxed();
+        let (history_sql, iterations) = match (native_sql, aggregate.native.clone()) {
+            (Some(sql), Some(native)) => {
+                tracing::info!(history = %sql, "subscribed (aggregate, native)");
+                let run = NativeRun::new(
+                    self.history.clone(),
+                    sql.clone(),
+                    native,
+                    plan.stream.clone(),
+                    events,
+                    watermark.clone(),
+                );
+                let iterations = stream::unfold(run, |mut run| async move {
+                    let next = run.step().await?;
+                    Some((next, run))
+                })
+                .boxed();
+                (sql, iterations)
+            }
+            _ => {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                let chdb = Chdb::shared()?;
+                let table = format!(
+                    "chlive_agg_{}_{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+                );
+                let remote = aggregate.remote(
+                    &self.native.address,
+                    &self.native.user,
+                    &self.native.password,
+                );
+                let create = aggregate.create_sql(&table, &remote, &bound);
+                tracing::info!(table, create = %create.replace(&self.native.password, "***"), "subscribed (aggregate, chDB)");
+                let run = AggregateRun {
+                    table: Arc::new(ChdbTable {
+                        chdb: chdb.clone(),
+                        name: table,
+                    }),
+                    chdb,
+                    create: Some(create.clone()),
+                    aggregate,
+                    stream: plan.stream.clone(),
+                    events,
+                    sent: GroupDiffer::default(),
+                    at: watermark.clone(),
+                    batches: 0,
+                    failed: false,
+                };
+                let iterations = stream::unfold(run, |mut run| async move {
+                    let next = run.step().await?;
+                    Some((next, run))
+                })
+                .boxed();
+                (create, iterations)
+            }
+        };
         Ok(Subscription {
             plan,
             watermark,
-            history_sql: create,
+            history_sql,
             resumed: false,
             iterations,
         })
@@ -509,175 +557,6 @@ async fn read_ahead(
         }
     }
     Ok((own, held))
-}
-
-/// A chDB table that goes away with its subscription.
-struct ChdbTable {
-    chdb: Chdb,
-    name: String,
-}
-
-impl Drop for ChdbTable {
-    fn drop(&mut self) {
-        let (chdb, sql) = (
-            self.chdb.clone(),
-            format!("DROP TABLE IF EXISTS {}", self.name),
-        );
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(async move {
-                if let Err(e) = chdb.exec(sql).await {
-                    tracing::warn!(error = %e, "dropping an aggregate table");
-                }
-            });
-        }
-    }
-}
-
-/// A running aggregate subscription (see [`Engine::subscribe_aggregate`]).
-struct AggregateRun {
-    chdb: Chdb,
-    table: Arc<ChdbTable>,
-    /// The history's `CREATE TABLE … AS SELECT … FROM remote(…)`, until it has run.
-    create: Option<String>,
-    aggregate: AggregatePlan,
-    stream: StreamPlan,
-    events: BoxStream<'static, Vec<Event>>,
-    /// Every group's row as last sent, by id.
-    sent: HashMap<String, Row>,
-    at: Watermark,
-    batches: u64,
-    failed: bool,
-}
-
-/// Merged state rows pile up in the chDB table until merged; force that every this many batches.
-const OPTIMIZE_EVERY: u64 = 1000;
-
-impl AggregateRun {
-    async fn step(&mut self) -> Option<Result<Iteration, EngineError>> {
-        if self.failed {
-            return None;
-        }
-        let result = match self.create.take() {
-            Some(create) => self.history(create).await,
-            None => {
-                let batch = self.events.next().await?;
-                self.batch(batch).await
-            }
-        };
-        self.failed = result.is_err();
-        Some(result)
-    }
-
-    async fn history(&mut self, create: String) -> Result<Iteration, EngineError> {
-        self.chdb.exec(create).await?;
-        let rows = self
-            .chdb
-            .rows(self.aggregate.snapshot_sql(&self.table.name))
-            .await?;
-        Ok(Iteration {
-            origin: Origin::History,
-            diffs: self.diffs(rows),
-            at: self.at.clone(),
-        })
-    }
-
-    async fn batch(&mut self, events: Vec<Event>) -> Result<Iteration, EngineError> {
-        let last = events.last().expect("a non-empty batch");
-        let origin = Origin::Event {
-            topic: last.topic.clone(),
-            partition: last.partition,
-            offset: last.offset,
-        };
-        let mut lines = String::new();
-        for event in &events {
-            let position = self.at.0.entry(event.partition).or_insert(event.offset);
-            *position = (*position).max(event.offset);
-            match self.stream.decode(&event.value) {
-                Ok(row) if self.stream.matches(&row) => {
-                    let mut object: Row = self
-                        .aggregate
-                        .batch_columns
-                        .iter()
-                        .map(|(id, name)| (name.clone(), row[id.0].to_json()))
-                        .collect();
-                    if object.is_empty() {
-                        object.insert(crate::plan::PLACEHOLDER.into(), Value::from(1));
-                    }
-                    lines.push_str(&Value::Object(object).to_string());
-                    lines.push('\n');
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    topic = %event.topic,
-                    partition = event.partition,
-                    offset = event.offset,
-                    error = %e,
-                    "skipping event"
-                ),
-            }
-        }
-        if lines.is_empty() {
-            return Ok(Iteration {
-                origin,
-                diffs: Vec::new(),
-                at: self.at.clone(),
-            });
-        }
-        let table = &self.table.name;
-        self.chdb
-            .exec(self.aggregate.insert_sql(table, &lines))
-            .await?;
-        let rows = self
-            .chdb
-            .rows(self.aggregate.touched_sql(table, &lines))
-            .await?;
-        self.batches += 1;
-        if self.batches.is_multiple_of(OPTIMIZE_EVERY) {
-            self.chdb
-                .exec(format!("OPTIMIZE TABLE {table} FINAL"))
-                .await?;
-        }
-        Ok(Iteration {
-            origin,
-            diffs: self.diffs(rows),
-            at: self.at.clone(),
-        })
-    }
-
-    /// Finalized group rows (with their keys as `__k0…`) into inserts for new groups and
-    /// updates of the columns that changed.
-    fn diffs(&mut self, rows: Vec<Row>) -> Vec<Diff> {
-        let mut diffs = Vec::new();
-        for mut row in rows {
-            let key: Vec<Value> = (0..self.aggregate.keys)
-                .map(|i| row.shift_remove(&format!("__k{i}")).unwrap_or(Value::Null))
-                .collect();
-            let id = Value::Array(key).to_string();
-            match self.sent.get_mut(&id) {
-                None => {
-                    self.sent.insert(id.clone(), row.clone());
-                    diffs.push(Diff::Insert {
-                        row,
-                        index: None,
-                        id: Some(id),
-                    });
-                }
-                Some(old) => {
-                    let set: Row = row
-                        .into_iter()
-                        .filter(|(k, v)| old.get(k) != Some(v))
-                        .collect();
-                    if !set.is_empty() {
-                        for (k, v) in &set {
-                            old.insert(k.clone(), v.clone());
-                        }
-                        diffs.push(Diff::Update { id, set });
-                    }
-                }
-            }
-        }
-        diffs
-    }
 }
 
 /// What a subscription fetches first.

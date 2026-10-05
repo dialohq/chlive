@@ -41,6 +41,19 @@ impl HistorySource for FakeHistory {
         if sql.contains("max(_offset)") {
             return Ok(vec![obj(json!({"p": 0, "o": 0}))]);
         }
+        if sql.contains(" GROUP BY ") {
+            // the native aggregate test's history: its one group, as states
+            assert_eq!(
+                sql,
+                "SELECT user_id AS __k0, count() AS __a0_0, max(latency_ms) AS __a1_0, \
+                 count(latency_ms) AS __a1_1 FROM default.requests \
+                 WHERE (latency_ms > 100) AND (toInt64(_offset) <= multiIf(_partition = 0, 0, -1)) \
+                 GROUP BY __k0"
+            );
+            return Ok(vec![obj(
+                json!({"__k0": "h1", "__a0_0": 1, "__a1_0": 900, "__a1_1": 1}),
+            )]);
+        }
         // the history row, projected to the selected columns (the WHERE is the test's job)
         let history = obj(json!({"user_id": "h1", "latency_ms": 900}));
         let columns = sql
@@ -480,4 +493,44 @@ async fn http_get(url: &str) -> String {
     s.read_to_string(&mut buf).await.unwrap();
     let body = buf.split_once("\r\n\r\n").unwrap().1;
     body.to_string()
+}
+
+#[tokio::test]
+async fn aggregates_are_a_snapshot_with_ids_then_new_groups() {
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe(
+        "g",
+        "select user_id, count() as n, max(latency_ms) as top from requests \
+         where latency_ms > 100 group by user_id",
+    )
+    .await;
+    let mut snapshot = c.expect().await;
+    snapshot.as_object_mut().unwrap().remove("at");
+    assert_eq!(
+        snapshot,
+        json!({"type": "snapshot", "id": "g",
+               "columns": [{"name": "user_id", "type": "String"}, {"name": "n", "type": "UInt64"},
+                           {"name": "top", "type": "UInt32"}],
+               "rows": [{"user_id": "h1", "n": 1, "top": 900}],
+               "ids": ["[\"h1\"]"]})
+    );
+    let mut changes = Vec::new();
+    while changes.len() < 2 {
+        let m = c.expect().await;
+        assert_eq!(
+            (m["type"].as_str(), m["id"].as_str()),
+            (Some("diff"), Some("g")),
+            "{m}"
+        );
+        changes.extend(m["changes"].as_array().unwrap().iter().cloned());
+    }
+    assert_eq!(
+        changes,
+        [
+            json!({"op": "insert", "id": "[\"slow\"]", "row": {"user_id": "slow", "n": 1, "top": 500}}),
+            json!({"op": "insert", "id": "[\"slower\"]", "row": {"user_id": "slower", "n": 1, "top": 700}}),
+        ]
+    );
+    assert_eq!(c.next().await, None);
 }

@@ -17,11 +17,13 @@ document.addEventListener("visibilitychange", () => document.hidden && client.fl
 
 // Queries in the chlive dialect:
 // SELECT * | columns FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
-// SELECT keys, count() | count(c) | sum(c) | avg(c) | min(c) | max(c) [AS name], … FROM table [WHERE …] [GROUP BY keys]
+// SELECT keys, agg(c) [AS name], … FROM table [WHERE …] [GROUP BY keys]
+//   count, sum, avg, min, max run natively in the engine; uniq, uniqExact, median, any, anyLast in chDB
 const QUERY_PRESETS = [
   "select country, count() as n, avg(latency_ms) as avg_latency from events group by country",
   "select count() as events, sum(amount) as revenue, max(latency_ms) from events",
   "select path, min(latency_ms), max(latency_ms), sum(amount) from events where country = 'PL' group by path",
+  "select country, uniqExact(user_id) as users, median(latency_ms) from events group by country",
   "select ts, user_id, country, path, latency_ms from events where latency_ms > 500",
   "select ts, user_id, country, latency_ms from events order by latency_ms desc",
   "select ts, user_id, country, path from events where country in ('PL', 'DE') order by country, ts desc",

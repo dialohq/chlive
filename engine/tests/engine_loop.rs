@@ -77,6 +77,17 @@ impl HistorySource for FakeHistory {
             s if s == format!("SELECT user_id FROM default.requests WHERE {REQUESTS_BOUND}") => {
                 Ok(vec![row(json!({"user_id": "slow-history"}))])
             }
+            s if s
+                == format!(
+                    "SELECT user_id AS __k0, count() AS __a0_0, sum(latency_ms) AS __a1_0, \
+                     max(latency_ms) AS __a2_0, count(latency_ms) AS __a2_1 \
+                     FROM default.requests WHERE {REQUESTS_BOUND} GROUP BY __k0"
+                ) =>
+            {
+                Ok(vec![row(
+                    json!({"__k0": "u1", "__a0_0": 1, "__a1_0": 900, "__a2_0": 900, "__a2_1": 1}),
+                )])
+            }
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -460,4 +471,35 @@ async fn resume_falls_back_to_a_snapshot_when_the_topic_was_recreated() {
     assert!(!s.resumed);
     let first = s.map(|i| i.unwrap()).collect::<Vec<_>>().await.remove(0);
     assert_eq!(first.origin, Origin::History);
+}
+
+#[tokio::test]
+async fn group_by_runs_natively_without_chdb() {
+    let mut source = MemorySource::new();
+    source
+        .push("requests", 0, r#"{"user_id": "u1", "latency_ms": 900}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "u1", "latency_ms": 100}"#) // count and sum change
+        .push("requests", 0, r#"{"user_id": "u2", "latency_ms": 50}"#) // a new group
+        .push("requests", 0, r#"{"user_id": "u1", "latency_ms": 1000}"#); // the max changes too
+    let sql = "select user_id, count() as n, sum(latency_ms) as total, max(latency_ms) as top \
+               from requests group by user_id";
+    let subscription = engine(source)
+        .with_max_batch(1)
+        .subscribe(sql)
+        .await
+        .unwrap();
+    let agg = subscription.plan.aggregate.as_ref().unwrap();
+    assert!(agg.native.is_some(), "{}", subscription.plan);
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    let lines: Vec<String> = iterations.iter().map(|i| i.to_string()).collect();
+    assert_eq!(
+        lines,
+        [
+            "+ [\"u1\"] {\"user_id\":\"u1\",\"n\":1,\"total\":900,\"top\":900}\nhistory: 1 rows",
+            // updates carry only the columns that changed (the max stays 900)
+            "requests/0:1 ~ [\"u1\"] {\"n\":2,\"total\":1000}",
+            "requests/0:2 + [\"u2\"] {\"user_id\":\"u2\",\"n\":1,\"total\":50,\"top\":50}",
+            "requests/0:3 ~ [\"u1\"] {\"n\":3,\"total\":2000,\"top\":1000}",
+        ]
+    );
 }

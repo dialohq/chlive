@@ -107,9 +107,15 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    Uniq,
+    UniqExact,
+    Median,
+    Any,
+    AnyLast,
 }
 
 impl AggFunc {
+    /// The ClickHouse name (also the start of its `-State`/`-Merge` names).
     pub fn name(self) -> &'static str {
         match self {
             AggFunc::Count => "count",
@@ -117,6 +123,11 @@ impl AggFunc {
             AggFunc::Avg => "avg",
             AggFunc::Min => "min",
             AggFunc::Max => "max",
+            AggFunc::Uniq => "uniq",
+            AggFunc::UniqExact => "uniqExact",
+            AggFunc::Median => "median",
+            AggFunc::Any => "any",
+            AggFunc::AnyLast => "anyLast",
         }
     }
 }
@@ -341,20 +352,14 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
                 (col.name.clone(), col.ty.clone(), AggExpr::Key(id), c.span)
             }
             SelectExpr::Call { name, arg, span } => {
-                let func = match name.to_ascii_lowercase().as_str() {
-                    "count" => AggFunc::Count,
-                    "sum" => AggFunc::Sum,
-                    "avg" => AggFunc::Avg,
-                    "min" => AggFunc::Min,
-                    "max" => AggFunc::Max,
-                    _ => {
-                        return Err(BindError::at(
-                            format!(
-                                "unknown function {name} (supported: count, sum, avg, min, max)"
-                            ),
-                            span,
-                        ))
-                    }
+                let Some(func) = crate::aggregate::lookup(&name) else {
+                    return Err(BindError::at(
+                        format!(
+                            "unknown function {name} (supported: {})",
+                            crate::aggregate::SUPPORTED
+                        ),
+                        span,
+                    ));
                 };
                 let arg = match (func, arg) {
                     (AggFunc::Count, CallArg::None | CallArg::Star) => None,
@@ -394,72 +399,16 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
     Ok(Some(Aggregation { keys, items: out }))
 }
 
-/// An aggregate's result type, as ClickHouse gives it: `count` UInt64; `sum` the widest integer
-/// or Float64 of the argument's kind; `avg` Float64; `min`/`max` the argument's type (without
-/// LowCardinality); NULL-able when the argument is.
+/// An aggregate's result type (see [`crate::aggregate::result_type`]), with the error pointing
+/// at the argument.
 fn result_type(
     func: AggFunc,
     arg: Option<(&BoundColumn, &crate::ast::ColumnRef)>,
 ) -> Result<Type, BindError> {
-    let Some((col, c)) = arg else {
-        return Ok(Type::parse("UInt64"));
-    };
-    let nullable = |t: &str| {
-        if col.ty.nullable {
-            format!("Nullable({t})")
-        } else {
-            t.to_string()
-        }
-    };
-    let numeric = matches!(col.ty.kind, Kind::Int { .. } | Kind::Float);
-    let base = match func {
-        AggFunc::Count => return Ok(Type::parse("UInt64")),
-        AggFunc::Sum | AggFunc::Avg if !numeric => {
-            return Err(BindError::at(
-                format!(
-                    "{}() needs a number; column {} is {}",
-                    func.name(),
-                    col.name,
-                    col.ty
-                ),
-                c.span,
-            ))
-        }
-        AggFunc::Sum => match col.ty.kind {
-            Kind::Int { signed: true, .. } => "Int64".to_string(),
-            Kind::Int { signed: false, .. } => "UInt64".to_string(),
-            _ => "Float64".to_string(),
-        },
-        AggFunc::Avg => "Float64".to_string(),
-        AggFunc::Min | AggFunc::Max => {
-            if col.ty.kind == Kind::Other {
-                return Err(BindError::at(
-                    format!(
-                        "{}() of column {} of type {} is not supported",
-                        func.name(),
-                        col.name,
-                        col.ty
-                    ),
-                    c.span,
-                ));
-            }
-            // the bare type: no LowCardinality, no Nullable (re-added below)
-            let mut t = col.ty.clickhouse.as_str();
-            for wrapper in ["LowCardinality(", "Nullable("] {
-                if let Some(inner) = t.strip_prefix(wrapper).and_then(|s| s.strip_suffix(')')) {
-                    t = inner;
-                }
-            }
-            if let Some(inner) = t
-                .strip_prefix("Nullable(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                t = inner;
-            }
-            t.to_string()
-        }
-    };
-    Ok(Type::parse(&nullable(&base)))
+    crate::aggregate::result_type(func, arg.map(|(col, _)| &col.ty)).map_err(|e| match arg {
+        Some((col, c)) => BindError::at(format!("{e}; column {} is {}", col.name, col.ty), c.span),
+        None => BindError::at(e, Span::default()),
+    })
 }
 
 /// ORDER BY: columns of the table, selected or not; `ALL` is the SELECT list, in SELECT order
@@ -1206,8 +1155,8 @@ mod tests {
             "SELECT * can't be used with GROUP BY; list the columns and aggregates at 1:22"
         );
         assert_eq!(
-            e("select median(ts) from events").await,
-            "unknown function median (supported: count, sum, avg, min, max) at 1:8"
+            e("select stddev(ts) from events").await,
+            "unknown function stddev (supported: count, sum, avg, min, max, uniq, uniqExact, median, any, anyLast) at 1:8"
         );
         assert_eq!(
             e("select sum(user_id) from events").await,
@@ -1219,7 +1168,7 @@ mod tests {
         );
         assert_eq!(
             e("select max(tags) from events").await,
-            "max() of column tags of type Array(String) is not supported at 1:12"
+            "max() of this type is not supported; column tags is Array(String) at 1:12"
         );
         assert_eq!(
             e("select count(), count() from events").await,

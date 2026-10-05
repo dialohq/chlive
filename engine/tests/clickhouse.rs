@@ -5,7 +5,7 @@ use chlive_engine::diff::Diff;
 use chlive_engine::history::ClickHouseHttp;
 use chlive_engine::rules::HardcodedRules;
 use chlive_engine::source::MemorySource;
-use chlive_engine::{Engine, Origin};
+use chlive_engine::{Aggregates, Engine, Origin};
 use futures::StreamExt;
 use serde_json::json;
 
@@ -784,6 +784,10 @@ async fn aggregates_match_clickhouse() {
         "select count() as c, sum(amount) from events group by country",
         "select sum(amount), avg(n), min(flag), max(country) from events where flag",
         "select flag from events group by flag",
+        // no native implementation: these run in chDB
+        "select country, uniqExact(name), uniq(n), median(amount) from events group by country",
+        "select country, any(country), anyLast(country), uniqExact(score) from events group by country",
+        "select median(score), uniqExact(flag) from events",
     ];
     let mut engines = Vec::new();
     for (database, in_clickhouse) in [
@@ -814,15 +818,19 @@ async fn aggregates_match_clickhouse() {
         for e in &events {
             source.push("events", 0, e.as_str());
         }
-        let engine = Engine::new(
-            HardcodedRules {
-                database: database.into(),
-            },
-            ClickHouseHttp::new(&url(), "default", ""),
-            source,
-        )
-        .with_max_batch(7);
-        engines.push((database, engine));
+        // native where possible (the default), and everything in chDB, on the same data
+        for (mode, aggregates) in [("auto", Aggregates::Auto), ("chdb", Aggregates::ChdbOnly)] {
+            let engine = Engine::new(
+                HardcodedRules {
+                    database: database.into(),
+                },
+                ClickHouseHttp::new(&url(), "default", ""),
+                source.clone(),
+            )
+            .with_max_batch(7)
+            .with_aggregates(aggregates);
+            engines.push((format!("{database} {mode}"), engine));
+        }
     }
     let direct = ClickHouseHttp::new(&url(), "default", "");
     // rows as comparable text: floats to 9 significant digits (ClickHouse adds in parallel)
@@ -879,12 +887,16 @@ async fn aggregates_match_clickhouse() {
             );
             assert_eq!(canon(&list.rows), canon(&want), "{database}: {sql}");
             eprintln!(
-                "{database:>28}: {sql}: {} groups, {inserts} inserts, {updates} updates",
+                "{database:>33}: {sql}: {} groups, {inserts} inserts, {updates} updates",
                 list.rows.len()
             );
         }
     }
-    for (database, _) in &engines {
+    for database in [
+        "chlive_engine_agg_history",
+        "chlive_engine_agg_stream",
+        "chlive_engine_agg_split",
+    ] {
         exec(&format!("DROP DATABASE {database}")).await;
     } // the only test here using chDB: close it, or the test process crashes on exit
     chlive_engine::chdb::shutdown();

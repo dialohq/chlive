@@ -6,7 +6,8 @@ use std::cmp::Ordering;
 
 use crate::ast::CmpOp;
 use crate::binder::{
-    AggExpr, Aggregation, BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId, OrderKey,
+    AggExpr, AggFunc, Aggregation, BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId,
+    OrderKey,
 };
 use crate::diff::Row;
 use crate::order::{KeyOrder, SortKey};
@@ -50,9 +51,56 @@ pub struct AggregatePlan {
     source_table: String,
     filter: Option<String>,
     pub kafka: KafkaColumns,
+    /// When every aggregate has a native implementation: how to run without chDB.
+    pub native: Option<NativeAggregates>,
+}
+
+/// GROUP BY with native aggregates: their states come from main ClickHouse as plain SQL values
+/// (`count()`, `sum(x)`, …) and live in the engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeAggregates {
+    /// The grouping keys' columns, in order (`__k0…` in the history query).
+    pub keys: Vec<ColumnId>,
+    pub aggs: Vec<NativeAgg>,
+    /// The output columns, in SELECT order.
+    pub items: Vec<NativeItem>,
+    /// `SELECT country AS __k0, count() AS __a0_0, … FROM t`
+    select: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeAgg {
+    pub func: AggFunc,
+    pub arg: Option<ColumnId>,
+    pub arg_ty: Option<Type>,
+    pub result_ty: Type,
+    /// The history query's columns for this aggregate's state: alias and type.
+    pub history: Vec<(String, Type)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeItem {
+    /// The i-th grouping key, named.
+    Key(usize, String),
+    /// The i-th aggregate, named.
+    Agg(usize, String),
 }
 
 impl AggregatePlan {
+    /// Native: the history's per-group states from main ClickHouse, up to `bound`.
+    pub fn native_history_sql(&self, bound: &str) -> Option<String> {
+        let native = self.native.as_ref()?;
+        let filter = match &self.filter {
+            Some(f) => format!("({f}) AND ({bound})"),
+            None => bound.to_string(),
+        };
+        Some(format!(
+            "{} WHERE {filter}{}",
+            native.select,
+            self.group_by_clause()
+        ))
+    }
+
     /// Create the chDB table with the history's states, computed by main ClickHouse up to
     /// `bound` (`remote` is the `remote(…)` table function for it).
     pub fn create_sql(&self, table: &str, remote: &str, bound: &str) -> String {
@@ -142,6 +190,64 @@ fn backquote(name: &str) -> String {
     format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
 }
 
+/// The native plan, if every aggregate has a native implementation.
+fn native_aggregates(agg: &Aggregation, table: &BoundTable) -> Option<NativeAggregates> {
+    let col = |id: ColumnId| quote_ident(&table.column(id).clickhouse);
+    let mut select: Vec<String> = agg
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("{} AS __k{i}", col(*k)))
+        .collect();
+    let (mut aggs, mut items) = (Vec::new(), Vec::new());
+    for item in &agg.items {
+        match &item.expr {
+            AggExpr::Key(id) => {
+                let k = agg
+                    .keys
+                    .iter()
+                    .position(|k| k == id)
+                    .expect("a grouping key");
+                items.push(NativeItem::Key(k, item.name.clone()));
+            }
+            AggExpr::Call { func, arg } => {
+                let f = crate::aggregate::native(*func)?;
+                let arg_ty = arg.map(|a| table.column(a).ty.clone());
+                let arg_sql = arg.map(col);
+                let j = aggs.len();
+                let history: Vec<(String, Type)> = f
+                    .history_sql(arg_sql.as_deref(), arg_ty.as_ref(), &item.ty)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, (sql, ty))| {
+                        let alias = format!("__a{j}_{n}");
+                        select.push(format!("{sql} AS {alias}"));
+                        (alias, ty)
+                    })
+                    .collect();
+                aggs.push(NativeAgg {
+                    func: *func,
+                    arg: *arg,
+                    arg_ty,
+                    result_ty: item.ty.clone(),
+                    history,
+                });
+                items.push(NativeItem::Agg(j, item.name.clone()));
+            }
+        }
+    }
+    Some(NativeAggregates {
+        keys: agg.keys.clone(),
+        aggs,
+        items,
+        select: format!(
+            "SELECT {} FROM {}",
+            select.join(", "),
+            table.clickhouse_table
+        ),
+    })
+}
+
 fn aggregate_plan(agg: &Aggregation, table: &BoundTable, filter: Option<String>) -> AggregatePlan {
     let col = |id: ColumnId| quote_ident(&table.column(id).clickhouse);
     let mut state = Vec::new();
@@ -190,7 +296,9 @@ fn aggregate_plan(agg: &Aggregation, table: &BoundTable, filter: Option<String>)
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let native = native_aggregates(agg, table);
     AggregatePlan {
+        native,
         columns: agg
             .items
             .iter()
@@ -594,6 +702,13 @@ impl std::fmt::Display for Plan {
                 a.create_sql("<chdb table>", "remote(<main>)", "<watermark bound>")
             )?;
             writeln!(f, "merge:   {}", a.snapshot_sql("<chdb table>"))?;
+            match a.native_history_sql("<watermark bound>") {
+                Some(sql) => writeln!(f, "native:  {sql} (states in the engine; chDB unused)")?,
+                None => writeln!(
+                    f,
+                    "native:  no (an aggregate has no native implementation: chDB)"
+                )?,
+            }
             let batch: Vec<&str> = a.batch_columns.iter().map(|(_, n)| n.as_str()).collect();
             writeln!(
                 f,

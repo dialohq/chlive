@@ -359,6 +359,8 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
         ("total", "select count() as n, sum(amount), avg(latency_ms) from events"),
         ("by_country", "select country, count() as n, avg(latency_ms) as avg_latency, max(latency_ms) from events group by country"),
         ("pl_paths", "select path, count(), min(ts), max(amount) from events where country = 'PL' group by path"),
+        // no native uniqExact: runs in chDB
+        ("users", "select country, uniqExact(user_id) as users, count() as n from events group by country"),
     ];
     let conn = LiveConn::connect(&server).await?;
     for (id, sql) in QUERIES {
