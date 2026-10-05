@@ -326,6 +326,11 @@ async fn history_and_stream_agree_on_order_by() {
         ),
         ("select * from events order by flag, n desc", &["flag", "n"]),
         ("select * from events order by ts", &["ts"]),
+        // aliases: the ORDER BY column is read from history rows under its alias
+        (
+            "select name, score as s, n as count from events order by score desc, n limit 5",
+            &["score", "n"],
+        ),
         (
             "select * from events order by ts desc, label",
             &["ts", "label"],

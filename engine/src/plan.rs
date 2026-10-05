@@ -448,7 +448,7 @@ pub struct OrderPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderColumn {
     pub id: ColumnId,
-    /// The column's dialect name.
+    /// Its output name when selected, otherwise the column's dialect name.
     pub name: String,
     /// The field holding this column in a history row: its output name, or a hidden alias.
     pub history_field: String,
@@ -766,7 +766,7 @@ fn order_modifiers(k: &OrderKey) -> String {
 
 pub fn plan(bound: &BoundQuery) -> Plan {
     let table = &bound.table;
-    let columns: Vec<BoundColumn> = bound.output().cloned().collect();
+    let columns: Vec<BoundColumn> = bound.output().collect();
     let mut select_list: Vec<String> = columns
         .iter()
         .map(|c| {
@@ -784,8 +784,11 @@ pub fn plan(bound: &BoundQuery) -> Plan {
     let mut hidden = Vec::new();
     for k in &bound.order {
         let c = table.column(k.column);
-        let history_field = if bound.projection.contains(&k.column) {
-            c.name.clone()
+        // a selected column is in history rows under its output name (its first, if selected
+        // more than once)
+        let selected = bound.projection.iter().find(|p| p.column == k.column);
+        let history_field = if let Some(p) = selected {
+            p.name.clone()
         } else if let Some(existing) = order_columns
             .iter()
             .find(|o: &&OrderColumn| o.id == k.column)
@@ -799,7 +802,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
         };
         order_columns.push(OrderColumn {
             id: k.column,
-            name: c.name.clone(),
+            name: selected.map_or_else(|| c.name.clone(), |p| p.name.clone()),
             history_field,
             ty: c.ty.clone(),
         });
@@ -855,7 +858,12 @@ pub fn plan(bound: &BoundQuery) -> Plan {
     };
 
     // Columns to decode: the output's, then the filter's and ORDER BY's that aren't output.
-    let mut needed: Vec<ColumnId> = bound.projection.clone();
+    let mut needed: Vec<ColumnId> = Vec::new();
+    for p in &bound.projection {
+        if !needed.contains(&p.column) {
+            needed.push(p.column);
+        }
+    }
     if let Some(filter) = &bound.filter {
         filter.columns(&mut needed);
     }
@@ -925,6 +933,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binder::Projected;
     use serde_json::json;
 
     fn table() -> BoundTable {
@@ -956,7 +965,13 @@ mod tests {
         BoundQuery {
             table: table(),
             filter,
-            projection: projection.iter().map(|i| ColumnId(*i)).collect(),
+            projection: projection
+                .iter()
+                .map(|i| Projected {
+                    column: ColumnId(*i),
+                    name: table().columns[*i].name.clone(),
+                })
+                .collect(),
             order: Vec::new(),
             limit: None,
             aggregation: None,
@@ -1182,6 +1197,43 @@ mod tests {
              (a new row goes after the last row it ties with)"
         );
         assert!(plan(&bound(&[1], None)).stream.order.is_none());
+    }
+
+    #[test]
+    fn aliases_in_history_stream_and_order() {
+        // SELECT user_id AS u, latency_ms AS l, latency_ms ORDER BY latency_ms DESC
+        let mut b = ordered(&[1, 2, 2], None, &[(2, true, false)]);
+        b.projection[0].name = "u".into();
+        b.projection[1].name = "l".into();
+        let p = plan(&b);
+        assert_eq!(
+            p.history.sql(None),
+            "SELECT user_id AS u, latency_ms AS l, latency_ms FROM default.events \
+             ORDER BY latency_ms DESC NULLS LAST"
+        );
+        // a selected ORDER BY column is read from history rows under its (first) output name
+        let order = p.stream.order.as_ref().unwrap();
+        assert!(order.hidden.is_empty());
+        assert_eq!(order.columns[0].history_field, "l");
+        assert_eq!(order.columns[0].name, "l");
+        let w = Watermark(std::collections::BTreeMap::from([(0, 7)]));
+        assert!(p
+            .history
+            .keys_sql(&w)
+            .unwrap()
+            .starts_with("SELECT latency_ms AS l FROM default.events"));
+        // each column is decoded once; output under every name
+        assert_eq!(p.stream.required_keys(), ["user_id", "latency_ms"]);
+        let e = p
+            .stream
+            .decode(&row(json!({"user_id": "a", "latency_ms": 5})))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&p.stream.project(&e)).unwrap(),
+            r#"{"u":"a","l":5,"latency_ms":5}"#
+        );
+        let mut h = row(json!({"u": "a", "l": 9, "latency_ms": 9}));
+        assert_eq!(order.history_key(&mut h).unwrap(), [Value::Int(9)]);
     }
 
     #[test]

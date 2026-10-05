@@ -1,21 +1,6 @@
 //! Recursive-descent parser for the chlive dialect.
 //!
-//! Grammar so far:
-//! ```text
-//! query      := SELECT projection FROM table [WHERE or_expr] [';'] EOF
-//! projection := '*' | column (',' column)*
-//! column     := identifier
-//! table      := identifier
-//! or_expr    := and_expr (OR and_expr)*
-//! and_expr   := not_expr (AND not_expr)*
-//! not_expr   := NOT not_expr | predicate
-//! predicate  := operand cmp operand
-//!             | operand IS [NOT] NULL
-//!             | operand [NOT] IN '(' literal (',' literal)* ')'
-//!             | operand
-//! operand    := column | literal | '(' or_expr ')'
-//! literal    := number | '-' number | string | TRUE | FALSE | NULL
-//! ```
+//! The grammar is in the README ("Supported queries").
 
 use crate::ast::{CallArg, Direction, Limit, NullsOrder, Order, OrderItem, SelectExpr, SelectItem};
 use crate::ast::{CmpOp, ColumnRef, Expr, Literal, Projection, Query, TableRef};

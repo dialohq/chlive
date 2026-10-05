@@ -77,7 +77,7 @@ produce events '{"user_id": "u7", "latency_ms": 900}'  # one event per JSON argu
 
 **History and stream meet at a watermark.** At subscribe time the engine reads `max(_offset)` per `_partition` from the ClickHouse table. History is every row up to it (the history query gets `toInt64(_offset) <= multiIf(_partition = 0, W0, …)`), and each Kafka partition is consumed from the offset right after it. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. The table must have `_partition` and `_offset` columns; the binder says so if it doesn't.
 
-So far the dialect accepts `SELECT * | col, … FROM <table> [WHERE <condition>] [ORDER BY <order>] [LIMIT n]`. A condition can use:
+The full grammar is under [Supported queries](#supported-queries). A condition can use:
 - comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), with `AND`, `OR`, `NOT` and parentheses;
 - `IS [NOT] NULL` and `[NOT] IN (…)`;
 - operands that are columns or literals: numbers, strings, `TRUE`/`FALSE`.
@@ -105,7 +105,7 @@ Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 
 The query goes through parser → binder → planner. The binder resolves FROM, then WHERE, then SELECT, in SQL's evaluation order:
 - **FROM:** the table must exist in ClickHouse, have a Kafka topic, and have the `_partition` and `_offset` columns.
-- **SELECT:** listed columns must exist, and none may be selected twice.
+- **SELECT:** listed columns must exist. `col AS name` renames a column in the output; a column can be selected more than once under different names, but output names must be unique. An alias can't be another column's name (in ClickHouse it would shadow that column in WHERE and ORDER BY) or start with `_` (Kafka columns and the engine's hidden fields). Aliases only name output columns: WHERE and ORDER BY refer to table columns.
 
 The planner selects only the needed columns from ClickHouse, and the stream decodes only the needed JSON keys of each event; the other keys are skipped unparsed. Hard-coded naming rules map table `t` to ClickHouse `default.t` and to topic `t`, and keep column names the same on both sides; columns starting with `_` are hidden.
 
@@ -154,7 +154,7 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 - Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`. After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
 
-### GROUP BY and aggregates (on `feat/group-by-chdb`)
+### GROUP BY and aggregates
 
 `SELECT keys, agg(c) [AS name], … FROM t [WHERE …] [GROUP BY keys]`, with ClickHouse's result types and output names. Functions: `count()`, `count(c)`, `sum`, `avg`, `min`, `max` (native), and `uniq`, `uniqExact`, `median`, `any`, `anyLast` (chDB). Not yet: ORDER BY, LIMIT or HAVING with aggregates, expressions as arguments, and resuming aggregates (they start from a snapshot).
 
@@ -195,13 +195,34 @@ e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chliv
 
 ## Supported queries
 
-The engine's dialect, for now:
+The engine's dialect, in full (keywords are case-insensitive):
 
 ```
-SELECT * | col, … FROM <table> [WHERE <condition>] [ORDER BY ALL | col [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
+SELECT * | select_item [, select_item ...]
+FROM table
+[WHERE condition]
+[GROUP BY column [, column ...]]
+[ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST] | column [ASC|DESC] [NULLS FIRST|LAST] [, ...]]
+[LIMIT n]
+[;]
+
+select_item := column [AS alias]
+             | aggregate(column) [AS alias]
+             | count() | count(*) [AS alias]
+aggregate   := count | sum | avg | min | max                   -- native, in the engine
+             | uniq | uniqExact | median | any | anyLast       -- through chDB
+condition   := condition OR condition | condition AND condition | NOT condition | (condition)
+             | operand {= | != | <> | < | <= | > | >=} operand
+             | operand IS [NOT] NULL
+             | operand [NOT] IN (literal [, literal ...])
+             | operand
+operand     := column | literal
+literal     := number | -number | 'string' | TRUE | FALSE | NULL
+column, table, alias := identifier | "identifier" | `identifier`
 ```
 
-- A table needs a ClickHouse table (with `_partition` and `_offset`) and a Kafka topic of the same name.
-- Conditions: comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN (…)` over columns and literals; see [Engine](#engine-custom-dialect).
-- With `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot. `LIMIT` keeps the top N (with `ORDER BY`) or the latest N (without), deleting the rows that fall out.
-- No OFFSET, `GROUP BY`/aggregates, joins, functions or parameters yet. Without `LIMIT`, results only grow.
+- **Tables:** a table needs a ClickHouse table (with `_partition` and `_offset`) and a Kafka topic of the same name.
+- **Aliases** only name output columns: WHERE and ORDER BY refer to table columns. Output names must be unique; an alias can't be another column's name or start with `_`.
+- **ORDER BY / LIMIT:** with `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot. `LIMIT` keeps the top N (with `ORDER BY`) or the latest N (without), deleting the rows that fall out. Without `LIMIT`, plain results only grow.
+- **GROUP BY / aggregates** (also without GROUP BY: one global group): selected columns must be grouping columns; no `SELECT *`, ORDER BY or LIMIT yet. Groups are inserted, then updated.
+- **Not yet:** OFFSET, `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, subqueries, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters.

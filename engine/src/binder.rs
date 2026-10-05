@@ -5,7 +5,8 @@
 use std::fmt;
 
 use crate::ast::{
-    CallArg, CmpOp, Direction, Expr, Literal, NullsOrder, Order, Projection, Query, SelectExpr,
+    CallArg, CmpOp, ColumnRef, Direction, Expr, Literal, NullsOrder, Order, Projection, Query,
+    SelectExpr,
 };
 use crate::error::{render_at, Span};
 use crate::history::{HistoryError, HistorySource};
@@ -61,7 +62,7 @@ pub struct BoundQuery {
     /// The WHERE condition, typed.
     pub filter: Option<BoundExpr>,
     /// Output columns, in output order.
-    pub projection: Vec<ColumnId>,
+    pub projection: Vec<Projected>,
     /// ORDER BY keys, most significant first; empty when unordered.
     pub order: Vec<OrderKey>,
     /// LIMIT: at most this many rows.
@@ -69,6 +70,13 @@ pub struct BoundQuery {
     /// With GROUP BY or aggregate functions: the groups and what to compute per group. Then
     /// `projection` is empty and the output is `aggregation.items`.
     pub aggregation: Option<Aggregation>,
+}
+
+/// A selected column and its output name (its alias, or its own name).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Projected {
+    pub column: ColumnId,
+    pub name: String,
 }
 
 /// GROUP BY and aggregate functions.
@@ -188,8 +196,12 @@ impl BoundExpr {
 }
 
 impl BoundQuery {
-    pub fn output(&self) -> impl Iterator<Item = &BoundColumn> {
-        self.projection.iter().map(|id| self.table.column(*id))
+    /// The output columns, named as in the output.
+    pub fn output(&self) -> impl Iterator<Item = BoundColumn> + '_ {
+        self.projection.iter().map(|p| BoundColumn {
+            name: p.name.clone(),
+            ..self.table.column(p.column).clone()
+        })
     }
 }
 
@@ -267,7 +279,10 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
     }
     let projection = bind_select(query, &table)?;
     let order = match &query.order {
-        Some(order) => bind_order(order, &table, &projection)?,
+        Some(order) => {
+            let ids: Vec<ColumnId> = projection.iter().map(|p| p.column).collect();
+            bind_order(order, &table, &ids)?
+        }
         None => Vec::new(),
     };
     Ok(BoundQuery {
@@ -291,14 +306,6 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
         .map(|(k, s)| (k.as_slice(), Some(*s)))
         .or(has_calls.then_some((&[][..], None)))
     else {
-        if let Projection::Items(items) = &query.projection {
-            if items.iter().any(|i| i.alias.is_some()) {
-                return Err(BindError::at(
-                    "aliases are only supported with aggregates yet",
-                    query.from.span,
-                ));
-            }
-        }
         return Ok(None);
     };
     let mut keys = Vec::new();
@@ -387,6 +394,9 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
                 )
             }
         };
+        if let Some(alias) = &alias {
+            check_reserved(alias, span)?;
+        }
         let name = alias.unwrap_or(default_name);
         if out.iter().any(|o| o.name == name) {
             return Err(BindError::at(
@@ -812,25 +822,72 @@ fn coerce(lit: &Literal, span: Span, ty: &Type) -> Result<Value, BindError> {
 }
 
 /// SELECT: `*` is every column of the table; a list must name existing columns, once each.
-fn bind_select(query: &Query, table: &BoundTable) -> Result<Vec<ColumnId>, BindError> {
-    match &query.projection {
-        Projection::Wildcard => Ok(table.columns.iter().map(|c| c.id).collect()),
-        Projection::Items(_) => unreachable!("lists with functions or aliases are aggregations"),
-        Projection::Columns(refs) => {
-            let mut ids: Vec<ColumnId> = Vec::with_capacity(refs.len());
-            for r in refs {
-                let id = resolve_column(table, &r.name, r.span)?;
-                if ids.contains(&id) {
-                    return Err(BindError::at(
-                        format!("column {} is selected twice", r.name),
-                        r.span,
-                    ));
-                }
-                ids.push(id);
-            }
-            Ok(ids)
+fn bind_select(query: &Query, table: &BoundTable) -> Result<Vec<Projected>, BindError> {
+    let items: Vec<(&ColumnRef, Option<&String>)> = match &query.projection {
+        Projection::Wildcard => {
+            return Ok(table
+                .columns
+                .iter()
+                .map(|c| Projected {
+                    column: c.id,
+                    name: c.name.clone(),
+                })
+                .collect())
         }
+        Projection::Columns(refs) => refs.iter().map(|r| (r, None)).collect(),
+        Projection::Items(items) => items
+            .iter()
+            .map(|i| match &i.expr {
+                SelectExpr::Column(c) => (c, i.alias.as_ref()),
+                SelectExpr::Call { .. } => unreachable!("lists with calls are aggregations"),
+            })
+            .collect(),
+    };
+    let mut out: Vec<Projected> = Vec::with_capacity(items.len());
+    for (r, alias) in items {
+        let column = resolve_column(table, &r.name, r.span)?;
+        let name = match alias {
+            None => r.name.clone(),
+            Some(alias) => {
+                check_reserved(alias, r.span)?;
+                // In ClickHouse an alias shadows a column of the same name in WHERE and ORDER BY,
+                // so the history query would read the aliased column where the stream reads the
+                // table's: not allowed until aliases can be referred to.
+                if let Some(other) = table.columns.iter().find(|c| &c.name == alias) {
+                    if other.id != column {
+                        return Err(BindError::at(
+                            format!(
+                                "alias {alias} is also a column of {}; pick another name",
+                                table.name
+                            ),
+                            r.span,
+                        ));
+                    }
+                }
+                alias.clone()
+            }
+        };
+        if out.iter().any(|o| o.name == name) {
+            return Err(BindError::at(
+                format!("duplicate output column {name}; name it with AS"),
+                r.span,
+            ));
+        }
+        out.push(Projected { column, name });
     }
+    Ok(out)
+}
+
+/// Names starting with `_` are the Kafka columns' (`_partition`, `_offset`) and the engine's
+/// hidden fields (`__order_0`, `__k0`, …).
+fn check_reserved(alias: &str, span: Span) -> Result<(), BindError> {
+    if alias.starts_with('_') {
+        return Err(BindError::at(
+            format!("alias {alias}: names starting with _ are reserved"),
+            span,
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -891,8 +948,8 @@ mod tests {
         bind(&q, &catalog).await.map_err(|e| e.render(sql))
     }
 
-    fn names(b: &BoundQuery) -> Vec<&str> {
-        b.output().map(|c| c.name.as_str()).collect()
+    fn names(b: &BoundQuery) -> Vec<String> {
+        b.output().map(|c| c.name).collect()
     }
 
     #[tokio::test]
@@ -911,7 +968,26 @@ mod tests {
     async fn select_list_keeps_written_order() {
         let b = bind_sql("select latency_ms, ts from events").await.unwrap();
         assert_eq!(names(&b), ["latency_ms", "ts"]);
-        assert_eq!(b.projection, [ColumnId(2), ColumnId(0)]);
+        let ids: Vec<ColumnId> = b.projection.iter().map(|p| p.column).collect();
+        assert_eq!(ids, [ColumnId(2), ColumnId(0)]);
+    }
+
+    #[tokio::test]
+    async fn aliases_name_output_columns() {
+        let b = bind_sql("select user_id as u, latency_ms from events")
+            .await
+            .unwrap();
+        assert_eq!(names(&b), ["u", "latency_ms"]);
+        let out: Vec<BoundColumn> = b.output().collect();
+        assert_eq!(
+            (out[0].id, out[0].clickhouse.as_str()),
+            (ColumnId(1), "user_id")
+        );
+        // a column twice, under two names; and an alias that is its own name
+        let b = bind_sql("select ts, ts as t, latency_ms as latency_ms from events")
+            .await
+            .unwrap();
+        assert_eq!(names(&b), ["ts", "t", "latency_ms"]);
     }
 
     #[tokio::test]
@@ -942,7 +1018,7 @@ mod tests {
             bind_sql("select ts, user_id, ts from events")
                 .await
                 .unwrap_err(),
-            "column ts is selected twice at 1:21"
+            "duplicate output column ts; name it with AS at 1:21"
         );
         // column names are case-sensitive, like ClickHouse's
         assert!(bind_sql("select TS from events")
@@ -1183,8 +1259,20 @@ mod tests {
             "LIMIT with GROUP BY or aggregates is not supported yet at 1:34"
         );
         assert_eq!(
-            e("select ts as t from events").await,
-            "aliases are only supported with aggregates yet at 1:21"
+            e("select ts as t, user_id as t from events").await,
+            "duplicate output column t; name it with AS at 1:17"
+        );
+        assert_eq!(
+            e("select user_id as latency_ms from events").await,
+            "alias latency_ms is also a column of events; pick another name at 1:8"
+        );
+        assert_eq!(
+            e("select ts as _offset from events").await,
+            "alias _offset: names starting with _ are reserved at 1:8"
+        );
+        assert_eq!(
+            e("select count() as __k0 from events").await,
+            "alias __k0: names starting with _ are reserved at 1:8"
         );
         assert_eq!(
             e("select count() from events group by tags").await,

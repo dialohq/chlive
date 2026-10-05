@@ -7,7 +7,7 @@ import { LiveClientProvider, useLiveQueryDebug } from "@chlive/client/react";
 const client = new LiveClient({ url: defaultUrl(), cache: true });
 
 // Queries in the chlive dialect:
-// SELECT * | columns FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
+// SELECT * | column [AS name], … FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
 // SELECT keys, agg(c) [AS name], … FROM table [WHERE …] [GROUP BY keys]
 //   count, sum, avg, min, max run natively in the engine; uniq, uniqExact, median, any, anyLast in chDB
 const QUERY_PRESETS = [

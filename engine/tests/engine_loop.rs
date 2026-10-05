@@ -88,6 +88,20 @@ impl HistorySource for FakeHistory {
                     json!({"__k0": "u1", "__a0_0": 1, "__a1_0": 900, "__a2_0": 900, "__a2_1": 1}),
                 )])
             }
+            // the same top 3, with aliases
+            s if s
+                == format!(
+                    "SELECT user_id AS who, latency_ms AS ms FROM default.requests \
+                     WHERE (latency_ms > 100) AND ({REQUESTS_BOUND}) \
+                     ORDER BY latency_ms DESC NULLS LAST LIMIT 3"
+                ) =>
+            {
+                Ok(vec![
+                    row(json!({"who": "h900", "ms": 900})),
+                    row(json!({"who": "h500", "ms": 500})),
+                    row(json!({"who": "h500b", "ms": 500})),
+                ])
+            }
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -500,6 +514,39 @@ async fn group_by_runs_natively_without_chdb() {
             "requests/0:1 ~ [\"u1\"] {\"n\":2,\"total\":1000}",
             "requests/0:2 + [\"u2\"] {\"user_id\":\"u2\",\"n\":1,\"total\":50,\"top\":50}",
             "requests/0:3 ~ [\"u1\"] {\"n\":3,\"total\":2000,\"top\":1000}",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn aliases_name_history_and_stream_rows() {
+    let mut source = MemorySource::new();
+    source
+        .push("requests", 0, r#"{"user_id": "h900", "latency_ms": 900}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "e700", "latency_ms": 700}"#);
+    let subscription = engine(source)
+        .subscribe(
+            "select user_id as who, latency_ms as ms from requests where latency_ms > 100 \
+             order by latency_ms desc limit 3",
+        )
+        .await
+        .unwrap();
+    let names: Vec<&str> = subscription
+        .plan
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["who", "ms"]);
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    let lines: Vec<String> = iterations.iter().map(|i| i.to_string()).collect();
+    assert_eq!(
+        lines,
+        [
+            "+ {\"who\":\"h900\",\"ms\":900}\n+ {\"who\":\"h500\",\"ms\":500}\n\
+             + {\"who\":\"h500b\",\"ms\":500}\nhistory: 3 rows",
+            // placed by the aliased ORDER BY column; pushes the last tie out
+            "requests/0:1 + @1 {\"who\":\"e700\",\"ms\":700}\nrequests/0:1 - @3",
         ]
     );
 }
