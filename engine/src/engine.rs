@@ -78,18 +78,6 @@ pub struct Engine {
     source: Arc<dyn EventSource>,
     native: Native,
     max_batch: usize,
-    aggregates: Aggregates,
-}
-
-/// Which backend runs aggregate queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Aggregates {
-    /// Native states in the engine when every aggregate has a native implementation; chDB
-    /// otherwise.
-    #[default]
-    Auto,
-    /// Always chDB (ClickHouse's `-State`/`-Merge`), e.g. to compare the two.
-    ChdbOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -146,14 +134,7 @@ impl Engine {
                 password: String::new(),
             },
             max_batch: 1000,
-            aggregates: Aggregates::Auto,
         }
-    }
-
-    /// Which backend runs aggregate queries (default: native when possible).
-    pub fn with_aggregates(mut self, aggregates: Aggregates) -> Self {
-        self.aggregates = aggregates;
-        self
     }
 
     /// Parse, bind and plan a query without running it.
@@ -336,11 +317,10 @@ impl Engine {
             .await?
             .ready_chunks(self.max_batch)
             .boxed();
-        let native_sql = match self.aggregates {
-            Aggregates::Auto => aggregate.native_history_sql(&bound),
-            Aggregates::ChdbOnly => None,
-        };
-        let (history_sql, iterations) = match (native_sql, aggregate.native.clone()) {
+        let (history_sql, iterations) = match (
+            aggregate.native_history_sql(&bound),
+            aggregate.native.clone(),
+        ) {
             (Some(sql), Some(native)) => {
                 tracing::info!(history = %sql, "subscribed (aggregate, native)");
                 let run = NativeRun::new(

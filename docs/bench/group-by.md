@@ -1,11 +1,11 @@
 # GROUP BY: native states vs chDB, what it costs
 
-Measured on 2026-10-05 on the dev machine (Apple Silicon, release build), ClickHouse 26.7.2 and chDB 26.7.3 (`engine/examples/agg_bench.rs`; reproduce with `dnvr up`, then `cargo run --release -p chlive-engine --example agg_bench`).
+Measured on 2026-10-05 on the dev machine (Apple Silicon, release build), ClickHouse 26.7.2 and chDB 26.7.3 with `engine/examples/agg_bench.rs` at commit `930331a` (reproduce there with `dnvr up`, then `cargo run --release -p chlive-engine --example agg_bench`). The benchmark and the switch it used to force chDB (`Aggregates::ChdbOnly`) have since been removed: the engine always runs a query natively when it can.
 
 The engine runs a query's aggregates in one of two ways:
 
 - **Native** (when every aggregate has a native implementation: `count`, `sum`, `avg`, `min`, `max`): ClickHouse computes the parts of each group's state over HTTP (e.g. `sum(x)` and `count(x)` for `avg(x)`), and the engine keeps the states in Rust and updates them per event (`engine/src/aggregate/`).
-- **chDB** (the fallback, e.g. for `uniqExact` or `median`): main ClickHouse computes the history's aggregate states (`countState()`, …) with `remote()` into a chDB table in the engine process; each batch of events adds its states (`INSERT … SELECT …State() FROM format(JSONEachRow, …)`), and the touched groups are read back finalized (`…Merge`). `Aggregates::ChdbOnly` forces it for any query, which is how sections 3 and 4 measure both.
+- **chDB** (the fallback, e.g. for `uniqExact` or `median`): main ClickHouse computes the history's aggregate states (`countState()`, …) with `remote()` into a chDB table in the engine process; each batch of events adds its states (`INSERT … SELECT …State() FROM format(JSONEachRow, …)`), and the touched groups are read back finalized (`…Merge`). Sections 3 and 4 forced it for every query, to measure both on the same queries.
 
 Section 1 compares chDB's raw per-batch cost with a hand-rolled `HashMap` of (count, sum) per group: the floor for any native implementation. Section 3 is the real thing, through the engine, both ways (native over 1M events; chDB over 5k one at a time, 200k batched).
 
