@@ -116,18 +116,18 @@ Each iteration prints its diff: first the history (`+ {row}` per ClickHouse row,
 ```ts
 // React
 import { useLiveQuery } from "@chlive/client/react";
-const { rows, error } = useLiveQuery<Event>(sql); // error: { code, message }
+const { status, rows, error } = useLiveQuery<Event>(sql); // error: { code, message }
 
 // without React
 import { LiveClient } from "@chlive/client";
 const live = new LiveClient({ url: "ws://localhost:8080/live", cache: true });
-const sub = live.subscribe(sql, (s) => render(s.rows, s.error));
+const sub = live.subscribe(sql, (s) => render(s.status, s.rows, s.error));
 sub.unsubscribe();
 ```
 
-Rows are exactly the selected columns, in the query's order, so columns come from the rows themselves; the row type is the hook's type parameter. ORDER BY and LIMIT are already applied to `rows`. One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes from where it was.
+`status` is `loading` (nothing yet), `cached` (rows from the offline cache, being caught up), `live` or `error`. Rows are exactly the selected columns, in the query's order, so columns come from the rows themselves; the row type is the hook's type parameter. ORDER BY and LIMIT are already applied to `rows`. One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes from where it was.
 
-For dev tools, `useLiveQueryDebug` (and `subscribe`'s listener) also give `status` (`loading`, `cached` (rows from the offline cache, being caught up), `live` or `error`) and `stats`: per-subscription counters (snapshots, diffs, inserts, deletes, bytes, the last message and how long it took to apply, what the cache did).
+For dev tools, `useLiveQueryDebug` (and `subscribe`'s listener) also give `stats`: per-subscription counters (snapshots, diffs, inserts, deletes, bytes, the last message and how long it took to apply, what the cache did).
 
 ### Protocol
 

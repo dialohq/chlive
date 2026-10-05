@@ -492,7 +492,7 @@ const truncate = (s, n) => (s.length > n ? s.slice(0, n) + `\n… ${s.length - n
 const columnsOf = (rows) => Object.keys(rows[0] ?? {});
 
 function Result({ sql }) {
-  // an app would use `useLiveQuery(sql)`: just `{ rows, error }`; this one also shows the
+  // an app would use `useLiveQuery(sql)`: just `{ status, rows, error }`; this one also shows the
   // client's internals
   const state = useLiveQueryDebug(sql);
   const { rows, status, error } = state;
