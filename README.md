@@ -114,17 +114,20 @@ Each iteration prints its diff: first the history (`+ {row}` per ClickHouse row,
 ## Client
 
 ```ts
-import { LiveClient } from "@chlive/client";
-const live = new LiveClient({ url: "ws://localhost:8080/live" });
-const sub = live.subscribe("select * from events where latency_ms > 500", (s) => render(s.status, s.rows, s.columns, s.error));
-sub.unsubscribe();
-
 // React
 import { useLiveQuery } from "@chlive/client/react";
-const { rows, columns, status, error, errorCode } = useLiveQuery(sql);
+const { rows, error } = useLiveQuery<Event>(sql); // error: { code, message }
+
+// without React
+import { LiveClient } from "@chlive/client";
+const live = new LiveClient({ url: "ws://localhost:8080/live", cache: true });
+const sub = live.subscribe(sql, (s) => render(s.rows, s.error));
+sub.unsubscribe();
 ```
 
-`status` is `loading`, `cached` (rows from the offline cache, being caught up), `live` or `error`. `stats` has per-subscription counters for debugging (snapshots, diffs, inserts, deletes, bytes, the last message and how long it took to apply). One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes, and the new snapshot replaces the old rows.
+Rows are exactly the selected columns, in the query's order, so columns come from the rows themselves; the row type is the hook's type parameter. ORDER BY and LIMIT are already applied to `rows`. One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes from where it was.
+
+For dev tools, `useLiveQueryDebug` (and `subscribe`'s listener) also give `status` (`loading`, `cached` (rows from the offline cache, being caught up), `live` or `error`) and `stats`: per-subscription counters (snapshots, diffs, inserts, deletes, bytes, the last message and how long it took to apply, what the cache did).
 
 ### Protocol
 
@@ -164,14 +167,9 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 
 ### Offline cache
 
-`@chlive/client/cache` keeps results between sessions in SQLite (sqlite-wasm) on OPFS, in a dedicated worker, using the `opfs-sahpool` VFS, so no COOP/COEP headers are needed:
+`new LiveClient({ url, cache: true })` keeps results between sessions in SQLite (sqlite-wasm) on OPFS, in a dedicated worker, using the `opfs-sahpool` VFS, so no COOP/COEP headers are needed. `cache: { budgetBytes }` sets its size (2 GB by default); `live.clearCache()` empties it (e.g. on logout). It's loaded only when enabled (`@sqlite.org/sqlite-wasm` is an optional peer dependency).
 
-```ts
-import { createOpfsCache } from "@chlive/client/cache";
-const cache = createOpfsCache({ budgetBytes: 2 * 1024 ** 3 }); // the default budget
-const live = new LiveClient({ url, cache });
-addEventListener("pagehide", () => { live.flush(); cache.close(); });
-```
+The client takes care of the page's lifecycle: it saves pending results when the tab goes to the background or the page is hidden, then closes the database so a reload can open it at once, and reopens it if the page comes back from the back/forward cache.
 
 - **On subscribe**, the cached result (if any) is shown at once (`status: "cached"`, with `cachedAt`), and the subscription is sent with `since` = its cursor. The server resumes and sends only what was missed; reconnects resume the same way.
 - **On the server** (`Engine::subscribe_from`), resuming from cursor `C` with ClickHouse at watermark `W`:
@@ -179,7 +177,7 @@ addEventListener("pagehide", () => { live.flush(); cache.close(); });
   - With ORDER BY, the sort keys of the client's whole result (everything up to `C`) are read from ClickHouse first, so the catch-up's inserts and deletes have the right indexes; with LIMIT alone, its row count.
   - When the client is ahead of ClickHouse in a partition (it streamed events ClickHouse hasn't ingested yet), an ordered or limited query re-reads that partition from Kafka, from `W` up to `C`, before sending anything: those events are the client's own, so they only rebuild the state and aren't sent again. An unordered query just continues from `C`.
   - The cursor must fit the topic: past its end means the topic was recreated, and before its start means retention deleted what a resume would need. Either way the server sends a full snapshot instead.
-- **What's stored:** per query (the SQL text, for now), its rows as JSON chunks, its metadata, the cursor and when it was last used. Each write is one transaction: snapshots and ordered diffs are saved in full (batched, about 1 s), append-only diffs are appended, and `progress` moves the cursor.
+- **What's stored:** per query (the SQL text, for now), its rows as JSON chunks, the cursor and when it was last used. A database with an older layout is emptied (`PRAGMA user_version`). Each write is one transaction: snapshots and ordered diffs are saved in full (batched, about 1 s), append-only diffs are appended, and `progress` moves the cursor.
 - **GC:** above the budget, the least recently used queries are evicted.
 - **MVP limits:** one tab holds the database at a time; other tabs run without a cache (the playground shows why). Keys are query strings, not shapes yet.
 

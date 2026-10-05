@@ -1,11 +1,8 @@
-import type { Column, DiffMessage, OrderTerm, ResumeMessage, Row, SnapshotMessage } from "./protocol.ts";
+import type { DiffMessage, Row, SnapshotMessage } from "./protocol.ts";
 
-/** A result as kept in a cache: the rows, how to read them, and the cursor they're complete to. */
+/** A result as kept in a cache: the rows and the cursor they're complete to. */
 export interface CachedResult {
   rows: Row[];
-  columns: Column[];
-  order?: OrderTerm[];
-  limit?: number;
   /** The server's cursor for these rows (opaque). */
   at: string;
   /** `Date.now()` when they were saved. */
@@ -16,10 +13,6 @@ export interface CachedResult {
 
 /** A live result: the snapshot's rows, then each diff's changes applied in order. */
 export class ResultStore<R extends Row = Row> {
-  columns: Column[] = [];
-  /** The ORDER BY the rows are kept in, if any. */
-  order: OrderTerm[] | undefined;
-  limit: number | undefined;
   /** The cursor the rows are complete to (from the server), if any. */
   at: string | undefined;
   private data: R[] = [];
@@ -45,26 +38,13 @@ export class ResultStore<R extends Row = Row> {
 
   /** Start from a cached result (until the server resumes or replaces it). */
   applyCached(c: CachedResult): void {
-    this.columns = c.columns;
-    this.order = c.order;
-    this.limit = c.limit;
     this.at = c.at;
     this.data = c.rows as R[];
     this.setIds(c.ids, c.rows.length);
   }
 
-  /** The server resumes from our cursor: the rows stay; the diffs that follow update them. */
-  applyResume(msg: ResumeMessage): void {
-    this.columns = msg.columns;
-    this.order = msg.order;
-    this.limit = msg.limit;
-  }
-
   /** Replaces everything (also after a reconnect: the new snapshot is the whole result). */
   applySnapshot(msg: SnapshotMessage): void {
-    this.columns = msg.columns;
-    this.order = msg.order;
-    this.limit = msg.limit;
     this.at = msg.at;
     this.data = msg.rows as R[];
     this.setIds(msg.ids, msg.rows.length);

@@ -1,19 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { defaultUrl, LiveClient } from "@chlive/client";
-import { LiveClientProvider, useLiveQuery } from "@chlive/client/react";
-import { createOpfsCache } from "@chlive/client/cache";
+import { LiveClientProvider, useLiveQueryDebug } from "@chlive/client/react";
 
-// Results are cached in SQLite on OPFS: a reload shows them at once, then resumes from their cursor.
-const cache = createOpfsCache();
-const client = new LiveClient({ url: defaultUrl(), cache });
-// save pending results before the page goes away
-addEventListener("pagehide", () => {
-  client.flush();
-  // let the next page (e.g. after a reload) open the database right away
-  setTimeout(() => cache.close(), 0);
-});
-document.addEventListener("visibilitychange", () => document.hidden && client.flush());
+// Results are cached (SQLite on OPFS): a reload shows them at once, then resumes from their cursor.
+const client = new LiveClient({ url: defaultUrl(), cache: true });
 
 // Queries in the chlive dialect:
 // SELECT * | columns FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
@@ -336,7 +327,7 @@ const RATE_WINDOW_MS = 5000;
 
 /** What the client holds for this subscription, and what arrived lately. */
 function Debug({ state, sql, shown }) {
-  const { stats, rows, status, limit, order, columns } = state;
+  const { stats, rows, status } = state;
   const [log, setLog] = useState([]); // newest first
   const [open, setOpen] = useState(null); // index into log
   const [now, setNow] = useState(Date.now());
@@ -374,9 +365,7 @@ function Debug({ state, sql, shown }) {
           <tr>
             <th>rows in state</th>
             <td>
-              <b>{rows.length}</b>
-              {limit !== undefined && ` / limit ${limit}`} · {shown} rendered · {columns.length} columns
-              {order ? ` · ordered by ${order.map((o) => `${o.column} ${o.direction}`).join(", ")}` : " · unordered"}
+              <b>{rows.length}</b> · {shown} rendered
             </td>
           </tr>
           <tr>
@@ -439,7 +428,7 @@ function CacheRows({ stats }) {
   const [store, setStore] = useState(null);
   useEffect(() => {
     let live = true;
-    const read = () => cache.stats().then((s) => live && setStore(s ?? null));
+    const read = () => client.cacheInfo().then((s) => live && setStore(s ?? null));
     read();
     const t = setInterval(read, 2000);
     return () => {
@@ -454,8 +443,8 @@ function CacheRows({ stats }) {
       <tr>
         <th>cache</th>
         <td>
-          {cache.unavailable ? (
-            <span className="error">unavailable: {cache.unavailable}</span>
+          {store?.unavailable ? (
+            <span className="error">unavailable: {store.unavailable}</span>
           ) : !c ? (
             "reading…"
           ) : (
@@ -480,13 +469,13 @@ function CacheRows({ stats }) {
       <tr>
         <th>cache store</th>
         <td>
-          {store
+          {store?.queries !== undefined
             ? `${store.queries} queries · ${store.rows} rows · ${mb(store.bytes)} of ${mb(store.budgetBytes)}`
             : "—"}{" "}
           <button
             onClick={async () => {
-              await cache.clear();
-              setStore(await cache.stats());
+              await client.clearCache();
+              setStore(await client.cacheInfo());
             }}
           >
             Clear cache
@@ -499,29 +488,28 @@ function CacheRows({ stats }) {
 
 const truncate = (s, n) => (s.length > n ? s.slice(0, n) + `\n… ${s.length - n} more characters` : s);
 
+// columns from the rows themselves: each row has exactly the selected columns, in order
+const columnsOf = (rows) => Object.keys(rows[0] ?? {});
+
 function Result({ sql }) {
-  const state = useLiveQuery(sql);
-  const { rows, columns, order, limit, status, error, errorCode } = state;
+  // an app would use `useLiveQuery(sql)`: just `{ rows, error }`; this one also shows the
+  // client's internals
+  const state = useLiveQueryDebug(sql);
+  const { rows, status, error } = state;
+  const columns = columnsOf(rows);
   // ordered or limited results as they are (a LIMIT window has its newest row last); unordered
   // unlimited ones newest first
-  const asIs = order || limit !== undefined;
+  const asIs = /\b(order\s+by|limit)\b/i.test(sql);
   const shown = asIs ? rows.slice(0, SHOWN) : rows.slice(-SHOWN).reverse();
   return (
     <section>
       <p>
         <span className={`status ${status}`}>{status}</span> {rows.length} rows
         {rows.length > SHOWN && (asIs ? ` (first ${SHOWN} shown)` : ` (newest ${SHOWN} shown)`)}
-        {limit !== undefined && <small> · limit {limit}{order ? " (top)" : " (latest)"}</small>}
-        {order && (
-          <small>
-            {" "}
-            · ordered by {order.map((o) => `${o.column} ${o.direction}${o.nulls === "first" ? " nulls first" : ""}`).join(", ")}
-          </small>
-        )}
       </p>
       {error && (
         <pre className="error">
-          {errorCode}: {error}
+          {error.code}: {error.message}
         </pre>
       )}
       <Debug state={state} sql={sql} shown={shown.length} />
@@ -529,9 +517,7 @@ function Result({ sql }) {
         <thead>
           <tr>
             {columns.map((c) => (
-              <th key={c.name} title={c.type}>
-                {c.name}
-              </th>
+              <th key={c}>{c}</th>
             ))}
           </tr>
         </thead>
@@ -539,7 +525,7 @@ function Result({ sql }) {
           {shown.map((r, i) => (
             <tr key={i}>
               {columns.map((c) => (
-                <td key={c.name}>{String(r[c.name] ?? "")}</td>
+                <td key={c}>{String(r[c] ?? "")}</td>
               ))}
             </tr>
           ))}

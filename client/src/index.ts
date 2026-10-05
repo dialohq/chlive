@@ -1,4 +1,4 @@
-import type { ClientMessage, Column, DiffMessage, OrderTerm, Row, ServerMessage } from "./protocol.ts";
+import type { ClientMessage, DiffMessage, Row, ServerMessage } from "./protocol.ts";
 import { type CachedResult, ResultStore } from "./state.ts";
 
 export type * from "./protocol.ts";
@@ -8,22 +8,25 @@ export { ResultStore, type CachedResult } from "./state.ts";
  * - `loading`: nothing to show yet;
  * - `cached`: rows from the cache, while the server catches them up;
  * - `live`: up to date, and following changes;
- * - `error`: see `error` and `errorCode`.
+ * - `error`: see `error`.
  */
 export type Status = "loading" | "cached" | "live" | "error";
 
+/** Why a subscription failed; after an error it gets no more updates. */
+export interface LiveError {
+  /** `SYNTAX_ERROR`, `INVALID_QUERY` (both with a line:column in the message), `HISTORY_FAILED`,
+   * `STREAM_FAILED`, `AGGREGATE_FAILED`, or `CLIENT_ERROR` (a change the client couldn't apply). */
+  code: string;
+  message: string;
+}
+
 export interface LiveState<R extends Row = Row> {
   status: Status;
+  /** Exactly the selected columns, in the query's order (and in its ORDER BY order, if any). */
   rows: R[];
-  columns: Column[];
-  /** The ORDER BY the rows are in; absent for unordered queries (rows in arrival order). */
-  order?: OrderTerm[];
-  /** The query's LIMIT, if any. `rows` never has more: listeners only see whole diffs applied. */
-  limit?: number;
+  error?: LiveError;
   /** When the cached rows were saved (while `status` is `cached`). */
   cachedAt?: number;
-  error?: string;
-  errorCode?: string;
   /** What this subscription has received so far; for debugging and dev tools. */
   stats: SubscriptionStats;
 }
@@ -68,8 +71,9 @@ export interface CacheStats {
 }
 
 /**
- * Where results are kept between sessions (e.g. `@chlive/client/cache`'s SQLite on OPFS).
- * Keyed by query. Every write keeps the rows and their cursor together.
+ * Where results are kept between sessions. `cache: true` uses SQLite on OPFS
+ * (`@chlive/client/cache`); this is for other storage, and for tests. Keyed by query. Every
+ * write keeps the rows and their cursor together.
  */
 export interface ResultCache {
   /** The cached result, marking it as just used; `undefined` if there's none. */
@@ -81,6 +85,28 @@ export interface ResultCache {
   /** The rows are unchanged; only the cursor moved. */
   setCursor(key: string, at: string): Promise<void>;
   remove(key: string): Promise<void>;
+  /** Forget every result (e.g. on logout). */
+  clear?(): Promise<void>;
+  /** For dev tools: why the cache isn't available, if it isn't, and what it holds. */
+  info?(): Promise<CacheInfo>;
+  /** Let go of the storage (the page is being hidden), so the next page can open it. */
+  close?(): void;
+  /** Open it again (the page was restored from the back/forward cache). */
+  reopen?(): void;
+}
+
+export interface CacheInfo {
+  unavailable?: string;
+  queries?: number;
+  rows?: number;
+  bytes?: number;
+  budgetBytes?: number;
+}
+
+/** The built-in cache's settings. */
+export interface CacheOptions {
+  /** Total size of cached results before the least recently used go (default 2 GB). */
+  budgetBytes?: number;
 }
 
 export type Listener<R extends Row = Row> = (state: LiveState<R>) => void;
@@ -97,8 +123,12 @@ export interface LiveClientOptions {
   maxBackoffMs?: number;
   /** WebSocket implementation (defaults to the global one). */
   WebSocket?: new (url: string) => WebSocket;
-  /** Keep results between sessions: show them right away, then resume from their cursor. */
-  cache?: ResultCache;
+  /**
+   * Keep results between sessions: show them right away, then resume from their cursor.
+   * `true` (or settings) keeps them in SQLite on OPFS, in a worker; the client takes care of
+   * saving them when the page is hidden. Off by default.
+   */
+  cache?: boolean | CacheOptions | ResultCache;
   /** Full saves of a result are batched for this long after a change (default 1000 ms). */
   saveDelayMs?: number;
 }
@@ -134,7 +164,11 @@ const OPEN = 1;
  */
 export class LiveClient {
   private readonly opts: Required<Omit<LiveClientOptions, "WebSocket" | "cache">> &
-    Pick<LiveClientOptions, "WebSocket" | "cache">;
+    Pick<LiveClientOptions, "WebSocket">;
+  /** Resolves to the cache once it's set up (`undefined` without one); loads wait for it. */
+  private readonly cacheReady: Promise<ResultCache | undefined> | undefined;
+  private cache: ResultCache | undefined;
+  private removePageListeners: (() => void) | undefined;
   private ws: WebSocket | null = null;
   private subs = new Map<string, SubRecord>();
   private nextId = 1;
@@ -143,8 +177,50 @@ export class LiveClient {
   private closed = false;
 
   constructor(opts: LiveClientOptions) {
-    this.opts = { minBackoffMs: 500, maxBackoffMs: 10_000, saveDelayMs: 1000, ...opts };
+    const { cache, ...rest } = opts;
+    this.opts = { minBackoffMs: 500, maxBackoffMs: 10_000, saveDelayMs: 1000, ...rest };
     this.backoff = this.opts.minBackoffMs;
+    if (cache) {
+      this.cacheReady = openCache(cache)
+        .catch((e) => {
+          console.warn("chlive: the offline cache is unavailable:", e);
+          return undefined;
+        })
+        .then((c) => {
+          if (c && this.closed) c.close?.();
+          else this.cache = c;
+          return this.cache;
+        });
+      this.removePageListeners = this.watchPage();
+    }
+  }
+
+  /**
+   * Save results when the tab goes to the background (on mobile it may be killed without a
+   * `pagehide`) and when the page is hidden; then let go of the storage, so a reload can open
+   * it at once, and open it again if the page is restored from the back/forward cache.
+   */
+  private watchPage(): (() => void) | undefined {
+    const target = globalThis as { addEventListener?: typeof addEventListener; removeEventListener?: typeof removeEventListener };
+    if (typeof target.addEventListener !== "function") return undefined;
+    const hide = () => {
+      this.flush();
+      // after the saves just queued have been sent to the worker
+      setTimeout(() => this.cache?.close?.(), 0);
+    };
+    const show = (e: Event) => {
+      if ((e as PageTransitionEvent).persisted) this.cache?.reopen?.();
+    };
+    const doc = (globalThis as { document?: Document }).document;
+    const background = () => doc?.visibilityState === "hidden" && this.flush();
+    target.addEventListener("pagehide", hide);
+    target.addEventListener("pageshow", show);
+    doc?.addEventListener("visibilitychange", background);
+    return () => {
+      target.removeEventListener?.("pagehide", hide);
+      target.removeEventListener?.("pageshow", show);
+      doc?.removeEventListener("visibilitychange", background);
+    };
   }
 
   subscribe<R extends Row = Row>(sql: string, listener: Listener<R>): Subscription {
@@ -154,10 +230,10 @@ export class LiveClient {
       id,
       sql,
       store: new ResultStore<R>(),
-      state: { status: "loading", rows: [], columns: [], stats: newStats(id) },
+      state: { status: "loading", rows: [], stats: newStats(id) },
       stats: newStats(id),
       listener,
-      ready: !this.opts.cache,
+      ready: !this.cacheReady,
       persist: Promise.resolve(),
       saveTimer: null,
       saved: false,
@@ -166,10 +242,10 @@ export class LiveClient {
     this.subs.set(id, rec);
     listener(rec.state);
     this.ensureConnected();
-    if (this.opts.cache) {
+    if (this.cacheReady) {
       const started = performance.now();
-      this.opts.cache
-        .load(sql)
+      this.cacheReady
+        .then((cache) => cache?.load(sql))
         .catch((e) => {
           console.warn("chlive: reading the cache failed", e);
           return undefined;
@@ -210,14 +286,33 @@ export class LiveClient {
     };
   }
 
-  /** Write every pending result to the cache now (e.g. when the page is being hidden). */
-  flush(): void {
+  /** Forget every cached result (e.g. on logout). Results being shown stay. */
+  async clearCache(): Promise<void> {
+    const cache = await this.cacheReady;
+    await cache?.clear?.();
+  }
+
+  /** For dev tools: whether the cache is on and working, and what it holds. */
+  async cacheInfo(): Promise<CacheInfo | undefined> {
+    if (!this.cacheReady) return undefined;
+    const cache = await this.cacheReady;
+    if (!cache) return { unavailable: "it couldn't be set up" };
+    return (await cache.info?.()) ?? {};
+  }
+
+  /** Write every pending result to the cache now. */
+  private flush(): void {
     for (const rec of this.subs.values()) this.flushSave(rec);
   }
 
-  /** Close the socket and stop reconnecting. */
+  /** Close the socket and stop reconnecting; save pending results and close the cache. */
   close(): void {
     this.flush();
+    this.removePageListeners?.();
+    const cache = this.cache;
+    if (cache?.close) {
+      void Promise.all([...this.subs.values()].map((r) => r.persist)).then(() => cache.close!());
+    }
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.subs.clear();
@@ -295,7 +390,7 @@ export class LiveClient {
           this.scheduleSave(rec);
           break;
         case "resume":
-          rec.store.applyResume(msg);
+          // the rows we hold stay; the diffs that follow bring them up to date
           if (stats.cache) stats.cache = { ...stats.cache, resumed: true };
           rec.awaitingCatchUp = true;
           break;
@@ -318,12 +413,12 @@ export class LiveClient {
           break;
         case "error":
           rec.stats = stats;
-          this.emit(rec, { ...rec.state, status: "error", error: msg.message, errorCode: msg.code });
+          this.emit(rec, { ...rec.state, status: "error", error: { code: msg.code, message: msg.message } });
           return;
       }
     } catch (e) {
       rec.stats = stats;
-      this.emit(rec, { ...rec.state, status: "error", error: String(e), errorCode: "CLIENT_ERROR" });
+      this.emit(rec, { ...rec.state, status: "error", error: { code: "CLIENT_ERROR", message: String(e) } });
       return;
     }
     stats.lastApplyMs = performance.now() - started;
@@ -336,7 +431,7 @@ export class LiveClient {
 
   /** Queue a cache write after the previous ones; failures are logged, never fatal. */
   private queue(rec: SubRecord, write: (cache: ResultCache) => Promise<void>): void {
-    const cache = this.opts.cache;
+    const cache = this.cache;
     if (!cache) return;
     rec.persist = rec.persist
       .then(async () => {
@@ -350,7 +445,7 @@ export class LiveClient {
 
   /** Save the whole result soon (the latest state then, not now). */
   private scheduleSave(rec: SubRecord): void {
-    if (!this.opts.cache || rec.saveTimer) return;
+    if (!this.cache || rec.saveTimer) return;
     rec.saveTimer = setTimeout(() => this.flushSave(rec), this.opts.saveDelayMs);
   }
 
@@ -363,9 +458,6 @@ export class LiveClient {
     // the rows array is never mutated (a new one per diff), so this is a consistent state
     const result: CachedResult = {
       rows: rec.store.rows(),
-      columns: rec.store.columns,
-      order: rec.store.order,
-      limit: rec.store.limit,
       at,
       savedAt: Date.now(),
       ids: rec.store.ids().some((id) => id !== undefined) ? rec.store.ids() : undefined,
@@ -394,20 +486,20 @@ export class LiveClient {
   // -------------------------------------------------------------------------------------------
 
   private view(rec: SubRecord): LiveState<any> {
-    return {
-      status: rec.state.status,
-      rows: rec.store.rows(),
-      columns: rec.store.columns,
-      order: rec.store.order,
-      limit: rec.store.limit,
-      stats: rec.stats,
-    };
+    return { status: rec.state.status, rows: rec.store.rows(), stats: rec.stats };
   }
 
   private emit(rec: SubRecord, state: LiveState<any>): void {
     rec.state = { ...state, stats: rec.stats };
     rec.listener(rec.state);
   }
+}
+
+/** The cache for the `cache` option: the built-in one is loaded only when asked for. */
+async function openCache(opt: true | CacheOptions | ResultCache): Promise<ResultCache> {
+  if (opt !== true && typeof (opt as ResultCache).load === "function") return opt as ResultCache;
+  const { createOpfsCache } = await import("./cache/index.ts");
+  return createOpfsCache(opt === true ? {} : (opt as CacheOptions));
 }
 
 function newStats(id: string): SubscriptionStats {

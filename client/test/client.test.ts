@@ -51,7 +51,6 @@ test("subscribes, applies messages, resubscribes after reconnect", async () => {
 
   ws1.deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "h1" }] });
   assert.equal(states.at(-1)!.status, "live");
-  assert.deepEqual(states.at(-1)!.columns, COLUMNS);
   ws1.deliver({ type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: "e1" } }, { op: "insert", row: { user_id: "e2" } }] });
   assert.deepEqual(states.at(-1)!.rows, [{ user_id: "h1" }, { user_id: "e1" }, { user_id: "e2" }]);
   // each change gives React a new array
@@ -92,8 +91,8 @@ test("errors are reported per subscription", () => {
   });
   FakeSocket.all[0].deliver({ type: "snapshot", id: "s2", columns: COLUMNS, rows: [] });
   assert.equal(a!.status, "error");
-  assert.equal(a!.errorCode, "SYNTAX_ERROR");
-  assert.match(a!.error!, /at 1:10$/);
+  assert.equal(a!.error?.code, "SYNTAX_ERROR");
+  assert.match(a!.error!.message, /at 1:10$/);
   assert.equal(b!.status, "live");
   client.close();
 });
@@ -107,7 +106,7 @@ test("an unknown change op fails the subscription instead of being skipped", () 
   FakeSocket.all[0].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "h1" }] });
   FakeSocket.all[0].deliver({ type: "diff", id: "s1", changes: [{ op: "upsert", row: { user_id: "x" } }] });
   assert.equal(last!.status, "error");
-  assert.equal(last!.errorCode, "CLIENT_ERROR");
+  assert.equal(last!.error?.code, "CLIENT_ERROR");
   assert.deepEqual(last!.rows, [{ user_id: "h1" }]);
   client.close();
 });
@@ -169,6 +168,8 @@ function memoryCache(initial: Record<string, CachedResult> = {}) {
       data.set(k, { ...data.get(k)!, at });
     },
     remove: async (k) => void data.delete(k),
+    close: () => void calls.push("close"),
+    reopen: () => void calls.push("reopen"),
   };
   return { cache, data, calls };
 }
@@ -176,7 +177,7 @@ function memoryCache(initial: Record<string, CachedResult> = {}) {
 test("a cached result shows first, resumes from its cursor, and is kept up to date", async () => {
   FakeSocket.all = [];
   const { cache, data, calls } = memoryCache({
-    [SQL]: { rows: [{ user_id: "a" }], columns: COLUMNS, at: "c1", savedAt: 42 },
+    [SQL]: { rows: [{ user_id: "a" }], at: "c1", savedAt: 42 },
   });
   const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, saveDelayMs: 5 });
   const states: LiveState[] = [];
@@ -214,7 +215,7 @@ test("a cached result shows first, resumes from its cursor, and is kept up to da
 test("a snapshot instead of a resume replaces the cached rows, and is saved in full", async () => {
   FakeSocket.all = [];
   const { cache, data, calls } = memoryCache({
-    [SQL]: { rows: [{ user_id: "old" }], columns: COLUMNS, at: "stale", savedAt: 1 },
+    [SQL]: { rows: [{ user_id: "old" }], at: "stale", savedAt: 1 },
   });
   const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, saveDelayMs: 5 });
   let last: LiveState | undefined;
@@ -247,4 +248,29 @@ test("a cache miss subscribes without since, then saves the snapshot", async () 
   assert.equal(last!.stats.cache!.hit, false);
   assert.deepEqual(calls, [`load ${SQL}`, "save 1@c1"]);
   client.close();
+});
+
+test("the client saves results when the page is hidden, and manages the cache's lifecycle", async () => {
+  FakeSocket.all = [];
+  const { cache, data, calls } = memoryCache();
+  // a long save delay: only the page being hidden saves it
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, saveDelayMs: 60_000 });
+  client.subscribe(SQL, () => {});
+  FakeSocket.all[0].open();
+  await tick(1);
+  FakeSocket.all[0].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "a" }], at: "c1" });
+  dispatchEvent(new Event("pagehide"));
+  await tick(5);
+  assert.deepEqual(calls, [`load ${SQL}`, "save 1@c1", "close"]);
+  assert.deepEqual(data.get(SQL)!.rows, [{ user_id: "a" }]);
+  // restored from the back/forward cache: opened again; a normal pageshow does nothing
+  dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true }));
+  dispatchEvent(Object.assign(new Event("pageshow"), { persisted: false }));
+  assert.deepEqual(calls.slice(3), ["reopen"]);
+  // closing the client closes the cache and stops listening to the page
+  client.close();
+  await tick(1);
+  dispatchEvent(new Event("pagehide"));
+  await tick(5);
+  assert.deepEqual(calls.slice(4), ["close"]);
 });

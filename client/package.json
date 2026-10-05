@@ -14,10 +14,6 @@
     "./react": {
       "types": "./dist/react.d.ts",
       "default": "./dist/react.js"
-    },
-    "./cache": {
-      "types": "./dist/cache/index.d.ts",
-      "default": "./dist/cache/index.js"
     }
   },
   "files": [

@@ -24,6 +24,9 @@ export interface StoreStats {
 
 export const DEFAULT_BUDGET_BYTES = 2 * 1024 ** 3;
 
+/** The tables' layout; a database with another one is emptied. */
+const SCHEMA_VERSION = 2;
+
 /**
  * Cached results in SQLite: one `results` row per query (its metadata and cursor), and its rows
  * as JSON chunks in `chunks`, in order. Every write is one transaction, so rows and cursor
@@ -38,11 +41,15 @@ export class SqliteResultStore {
     this.db = db;
     this.budgetBytes = opts.budgetBytes ?? DEFAULT_BUDGET_BYTES;
     this.chunkRows = opts.chunkRows ?? 1000;
+    // an older layout is just a cache: start over
+    const [{ user_version: version }] = db.all("PRAGMA user_version") as { user_version: number }[];
+    if (Number(version) !== SCHEMA_VERSION) {
+      db.exec("DROP TABLE IF EXISTS chunks");
+      db.exec("DROP TABLE IF EXISTS results");
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    }
     db.exec(`CREATE TABLE IF NOT EXISTS results (
       key TEXT PRIMARY KEY,
-      columns TEXT NOT NULL,
-      ord TEXT,
-      lim INTEGER,
       cursor TEXT NOT NULL,
       rows INTEGER NOT NULL,
       bytes INTEGER NOT NULL,
@@ -69,9 +76,6 @@ export class SqliteResultStore {
     }
     return {
       rows,
-      columns: JSON.parse(r.columns as string),
-      order: r.ord === null ? undefined : JSON.parse(r.ord as string),
-      limit: r.lim === null ? undefined : Number(r.lim),
       at: r.cursor as string,
       savedAt: Number(r.saved_at),
     };
@@ -83,16 +87,12 @@ export class SqliteResultStore {
       this.db.exec("DELETE FROM chunks WHERE key = ?", [key]);
       const bytes = this.writeChunks(key, 0, result.rows);
       this.db.exec(
-        `INSERT INTO results (key, columns, ord, lim, cursor, rows, bytes, saved_at, used_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (key) DO UPDATE SET columns = excluded.columns, ord = excluded.ord,
-           lim = excluded.lim, cursor = excluded.cursor, rows = excluded.rows,
+        `INSERT INTO results (key, cursor, rows, bytes, saved_at, used_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (key) DO UPDATE SET cursor = excluded.cursor, rows = excluded.rows,
            bytes = excluded.bytes, saved_at = excluded.saved_at, used_at = excluded.used_at`,
         [
           key,
-          JSON.stringify(result.columns),
-          result.order === undefined ? null : JSON.stringify(result.order),
-          result.limit ?? null,
           result.at,
           result.rows.length,
           bytes,

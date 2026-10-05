@@ -1,5 +1,6 @@
-// @chlive/client/cache: keep live results between sessions, in SQLite on OPFS (in a worker).
-import type { ResultCache } from "../index.ts";
+// The offline cache: live results kept between sessions, in SQLite on OPFS (in a worker).
+// `new LiveClient({ cache: true })` loads and manages it; nothing here is called directly.
+import type { CacheInfo, ResultCache } from "../index.ts";
 import type { Row } from "../protocol.ts";
 import type { CachedResult } from "../state.ts";
 import type { StoreStats } from "./store.ts";
@@ -18,17 +19,15 @@ export interface OpfsCacheOptions {
   loadWaitMs?: number;
 }
 
-/** A `ResultCache`, plus what dev tools want to know about it. */
+/** A `ResultCache` with its whole lifecycle. If the database can't be opened (e.g. another tab
+ * holds it), every call does nothing and loads find nothing. */
 export interface OpfsCache extends ResultCache {
-  /** Resolves once the database is open: `false` if it can't be (e.g. another tab holds it),
-   * in which case every call does nothing and loads find nothing. */
-  readonly ready: Promise<boolean>;
-  /** Why it isn't available, if it isn't. */
-  readonly unavailable: string | undefined;
-  stats(): Promise<StoreStats | undefined>;
   clear(): Promise<void>;
-  /** Close the database (e.g. on `pagehide`), letting the next page open it right away. */
+  info(): Promise<CacheInfo>;
+  /** Close the database (the page is being hidden), letting the next page open it right away. */
   close(): void;
+  /** Open it again after `close` (the page was restored from the back/forward cache). */
+  reopen(): void;
 }
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
@@ -54,6 +53,14 @@ function startWorker() {
   return { worker, call };
 }
 
+/** The worker closes the database, then goes. */
+function release(w: ReturnType<typeof startWorker>): void {
+  void w
+    .call("close")
+    .catch(() => undefined)
+    .finally(() => w.worker.terminate());
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** A cache of live results in SQLite on OPFS, run in a dedicated worker. */
@@ -62,20 +69,29 @@ export function createOpfsCache(opts: OpfsCacheOptions = {}): OpfsCache {
   const loadWaitMs = opts.loadWaitMs ?? 1500;
   let current: ReturnType<typeof startWorker> | undefined;
   let unavailable: string | undefined;
+  /** Bumped by `close`: an open still in progress then lets go of the database. */
+  let generation = 0;
 
-  const ready = (async () => {
+  const open = async () => {
+    const opening = generation;
     const deadline = Date.now() + openTimeoutMs;
     for (;;) {
       const w = startWorker();
       try {
         await w.call<void>("init", opts.budgetBytes);
+        if (opening !== generation) {
+          release(w);
+          return false;
+        }
         current = w;
+        unavailable = undefined;
         return true;
       } catch (e) {
         w.worker.terminate();
         const message = (e as Error).message;
         // another page (often the one being reloaded) still holds the database: try again
         const held = /Access Handle|NoModificationAllowed/i.test(message);
+        if (opening !== generation) return false;
         if (!held || Date.now() >= deadline) {
           unavailable = message;
           console.warn("chlive: the offline cache is unavailable:", message);
@@ -84,7 +100,8 @@ export function createOpfsCache(opts: OpfsCacheOptions = {}): OpfsCache {
         await sleep(250);
       }
     }
-  })();
+  };
+  let ready = open();
   // ask the browser not to evict the cache under storage pressure
   void navigator.storage?.persist?.().catch(() => undefined);
 
@@ -92,23 +109,28 @@ export function createOpfsCache(opts: OpfsCacheOptions = {}): OpfsCache {
     (await ready) && current ? f(current.call) : otherwise;
 
   return {
-    ready,
-    get unavailable() {
-      return unavailable;
-    },
     load: async (key) => {
-      const open = await Promise.race([ready, sleep(loadWaitMs).then(() => false)]);
-      return open && current ? current.call<CachedResult | undefined>("load", key) : undefined;
+      const isOpen = await Promise.race([ready, sleep(loadWaitMs).then(() => false)]);
+      return isOpen && current ? current.call<CachedResult | undefined>("load", key) : undefined;
     },
     save: (key, result) => whenReady((call) => call<void>("save", key, result), undefined),
     append: (key: string, rows: Row[], at: string) =>
       whenReady((call) => call<void>("append", key, rows, at), undefined),
     setCursor: (key, at) => whenReady((call) => call<void>("setCursor", key, at), undefined),
     remove: (key) => whenReady((call) => call<void>("remove", key), undefined),
-    stats: () => whenReady((call) => call<StoreStats>("stats"), undefined),
     clear: () => whenReady((call) => call<void>("clear"), undefined),
+    info: async () => {
+      const stats = await whenReady((call) => call<StoreStats>("stats"), undefined);
+      return { unavailable, ...stats };
+    },
     close: () => {
-      void current?.call("close").catch(() => undefined);
+      generation++;
+      if (current) release(current);
+      current = undefined;
+      ready = Promise.resolve(false);
+    },
+    reopen: () => {
+      if (!current) ready = open();
     },
   };
 }

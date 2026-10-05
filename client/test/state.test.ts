@@ -13,7 +13,6 @@ test("snapshot, then inserts in arrival order", () => {
   s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 3 } }, { op: "insert", row: { n: 4 } }] });
   assert.deepEqual(s.rows().map((r) => r.n), [1, 2, 3, 4]);
   assert.deepEqual(before.map((r) => r.n), [1, 2], "earlier arrays are not mutated");
-  assert.deepEqual(s.columns, columns);
 });
 
 test("a snapshot replaces everything", () => {
@@ -38,7 +37,6 @@ test("ordered inserts land at their index, applied in sequence", () => {
   const s = new ResultStore<{ n: number }>();
   const order = [{ column: "n", direction: "desc" as const, nulls: "last" as const }];
   s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 9 }, { n: 5 }, { n: 1 }], order });
-  assert.deepEqual(s.order, order);
   s.applyDiff({
     type: "diff",
     id: "a",
@@ -66,7 +64,6 @@ test("an index outside the list throws and leaves the rows untouched", () => {
 test("LIMIT: a diff's inserts and deletes apply together", () => {
   const s = new ResultStore<{ n: number }>();
   s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }, { n: 2 }], limit: 2 });
-  assert.equal(s.limit, 2);
   // window: append, then the first row goes
   s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 3 } }, { op: "delete", index: 0 }] });
   assert.deepEqual(s.rows().map((r) => r.n), [2, 3]);

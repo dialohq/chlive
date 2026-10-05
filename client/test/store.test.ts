@@ -16,7 +16,6 @@ function db(): Db {
 
 const result = (n: number, at = "c1") => ({
   rows: Array.from({ length: n }, (_, i) => ({ n: i })),
-  columns: [{ name: "n", type: "UInt32" }],
   at,
   savedAt: 1,
 });
@@ -24,22 +23,18 @@ const result = (n: number, at = "c1") => ({
 test("save, load (in order, across chunks), append, cursor", () => {
   const s = new SqliteResultStore(db(), { chunkRows: 3 });
   assert.equal(s.load("q"), undefined);
-  s.save("q", { ...result(7), order: [{ column: "n", direction: "asc", nulls: "last" }], limit: 50 });
+  s.save("q", result(7));
   const r = s.load("q")!;
   assert.deepEqual(r.rows.map((x) => x.n), [0, 1, 2, 3, 4, 5, 6]);
-  assert.deepEqual(r.order, [{ column: "n", direction: "asc", nulls: "last" }]);
-  assert.equal(r.limit, 50);
   assert.equal(r.at, "c1");
   s.append("q", [{ n: 7 }, { n: 8 }], "c2");
   s.setCursor("q", "c3");
   const r2 = s.load("q")!;
   assert.deepEqual(r2.rows.map((x) => x.n), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
   assert.equal(r2.at, "c3");
-  assert.equal(r2.limit, 50);
   // a save replaces everything
   s.save("q", result(2, "c4"));
   assert.deepEqual(s.load("q")!.rows.length, 2);
-  assert.equal(s.load("q")!.limit, undefined);
   // appending to nothing does nothing
   s.append("nope", [{ n: 1 }], "c");
   assert.equal(s.load("nope"), undefined);
@@ -67,4 +62,16 @@ test("over the budget, the least recently used results go, never the one just wr
   assert.equal(s.stats().queries, 1);
   s.clear();
   assert.equal(s.stats().queries, 0);
+});
+
+test("a database with an older layout starts empty", () => {
+  const d = db();
+  d.exec("CREATE TABLE results (key TEXT PRIMARY KEY, columns TEXT NOT NULL, cursor TEXT NOT NULL)");
+  d.exec("INSERT INTO results VALUES ('q', '[]', 'c1')");
+  const s = new SqliteResultStore(d);
+  assert.equal(s.load("q"), undefined);
+  s.save("q", result(2));
+  assert.equal(s.load("q")!.rows.length, 2);
+  // the same layout again: kept
+  assert.equal(new SqliteResultStore(d).load("q")!.rows.length, 2);
 });
