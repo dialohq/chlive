@@ -14,9 +14,11 @@
         "typescript": "^5.9.0",
       },
       "peerDependencies": {
+        "@sqlite.org/sqlite-wasm": ">=3.50",
         "react": ">=18",
       },
       "optionalPeers": [
+        "@sqlite.org/sqlite-wasm",
         "react",
       ],
     },
