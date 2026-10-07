@@ -5,6 +5,12 @@
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
     dnvr.url = "github:dialohq/dnvr";
     dnvr.inputs.nixpkgs.follows = "nixpkgs";
+    # The production ingestion (Kafka Connect's ClickHouse sink, exactly once) and its pause
+    # server, which chlive's snapshots go through. A local checkout for now.
+    continuous-backup = {
+      url = "git+file:///Users/adam/continuous-backup";
+      flake = false;
+    };
   };
 
   outputs =
@@ -37,6 +43,10 @@
               tcpPort = 19000; # native protocol (`ch`)
             };
             playgroundPort = 5174;
+            connectPort = 18083; # Kafka Connect's REST API
+            pauseServerPort = 18091; # the pause server (snapshots)
+            keeperPort = 19181; # ClickHouse Keeper, embedded (KeeperMap: the sink's state)
+            keeperRaftPort = 19234;
             topics = [
               "events"
               "customers"
@@ -44,7 +54,112 @@
             ];
             # events seeded into an empty ClickHouse on `dnvr up` (scripts/seed.sql)
             seedCount = 10;
+            # partitions per topic (nix/packages/redpanda.nix creates them so)
+            partitions = 3;
           };
+
+          cb = inputs.continuous-backup;
+          # continuous-backup's binary; `pause-server <config>` is the pause server. Its tests
+          # run in its own repo.
+          backup = (pkgs.callPackage "${cb}/nix/backup.nix" { }).overrideAttrs (_: {
+            doCheck = false;
+          });
+          sinkPlugin = pkgs.callPackage "${cb}/nix/clickhouse-kafka-connect.nix" { };
+          supervise = import "${cb}/nix/supervise.nix" { inherit (pkgs) lib; };
+
+          # One sink connector per topic, into the table of the same name, exactly once: the
+          # connector keeps its offsets in a KeeperMap table, which the pause server reads.
+          sinkConnector = topic: {
+            name = "chlive-sink-${topic}";
+            stateTable = "chlive_sink_${topic}_state";
+            keeperPath = "/chlive-sink/${topic}";
+          };
+          connectorConfig =
+            topic:
+            let
+              c = sinkConnector topic;
+            in
+            pkgs.writeText "chlive-sink-${topic}.json" (
+              builtins.toJSON {
+                "connector.class" = "com.clickhouse.kafka.connect.ClickHouseSinkConnector";
+                "tasks.max" = "1";
+                topics = topic;
+                topic2TableMap = "${topic}=${topic}";
+                hostname = "127.0.0.1";
+                port = toString settings.clickhouse.httpPort;
+                ssl = "false";
+                database = "default";
+                username = "default";
+                password = "";
+                exactlyOnce = "true";
+                "consumer.override.isolation.level" = "read_committed";
+                "errors.tolerance" = "all";
+                "errors.deadletterqueue.topic.name" = "chlive-deadletterqueue";
+                "errors.deadletterqueue.topic.replication.factor" = "1";
+                "errors.deadletterqueue.context.headers.enable" = "true";
+                bufferCount = "0";
+                zkPath = c.keeperPath;
+                zkDatabase = c.stateTable;
+                "value.converter" = "org.apache.kafka.connect.json.JsonConverter";
+                "value.converter.schemas.enable" = "false";
+                clickhouseSettings = "async_insert=0,insert_deduplicate=1";
+              }
+            );
+          connectProperties = pkgs.writeText "chlive-connect.properties" ''
+            bootstrap.servers=127.0.0.1:${toString settings.kafkaPort}
+            group.id=chlive-connect
+            config.storage.topic=chlive-connect-configs
+            offset.storage.topic=chlive-connect-offsets
+            status.storage.topic=chlive-connect-status
+            config.storage.replication.factor=1
+            offset.storage.replication.factor=1
+            status.storage.replication.factor=1
+            key.converter=org.apache.kafka.connect.storage.StringConverter
+            value.converter=org.apache.kafka.connect.json.JsonConverter
+            value.converter.schemas.enable=false
+            plugin.path=${sinkPlugin}/plugins
+            listeners=http://127.0.0.1:${toString settings.connectPort}
+            connector.client.config.override.policy=All
+            offset.flush.interval.ms=1000
+          '';
+          pauseServerConfig = pkgs.writeText "chlive-pause-server.json" (
+            builtins.toJSON {
+              listen = "127.0.0.1:${toString settings.pauseServerPort}";
+              # relative to DNVR_ROOT, where the process runs
+              pausesFile = ".dnvr/pause-server/pauses.json";
+              connectUrl = "http://127.0.0.1:${toString settings.connectPort}";
+              clickhouseUrl = "http://127.0.0.1:${toString settings.clickhouse.httpPort}";
+              pauseTimeoutSeconds = 30;
+              pipelines = map (
+                topic:
+                let
+                  c = sinkConnector topic;
+                in
+                {
+                  connector = c.name;
+                  database = "default";
+                  state_table = c.stateTable;
+                  keeper_path = c.keeperPath;
+                  table = topic;
+                  inherit topic;
+                  inherit (settings) partitions;
+                }
+              ) settings.topics;
+              timeouts = {
+                clickhouseConnectSeconds = 10;
+                connectConnectSeconds = 10;
+                connectRequestSeconds = 30;
+                connectPollSeconds = 1;
+                kafkaMetadataSeconds = 10;
+                kafkaCatalogReadSeconds = 15;
+                kafkaTransactionSeconds = 30;
+                kafkaMaxPollSeconds = 86400;
+                kafkaReplayPollSeconds = 15;
+                recoveryCatchupSeconds = 3600;
+                controllerRetrySeconds = 15;
+              };
+            }
+          );
 
           clickhouse = pkgs.callPackage ./nix/packages/clickhouse.nix { };
           # chDB (ClickHouse as a library), embedded in the engine to merge aggregate states;
@@ -150,7 +265,7 @@
           dnvr.shells.default =
             { config, ... }:
             {
-              description = "chlive: Redpanda (Docker) + ClickHouse + chlive-server (WebSocket over chlive-engine) + examples";
+              description = "chlive: Redpanda (Docker) + ClickHouse + Kafka Connect's ClickHouse sink + pause server + chlive-server (WebSocket over chlive-engine) + examples";
 
               packages = toolchain;
 
@@ -165,8 +280,9 @@
                 redpanda.command = redpanda;
 
                 # ClickHouse via dnvr's preset, on our pinned version (nix/packages/clickhouse.nix).
-                # Writable storage for SQL-created users (chlive_ro, see scripts/schema.sql),
-                # relative to DNVR_ROOT like the preset's other paths.
+                # Writable storage for SQL-created users (see scripts/schema.sql), relative to
+                # DNVR_ROOT like the preset's other paths; and an embedded Keeper, for the
+                # sink's KeeperMap state tables.
                 clickhouse = {
                   imports = [ presets.clickhouse ];
                   package = clickhouse;
@@ -174,16 +290,32 @@
                   inherit (settings.clickhouse) httpPort tcpPort;
                   dataDir = ".dnvr/clickhouse";
                   timezone = "UTC";
-                  extraConfigXml = "<access_control_path>.dnvr/clickhouse/access/</access_control_path>";
+                  extraConfigXml = ''
+                    <access_control_path>.dnvr/clickhouse/access/</access_control_path>
+                    <keeper_server>
+                      <tcp_port>${toString settings.keeperPort}</tcp_port>
+                      <server_id>1</server_id>
+                      <log_storage_path>.dnvr/clickhouse/coordination/log</log_storage_path>
+                      <snapshot_storage_path>.dnvr/clickhouse/coordination/snapshots</snapshot_storage_path>
+                      <raft_configuration>
+                        <server>
+                          <id>1</id>
+                          <hostname>127.0.0.1</hostname>
+                          <port>${toString settings.keeperRaftPort}</port>
+                        </server>
+                      </raft_configuration>
+                    </keeper_server>
+                    <zookeeper>
+                      <node><host>127.0.0.1</host><port>${toString settings.keeperPort}</port></node>
+                    </zookeeper>
+                    <keeper_map_path_prefix>/clickhouse/keeper_map</keeper_map_path_prefix>
+                  '';
                 };
 
-                # Schema, Kafka-engine ingestion and the readonly user. Idempotent; reruns on
-                # every start and then idles so its `ready` key stays live.
+                # Tables, the sink's state tables and the users. Idempotent; reruns on every start
+                # and then idles so its `ready` key stays live.
                 schema = {
-                  env = {
-                    CH_DATABASE = "dnvr://clickhouse/database";
-                    KAFKA_TOPICS = "dnvr://redpanda/topics";
-                  };
+                  env.CH_DATABASE = "dnvr://clickhouse/database";
                   command = ''
                     cd "$DNVR_ROOT"
                     ${chClient} --multiquery < scripts/schema.sql
@@ -193,17 +325,76 @@
                   '';
                 };
 
-                # Seed historical events (scripts/seed.sql, produced through Kafka) when ClickHouse has
-                # fewer than $SEED_COUNT, then wait until main has ingested them.
+                # Kafka Connect, running the ClickHouse sink connectors.
+                connect = {
+                  env.KAFKA = "dnvr://redpanda/bootstrap";
+                  command = ''
+                    ${supervise {
+                      name = "Kafka Connect";
+                      start = "${pkgs.apacheKafka}/bin/connect-distributed.sh ${connectProperties}";
+                      readyWhen = "${pkgs.curl}/bin/curl -fs http://127.0.0.1:${toString settings.connectPort}/connector-plugins >/dev/null";
+                      onReady = ''
+                        dnvr-state set url http://127.0.0.1:${toString settings.connectPort}
+                        echo "[connect] ready"
+                      '';
+                    }}
+                  '';
+                };
+
+                # One sink connector per topic (created or updated), once the tables exist.
+                connectors = {
+                  env = {
+                    CONNECT_URL = "dnvr://connect/url";
+                    SCHEMA_READY = "dnvr://schema/ready";
+                    TOPICS = "dnvr://redpanda/topics";
+                  };
+                  command = ''
+                    ${pkgs.lib.concatMapStrings (topic: ''
+                      ${pkgs.curl}/bin/curl -sS --fail-with-body -X PUT \
+                        -H 'Content-Type: application/json' --data-binary @${connectorConfig topic} \
+                        "$CONNECT_URL/connectors/${(sinkConnector topic).name}/config" >/dev/null
+                      until ${pkgs.curl}/bin/curl -fs "$CONNECT_URL/connectors/${(sinkConnector topic).name}/status" \
+                        | ${pkgs.jq}/bin/jq -e '.connector.state == "RUNNING" and (.tasks | length > 0) and all(.tasks[]; .state == "RUNNING")' >/dev/null; do
+                        sleep 0.5
+                      done
+                      echo "[connectors] ${(sinkConnector topic).name} running"
+                    '') settings.topics}
+                    dnvr-state set ready 1
+                    exec tail -f /dev/null
+                  '';
+                };
+
+                # Pauses a table's ingestion while chlive-server snapshots it.
+                pause-server = {
+                  env.CONNECTORS_READY = "dnvr://connectors/ready";
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    mkdir -p .dnvr/pause-server
+                    export CLICKHOUSE_USERNAME=default CLICKHOUSE_PASSWORD=
+                    ${supervise {
+                      name = "Pause server";
+                      start = "${backup}/bin/durable-clickhouse-backup pause-server ${pauseServerConfig}";
+                      readyWhen = "${pkgs.curl}/bin/curl -fs http://127.0.0.1:${toString settings.pauseServerPort}/health >/dev/null";
+                      onReady = ''
+                        dnvr-state set url http://127.0.0.1:${toString settings.pauseServerPort}
+                        echo "[pause-server] ready"
+                      '';
+                    }}
+                  '';
+                };
+
+                # Seed historical events (scripts/seed.sql, produced to Kafka and ingested by the
+                # sink) when ClickHouse has fewer than $SEED_COUNT, then wait until they're in.
                 seed = {
-                  env.SCHEMA_READY = "dnvr://schema/ready";
+                  env.CONNECTORS_READY = "dnvr://connectors/ready";
                   command = ''
                     cd "$DNVR_ROOT"
                     count() { ${chClient} --query "SELECT count() FROM default.events"; }
                     have=$(count)
                     if [ "$have" -lt "$SEED_COUNT" ]; then
                       echo "[seed] ClickHouse has $have events; seeding $((SEED_COUNT - have))"
-                      ${chClient} --param_count=$((SEED_COUNT - have)) --queries-file scripts/seed.sql
+                      clickhouse local --param_count=$((SEED_COUNT - have)) --queries-file scripts/seed.sql \
+                        | ${pkgs.lib.getExe (pkgs.writeShellApplication { name = "produce"; inherit (produceScript) text; })} events >/dev/null
                       until [ "$(count)" -ge "$SEED_COUNT" ]; do sleep 1; done
                       echo "[seed] ClickHouse now has $(count) events"
                     else
@@ -214,9 +405,10 @@
                   '';
                 };
 
-                # On its defaults: :8080, this ClickHouse (as chlive_ro) and this Redpanda.
+                # On its defaults: :8080, this ClickHouse (as chlive_ro, snapshots as
+                # chlive_snap), this Redpanda and this pause server.
                 server = {
-                  env.SCHEMA_READY = "dnvr://schema/ready";
+                  env.PAUSE_SERVER = "dnvr://pause-server/url";
                   command = ''
                     cd "$DNVR_ROOT"
                     exec cargo run --release -p chlive-server
@@ -255,7 +447,8 @@
                 reset-data = {
                   description = "Delete local Redpanda and ClickHouse data (run while `dnvr up` is stopped)";
                   text = ''
-                    # Kafka offsets and ClickHouse's _offset watermarks must be reset together.
+                    # Kafka (with Connect's own topics) and ClickHouse (with the sink's KeeperMap
+                    # offsets) must be reset together.
                     docker rm -f chlive-redpanda >/dev/null 2>&1 || true
                     docker volume rm chlive-redpanda >/dev/null 2>&1 || true
                     rm -rf "''${DNVR_ROOT:?}/${config.processes.clickhouse.dataDir}"

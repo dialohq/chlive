@@ -1,11 +1,9 @@
--- Seed historical events by producing them to Kafka through the Kafka-engine table:
--- ClickHouse writes each row as one JSONEachRow message to the `events` topic, and the
--- events_mv materialized view ingests it back into `events` with its real _partition/_offset.
--- (Inserting into `events` directly would invent offsets and break chlive's watermarks.)
+-- Historical events, as JSON lines to produce to the `events` topic; the sink connector then
+-- ingests them. (Inserting into `events` directly would put rows in ClickHouse that aren't in
+-- Kafka, and the sink's offsets wouldn't match them.)
 --
--- Usage: clickhouse client --param_count=1000000 --queries-file scripts/seed.sql
+-- Usage: clickhouse local --param_count=1000 --queries-file scripts/seed.sql | produce events
 -- Timestamps are spread uniformly over the last 7 days.
-INSERT INTO default.events_queue
 WITH
     -- weighted country mix (weights sum to 100)
     arrayFlatten(arrayMap((c, w) -> arrayResize([c], w, c),
@@ -21,4 +19,5 @@ SELECT
     toUInt32(200 * pow(-log(1 - randCanonical(5)), 1.6)) + 1 AS latency_ms,
     -- 60% of events carry no amount, the rest 1.00-500.00
     if(randCanonical(6) < 0.6, 0, (100 + rand(7) % 49900) / 100) AS amount
-FROM numbers({count:UInt64});
+FROM numbers({count:UInt64})
+FORMAT JSONEachRow;
