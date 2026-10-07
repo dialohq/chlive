@@ -162,12 +162,12 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 
 ### GROUP BY and aggregates
 
-`SELECT keys, agg(c) [AS name], … FROM t [WHERE …] [GROUP BY keys]`, with ClickHouse's result types and output names. Functions: `count()`, `count(c)`, `sum`, `avg`, `min`, `max` (native), and `uniq`, `uniqExact`, `median`, `any`, `anyLast` (chDB). Not yet: ORDER BY, LIMIT or HAVING with aggregates, expressions as arguments, and resuming aggregates (they start from a snapshot).
+`SELECT keys, agg(c) [AS name], … FROM t [WHERE …] [GROUP BY keys] [ORDER BY …] [LIMIT n]`, with ClickHouse's result types and output names (see [Supported queries](#supported-queries)). Functions: `count()`, `count(c)`, `sum`, `avg`, `min`, `max` (native), and `uniq`, `uniqExact`, `median`, `any`, `anyLast` (chDB). Not yet: HAVING, expressions as arguments, and resuming aggregates (they start from a snapshot).
 
 - **Native** when every aggregate in the query has a native implementation (`engine/src/aggregate/`: the `AggregateFunction` and `AggregateState` traits). ClickHouse computes the parts of each group's state over HTTP (`avg(x)` → `sum(x)`, `count(x)`), and the engine keeps the states in memory and updates them per event. `--explain` says which way a query runs.
 - **chDB** (ClickHouse as a library, inside the engine) otherwise. Main ClickHouse computes the history's aggregate states (`uniqExactState(x)`, …) with `remote()` into a chDB table per subscription; each batch of events (up to 1000 that arrived together) adds its states, and the groups it touched are read back finalized with `…Merge`.
 - Either way, the groups touched by a batch are compared with what was sent.
-- **Rows have ids**, their group's key as JSON (`["PL"]`, `[]` for a global aggregate). The snapshot carries `ids`; new groups are `insert`s with an `id`; changed ones `{"op": "update", "id", "set": {…}}` with only the changed columns.
+- **Rows have ids**, their group's key as JSON (`["PL"]`, `[]` for a global aggregate). The snapshot carries `ids`; new groups are `insert`s with an `id`; changed ones `{"op": "update", "id", "set": {…}}` with only the changed columns, and, when an ordered result moves the row, `"index"`: where it is after the move.
 - **Cost:** see [docs/bench/group-by.md](docs/bench/group-by.md). Natively ~1 M events/s per subscription one at a time, up to several M/s batched. chDB costs ~2–5 ms per batch, so ~500 events/s one at a time and ~150–500 k/s in batches of 1000.
 - Binaries call `chlive_engine::chdb::shutdown()` before exiting: with chDB open, its exit handlers crash the process.
 
@@ -207,9 +207,12 @@ SELECT * | select_item [, select_item ...]
 FROM table
 [WHERE condition]
 [GROUP BY column [, column ...]]
-[ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST] | column [ASC|DESC] [NULLS FIRST|LAST] [, ...]]
+[ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST] | order_item [ASC|DESC] [NULLS FIRST|LAST] [, ...]]
 [LIMIT n]
 [;]
+
+order_item  := column
+             | aggregate(column) | count() | count(*)        -- with GROUP BY or aggregates
 
 select_item := column [AS alias]
              | aggregate(column) [AS alias]
@@ -227,7 +230,9 @@ column, table, alias := identifier | "identifier" | `identifier`
 ```
 
 - **Tables:** a table needs a ClickHouse table, ingested by one sink connector (known to the pause server) from a Kafka topic of the same name.
-- **Aliases** only name output columns: WHERE and ORDER BY refer to table columns. Output names must be unique; an alias can't be another column's name or start with `_`.
+- **Aliases** only name output columns: WHERE and (plain queries') ORDER BY refer to table columns. Output names must be unique; an alias can't be another column's name or start with `_`.
 - **ORDER BY / LIMIT:** with `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot. `LIMIT` keeps the top N (with `ORDER BY`) or the latest N (without), deleting the rows that fall out. Without `LIMIT`, plain results only grow.
-- **GROUP BY / aggregates** (also without GROUP BY: one global group): selected columns must be grouping columns; no `SELECT *`, ORDER BY or LIMIT yet. Groups are inserted, then updated.
+- **GROUP BY / aggregates** (also without GROUP BY: one global group): selected columns must be grouping columns; no `SELECT *`. Groups are inserted, then updated.
+  - **ORDER BY** takes an output name (an alias or a default name like `count()`), a grouping column, or an aggregate call (`order by count() desc`; one that isn't selected is computed anyway), or `ALL`. As values change, groups move: an `update` with an `index`. A group whose sort key changes goes after the groups it ties with.
+  - **LIMIT n** keeps the first n groups by ORDER BY: a group falling out is deleted and the next one comes in, and the others are kept to come back in later. Without ORDER BY, it's the first n groups seen.
 - **Not yet:** OFFSET, `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, subqueries, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters.
