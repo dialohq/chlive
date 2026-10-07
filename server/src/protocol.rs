@@ -154,7 +154,8 @@ pub const BAD_MESSAGE: &str = "BAD_MESSAGE";
 pub const DUPLICATE_ID: &str = "DUPLICATE_ID";
 
 /// The error code for an engine error. `SYNTAX_ERROR` and `INVALID_QUERY` are problems with
-/// the query (their message has a line:column); the others are with ClickHouse or Kafka.
+/// the query (their message has a line:column); the others are with ClickHouse, Kafka, chDB or
+/// the snapshots (the pause server).
 pub fn error_code(e: &EngineError) -> &'static str {
     match e {
         EngineError::Syntax(_) => "SYNTAX_ERROR",
@@ -162,6 +163,7 @@ pub fn error_code(e: &EngineError) -> &'static str {
         EngineError::History(_) => "HISTORY_FAILED",
         EngineError::Source(_) => "STREAM_FAILED",
         EngineError::Aggregate(_) => "AGGREGATE_FAILED",
+        EngineError::Snapshot(_) => "SNAPSHOT_FAILED",
     }
 }
 

@@ -10,7 +10,7 @@ use crate::ast::{
 };
 use crate::error::{render_at, Span};
 use crate::history::{HistoryError, HistorySource};
-use crate::rules::{KafkaColumns, NamingRules, TopicId};
+use crate::rules::{NamingRules, TopicId};
 use crate::source::{EventSource, SourceError};
 use crate::types::{parse_date, parse_datetime, Kind, Type, Value};
 
@@ -43,14 +43,21 @@ pub struct BoundColumn {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundTable {
     pub name: String,
+    /// The ClickHouse table, quoted for SQL (`db.table`).
     pub clickhouse_table: String,
+    /// The same, unquoted.
+    pub database: String,
+    pub clickhouse_name: String,
     pub topic: TopicId,
-    /// ClickHouse columns with each row's Kafka partition and offset.
-    pub kafka: KafkaColumns,
     pub columns: Vec<BoundColumn>,
 }
 
 impl BoundTable {
+    /// What to snapshot for this table's history.
+    pub fn snapshot_table(&self) -> crate::snapshot::SnapshotTable {
+        crate::snapshot::SnapshotTable::new(&self.database, &self.clickhouse_name, &self.topic.0)
+    }
+
     pub fn column(&self, id: ColumnId) -> &BoundColumn {
         &self.columns[id.0]
     }
@@ -486,6 +493,13 @@ fn resolve_column(table: &BoundTable, name: &str, span: Span) -> Result<ColumnId
 /// each row's Kafka partition and offset (so history and stream can be lined up).
 async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, BindError> {
     let from = &query.from;
+    if from.name.starts_with(crate::snapshot::CLONE_PREFIX) {
+        return Err(BindError::at(
+            format!("unknown table {} (snapshots aren't tables)", from.name),
+            from.span,
+        ));
+    }
+    let (database, clickhouse_name) = catalog.rules.clickhouse_location(&from.name);
     let clickhouse_table = catalog.rules.clickhouse_table(&from.name);
     let described = match catalog.history.describe(&clickhouse_table).await {
         Ok(cols) => cols,
@@ -513,19 +527,6 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
             from.span,
         ));
     }
-    let kafka = catalog.rules.kafka_columns();
-    for column in [&kafka.partition, &kafka.offset] {
-        if !described.iter().any(|c| &c.name == column) {
-            return Err(BindError::at(
-                format!(
-                    "table {} has no {column} column in ClickHouse ({clickhouse_table}); chlive \
-                     needs each row's Kafka partition and offset to line history up with the topic",
-                    from.name
-                ),
-                from.span,
-            ));
-        }
-    }
     let columns = described
         .into_iter()
         .filter(|c| !catalog.rules.is_hidden(&c.name))
@@ -544,8 +545,9 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
     Ok(BoundTable {
         name: from.name.clone(),
         clickhouse_table,
+        database,
+        clickhouse_name,
         topic,
-        kafka,
         columns,
     })
 }
@@ -1000,10 +1002,13 @@ mod tests {
             bind_sql("select * from orders").await.unwrap_err(),
             "no event stream for table orders (topic orders) at 1:15"
         );
+        // no Kafka bookkeeping columns needed: snapshots line history up with the topic
+        assert!(bind_sql("select * from plain").await.is_ok());
         assert_eq!(
-            bind_sql("select * from plain").await.unwrap_err(),
-            "table plain has no _offset column in ClickHouse (default.plain); chlive needs each \
-             row's Kafka partition and offset to line history up with the topic at 1:15"
+            bind_sql("select * from __chlive_snap_events_1_0")
+                .await
+                .unwrap_err(),
+            "unknown table __chlive_snap_events_1_0 (snapshots aren't tables) at 1:15"
         );
         assert_eq!(
             bind_sql("select ts, nope from events").await.unwrap_err(),

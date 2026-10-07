@@ -1,16 +1,81 @@
 //! Against a real ClickHouse (the dev shell's, or CHLIVE_CLICKHOUSE_URL); runs only with
 //! CHLIVE_E2E=1. Uses its own small table instead of the seeded `default.events`.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
 use chlive_engine::diff::Diff;
 use chlive_engine::history::ClickHouseHttp;
 use chlive_engine::rules::HardcodedRules;
+use chlive_engine::snapshot::{
+    ClickHouseCloner, Paused, Pauser, SnapshotConfig, SnapshotError, SnapshotManager, SnapshotTable,
+};
 use chlive_engine::source::MemorySource;
+use chlive_engine::watermark::Watermark;
 use chlive_engine::{Engine, Origin};
 use futures::StreamExt;
 use serde_json::json;
 
 fn url() -> String {
     std::env::var("CHLIVE_CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:18123".into())
+}
+
+/// Stands in for the pause server: ingestion is "paused" with the offsets the test put in
+/// ClickHouse. The clone is real.
+struct FixedPause(Watermark);
+
+#[async_trait]
+impl Pauser for FixedPause {
+    async fn pause(&self, _: &SnapshotTable) -> Result<Paused, SnapshotError> {
+        Ok(Paused {
+            token: "t".into(),
+            ttl: Duration::from_secs(60),
+            watermark: self.0.clone(),
+        })
+    }
+    async fn resume(&self, _: &str) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+    async fn renew(&self, _: &str) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+}
+
+/// An engine over `database`, whose tables hold the offsets in `watermark`.
+fn engine_at(database: String, source: MemorySource, watermark: Watermark) -> Engine {
+    let snapshots = SnapshotManager::start(
+        Arc::new(FixedPause(watermark)),
+        Arc::new(ClickHouseCloner::new(&url(), "default", "")),
+        SnapshotConfig {
+            refresh: Duration::from_secs(3600),
+            idle: Duration::from_secs(3600),
+            sweep: false,
+        },
+    );
+    Engine::new(
+        HardcodedRules { database },
+        ClickHouseHttp::new(&url(), "default", ""),
+        source,
+        snapshots,
+    )
+}
+
+/// ClickHouse holds partition 0's first `n` events.
+fn upto(n: usize) -> Watermark {
+    Watermark([(0, n as i64 - 1)].into())
+}
+
+async fn query(sql: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(url())
+        .header("X-ClickHouse-User", "default")
+        .body(sql.to_string())
+        .send()
+        .await
+        .expect("ClickHouse reachable (is `dnvr up` running?)");
+    assert!(resp.status().is_success(), "{sql}");
+    resp.text().await.unwrap()
 }
 
 async fn exec(sql: &str) {
@@ -36,8 +101,8 @@ async fn select_star_from_events_against_clickhouse() {
     }
     exec("CREATE DATABASE IF NOT EXISTS chlive_engine_test").await;
     exec("DROP TABLE IF EXISTS chlive_engine_test.events").await;
-    exec("CREATE TABLE chlive_engine_test.events (ts DateTime64(3), user_id String, latency_ms UInt32, _partition UInt64, _offset UInt64) ENGINE = MergeTree ORDER BY ts").await;
-    exec("INSERT INTO chlive_engine_test.events VALUES ('2026-10-01 12:00:00.000', 'u1', 10, 0, 0), ('2026-10-01 12:00:01.000', 'u2', 20, 1, 0)").await;
+    exec("CREATE TABLE chlive_engine_test.events (ts DateTime64(3), user_id String, latency_ms UInt32) ENGINE = MergeTree ORDER BY ts").await;
+    exec("INSERT INTO chlive_engine_test.events VALUES ('2026-10-01 12:00:00.000', 'u1', 10), ('2026-10-01 12:00:01.000', 'u2', 20)").await;
 
     // the topic holds the two rows ClickHouse has (partitions 0 and 1, offset 0 each), then u3
     let mut source = MemorySource::new();
@@ -57,20 +122,24 @@ async fn select_star_from_events_against_clickhouse() {
             0,
             r#"{"ts": "2026-10-01 12:00:02.000", "user_id": "u3", "latency_ms": 30}"#,
         );
-    let engine = Engine::new(
-        HardcodedRules {
-            database: "chlive_engine_test".into(),
-        },
-        ClickHouseHttp::new(&url(), "default", ""),
+    let engine = engine_at(
+        "chlive_engine_test".into(),
         source,
+        Watermark([(0, 0), (1, 0)].into()),
     );
     let subscription = engine.subscribe("SELECT * FROM events").await.unwrap();
     assert_eq!(subscription.watermark.describe(), "{0: 0, 1: 0}");
-    assert_eq!(
-        subscription.history_sql,
-        "SELECT ts, user_id, latency_ms FROM chlive_engine_test.events \
-         WHERE toInt64(_offset) <= multiIf(_partition = 0, 0, _partition = 1, 0, -1)"
+    // history reads a clone of the table, made by CREATE … AS + ATTACH PARTITION ALL
+    assert!(
+        subscription.history_sql.starts_with(
+            "SELECT ts, user_id, latency_ms FROM chlive_engine_test.__chlive_snap_events_"
+        ),
+        "{}",
+        subscription.history_sql
     );
+    let clones = "SELECT count() FROM system.tables WHERE database = 'chlive_engine_test' \
+                  AND startsWith(name, '__chlive_snap_')";
+    assert_eq!(query(clones).await.trim(), "1");
 
     let its: Vec<_> = subscription.map(|i| i.unwrap()).collect().await;
     assert_eq!(its.len(), 2);
@@ -100,7 +169,7 @@ async fn select_star_from_events_against_clickhouse() {
         .await
         .unwrap();
     assert_eq!(
-        subscription.plan.history.sql(None),
+        subscription.plan.history.sql("chlive_engine_test.events"),
         "SELECT latency_ms, user_id FROM chlive_engine_test.events"
     );
     let lines: Vec<String> = subscription.map(|i| i.unwrap().to_string()).collect().await;
@@ -115,6 +184,10 @@ async fn select_star_from_events_against_clickhouse() {
         ]
     );
     assert_eq!(lines[1], r#"events/0:1 + {"latency_ms":30,"user_id":"u3"}"#);
+
+    // the clone goes when the engine stops (no subscription reads it anymore)
+    engine.shutdown().await;
+    assert_eq!(query(clones).await.trim(), "0");
 
     exec("DROP DATABASE chlive_engine_test").await;
 }
@@ -178,14 +251,9 @@ async fn history_and_stream_agree_on_where() {
     ];
 
     let events: Vec<&str> = EVENTS.lines().collect();
-    // In ClickHouse, each event is at partition 0 and its offset in the topic.
-    let with_offsets = |events: &[&str]| -> String {
-        events
-            .iter()
-            .enumerate()
-            .map(|(offset, e)| format!("{{\"_partition\":0,\"_offset\":{offset},{}\n", &e[1..]))
-            .collect()
-    };
+    // ClickHouse holds the first events of partition 0 (offsets 0, 1, …)
+    let with_offsets =
+        |events: &[&str]| -> String { events.iter().map(|e| format!("{e}\n")).collect() };
     let mut source = MemorySource::new();
     for e in &events {
         source.push("events", 0, *e);
@@ -201,7 +269,7 @@ async fn history_and_stream_agree_on_where() {
         exec(&format!(
             "CREATE TABLE {database}.events (ts DateTime64(3), user_id String, \
              country LowCardinality(String), latency_ms UInt32, amount Float64, \
-             coupon Nullable(String), _partition UInt64, _offset UInt64) \
+             coupon Nullable(String)) \
              ENGINE = MergeTree ORDER BY tuple()"
         ))
         .await;
@@ -212,13 +280,7 @@ async fn history_and_stream_agree_on_where() {
             ))
             .await;
         }
-        let engine = Engine::new(
-            HardcodedRules {
-                database: database.into(),
-            },
-            ClickHouseHttp::new(&url(), "default", ""),
-            source.clone(),
-        );
+        let engine = engine_at(database.into(), source.clone(), upto(in_clickhouse));
         engines.push((database, in_clickhouse, engine));
     }
 
@@ -384,27 +446,20 @@ async fn history_and_stream_agree_on_order_by() {
         exec(&format!(
             "CREATE TABLE {database}.events (ts DateTime64(3), name String, \
              score Nullable(Float64), n Int32, flag Bool, label Nullable(String), \
-             _partition UInt64, _offset UInt64) ENGINE = MergeTree ORDER BY tuple()"
+            ) ENGINE = MergeTree ORDER BY tuple()"
         ))
         .await;
         if in_clickhouse > 0 {
             let rows: String = EVENTS[..in_clickhouse]
                 .iter()
-                .enumerate()
-                .map(|(o, e)| format!("{{\"_partition\":0,\"_offset\":{o},{}\n", &e[1..]))
+                .map(|e| format!("{e}\n"))
                 .collect();
             exec(&format!(
                 "INSERT INTO {database}.events FORMAT JSONEachRow\n{rows}"
             ))
             .await;
         }
-        let engine = Engine::new(
-            HardcodedRules {
-                database: database.into(),
-            },
-            ClickHouseHttp::new(&url(), "default", ""),
-            source.clone(),
-        );
+        let engine = engine_at(database.into(), source.clone(), upto(in_clickhouse));
         engines.push((database, engine));
     }
 
@@ -610,14 +665,13 @@ async fn resume_matches_a_fresh_subscription() {
         exec(&format!("CREATE DATABASE {DB}")).await;
         exec(&format!(
             "CREATE TABLE {DB}.events (ts DateTime64(3), name String, score Nullable(Float64), \
-             n Int32, flag Bool, _partition UInt64, _offset UInt64) ENGINE = MergeTree ORDER BY tuple()"
+             n Int32, flag Bool) ENGINE = MergeTree ORDER BY tuple()"
         ))
         .await;
         if in_clickhouse > 0 {
             let rows: String = EVENTS[..in_clickhouse]
                 .iter()
-                .enumerate()
-                .map(|(o, e)| format!("{{\"_partition\":0,\"_offset\":{o},{}\n", &e[1..]))
+                .map(|e| format!("{e}\n"))
                 .collect();
             exec(&format!(
                 "INSERT INTO {DB}.events FORMAT JSONEachRow\n{rows}"
@@ -628,13 +682,7 @@ async fn resume_matches_a_fresh_subscription() {
         for e in &EVENTS[..in_topic] {
             source.push("events", 0, *e);
         }
-        Engine::new(
-            HardcodedRules {
-                database: DB.into(),
-            },
-            ClickHouseHttp::new(&url(), "default", ""),
-            source,
-        )
+        engine_at(DB.into(), source, upto(in_clickhouse))
     }
 
     /// Run a subscription to the end, applying it to `rows`; returns its last cursor token.
@@ -706,18 +754,23 @@ async fn resume_matches_a_fresh_subscription() {
         out
     };
 
-    // (ClickHouse, topic) before; then ClickHouse after, with the whole topic
-    // (4, 7, 4) and (0, 7, 0): the client is ahead of ClickHouse, which (in the last case) has
-    // nothing at all, so the whole state is rebuilt from Kafka
+    // (snapshot, topic) before; then the snapshot after, with the whole topic.
+    // (4, 7, 4) and (0, 7, 0): the client is ahead of the snapshot, which (in the last case)
+    // has nothing at all, so the whole state is rebuilt from Kafka. Otherwise the client is
+    // behind the new snapshot: unordered queries still resume (from Kafka), stateful ones get a
+    // full snapshot.
     for (k1, k2, later_in_clickhouse) in [(4, 7, 12), (4, 7, 4), (0, 5, 9), (6, 6, 12), (0, 7, 0)] {
         for (sql, keys) in CASES {
             let mut cached = Vec::new();
             let (_, token, _) = run(&setup(k1, k2).await, sql, None, &mut cached).await;
             let engine = setup(later_in_clickhouse, EVENTS.len()).await;
             let (resumed, _, changes) = run(&engine, sql, Some(&token), &mut cached).await;
-            // always a resume, also when the client is ahead of ClickHouse (its events are
-            // then re-read from Kafka)
-            assert!(resumed, "{sql}: did not resume");
+            let stateful = !keys.is_empty() || sql.contains(" limit ");
+            assert_eq!(
+                resumed,
+                !stateful || k2 >= later_in_clickhouse,
+                "{sql}: resumed {resumed} [CH {k1}/topic {k2} -> CH {later_in_clickhouse}]"
+            );
             let mut fresh = Vec::new();
             run(&engine, sql, None, &mut fresh).await;
             let (got, want) = (names(&cached), names(&fresh));
@@ -805,14 +858,13 @@ async fn aggregates_match_clickhouse() {
         exec(&format!(
             "CREATE TABLE {database}.events (ts DateTime64(3), name String, \
              country LowCardinality(String), score Nullable(Float64), n Int32, amount Float64, \
-             flag Bool, _partition UInt64, _offset UInt64) ENGINE = MergeTree ORDER BY tuple()"
+             flag Bool) ENGINE = MergeTree ORDER BY tuple()"
         ))
         .await;
         if in_clickhouse > 0 {
             let rows: String = events[..in_clickhouse]
                 .iter()
-                .enumerate()
-                .map(|(o, e)| format!("{{\"_partition\":0,\"_offset\":{o},{}\n", &e[1..]))
+                .map(|e| format!("{e}\n"))
                 .collect();
             exec(&format!(
                 "INSERT INTO {database}.events FORMAT JSONEachRow\n{rows}"
@@ -823,14 +875,7 @@ async fn aggregates_match_clickhouse() {
         for e in &events {
             source.push("events", 0, e.as_str());
         }
-        let engine = Engine::new(
-            HardcodedRules {
-                database: database.into(),
-            },
-            ClickHouseHttp::new(&url(), "default", ""),
-            source,
-        )
-        .with_max_batch(7);
+        let engine = engine_at(database.into(), source, upto(in_clickhouse)).with_max_batch(7);
         engines.push((database, engine));
     }
     let direct = ClickHouseHttp::new(&url(), "default", "");

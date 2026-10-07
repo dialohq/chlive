@@ -15,7 +15,7 @@ export type Status = "loading" | "cached" | "live" | "error";
 /** Why a subscription failed; after an error it gets no more updates. */
 export interface LiveError {
   /** `SYNTAX_ERROR`, `INVALID_QUERY` (both with a line:column in the message), `HISTORY_FAILED`,
-   * `STREAM_FAILED`, `AGGREGATE_FAILED`, or `CLIENT_ERROR` (a change the client couldn't apply). */
+   * `STREAM_FAILED`, `AGGREGATE_FAILED`, `SNAPSHOT_FAILED`, or `CLIENT_ERROR` (a change the client couldn't apply). */
   code: string;
   message: string;
 }

@@ -16,7 +16,7 @@ const VERSION: u64 = 1;
 /// A stable hash (FNV-1a, 64 bit) of everything the result depends on: the history query
 /// (table, columns, filter, ORDER BY, LIMIT), the output column types and the topics.
 pub fn fingerprint(plan: &Plan) -> String {
-    let mut text = plan.history.sql(None);
+    let mut text = plan.history.sql(&plan.history.table);
     for c in &plan.columns {
         text.push_str(&format!("|{}:{}", c.name, c.ty.clickhouse));
     }

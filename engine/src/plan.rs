@@ -11,14 +11,15 @@ use crate::binder::{
 };
 use crate::diff::Row;
 use crate::order::{KeyOrder, SortKey};
-use crate::rules::{quote_ident, KafkaColumns, TopicId};
+use crate::rules::{quote_ident, TopicId};
 use crate::types::quote_string;
 use crate::types::{decode, DecodeError, Type, Value};
-use crate::watermark::Watermark;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     pub table: String,
+    /// What history snapshots are taken of: the ClickHouse table and its topic.
+    pub source: crate::snapshot::SnapshotTable,
     /// Output columns, in output order.
     pub columns: Vec<BoundColumn>,
     pub history: HistoryPlan,
@@ -48,9 +49,7 @@ pub struct AggregatePlan {
     pub batch_columns: Vec<(ColumnId, String)>,
     /// `'country LowCardinality(String), latency_ms UInt32'`, for `format()`.
     structure: String,
-    source_table: String,
     filter: Option<String>,
-    pub kafka: KafkaColumns,
     /// When every aggregate has a native implementation: how to run without chDB.
     pub native: Option<NativeAggregates>,
 }
@@ -64,7 +63,7 @@ pub struct NativeAggregates {
     pub aggs: Vec<NativeAgg>,
     /// The output columns, in SELECT order.
     pub items: Vec<NativeItem>,
-    /// `SELECT country AS __k0, count() AS __a0_0, … FROM t`
+    /// `country AS __k0, count() AS __a0_0, …`
     select: String,
 }
 
@@ -87,49 +86,50 @@ pub enum NativeItem {
 }
 
 impl AggregatePlan {
-    /// Native: the history's per-group states from main ClickHouse, up to `bound`.
-    pub fn native_history_sql(&self, bound: &str) -> Option<String> {
+    /// Native: the history's per-group states from main ClickHouse, read from `from` (a
+    /// snapshot of the table).
+    pub fn native_history_sql(&self, from: &str) -> Option<String> {
         let native = self.native.as_ref()?;
-        let filter = match &self.filter {
-            Some(f) => format!("({f}) AND ({bound})"),
-            None => bound.to_string(),
-        };
         Some(format!(
-            "{} WHERE {filter}{}",
+            "SELECT {} FROM {from}{}{}",
             native.select,
+            self.where_clause(),
             self.group_by_clause()
         ))
     }
 
-    /// Create the chDB table with the history's states, computed by main ClickHouse up to
-    /// `bound` (`remote` is the `remote(…)` table function for it).
-    pub fn create_sql(&self, table: &str, remote: &str, bound: &str) -> String {
+    /// Create the chDB table with the history's states, computed by main ClickHouse (`remote`:
+    /// the `remote(…)` table function reading a snapshot of the table).
+    pub fn create_sql(&self, table: &str, remote: &str) -> String {
         let order = if self.keys == 0 {
             "tuple()".to_string()
         } else {
             format!("({})", self.group_by)
         };
-        let filter = match &self.filter {
-            Some(f) => format!("({f}) AND ({bound})"),
-            None => bound.to_string(),
-        };
         format!(
             "CREATE TABLE {table} ENGINE = AggregatingMergeTree ORDER BY {order} \
-             SETTINGS allow_nullable_key = 1 AS SELECT {} FROM {remote} WHERE {filter}{}",
+             SETTINGS allow_nullable_key = 1 AS SELECT {} FROM {remote}{}{}",
             self.state_select,
+            self.where_clause(),
             self.group_by_clause()
         )
     }
 
-    /// The `remote()` reading `source_table` from main ClickHouse.
-    pub fn remote(&self, address: &str, user: &str, password: &str) -> String {
+    /// The `remote()` reading `table` (`db.name`) from main ClickHouse.
+    pub fn remote(table: &str, address: &str, user: &str, password: &str) -> String {
         format!(
-            "remote({}, {}, {}, {})",
+            "remote({}, {table}, {}, {})",
             quote_string(address),
-            self.source_table,
             quote_string(user),
             quote_string(password)
         )
+    }
+
+    fn where_clause(&self) -> String {
+        match &self.filter {
+            Some(f) => format!(" WHERE {f}"),
+            None => String::new(),
+        }
     }
 
     /// Every group's finalized values.
@@ -240,11 +240,7 @@ fn native_aggregates(agg: &Aggregation, table: &BoundTable) -> Option<NativeAggr
         keys: agg.keys.clone(),
         aggs,
         items,
-        select: format!(
-            "SELECT {} FROM {}",
-            select.join(", "),
-            table.clickhouse_table
-        ),
+        select: select.join(", "),
     })
 }
 
@@ -319,83 +315,49 @@ fn aggregate_plan(agg: &Aggregation, table: &BoundTable, filter: Option<String>)
             .join(", "),
         batch_columns,
         structure,
-        source_table: table.clickhouse_table.clone(),
         filter,
-        kafka: table.kafka.clone(),
     }
 }
 
-/// The history query. Its upper bound, the [`Watermark`], is only known when subscribing.
+/// The history query. It reads a snapshot of the table, which is only known when subscribing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryPlan {
-    /// The fully qualified ClickHouse table.
+    /// The table snapshots are taken of (`db.table`).
     pub table: String,
-    /// `SELECT … FROM …`
+    /// The SELECT list.
     pub select: String,
     /// The WHERE condition, rendered for ClickHouse.
     pub filter: Option<String>,
     /// `ORDER BY …`, with every key's direction and NULL placement explicit.
     pub order: Option<String>,
     pub limit: Option<u64>,
-    /// With ORDER BY: `SELECT <sort columns> FROM …`, the keys a resume rebuilds the order from.
+    /// With ORDER BY: the sort columns, the keys a resume rebuilds the order from.
     pub keys_select: Option<String>,
-    pub kafka: KafkaColumns,
 }
 
 impl HistoryPlan {
-    /// The query, bounded by `watermark` (rows up to it) or, without one, unbounded.
-    pub fn sql(&self, watermark: Option<&Watermark>) -> String {
-        let bound =
-            watermark.map(|w| w.history_predicate(&self.kafka.partition, &self.kafka.offset));
-        self.build(&self.select, bound, self.order.as_deref(), self.limit)
+    /// The query, reading `from` (a snapshot of [`Self::table`]).
+    pub fn sql(&self, from: &str) -> String {
+        self.build(&self.select, from, self.order.as_deref(), self.limit)
     }
 
-    /// Resume: the sort keys of the result up to `at` (with ORDER BY), in order.
-    pub fn keys_sql(&self, at: &Watermark) -> Option<String> {
+    /// Resume: the sort keys of the result (with ORDER BY), in order.
+    pub fn keys_sql(&self, from: &str) -> Option<String> {
         let select = self.keys_select.as_ref()?;
-        let bound = at.history_predicate(&self.kafka.partition, &self.kafka.offset);
-        Some(self.build(select, Some(bound), self.order.as_deref(), self.limit))
+        Some(self.build(select, from, self.order.as_deref(), self.limit))
     }
 
-    /// Resume: how many rows the result had up to `at`, at most the LIMIT (`n`).
-    pub fn count_sql(&self, at: &Watermark) -> String {
-        let bound = at.history_predicate(&self.kafka.partition, &self.kafka.offset);
-        let inner = self.build(
-            &format!("SELECT 1 FROM {}", self.table),
-            Some(bound),
-            None,
-            self.limit,
-        );
+    /// Resume: how many rows the result has, at most the LIMIT.
+    pub fn count_sql(&self, from: &str) -> String {
+        let inner = self.build("1", from, None, self.limit);
         format!("SELECT count() AS n FROM ({inner})")
     }
 
-    /// Resume: the rows after `from` and up to `to`. With ORDER BY and LIMIT only the top N of
-    /// them can matter; with LIMIT alone only the latest N (by offset, then reversed).
-    pub fn catch_up_sql(&self, from: &Watermark, to: &Watermark) -> String {
-        let range = from.range_predicate(to, &self.kafka.partition, &self.kafka.offset);
-        match (&self.order, self.limit) {
-            (Some(order), limit) => self.build(&self.select, Some(range), Some(order), limit),
-            (None, Some(n)) => {
-                let latest = format!("ORDER BY toInt64({}) DESC", quote_ident(&self.kafka.offset));
-                self.build(&self.select, Some(range), Some(&latest), Some(n))
-            }
-            (None, None) => self.build(&self.select, Some(range), None, None),
+    fn build(&self, select: &str, from: &str, order: Option<&str>, limit: Option<u64>) -> String {
+        let mut sql = format!("SELECT {select} FROM {from}");
+        if let Some(f) = &self.filter {
+            sql.push_str(&format!(" WHERE {f}"));
         }
-    }
-
-    fn build(
-        &self,
-        select: &str,
-        bound: Option<String>,
-        order: Option<&str>,
-        limit: Option<u64>,
-    ) -> String {
-        let mut sql = match (&self.filter, bound) {
-            (None, None) => select.to_string(),
-            (Some(f), None) => format!("{select} WHERE {f}"),
-            (None, Some(b)) => format!("{select} WHERE {b}"),
-            (Some(f), Some(b)) => format!("{select} WHERE ({f}) AND ({b})"),
-        };
         if let Some(order) = order {
             sql.push(' ');
             sql.push_str(order);
@@ -699,10 +661,13 @@ impl std::fmt::Display for Plan {
             writeln!(
                 f,
                 "history: {}",
-                a.create_sql("<chdb table>", "remote(<main>)", "<watermark bound>")
+                a.create_sql(
+                    "<chdb table>",
+                    &AggregatePlan::remote("<snapshot>", "<main>", "<user>", "<password>")
+                )
             )?;
             writeln!(f, "merge:   {}", a.snapshot_sql("<chdb table>"))?;
-            match a.native_history_sql("<watermark bound>") {
+            match a.native_history_sql("<snapshot>") {
                 Some(sql) => writeln!(f, "native:  {sql} (states in the engine; chDB unused)")?,
                 None => writeln!(
                     f,
@@ -716,12 +681,13 @@ impl std::fmt::Display for Plan {
                 batch.join(", ")
             )?;
         } else {
-            writeln!(f, "history: {}", self.history.sql(None))?;
+            writeln!(f, "history: {}", self.history.sql("<snapshot>"))?;
         }
         writeln!(
             f,
-            "         up to max({}) per {}, read when subscribing",
-            self.history.kafka.offset, self.history.kafka.partition
+            "         <snapshot>: a clone of {} made while its ingestion was paused, with the \
+             offsets it holds",
+            self.history.table
         )?;
         writeln!(
             f,
@@ -823,11 +789,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
     });
     let history = HistoryPlan {
         table: table.clickhouse_table.clone(),
-        select: format!(
-            "SELECT {} FROM {}",
-            select_list.join(", "),
-            table.clickhouse_table
-        ),
+        select: select_list.join(", "),
         filter: bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
         order: order_sql,
         limit: bound.limit,
@@ -848,13 +810,8 @@ pub fn plan(bound: &BoundQuery) -> Plan {
                     fields.push(field);
                 }
             }
-            format!(
-                "SELECT {} FROM {}",
-                fields.join(", "),
-                table.clickhouse_table
-            )
+            fields.join(", ")
         }),
-        kafka: table.kafka.clone(),
     };
 
     // Columns to decode: the output's, then the filter's and ORDER BY's that aren't output.
@@ -923,6 +880,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
     };
     Plan {
         table: table.name.clone(),
+        source: table.snapshot_table(),
         columns,
         history,
         stream,
@@ -934,6 +892,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
 mod tests {
     use super::*;
     use crate::binder::Projected;
+    use crate::watermark::Watermark;
     use serde_json::json;
 
     fn table() -> BoundTable {
@@ -947,11 +906,9 @@ mod tests {
         BoundTable {
             name: "events".into(),
             clickhouse_table: "default.events".into(),
+            database: "default".into(),
+            clickhouse_name: "events".into(),
             topic: TopicId("events".into()),
-            kafka: KafkaColumns {
-                partition: "_partition".into(),
-                offset: "_offset".into(),
-            },
             columns: vec![
                 col(0, "ts", "DateTime64(3)"),
                 col(1, "user_id", "String"),
@@ -994,7 +951,7 @@ mod tests {
     fn select_star_plan() {
         let p = plan(&bound(&[0, 1, 2, 3], None));
         assert_eq!(
-            p.history.sql(None),
+            p.history.sql("default.events"),
             "SELECT ts, user_id, latency_ms, coupon FROM default.events"
         );
         assert_eq!(p.stream.topics, [TopicId("events".into())]);
@@ -1014,7 +971,7 @@ mod tests {
         };
         let p = plan(&bound(&[1], Some(f)));
         assert_eq!(
-            p.history.sql(None),
+            p.history.sql("default.events"),
             "SELECT user_id FROM default.events WHERE latency_ms > 100"
         );
         assert_eq!(p.stream.required_keys(), ["user_id", "latency_ms"]);
@@ -1060,18 +1017,17 @@ mod tests {
         );
         let p = plan(&bound(&[1], Some(f)));
         assert_eq!(
-            p.history.sql(None),
+            p.history.sql("default.events"),
             r"SELECT user_id FROM default.events WHERE ((user_id = 'it\'s') OR (coupon IS NOT NULL)) AND (latency_ms NOT IN (1, -2))"
         );
     }
 
     #[test]
-    fn history_is_bounded_by_the_watermark() {
-        let w = Watermark(std::collections::BTreeMap::from([(0, 7), (2, 3)]));
+    fn history_reads_the_snapshot() {
         let p = plan(&bound(&[1], None));
         assert_eq!(
-            p.history.sql(Some(&w)),
-            "SELECT user_id FROM default.events WHERE toInt64(_offset) <= multiIf(_partition = 0, 7, _partition = 2, 3, -1)"
+            p.history.sql("default.__chlive_snap_events_1_0"),
+            "SELECT user_id FROM default.__chlive_snap_events_1_0"
         );
         let f = BoundExpr::Or(
             Box::new(BoundExpr::IsNull {
@@ -1081,11 +1037,13 @@ mod tests {
             lit(Value::Bool(false)),
         );
         let p = plan(&bound(&[1], Some(f)));
-        // the filter is parenthesized as a whole, so its OR can't swallow the bound
         assert_eq!(
-            p.history.sql(Some(&w)),
-            "SELECT user_id FROM default.events WHERE ((coupon IS NULL) OR (false)) AND (toInt64(_offset) <= multiIf(_partition = 0, 7, _partition = 2, 3, -1))"
+            p.history.sql("s"),
+            "SELECT user_id FROM s WHERE (coupon IS NULL) OR (false)"
         );
+        // the logical table is what cursors are tied to
+        assert_eq!(p.history.table, "default.events");
+        assert_eq!(p.source.table, "events");
     }
 
     #[test]
@@ -1155,16 +1113,10 @@ mod tests {
             &[(2, true, false), (1, false, true), (2, false, false)],
         ));
         assert_eq!(
-            p.history.sql(None),
+            p.history.sql("default.events"),
             "SELECT user_id, latency_ms AS __order_0 FROM default.events WHERE coupon IS NOT NULL \
              ORDER BY latency_ms DESC NULLS LAST, user_id ASC NULLS FIRST, latency_ms ASC NULLS LAST"
         );
-        // the bound goes before ORDER BY
-        let w = Watermark(std::collections::BTreeMap::from([(0, 7)]));
-        assert!(p
-            .history
-            .sql(Some(&w))
-            .ends_with("AND (toInt64(_offset) <= multiIf(_partition = 0, 7, -1)) ORDER BY latency_ms DESC NULLS LAST, user_id ASC NULLS FIRST, latency_ms ASC NULLS LAST"));
         // order-only columns are decoded, but not output
         assert_eq!(
             p.stream.required_keys(),
@@ -1207,7 +1159,7 @@ mod tests {
         b.projection[1].name = "l".into();
         let p = plan(&b);
         assert_eq!(
-            p.history.sql(None),
+            p.history.sql("default.events"),
             "SELECT user_id AS u, latency_ms AS l, latency_ms FROM default.events \
              ORDER BY latency_ms DESC NULLS LAST"
         );
@@ -1216,12 +1168,11 @@ mod tests {
         assert!(order.hidden.is_empty());
         assert_eq!(order.columns[0].history_field, "l");
         assert_eq!(order.columns[0].name, "l");
-        let w = Watermark(std::collections::BTreeMap::from([(0, 7)]));
         assert!(p
             .history
-            .keys_sql(&w)
+            .keys_sql("s")
             .unwrap()
-            .starts_with("SELECT latency_ms AS l FROM default.events"));
+            .starts_with("SELECT latency_ms AS l FROM s"));
         // each column is decoded once; output under every name
         assert_eq!(p.stream.required_keys(), ["user_id", "latency_ms"]);
         let e = p
@@ -1238,9 +1189,7 @@ mod tests {
 
     #[test]
     fn resume_queries() {
-        let c = Watermark(std::collections::BTreeMap::from([(0, 5)]));
-        let w = Watermark(std::collections::BTreeMap::from([(0, 9), (1, 2)]));
-        // ordered + limited, ordered by an unselected column
+        // ordered + limited, ordered by an unselected column: the snapshot's sort keys
         let f = BoundExpr::IsNull {
             expr: col(3),
             negated: true,
@@ -1249,38 +1198,18 @@ mod tests {
         b.limit = Some(10);
         let p = plan(&b);
         assert_eq!(
-            p.history.keys_sql(&c).unwrap(),
-            "SELECT latency_ms AS __order_0, user_id FROM default.events WHERE (coupon IS NOT NULL) \
-             AND (toInt64(_offset) <= multiIf(_partition = 0, 5, -1)) \
+            p.history.keys_sql("s").unwrap(),
+            "SELECT latency_ms AS __order_0, user_id FROM s WHERE coupon IS NOT NULL \
              ORDER BY latency_ms DESC NULLS LAST, user_id ASC NULLS LAST LIMIT 10"
         );
-        assert_eq!(
-            p.history.catch_up_sql(&c, &w),
-            "SELECT user_id, latency_ms AS __order_0 FROM default.events WHERE (coupon IS NOT NULL) \
-             AND (toInt64(_offset) > multiIf(_partition = 0, 5, -1) \
-             AND toInt64(_offset) <= multiIf(_partition = 0, 9, _partition = 1, 2, -1)) \
-             ORDER BY latency_ms DESC NULLS LAST, user_id ASC NULLS LAST LIMIT 10"
-        );
-        // LIMIT alone: the client's row count, and the latest rows
+        // LIMIT alone: the snapshot's row count, at most the LIMIT
         let mut b = bound(&[1], None);
         b.limit = Some(3);
         let p = plan(&b);
-        assert!(p.history.keys_sql(&c).is_none());
+        assert!(p.history.keys_sql("s").is_none());
         assert_eq!(
-            p.history.count_sql(&c),
-            "SELECT count() AS n FROM (SELECT 1 FROM default.events \
-             WHERE toInt64(_offset) <= multiIf(_partition = 0, 5, -1) LIMIT 3)"
-        );
-        assert!(p
-            .history
-            .catch_up_sql(&c, &w)
-            .ends_with(" ORDER BY toInt64(_offset) DESC LIMIT 3"));
-        // unordered: just the range
-        let p = plan(&bound(&[1], None));
-        assert_eq!(
-            p.history.catch_up_sql(&c, &w),
-            "SELECT user_id FROM default.events WHERE toInt64(_offset) > multiIf(_partition = 0, 5, -1) \
-             AND toInt64(_offset) <= multiIf(_partition = 0, 9, _partition = 1, 2, -1)"
+            p.history.count_sql("s"),
+            "SELECT count() AS n FROM (SELECT 1 FROM s LIMIT 3)"
         );
     }
 

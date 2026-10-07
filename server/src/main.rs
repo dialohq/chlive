@@ -2,6 +2,9 @@
 //! A thin user of the `chlive-server` library.
 
 use anyhow::Result;
+use std::time::Duration;
+
+use chlive_engine::snapshot::SnapshotConfig;
 use chlive_engine::{Config, Engine};
 use clap::Parser;
 use tracing::info;
@@ -39,6 +42,25 @@ struct Cli {
         default_value = "127.0.0.1:19000"
     )]
     clickhouse_native: String,
+    /// The pause server, which pauses a table's ingestion for a snapshot (default: the dev
+    /// shell's)
+    #[arg(
+        long,
+        env = "CHLIVE_PAUSE_SERVER",
+        default_value = "http://127.0.0.1:18091"
+    )]
+    pause_server: String,
+    /// ClickHouse user creating and dropping snapshots (clones of the tables)
+    #[arg(long, env = "CHLIVE_SNAPSHOT_USER", default_value = "chlive_snap")]
+    snapshot_user: String,
+    #[arg(long, env = "CHLIVE_SNAPSHOT_PASSWORD", default_value = "chlive_snap")]
+    snapshot_password: String,
+    /// Seconds between snapshots of a table in use
+    #[arg(long, env = "CHLIVE_SNAPSHOT_REFRESH", default_value_t = 10)]
+    snapshot_refresh: u64,
+    /// Seconds without subscriptions after which a table's snapshots stop
+    #[arg(long, env = "CHLIVE_SNAPSHOT_IDLE", default_value_t = 3600)]
+    snapshot_idle: u64,
 }
 
 #[tokio::main]
@@ -57,13 +79,23 @@ async fn main() -> Result<()> {
         database: cli.database,
         kafka_brokers: cli.kafka,
         clickhouse_native: cli.clickhouse_native,
+        pause_server_url: cli.pause_server,
+        snapshot_user: cli.snapshot_user,
+        snapshot_password: cli.snapshot_password,
+        snapshots: SnapshotConfig {
+            refresh: Duration::from_secs(cli.snapshot_refresh),
+            idle: Duration::from_secs(cli.snapshot_idle),
+            sweep: true,
+        },
     });
-    let server = chlive_server::start(&cli.listen, engine).await?;
+    let engine = std::sync::Arc::new(engine);
+    let server = chlive_server::start(&cli.listen, engine.clone()).await?;
     info!(addr = %server.addr, "listening (WebSocket at /live)");
     tokio::select! {
         r = async { server.wait().await } => r?,
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
     }
+    engine.shutdown().await;
     // with chDB open (aggregates), the process must close it before exiting
     chlive_engine::chdb::shutdown();
     Ok(())

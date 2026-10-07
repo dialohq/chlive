@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use chlive_engine::diff::Row;
 use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
 use chlive_engine::rules::{HardcodedRules, TopicId};
+use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Snapshots};
 use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
+use chlive_engine::watermark::Watermark;
 use chlive_engine::Engine;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::SinkExt;
@@ -16,7 +18,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-/// `requests`: ClickHouse has offset 0 of partition 0 (the row `h1`).
+/// History as read from a snapshot of `requests`: the row `h1`.
 struct FakeHistory;
 
 #[async_trait]
@@ -27,28 +29,19 @@ impl HistorySource for FakeHistory {
             ty: ty.into(),
         };
         match table {
-            "default.requests" => Ok(vec![
-                col("user_id", "String"),
-                col("latency_ms", "UInt32"),
-                col("_partition", "UInt64"),
-                col("_offset", "UInt64"),
-            ]),
+            "default.requests" => Ok(vec![col("user_id", "String"), col("latency_ms", "UInt32")]),
             _ => Err(HistoryError::UnknownTable(table.into())),
         }
     }
 
     async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError> {
-        if sql.contains("max(_offset)") {
-            return Ok(vec![obj(json!({"p": 0, "o": 0}))]);
-        }
         if sql.contains(" GROUP BY ") {
             // the native aggregate test's history: its one group, as states
             assert_eq!(
                 sql,
                 "SELECT user_id AS __k0, count() AS __a0_0, max(latency_ms) AS __a1_0, \
-                 count(latency_ms) AS __a1_1 FROM default.requests \
-                 WHERE (latency_ms > 100) AND (toInt64(_offset) <= multiIf(_partition = 0, 0, -1)) \
-                 GROUP BY __k0"
+                 count(latency_ms) AS __a1_1 FROM default.__chlive_snap_requests \
+                 WHERE latency_ms > 100 GROUP BY __k0"
             );
             return Ok(vec![obj(
                 json!({"__k0": "h1", "__a0_0": 1, "__a1_0": 900, "__a1_1": 1}),
@@ -64,6 +57,20 @@ impl HistorySource for FakeHistory {
             .split(", ")
             .map(|c| (c.to_string(), history[c].clone()))
             .collect()])
+    }
+}
+
+/// The snapshot of `requests` holds offset 0 of partition 0 (the row `h1`).
+struct FakeSnapshots;
+
+#[async_trait]
+impl Snapshots for FakeSnapshots {
+    async fn acquire(&self, table: &SnapshotTable) -> Result<Lease, SnapshotError> {
+        Ok(std::sync::Arc::new(Snapshot::fixed(
+            &table.database,
+            &format!("__chlive_snap_{}", table.table),
+            Watermark([(0, 0)].into()),
+        )))
     }
 }
 
@@ -105,7 +112,12 @@ async fn server() -> chlive_server::Server {
             0,
             r#"{"user_id": "slower", "latency_ms": "700"}"#,
         );
-    let engine = Engine::new(HardcodedRules::default(), FakeHistory, Endless(events));
+    let engine = Engine::new(
+        HardcodedRules::default(),
+        FakeHistory,
+        Endless(events),
+        FakeSnapshots,
+    );
     chlive_server::start("127.0.0.1:0", engine).await.unwrap()
 }
 

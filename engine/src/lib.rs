@@ -18,7 +18,9 @@
 //!
 //! Inside: [`parser`] → [`binder`] (via [`rules`]) → [`plan`] → [`engine`], which yields the
 //! history from ClickHouse and then one iteration per event of the subscribed topics. History
-//! and events meet at a per-partition offset [`watermark`], so each event is in exactly one.
+//! is read from a [`snapshot`] of the table, taken while its ingestion was paused, so it holds
+//! exactly the offsets up to a per-partition [`watermark`]; the stream starts right after, so
+//! each event is in exactly one.
 
 pub mod aggregate;
 pub mod ast;

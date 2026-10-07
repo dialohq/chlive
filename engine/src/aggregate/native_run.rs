@@ -27,6 +27,8 @@ pub(crate) struct NativeRun {
     history: Arc<dyn HistorySource>,
     /// The history query, until it has run.
     history_sql: Option<String>,
+    /// The snapshot it reads, until then.
+    snapshot: Option<crate::snapshot::Lease>,
     plan: NativeAggregates,
     stream: StreamPlan,
     events: BoxStream<'static, Vec<Event>>,
@@ -40,6 +42,7 @@ impl NativeRun {
     pub(crate) fn new(
         history: Arc<dyn HistorySource>,
         history_sql: String,
+        snapshot: crate::snapshot::Lease,
         plan: NativeAggregates,
         stream: StreamPlan,
         events: BoxStream<'static, Vec<Event>>,
@@ -48,6 +51,7 @@ impl NativeRun {
         Self {
             history,
             history_sql: Some(history_sql),
+            snapshot: Some(snapshot),
             plan,
             stream,
             events,
@@ -86,7 +90,9 @@ impl NativeRun {
     }
 
     async fn history(&mut self, sql: &str) -> Result<Iteration, EngineError> {
-        let rows = self.history.fetch(sql).await?;
+        let rows = self.history.fetch(sql).await;
+        self.snapshot = None;
+        let rows = rows?;
         let mut ids = Vec::with_capacity(rows.len());
         for mut row in rows {
             let key: Vec<Json> = (0..self.plan.keys.len())

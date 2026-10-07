@@ -410,7 +410,7 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
         assert_eq!(canon(&live.rows), canon(&direct), "{id}");
     }
     drop(conn);
-    server.stop();
+    server.shutdown().await;
     // the only test here using chDB: close it, or the test process crashes on exit
     tokio::time::sleep(Duration::from_millis(200)).await;
     chlive_engine::chdb::shutdown();

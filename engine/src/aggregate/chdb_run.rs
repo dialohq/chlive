@@ -43,6 +43,8 @@ pub(crate) struct AggregateRun {
     pub(crate) table: Arc<ChdbTable>,
     /// The history's `CREATE TABLE … AS SELECT … FROM remote(…)`, until it has run.
     pub(crate) create: Option<String>,
+    /// The snapshot `create` reads, until it has run.
+    pub(crate) snapshot: Option<crate::snapshot::Lease>,
     pub(crate) aggregate: AggregatePlan,
     pub(crate) stream: StreamPlan,
     pub(crate) events: BoxStream<'static, Vec<Event>>,
@@ -73,6 +75,7 @@ impl AggregateRun {
 
     async fn history(&mut self, create: String) -> Result<Iteration, EngineError> {
         self.chdb.exec(create).await?;
+        self.snapshot = None; // its states are in chDB now
         let rows = self
             .chdb
             .rows(self.aggregate.snapshot_sql(&self.table.name))

@@ -24,6 +24,9 @@ use crate::order::{OrderedState, SortKey, WindowState};
 use crate::parser::parse;
 use crate::plan::{plan, AggregatePlan, Plan, StreamPlan};
 use crate::rules::{HardcodedRules, NamingRules, TopicId};
+use crate::snapshot::{
+    ClickHouseCloner, Lease, PauseServer, SnapshotConfig, SnapshotError, SnapshotManager, Snapshots,
+};
 use crate::source::{Event, EventSource, KafkaSource, SourceError, TopicStart};
 use crate::watermark::Watermark;
 
@@ -42,13 +45,20 @@ pub enum EngineError {
     /// Aggregating (chDB) failed.
     #[error(transparent)]
     Aggregate(#[from] ChdbError),
+    /// No snapshot of the table could be taken (pause server or ClickHouse).
+    #[error("snapshot: {0}")]
+    Snapshot(#[from] SnapshotError),
 }
 
 /// Everything [`Engine::connect`] needs for the standard setup: ClickHouse over HTTP, Kafka,
-/// and the hard-coded naming rules.
+/// snapshots through the pause server, and the hard-coded naming rules.
+///
+/// `clickhouse_url` and `clickhouse_native` must be the same ClickHouse node: snapshots are
+/// created there, and exist only there.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub clickhouse_url: String,
+    /// Reads history (needs SELECT on the tables and their snapshots).
     pub user: String,
     pub password: String,
     /// ClickHouse database that dialect tables map to.
@@ -57,6 +67,13 @@ pub struct Config {
     pub kafka_brokers: String,
     /// ClickHouse's native protocol address, for chDB's `remote()` (aggregates).
     pub clickhouse_native: String,
+    /// The pause server (continuous-backup's), e.g. `http://127.0.0.1:18091`.
+    pub pause_server_url: String,
+    /// Creates and drops snapshots: CREATE TABLE, ALTER (ATTACH PARTITION) and DROP TABLE in
+    /// the tables' databases, and SYSTEM SYNC REPLICA for replicated tables.
+    pub snapshot_user: String,
+    pub snapshot_password: String,
+    pub snapshots: SnapshotConfig,
 }
 
 impl Default for Config {
@@ -68,6 +85,10 @@ impl Default for Config {
             database: "default".into(),
             kafka_brokers: "127.0.0.1:9092".into(),
             clickhouse_native: "127.0.0.1:19000".into(),
+            pause_server_url: "http://127.0.0.1:18091".into(),
+            snapshot_user: "default".into(),
+            snapshot_password: String::new(),
+            snapshots: SnapshotConfig::default(),
         }
     }
 }
@@ -76,6 +97,7 @@ pub struct Engine {
     rules: Arc<dyn NamingRules>,
     history: Arc<dyn HistorySource>,
     source: Arc<dyn EventSource>,
+    snapshots: Arc<dyn Snapshots>,
     native: Native,
     max_batch: usize,
 }
@@ -88,14 +110,25 @@ struct Native {
 }
 
 impl Engine {
-    /// The standard setup from a [`Config`].
+    /// The standard setup from a [`Config`]. Starts the snapshot task, so it must run inside a
+    /// tokio runtime.
     pub fn connect(config: Config) -> Self {
+        let snapshots = SnapshotManager::start(
+            Arc::new(PauseServer::new(&config.pause_server_url)),
+            Arc::new(ClickHouseCloner::new(
+                &config.clickhouse_url,
+                &config.snapshot_user,
+                &config.snapshot_password,
+            )),
+            config.snapshots,
+        );
         Self::new(
             HardcodedRules {
                 database: config.database,
             },
             ClickHouseHttp::new(&config.clickhouse_url, &config.user, &config.password),
             KafkaSource::new(&config.kafka_brokers),
+            snapshots,
         )
         .with_clickhouse_native(&config.clickhouse_native, &config.user, &config.password)
     }
@@ -118,16 +151,18 @@ impl Engine {
         self
     }
 
-    /// Any naming rules, history and event source, e.g. fakes in tests.
+    /// Any naming rules, history, event source and snapshots, e.g. fakes in tests.
     pub fn new(
         rules: impl NamingRules + 'static,
         history: impl HistorySource + 'static,
         source: impl EventSource + 'static,
+        snapshots: impl Snapshots + 'static,
     ) -> Self {
         Self {
             rules: Arc::new(rules),
             history: Arc::new(history),
             source: Arc::new(source),
+            snapshots: Arc::new(snapshots),
             native: Native {
                 address: "127.0.0.1:19000".into(),
                 user: "default".into(),
@@ -135,6 +170,11 @@ impl Engine {
             },
             max_batch: 1000,
         }
+    }
+
+    /// Stop taking snapshots and drop the ones no subscription is reading. Call before exiting.
+    pub async fn shutdown(&self) {
+        self.snapshots.shutdown().await;
     }
 
     /// Parse, bind and plan a query without running it.
@@ -156,53 +196,69 @@ impl Engine {
     /// Plan a query and start it: the history first, then one iteration per event of the
     /// plan's topics.
     ///
-    /// History and stream meet at the [`Watermark`], read now: history is every row up to it,
-    /// and each partition is consumed from right after it. So every event is in exactly one of
-    /// them, wherever ClickHouse's ingestion is at.
+    /// History is read from a snapshot of the table (see [`crate::snapshot`]): a clone holding
+    /// every offset up to its [`Watermark`], and each partition is consumed from right after
+    /// it. So every event is in exactly one of them, wherever ClickHouse's ingestion is at.
     pub async fn subscribe(&self, sql: &str) -> Result<Subscription, EngineError> {
         self.subscribe_from(sql, None).await
     }
 
     /// Like [`subscribe`](Self::subscribe), but for a client that already holds the result up to
     /// the cursor `since` (a token from an earlier [`Iteration::at`], see [`crate::cursor`]).
-    /// The first iteration is then a [`Origin::CatchUp`] with only what the client is missing:
-    /// - ClickHouse's rows after the cursor and up to the current watermark `W`;
-    /// - with ORDER BY, placed by the sort keys of the client's result, read from ClickHouse up
-    ///   to the cursor and, where the client is ahead of ClickHouse, from Kafka (its events
-    ///   between `W` and the cursor, read first and not sent again); with LIMIT alone, by the
-    ///   client's row count, likewise;
-    /// - and the stream continues from `max(cursor, W)`, so nothing is missed or repeated.
+    /// The first iteration is then an [`Origin::CatchUp`], and the client gets only what it's
+    /// missing:
+    /// - unordered, unlimited: nothing to rebuild; the stream continues right after the cursor;
+    /// - with ORDER BY or LIMIT, the client's state is rebuilt: the snapshot's sort keys (or row
+    ///   count), then the client's own events between the snapshot and the cursor, re-read from
+    ///   Kafka and not sent again; the stream continues after the cursor. This needs the cursor
+    ///   at or past the snapshot in every partition.
     ///
-    /// An invalid cursor (another plan, or past the end of the topic, e.g. it was recreated)
-    /// gives a normal subscription from history ([`Subscription::resumed`] is false).
+    /// Otherwise (another plan, a cursor behind the snapshot, offsets gone from the topic by
+    /// retention or recreation) it's a normal subscription from history
+    /// ([`Subscription::resumed`] is false).
     pub async fn subscribe_from(
         &self,
         sql: &str,
         since: Option<&str>,
     ) -> Result<Subscription, EngineError> {
         let plan = self.explain(sql).await?;
-        let kafka = &plan.history.kafka;
-        let watermark = Watermark::fetch(
-            self.history.as_ref(),
-            &plan.history.table,
-            &kafka.partition,
-            &kafka.offset,
-        )
-        .await?;
         if let Some(aggregate) = plan.aggregate.clone() {
             // aggregates always start from history (no resume yet)
-            return self.subscribe_aggregate(plan, aggregate, watermark).await;
+            let lease = self.snapshot(&plan.source).await?;
+            return self.subscribe_aggregate(plan, aggregate, lease).await;
         }
         // With ORDER BY or LIMIT the server rebuilds the client's state, which needs every row
-        // the client holds; without, there's nothing to rebuild.
+        // the client holds; without, there's nothing to rebuild, nor any snapshot to read.
         let stateful = plan.stream.order.is_some() || plan.stream.limit.is_some();
-        let resume_from = match since {
-            Some(token) => self.resumable(&plan, token, &watermark, stateful).await?,
-            None => None,
+        if let (Some(token), false) = (since, stateful) {
+            if let Some(cursor) = self.resumable(&plan, token, None).await? {
+                let first = First::CatchUp {
+                    seed: Seed::Nothing,
+                    ahead: Watermark::default(),
+                };
+                return self
+                    .start(
+                        plan,
+                        None,
+                        cursor.clone(),
+                        cursor.clone(),
+                        first,
+                        String::new(),
+                        true,
+                    )
+                    .await;
+            }
+        }
+        let lease = self.snapshot(&plan.source).await?;
+        let watermark = lease.watermark.clone();
+        let from = lease.sql_table();
+        let resume_from = match (since, stateful) {
+            (Some(token), true) => self.resumable(&plan, token, Some(&watermark)).await?,
+            _ => None,
         };
-        let (begin, at, first, history_sql) = match &resume_from {
+        let (begin, at, first, history_sql) = match resume_from {
             None => {
-                let sql = plan.history.sql(Some(&watermark));
+                let sql = plan.history.sql(&from);
                 (
                     watermark.clone(),
                     watermark.clone(),
@@ -211,44 +267,53 @@ impl Engine {
                 )
             }
             Some(cursor) => {
-                let catch_up = plan.history.catch_up_sql(cursor, &watermark);
-                let seed = match (&plan.stream.order, plan.stream.limit) {
-                    (Some(_), _) => Seed::Keys(plan.history.keys_sql(cursor).expect("ordered")),
-                    (None, Some(_)) => Seed::Count(plan.history.count_sql(cursor)),
-                    (None, None) => Seed::Nothing,
+                // the client's state as of the snapshot (it's at or past it everywhere) ...
+                let seed_sql = match &plan.stream.order {
+                    Some(_) => plan.history.keys_sql(&from).expect("ordered"),
+                    None => plan.history.count_sql(&from),
                 };
-                // Where the client is ahead of ClickHouse (it streamed events ClickHouse hasn't
-                // ingested yet), those events are re-read from Kafka to rebuild the state: the
-                // stream starts right after ClickHouse there, and its events up to the cursor
-                // are the client's own (`ahead`), never sent again.
-                let ahead = Watermark(if stateful {
+                let seed = match &plan.stream.order {
+                    Some(_) => Seed::Keys(seed_sql.clone()),
+                    None => Seed::Count(seed_sql.clone()),
+                };
+                // ... then its own events after the snapshot, re-read from Kafka and not sent
+                let ahead = Watermark(
                     cursor
                         .0
                         .iter()
                         .filter(|(p, o)| **o > watermark.get(**p))
                         .map(|(p, o)| (*p, *o))
-                        .collect()
-                } else {
-                    Default::default()
-                });
-                let mut begin = cursor.max(&watermark);
-                for p in ahead.0.keys() {
-                    begin.0.insert(*p, watermark.get(*p));
-                }
-                // nothing to fetch where ClickHouse isn't past the client
-                let behind = watermark.0.iter().all(|(p, w)| *w <= cursor.get(*p));
+                        .collect(),
+                );
                 (
-                    begin,
+                    watermark.clone(),
                     cursor.max(&watermark),
-                    First::CatchUp {
-                        seed,
-                        rows: (!behind).then(|| catch_up.clone()),
-                        ahead,
-                    },
-                    catch_up,
+                    First::CatchUp { seed, ahead },
+                    seed_sql,
                 )
             }
         };
+        let resumed = matches!(first, First::CatchUp { .. });
+        self.start(plan, Some(lease), begin, at, first, history_sql, resumed)
+            .await
+    }
+
+    async fn snapshot(&self, table: &crate::snapshot::SnapshotTable) -> Result<Lease, EngineError> {
+        Ok(self.snapshots.acquire(table).await?)
+    }
+
+    /// Subscribe to the topics from `begin` and run: `first`, then the events.
+    #[allow(clippy::too_many_arguments)]
+    async fn start(
+        &self,
+        plan: Plan,
+        lease: Option<Lease>,
+        begin: Watermark,
+        at: Watermark,
+        first: First,
+        history_sql: String,
+        resumed: bool,
+    ) -> Result<Subscription, EngineError> {
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
             let partitions = self
@@ -266,36 +331,35 @@ impl Engine {
         }
         tracing::info!(
             history = %history_sql,
-            watermark = %watermark.describe(),
-            resumed_from = %resume_from.as_ref().map(Watermark::describe).unwrap_or_default(),
+            begin = %begin.describe(),
+            resumed,
             "subscribed"
         );
         let events = self
             .source
             .subscribe(&starts, &plan.stream.required_keys())
             .await?;
-        let iterations = self.iterations(&plan, first, at, events);
+        let iterations = self.iterations(&plan, lease, first, at, events);
         Ok(Subscription {
             plan,
-            watermark,
+            watermark: begin,
             history_sql,
-            resumed: resume_from.is_some(),
+            resumed,
             iterations,
         })
     }
 
-    /// GROUP BY / aggregates: chDB keeps each group's aggregate states in a table of its own
-    /// (dropped with the subscription). History: main ClickHouse computes the states up to the
-    /// watermark (`remote()`). Then, per batch of events: their states are added, and the groups
-    /// they touched are read back finalized (`-Merge`) and compared with what was sent.
+    /// GROUP BY / aggregates, natively or in chDB (see [`crate::aggregate`]). History: the
+    /// states of the snapshot's rows, computed by main ClickHouse. Then, per batch of events:
+    /// the groups they touched are updated and compared with what was sent.
     async fn subscribe_aggregate(
         &self,
         plan: Plan,
         aggregate: AggregatePlan,
-        watermark: Watermark,
+        lease: Lease,
     ) -> Result<Subscription, EngineError> {
-        let bound =
-            watermark.history_predicate(&aggregate.kafka.partition, &aggregate.kafka.offset);
+        let watermark = lease.watermark.clone();
+        let from = lease.sql_table();
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
             let partitions = self
@@ -318,7 +382,7 @@ impl Engine {
             .ready_chunks(self.max_batch)
             .boxed();
         let (history_sql, iterations) = match (
-            aggregate.native_history_sql(&bound),
+            aggregate.native_history_sql(&from),
             aggregate.native.clone(),
         ) {
             (Some(sql), Some(native)) => {
@@ -326,6 +390,7 @@ impl Engine {
                 let run = NativeRun::new(
                     self.history.clone(),
                     sql.clone(),
+                    lease,
                     native,
                     plan.stream.clone(),
                     events,
@@ -346,12 +411,13 @@ impl Engine {
                     std::process::id(),
                     NEXT.fetch_add(1, AtomicOrdering::Relaxed)
                 );
-                let remote = aggregate.remote(
+                let remote = AggregatePlan::remote(
+                    &from,
                     &self.native.address,
                     &self.native.user,
                     &self.native.password,
                 );
-                let create = aggregate.create_sql(&table, &remote, &bound);
+                let create = aggregate.create_sql(&table, &remote);
                 tracing::info!(table, create = %create.replace(&self.native.password, "***"), "subscribed (aggregate, chDB)");
                 let run = AggregateRun {
                     table: Arc::new(ChdbTable {
@@ -360,6 +426,7 @@ impl Engine {
                     }),
                     chdb,
                     create: Some(create.clone()),
+                    snapshot: Some(lease),
                     aggregate,
                     stream: plan.stream.clone(),
                     events,
@@ -385,32 +452,42 @@ impl Engine {
         })
     }
 
-    /// The cursor in `token`, if this plan can resume from it: one of ours for this plan, and
-    /// every offset to be read again still in the topic. Past its end means the topic was
+    /// The cursor in `token`, if this plan can resume from it: one of ours for this plan, at or
+    /// past `snapshot` in every partition (stateful queries, which rebuild their state from it),
+    /// and every offset to be read again still in the topic. Past its end means the topic was
     /// recreated; before its start, retention deleted what's needed.
     async fn resumable(
         &self,
         plan: &Plan,
         token: &str,
-        watermark: &Watermark,
-        stateful: bool,
+        snapshot: Option<&Watermark>,
     ) -> Result<Option<Watermark>, EngineError> {
         let Some(cursor) = cursor::decode(plan, token) else {
             tracing::info!("resume cursor is for another plan or malformed; starting over");
             return Ok(None);
         };
+        if let Some(w) = snapshot {
+            if let Some((p, o)) = w.0.iter().find(|(p, o)| cursor.get(**p) < **o) {
+                tracing::info!(
+                    cursor = %cursor.describe(),
+                    partition = p,
+                    snapshot = o,
+                    "resume cursor is behind the snapshot; starting over"
+                );
+                return Ok(None);
+            }
+        }
         for topic in &plan.stream.topics {
             let Some(bounds) = self.source.offset_bounds(topic).await? else {
                 continue;
             };
             for (p, c) in &cursor.0 {
                 let (low, high) = bounds.get(p).copied().unwrap_or((0, 0));
-                let w = watermark.get(*p);
-                // the first offset the resume reads from Kafka in this partition
-                let first = if stateful && *c > w {
-                    w + 1
-                } else {
-                    (*c).max(w) + 1
+                // the first offset the resume reads from Kafka in this partition: right after
+                // the snapshot when rebuilding a state, right after the cursor otherwise
+                let first = match snapshot {
+                    Some(w) => w.get(*p) + 1,
+                    None => *c + 1,
                 };
                 if *c >= high || first < low {
                     tracing::info!(
@@ -430,16 +507,14 @@ impl Engine {
     fn iterations(
         &self,
         plan: &Plan,
+        lease: Option<Lease>,
         first: First,
         at: Watermark,
         events: BoxStream<'static, Event>,
     ) -> BoxStream<'static, Result<Iteration, EngineError>> {
         enum Item {
             History(Result<Vec<Row>, HistoryError>),
-            CatchUp(
-                Result<(Option<Vec<Row>>, Vec<Row>), HistoryError>,
-                Vec<Event>,
-            ),
+            CatchUp(Result<Option<Vec<Row>>, HistoryError>, Vec<Event>),
             Event(Event),
             Failed(EngineError),
         }
@@ -449,23 +524,17 @@ impl Engine {
             match first {
                 First::History(sql) => {
                     let rows = history.fetch(&sql).await;
+                    drop(lease); // done with the snapshot
                     stream::iter([Item::History(rows)])
                         .chain(events.map(Item::Event))
                         .boxed()
                 }
-                First::CatchUp { seed, rows, ahead } => {
-                    let fetched = async {
-                        let seed = match seed {
-                            Seed::Keys(sql) | Seed::Count(sql) => Some(history.fetch(&sql).await?),
-                            Seed::Nothing => None,
-                        };
-                        let rows = match rows {
-                            Some(sql) => history.fetch(&sql).await?,
-                            None => Vec::new(),
-                        };
-                        Ok((seed, rows))
-                    }
-                    .await;
+                First::CatchUp { seed, ahead } => {
+                    let fetched = match seed {
+                        Seed::Keys(sql) | Seed::Count(sql) => history.fetch(&sql).await.map(Some),
+                        Seed::Nothing => Ok(None),
+                    };
+                    drop(lease);
                     let mut events = events;
                     match read_ahead(&mut events, &ahead).await {
                         Ok((own, held)) => stream::iter([Item::CatchUp(fetched, own)])
@@ -541,14 +610,13 @@ async fn read_ahead(
 
 /// What a subscription fetches first.
 enum First {
-    /// The whole result up to the watermark.
+    /// The whole result, from a snapshot.
     History(String),
-    /// Resume: what to seed the state with, and the rows the client is missing (`None` when
-    /// ClickHouse has nothing past the client's cursor).
+    /// Resume: what to seed the state with (from a snapshot), and where the client's own events
+    /// after the snapshot end.
     CatchUp {
         seed: Seed,
-        rows: Option<String>,
-        /// Per partition, the client's cursor where it is ahead of ClickHouse.
+        /// Per partition, the client's cursor where it is past the snapshot.
         ahead: Watermark,
     },
 }
@@ -643,10 +711,10 @@ fn catch_up_iteration(
     plan: &StreamPlan,
     state: &mut ResultState,
     at: &Watermark,
-    fetched: Result<(Option<Vec<Row>>, Vec<Row>), HistoryError>,
+    fetched: Result<Option<Vec<Row>>, HistoryError>,
     own: Vec<Event>,
 ) -> Result<Iteration, EngineError> {
-    let (seed, mut rows) = fetched?;
+    let seed = fetched?;
     match (&mut *state, &plan.order, seed) {
         (ResultState::Ordered(s), Some(order), Some(mut keys)) => {
             for k in &mut keys {
@@ -663,7 +731,7 @@ fn catch_up_iteration(
         }
         _ => {}
     }
-    // the client's own events that ClickHouse doesn't have yet: into the state, not sent
+    // the client's own events after the snapshot: into the state, not sent
     for event in own {
         if let Ok(row) = plan.decode(&event.value) {
             if plan.matches(&row) {
@@ -672,20 +740,10 @@ fn catch_up_iteration(
             }
         }
     }
-    if plan.order.is_none() && plan.limit.is_some() {
-        rows.reverse(); // fetched latest first
-    }
-    let mut diffs = Vec::new();
-    for mut row in rows {
-        let key = match &plan.order {
-            Some(order) => Some(order.history_key(&mut row).map_err(bad_history_row)?),
-            None => None,
-        };
-        diffs.extend(state.place(row, key));
-    }
+    // the client has everything up to its cursor: what it's missing comes from the stream
     Ok(Iteration {
         origin: Origin::CatchUp,
-        diffs,
+        diffs: Vec::new(),
         at: at.clone(),
     })
 }
@@ -732,10 +790,11 @@ fn event_iteration(
 /// A running query: a stream of [`Iteration`]s, plus the plan it runs.
 pub struct Subscription {
     pub plan: Plan,
-    /// Where history ends and the stream begins.
+    /// Where history ends and the stream begins: the snapshot's watermark (or, when resumed
+    /// without one, the client's cursor).
     pub watermark: Watermark,
-    /// The history query as run: the plan's, bounded by the watermark (or, when resumed, the
-    /// catch-up query).
+    /// The history query as run, against the snapshot (or, when resumed, its seed query; empty
+    /// without one).
     pub history_sql: String,
     /// Whether this resumed from a client's cursor (the first iteration is then a catch-up).
     pub resumed: bool,

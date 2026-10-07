@@ -18,6 +18,7 @@ pub use ws::router;
 pub struct Server {
     pub addr: SocketAddr,
     task: JoinHandle<std::io::Result<()>>,
+    engine: Arc<Engine>,
 }
 
 impl Server {
@@ -29,13 +30,20 @@ impl Server {
     pub fn stop(&self) {
         self.task.abort();
     }
+
+    /// Stop serving, then the engine (dropping its snapshots).
+    pub async fn shutdown(&self) {
+        self.stop();
+        self.engine.shutdown().await;
+    }
 }
 
 /// Listen on `addr` (port 0 picks a free one) and serve `engine` in the background.
-pub async fn start(addr: &str, engine: Engine) -> std::io::Result<Server> {
+pub async fn start(addr: &str, engine: impl Into<Arc<Engine>>) -> std::io::Result<Server> {
     let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
-    let router = router(Arc::new(engine));
+    let engine = engine.into();
+    let router = router(engine.clone());
     let task = tokio::spawn(async move { axum::serve(listener, router).await });
-    Ok(Server { addr, task })
+    Ok(Server { addr, task, engine })
 }

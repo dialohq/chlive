@@ -23,27 +23,23 @@ pub struct ColumnMapping {
 }
 
 pub trait NamingRules: Send + Sync {
-    /// Fully qualified ClickHouse table holding a dialect table's history.
-    fn clickhouse_table(&self, table: &str) -> String;
+    /// The ClickHouse database and table holding a dialect table's history.
+    fn clickhouse_location(&self, table: &str) -> (String, String);
+    /// The same, quoted for SQL: `db.table`.
+    fn clickhouse_table(&self, table: &str) -> String {
+        let (db, name) = self.clickhouse_location(table);
+        format!("{}.{}", quote_ident(&db), quote_ident(&name))
+    }
     /// Topic carrying a dialect table's new rows.
     fn topic(&self, table: &str) -> TopicId;
     /// Dialect name and JSON key of a ClickHouse column.
     fn column(&self, clickhouse_column: &str) -> ColumnMapping;
-    /// ClickHouse columns that are not part of the dialect table (e.g. Kafka bookkeeping).
+    /// ClickHouse columns that are not part of the dialect table (e.g. bookkeeping).
     fn is_hidden(&self, clickhouse_column: &str) -> bool;
-    /// ClickHouse columns holding each row's Kafka partition and offset, which line history up
-    /// with the topic (see [`crate::watermark`]).
-    fn kafka_columns(&self) -> KafkaColumns;
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct KafkaColumns {
-    pub partition: String,
-    pub offset: String,
 }
 
 /// Identity mapping: table `t` is ClickHouse `<database>.t` and topic `t`; columns keep their
-/// names everywhere; columns starting with `_` (`_partition`, `_offset`) are hidden.
+/// names everywhere; columns starting with `_` are hidden.
 #[derive(Debug, Clone)]
 pub struct HardcodedRules {
     pub database: String,
@@ -58,8 +54,8 @@ impl Default for HardcodedRules {
 }
 
 impl NamingRules for HardcodedRules {
-    fn clickhouse_table(&self, table: &str) -> String {
-        format!("{}.{}", quote_ident(&self.database), quote_ident(table))
+    fn clickhouse_location(&self, table: &str) -> (String, String) {
+        (self.database.clone(), table.to_string())
     }
 
     fn topic(&self, table: &str) -> TopicId {
@@ -75,13 +71,6 @@ impl NamingRules for HardcodedRules {
 
     fn is_hidden(&self, clickhouse_column: &str) -> bool {
         clickhouse_column.starts_with('_')
-    }
-
-    fn kafka_columns(&self) -> KafkaColumns {
-        KafkaColumns {
-            partition: "_partition".into(),
-            offset: "_offset".into(),
-        }
     }
 }
 

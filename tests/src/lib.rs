@@ -47,10 +47,15 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// The dev shell's stack (or CHLIVE_CLICKHOUSE_URL / CHLIVE_KAFKA), as the
-/// server's read-only ClickHouse user.
+/// The dev shell's stack (or CHLIVE_CLICKHOUSE_URL / CHLIVE_KAFKA / CHLIVE_PAUSE_SERVER), as
+/// the server's ClickHouse users.
 pub fn config() -> Config {
+    let env = |k: &str, default: &str| std::env::var(k).unwrap_or_else(|_| default.into());
     Config {
+        pause_server_url: env("CHLIVE_PAUSE_SERVER", "http://127.0.0.1:18091"),
+        snapshot_user: "chlive_snap".into(),
+        snapshot_password: "chlive_snap".into(),
+        snapshots: Default::default(),
         clickhouse_url: std::env::var("CHLIVE_CLICKHOUSE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18123".into()),
         user: "chlive_ro".into(),
@@ -320,10 +325,14 @@ pub fn clickhouse() -> ClickHouseHttp {
     ClickHouseHttp::new(&c.clickhouse_url, &c.user, &c.password)
 }
 
-/// Highest offset per partition that ClickHouse has ingested into `default.events`.
+/// Highest offset per partition that ClickHouse has ingested into `default.events`, from the
+/// sink connector's exactly-once state (KeeperMap, keyed `events-<partition>`).
 pub async fn ingested() -> Result<BTreeMap<i32, i64>> {
     let rows = clickhouse()
-        .fetch("SELECT _partition AS p, max(_offset) AS o FROM default.events GROUP BY p")
+        .fetch(
+            "SELECT toInt32(splitByChar('-', key)[-1]) AS p, maxOffset AS o \
+             FROM default.chlive_sink_events_state WHERE state = 'AFTER_PROCESSING'",
+        )
         .await?;
     Ok(rows
         .iter()
@@ -358,7 +367,9 @@ pub async fn direct(sql: &str) -> Result<Vec<Row>> {
         .explain(sql)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(clickhouse().fetch(&plan.history.sql(None)).await?)
+    Ok(clickhouse()
+        .fetch(&plan.history.sql(&plan.history.table))
+        .await?)
 }
 
 /// Rows as a sorted list of their JSON, to compare results as multisets (duplicates count).

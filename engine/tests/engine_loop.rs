@@ -4,17 +4,31 @@ use async_trait::async_trait;
 use chlive_engine::diff::{Diff, Row};
 use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
 use chlive_engine::rules::{HardcodedRules, TopicId};
+use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Snapshots};
 use chlive_engine::source::MemorySource;
+use chlive_engine::watermark::Watermark;
 use chlive_engine::{Engine, Iteration, Origin};
 use futures::StreamExt;
 use serde_json::json;
+use std::sync::Arc;
 
-/// `events`: ClickHouse has offsets 0..=1 of partition 0 and nothing of partition 1.
-/// `requests`: ClickHouse has offset 0 of partition 0.
+/// History as read from a snapshot (the fake snapshots are the tables themselves).
 struct FakeHistory;
 
-const EVENTS_BOUND: &str = "toInt64(_offset) <= multiIf(_partition = 0, 1, -1)";
-const REQUESTS_BOUND: &str = "toInt64(_offset) <= multiIf(_partition = 0, 0, -1)";
+/// `events`: the snapshot has offsets 0..=1 of partition 0 and nothing of partition 1.
+/// `requests`: the snapshot has offset 0 of partition 0.
+struct FakeSnapshots;
+
+#[async_trait]
+impl Snapshots for FakeSnapshots {
+    async fn acquire(&self, table: &SnapshotTable) -> Result<Lease, SnapshotError> {
+        let w = match table.table.as_str() {
+            "events" => Watermark([(0, 1), (1, -1)].into()),
+            _ => Watermark([(0, 0)].into()),
+        };
+        Ok(Arc::new(Snapshot::fixed(&table.database, &table.table, w)))
+    }
+}
 
 #[async_trait]
 impl HistorySource for FakeHistory {
@@ -24,40 +38,22 @@ impl HistorySource for FakeHistory {
             ty: ty.into(),
         };
         match table {
-            "default.events" => Ok(vec![
-                col("ts", "String"),
-                col("user_id", "String"),
-                col("_partition", "UInt64"),
-                col("_offset", "UInt64"),
-            ]),
-            "default.requests" => Ok(vec![
-                col("user_id", "String"),
-                col("latency_ms", "UInt32"),
-                col("_partition", "UInt64"),
-                col("_offset", "UInt64"),
-            ]),
+            "default.events" => Ok(vec![col("ts", "String"), col("user_id", "String")]),
+            "default.requests" => Ok(vec![col("user_id", "String"), col("latency_ms", "UInt32")]),
             _ => Err(HistoryError::UnknownTable(table.into())),
         }
     }
 
     async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError> {
         // ClickHouse returns exactly the selected columns, in order
-        let events = format!("SELECT ts, user_id FROM default.events WHERE {EVENTS_BOUND}");
-        let events_users = format!("SELECT user_id FROM default.events WHERE {EVENTS_BOUND}");
-        let slow = format!(
-            "SELECT user_id FROM default.requests WHERE (latency_ms > 100) AND ({REQUESTS_BOUND})"
-        );
-        let slowest = format!(
+        let events = String::from("SELECT ts, user_id FROM default.events");
+        let events_users = String::from("SELECT user_id FROM default.events");
+        let slow = String::from("SELECT user_id FROM default.requests WHERE latency_ms > 100");
+        let slowest = String::from(
             "SELECT user_id, latency_ms AS __order_0 FROM default.requests \
-             WHERE (latency_ms > 100) AND ({REQUESTS_BOUND}) ORDER BY latency_ms DESC NULLS LAST"
+             WHERE latency_ms > 100 ORDER BY latency_ms DESC NULLS LAST",
         );
         match sql {
-            "SELECT _partition AS p, max(_offset) AS o FROM default.events GROUP BY p" => {
-                Ok(vec![row(json!({"p": 0, "o": 1}))])
-            }
-            "SELECT _partition AS p, max(_offset) AS o FROM default.requests GROUP BY p" => {
-                Ok(vec![row(json!({"p": 0, "o": 0}))])
-            }
             s if s == events => Ok(vec![
                 row(json!({"ts": "h1", "user_id": "u1"})),
                 row(json!({"ts": "h2", "user_id": "u2"})),
@@ -74,34 +70,29 @@ impl HistorySource for FakeHistory {
                 row(json!({"user_id": "h500b", "__order_0": 500})),
             ]),
             s if s == format!("{slow} LIMIT 2") => Ok(vec![row(json!({"user_id": "h900"}))]),
-            s if s == format!("SELECT user_id FROM default.requests WHERE {REQUESTS_BOUND}") => {
+            "SELECT user_id FROM default.requests" => {
                 Ok(vec![row(json!({"user_id": "slow-history"}))])
             }
-            s if s
-                == format!(
-                    "SELECT user_id AS __k0, count() AS __a0_0, sum(latency_ms) AS __a1_0, \
+            "SELECT user_id AS __k0, count() AS __a0_0, sum(latency_ms) AS __a1_0, \
                      max(latency_ms) AS __a2_0, count(latency_ms) AS __a2_1 \
-                     FROM default.requests WHERE {REQUESTS_BOUND} GROUP BY __k0"
-                ) =>
-            {
-                Ok(vec![row(
-                    json!({"__k0": "u1", "__a0_0": 1, "__a1_0": 900, "__a2_0": 900, "__a2_1": 1}),
-                )])
-            }
+                     FROM default.requests GROUP BY __k0" => Ok(vec![row(
+                json!({"__k0": "u1", "__a0_0": 1, "__a1_0": 900, "__a2_0": 900, "__a2_1": 1}),
+            )]),
             // the same top 3, with aliases
-            s if s
-                == format!(
-                    "SELECT user_id AS who, latency_ms AS ms FROM default.requests \
-                     WHERE (latency_ms > 100) AND ({REQUESTS_BOUND}) \
-                     ORDER BY latency_ms DESC NULLS LAST LIMIT 3"
-                ) =>
-            {
-                Ok(vec![
-                    row(json!({"who": "h900", "ms": 900})),
-                    row(json!({"who": "h500", "ms": 500})),
-                    row(json!({"who": "h500b", "ms": 500})),
-                ])
-            }
+            "SELECT user_id AS who, latency_ms AS ms FROM default.requests \
+                     WHERE latency_ms > 100 \
+                     ORDER BY latency_ms DESC NULLS LAST LIMIT 3" => Ok(vec![
+                row(json!({"who": "h900", "ms": 900})),
+                row(json!({"who": "h500", "ms": 500})),
+                row(json!({"who": "h500b", "ms": 500})),
+            ]),
+            // a resume's seed: the snapshot's sort keys
+            "SELECT latency_ms AS __order_0 FROM default.requests WHERE latency_ms > 100 \
+             ORDER BY latency_ms DESC NULLS LAST LIMIT 3" => Ok(vec![
+                row(json!({"__order_0": 900})),
+                row(json!({"__order_0": 500})),
+                row(json!({"__order_0": 500})),
+            ]),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -121,7 +112,12 @@ fn events_topic() -> MemorySource {
 }
 
 fn engine(source: MemorySource) -> Engine {
-    Engine::new(HardcodedRules::default(), FakeHistory, source)
+    Engine::new(
+        HardcodedRules::default(),
+        FakeHistory,
+        source,
+        FakeSnapshots,
+    )
 }
 
 #[tokio::test]
@@ -143,7 +139,7 @@ async fn history_up_to_the_watermark_then_events_after_it() {
         .await
         .unwrap();
     assert_eq!(subscription.plan.stream.topics, [TopicId("events".into())]);
-    assert_eq!(subscription.watermark.describe(), "{0: 1}");
+    assert_eq!(subscription.watermark.describe(), "{0: 1, 1: -1}");
 
     let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
     let history = &iterations[0];
@@ -243,12 +239,12 @@ async fn column_list_prunes_history_and_events() {
         .await
         .unwrap();
     assert_eq!(
-        subscription.plan.history.sql(None),
+        subscription.plan.history.sql("default.events"),
         "SELECT user_id FROM default.events"
     );
     assert_eq!(
         subscription.history_sql,
-        format!("SELECT user_id FROM default.events WHERE {EVENTS_BOUND}")
+        "SELECT user_id FROM default.events"
     );
     assert_eq!(subscription.plan.stream.required_keys(), ["user_id"]);
     let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
@@ -548,5 +544,67 @@ async fn aliases_name_history_and_stream_rows() {
             // placed by the aliased ORDER BY column; pushes the last tie out
             "requests/0:1 + @1 {\"who\":\"e700\",\"ms\":700}\nrequests/0:1 - @3",
         ]
+    );
+}
+
+fn token(plan: &chlive_engine::Plan, at: &[(i32, i64)]) -> String {
+    chlive_engine::cursor::encode(plan, &Watermark(at.iter().copied().collect()))
+}
+
+#[tokio::test]
+async fn ordered_resume_rebuilds_from_the_snapshot_and_the_clients_own_events() {
+    let sql =
+        "select user_id from requests where latency_ms > 100 order by latency_ms desc limit 3";
+    let source = || {
+        let mut s = MemorySource::new();
+        s.push("requests", 0, r#"{"user_id": "h900", "latency_ms": 900}"#) // 0: in the snapshot
+            .push("requests", 0, r#"{"user_id": "e700", "latency_ms": 700}"#) // 1: the client's
+            .push("requests", 0, r#"{"user_id": "e1000", "latency_ms": 1000}"#); // 2: new
+        s
+    };
+    let e = engine(source());
+    let plan = e.explain(sql).await.unwrap();
+
+    // the client saw offset 1, past the snapshot (0): resumed
+    let s = e
+        .subscribe_from(sql, Some(&token(&plan, &[(0, 1)])))
+        .await
+        .unwrap();
+    assert!(s.resumed);
+    let lines: Vec<String> = s.map(|i| i.unwrap().to_string()).collect().await;
+    assert_eq!(
+        lines,
+        [
+            // the state as the client has it (900, 700, 500), rebuilt, nothing sent
+            "caught up: 0 changes",
+            "requests/0:2 + @0 {\"user_id\":\"e1000\"}\nrequests/0:2 - @3",
+        ]
+    );
+
+    // behind the snapshot: its state can't be rebuilt, so a full snapshot
+    let e = engine(source());
+    let s = e
+        .subscribe_from(sql, Some(&token(&plan, &[(0, -1)])))
+        .await
+        .unwrap();
+    assert!(!s.resumed);
+}
+
+#[tokio::test]
+async fn unordered_resume_continues_from_the_cursor_without_clickhouse() {
+    let sql = "select user_id from events";
+    let e = engine(events_topic());
+    let plan = e.explain(sql).await.unwrap();
+    // behind the snapshot ({0: 1}): fine, the stream replays from right after the cursor
+    let s = e
+        .subscribe_from(sql, Some(&token(&plan, &[(0, 0), (1, -1)])))
+        .await
+        .unwrap();
+    assert!(s.resumed);
+    assert_eq!(s.history_sql, "");
+    let lines: Vec<String> = s.map(|i| i.unwrap().to_string()).collect().await;
+    assert_eq!(
+        lines,
+        ["caught up: 0 changes", "events/0:1 + {\"user_id\":\"u2\"}"]
     );
 }
