@@ -34,6 +34,7 @@ pub mod order;
 pub mod parser;
 pub mod plan;
 pub mod rules;
+pub mod snapshot;
 pub mod source;
 pub mod types;
 pub mod watermark;
