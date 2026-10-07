@@ -4,7 +4,7 @@ A minimal **query-driven live sync layer** for a Kafka → ClickHouse analytics 
 
 ## Quickstart
 
-Everything except Redpanda comes from the nix flake: the Rust and Bun toolchains, and **ClickHouse 26.7.2** (packaged in `nix/packages/clickhouse.nix`, because nixpkgs has another version). Redpanda runs in **Docker**, so Docker must be running. Local services run through [dnvr](https://github.com/dialohq/dnvr). One dev shell runs the whole stack, for the server, the engine and the examples alike.
+Everything except Redpanda comes from the nix flake: the Rust and Bun toolchains, **ClickHouse 26.7.2** (packaged in `nix/packages/clickhouse.nix`, because nixpkgs has another version), Kafka Connect, and from [continuous-backup](https://github.com/dialohq/clickhouse-continuous-backup) (a flake input, for now the local checkout `/Users/adam/continuous-backup`) the ClickHouse sink connector and the pause server. Redpanda runs in **Docker**, so Docker must be running. Local services run through [dnvr](https://github.com/dialohq/dnvr). One dev shell runs the whole stack, for the server, the engine and the examples alike.
 
 ```sh
 nix develop      # or `direnv allow` once (run `direnv reload` after flake changes)
@@ -16,13 +16,16 @@ dnvr up          # starts everything in a tmux dashboard
 | process | what | where |
 |---|---|---|
 | `redpanda` | Redpanda in Docker (container `chlive-redpanda`, volume `chlive-redpanda`); creates topics `events`, `customers`, `orders` (3 partitions each) | Kafka `127.0.0.1:9092`, HTTP proxy `127.0.0.1:8082` |
-| `clickhouse` | ClickHouse 26.7.2 (dnvr's clickhouse preset) | HTTP `127.0.0.1:18123`, native `127.0.0.1:19000` |
-| `schema` → clickhouse, redpanda | applies `scripts/schema.sql` (Kafka-engine tables, MVs, the `chlive_ro` user) | |
-| `seed` → schema | runs `scripts/seed.sql` if ClickHouse has fewer than `$SEED_COUNT` events: generated, backdated events produced to Kafka from ClickHouse | |
-| `server` → schema | chlive-server: WebSocket over chlive-engine, as `chlive_ro`, on its default ports | `:8080` (`/live`, `/debug/subscriptions`, `/healthz`) |
+| `clickhouse` | ClickHouse 26.7.2 (dnvr's clickhouse preset), with an embedded Keeper (for KeeperMap) | HTTP `127.0.0.1:18123`, native `127.0.0.1:19000`, Keeper `19181` |
+| `schema` → clickhouse | applies `scripts/schema.sql` (tables, the sink's KeeperMap state tables, the `chlive_ro` and `chlive_snap` users) | |
+| `connect` → redpanda | Kafka Connect, with the ClickHouse sink plugin | REST `127.0.0.1:18083` |
+| `connectors` → connect, schema | one sink connector per topic (`chlive-sink-<topic>`, exactly once), into the table of the same name; waits until they run | |
+| `pause-server` → connectors | continuous-backup's pause server: pauses a table's connector and reports its exact offsets, for snapshots | `127.0.0.1:18091` |
+| `seed` → connectors | if ClickHouse has fewer than `$SEED_COUNT` events: `scripts/seed.sql` generates backdated events, produced to Kafka and ingested by the sink | |
+| `server` → pause-server | chlive-server: WebSocket over chlive-engine, as `chlive_ro` (snapshots as `chlive_snap`), on its default ports | `:8080` (`/live`, `/debug/subscriptions`, `/healthz`) |
 | `playground` | the example query playground | <http://localhost:5174> |
 
-Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `engine` (the engine CLI), `e2e` (the tests that need the stack), and `reset-data` (wipe Redpanda and ClickHouse data together, since Kafka offsets and ClickHouse's `_offset`s must match; run it with the group stopped).
+Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `engine` (the engine CLI), `e2e` (the tests that need the stack), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
 
 State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume. Redpanda uses its standard ports (Kafka 9092, HTTP proxy 8082) and the server listens on 8080; ClickHouse uses 18123/19000 rather than 8123/9000, so it can run next to another local ClickHouse. These are the built-in defaults of the server, the engine CLI, the tests and the example, so nothing needs configuring; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_KAFKA` and `CHLIVE_LISTEN` override them.
 
@@ -40,25 +43,28 @@ Writes go **straight to Kafka** through Redpanda's HTTP proxy (`127.0.0.1:8082`,
 
 ## How it works
 
-The **engine** (`engine/`, see [Engine](#engine-custom-dialect)) does the work: it parses and binds the query against ClickHouse's schema, reads a per-partition offset watermark, runs the history query on ClickHouse up to it, and consumes the table's Kafka topic from right after it, decoding, filtering and projecting each event itself. Every event is in exactly one of history and stream.
+Ingestion is Kafka Connect's ClickHouse sink, exactly once, which keeps no Kafka offsets in the rows. The **engine** (`engine/`, see [Engine](#engine-custom-dialect)) parses and binds the query against ClickHouse's schema, runs the history query on a **snapshot** of the table, and consumes the table's Kafka topic from right after the snapshot's offsets, decoding, filtering and projecting each event itself. Every event is in exactly one of history and stream.
 
-The **server** (`server/`) is a thin WebSocket layer: one engine subscription per client subscription, its history sent as a `snapshot` and its events as `diff`s. There is no sharing between subscribers yet: each subscription reads its own watermark and has its own Kafka consumer.
+A snapshot is a clone of the table taken while the pause server holds its ingestion: `/pause` reports, per partition, the next offset the sink would ingest; `CREATE TABLE … AS` + `ATTACH PARTITION ALL FROM` clones the table (it links the existing parts, so it's fast whatever the size); `/resume`. Any snapshot is correct, however old (an older one only means more Kafka to replay), so the engine's snapshot task keeps one per table in use, refreshed every 10 s while subscriptions come, stopped after 1 h without any; replaced clones are dropped once no subscription reads them (`engine/src/snapshot/`).
+
+The **server** (`server/`) is a thin WebSocket layer: one engine subscription per client subscription, its history sent as a `snapshot` and its events as `diff`s. Subscriptions share snapshots, but each has its own Kafka consumer.
 
 ```
-Kafka ──▶ ClickHouse (Kafka engine + MV adds _partition/_offset)
-  │             ▲ watermark + history query, once per subscription
-  │             │
+Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── clone (CREATE … AS + ATTACH PARTITION)
+  │                  ▲ pause / resume                 │ history query on the clone
+  │             pause server ◀── snapshot task ───────┤
+  │                  (offsets of the clone)           ▼
   └──────▶ chlive-server = WebSocket + chlive-engine ── snapshot, diffs ──▶ @chlive/client
-   events after the watermark
+   events after the clone's offsets
 ```
 
 ## Layout
 
 | path | what |
 |---|---|
-| `flake.nix` | the dnvr dev shells: toolchain, env, the local stacks' processes (Redpanda in Docker, ClickHouse 26.7.2, schema, seed, server, examples) and scripts |
+| `flake.nix` | the dnvr dev shells: toolchain, env, the local stacks' processes (Redpanda in Docker, ClickHouse 26.7.2, Kafka Connect with the ClickHouse sink, the pause server, schema, seed, server, examples) and scripts |
 | `nix/packages/` | custom derivations: `clickhouse.nix` (26.7.2), `redpanda.nix` (the Docker-run Redpanda process) |
-| `scripts/` | `schema.sql` (tables, Kafka ingestion, read-only user) and `seed.sql` (historical events via Kafka); |
+| `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
 | `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka; also a CLI that prints each iteration's diffs |
 | `server/` | `chlive-server` (Rust): the WebSocket protocol over the engine |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
@@ -75,7 +81,7 @@ engine "select * from events where latency_ms > 500"   # history, then live even
 produce events '{"user_id": "u7", "latency_ms": 900}'  # one event per JSON argument
 ```
 
-**History and stream meet at a watermark.** At subscribe time the engine reads `max(_offset)` per `_partition` from the ClickHouse table. History is every row up to it (the history query gets `toInt64(_offset) <= multiIf(_partition = 0, W0, …)`), and each Kafka partition is consumed from the offset right after it. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. The table must have `_partition` and `_offset` columns; the binder says so if it doesn't.
+**History and stream meet at a snapshot's watermark.** At subscribe time the engine takes the table's current snapshot (see [How it works](#how-it-works)): a clone holding exactly the offsets below the pause server's `N[p]` per partition. History is the whole clone, and each Kafka partition is consumed from `N[p]`. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. A table must be ingested by exactly one sink connector, from the topic of the same name. The engine's ClickHouse node must be the one clones are made on (`clickhouse_url` and `clickhouse_native` point to one node); for replicated tables it runs `SYSTEM SYNC REPLICA` first.
 
 The full grammar is under [Supported queries](#supported-queries). A condition can use:
 - comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), with `AND`, `OR`, `NOT` and parentheses;
@@ -101,10 +107,10 @@ Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 - **Conditions.** They're evaluated with SQL's three-valued logic.
 - **Literals.** They're typed and checked at bind time; for example, comparing `latency_ms` with a string is a positioned error.
 - **Output.** Event rows are rendered the way ClickHouse renders rows.
-- **Tested.** The agreement test in `engine/tests/clickhouse.rs` checks, for 22 predicates, that three setups return the same rows: everything in history; everything from the stream; and half from each, split at the watermark. `engine/tests/kafka.rs` produces events before, around and after subscribing, against the real Redpanda and ClickHouse, and checks that each arrives exactly once.
+- **Tested.** The agreement test in `engine/tests/clickhouse.rs` checks, for 22 predicates, that three setups return the same rows: everything in history; everything from the stream; and half from each, split at the snapshot (real clones, with a stand-in for the pause server). `engine/tests/kafka.rs` produces events before, around and after subscribing, against the real Redpanda and ClickHouse, and checks that each arrives exactly once.
 
 The query goes through parser → binder → planner. The binder resolves FROM, then WHERE, then SELECT, in SQL's evaluation order:
-- **FROM:** the table must exist in ClickHouse, have a Kafka topic, and have the `_partition` and `_offset` columns.
+- **FROM:** the table must exist in ClickHouse and have a Kafka topic. Snapshots (`__chlive_snap_*`) aren't tables.
 - **SELECT:** listed columns must exist. `col AS name` renames a column in the output; a column can be selected more than once under different names, but output names must be unique. An alias can't be another column's name (in ClickHouse it would shadow that column in WHERE and ORDER BY) or start with `_` (Kafka columns and the engine's hidden fields). Aliases only name output columns: WHERE and ORDER BY refer to table columns.
 
 The planner selects only the needed columns from ClickHouse, and the stream decodes only the needed JSON keys of each event; the other keys are skipped unparsed. Hard-coded naming rules map table `t` to ClickHouse `default.t` and to topic `t`, and keep column names the same on both sides; columns starting with `_` are hidden.
@@ -151,7 +157,7 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 - `{"op": "delete", "index": k}` removes the row at `k`; the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes.
 - A `diff` is atomic: its changes apply in sequence, each index into the list as the previous change left it, and only the state after all of them is meaningful (in between, an insert and its delete can briefly make one row more than the LIMIT). The client applies a whole diff to one copy of the rows before its listeners see it.
 - **Resuming.** `snapshot`, `diff` and `{"type": "progress", "id", "at"}` carry `at`, an opaque cursor: how far the result is complete, per Kafka partition, counting events that didn't match. A client that kept a result subscribes with `"since": <at>`; the server answers `{"type": "resume", "id", "columns", "order"?, "limit"?}` instead of a snapshot (the client's rows are still valid), then diffs with only what was missed. If it can't resume (another query or schema, a topic recreated since, …), it sends a normal `snapshot`.
-- Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`. After an error, that subscription is over.
+- Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`. After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
 
 ### GROUP BY and aggregates
@@ -172,11 +178,10 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 The client takes care of the page's lifecycle: it saves pending results when the tab goes to the background or the page is hidden, then closes the database so a reload can open it at once, and reopens it if the page comes back from the back/forward cache.
 
 - **On subscribe**, the cached result (if any) is shown at once (`status: "cached"`, with `cachedAt`), and the subscription is sent with `since` = its cursor. The server resumes and sends only what was missed; reconnects resume the same way.
-- **On the server** (`Engine::subscribe_from`), resuming from cursor `C` with ClickHouse at watermark `W`:
-  - ClickHouse's rows with `C < offset ≤ W` come as the catch-up, then the stream continues from `max(C, W)`.
-  - With ORDER BY, the sort keys of the client's whole result (everything up to `C`) are read from ClickHouse first, so the catch-up's inserts and deletes have the right indexes; with LIMIT alone, its row count.
-  - When the client is ahead of ClickHouse in a partition (it streamed events ClickHouse hasn't ingested yet), an ordered or limited query re-reads that partition from Kafka, from `W` up to `C`, before sending anything: those events are the client's own, so they only rebuild the state and aren't sent again. An unordered query just continues from `C`.
-  - The cursor must fit the topic: past its end means the topic was recreated, and before its start means retention deleted what a resume would need. Either way the server sends a full snapshot instead.
+- **On the server** (`Engine::subscribe_from`), resuming from cursor `C`; the table's current snapshot holds offsets up to `W`:
+  - Unordered, unlimited: nothing to rebuild and no ClickHouse at all; the stream continues from `C`, replaying from Kafka what the client missed.
+  - With ORDER BY (or LIMIT alone), the server rebuilds the client's state: the snapshot's sort keys (or row count), then the client's own events between `W` and `C`, re-read from Kafka and not sent again; then the stream continues from `C`. This needs `C ≥ W` in every partition; a client behind the snapshot gets a full snapshot instead (rare: snapshots are recent, and clients usually stream past them).
+  - The cursor must fit the topic: past its end means the topic was recreated, and before the start of what the resume reads means retention deleted it. Either way the server sends a full snapshot instead.
 - **What's stored:** per query (the SQL text, for now), its rows as JSON chunks, the cursor and when it was last used. A database with an older layout is emptied (`PRAGMA user_version`). Each write is one transaction: snapshots and ordered diffs are saved in full (batched, about 1 s), append-only diffs are appended, and `progress` moves the cursor.
 - **GC:** above the budget, the least recently used queries are evicted.
 - **MVP limits:** one tab holds the database at a time; other tabs run without a cache (the playground shows why). Keys are query strings, not shapes yet.
@@ -221,7 +226,7 @@ literal     := number | -number | 'string' | TRUE | FALSE | NULL
 column, table, alias := identifier | "identifier" | `identifier`
 ```
 
-- **Tables:** a table needs a ClickHouse table (with `_partition` and `_offset`) and a Kafka topic of the same name.
+- **Tables:** a table needs a ClickHouse table, ingested by one sink connector (known to the pause server) from a Kafka topic of the same name.
 - **Aliases** only name output columns: WHERE and ORDER BY refer to table columns. Output names must be unique; an alias can't be another column's name or start with `_`.
 - **ORDER BY / LIMIT:** with `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot. `LIMIT` keeps the top N (with `ORDER BY`) or the latest N (without), deleting the rows that fall out. Without `LIMIT`, plain results only grow.
 - **GROUP BY / aggregates** (also without GROUP BY: one global group): selected columns must be grouping columns; no `SELECT *`, ORDER BY or LIMIT yet. Groups are inserted, then updated.
