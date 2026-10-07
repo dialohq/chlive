@@ -114,7 +114,8 @@ async fn live_results_match_direct_queries() -> Result<()> {
         }
     }
 
-    // a fresh subscription's snapshot is the whole result, with nothing left to stream
+    // a fresh subscription gets the same result: a recent snapshot (shared, up to the refresh
+    // interval old), then whatever came after it, replayed from Kafka
     let fresh = LiveConn::connect(&server).await?;
     fresh.subscribe("slow", CASES[1].1);
     fresh.wait_ready(&["slow"], Duration::from_secs(60)).await?;
@@ -122,7 +123,6 @@ async fn live_results_match_direct_queries() -> Result<()> {
         .wait_quiet(Duration::from_millis(500), Duration::from_secs(30))
         .await?;
     let r = fresh.result("slow").unwrap();
-    assert_eq!(r.inserted, 0);
     assert_eq!(
         multiset(&r.rows),
         multiset(&conn.result("slow").unwrap().rows)
@@ -414,5 +414,63 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
     // the only test here using chDB: close it, or the test process crashes on exit
     tokio::time::sleep(Duration::from_millis(200)).await;
     chlive_engine::chdb::shutdown();
+    Ok(())
+}
+
+/// The clones of `default.orders` that exist now.
+async fn orders_clones() -> Result<Vec<String>> {
+    let rows = clickhouse()
+        .fetch(
+            "SELECT name FROM system.tables WHERE database = 'default' \
+             AND startsWith(name, '__chlive_snap_orders_') ORDER BY name",
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect())
+}
+
+/// Until `done` holds of the clones, at most 20 s (a refresh pauses the connector: ~1-2 s).
+async fn until_clones(what: &str, done: impl Fn(&[String]) -> bool) -> Result<Vec<String>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let now = orders_clones().await?;
+        if done(&now) {
+            return Ok(now);
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "{what}: {now:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Snapshots follow usage: a table in use gets fresh clones, replaced ones are dropped, and
+/// after the idle time without subscriptions the last one goes too. (`orders`, which no other
+/// test subscribes to, with a short refresh and idle time.)
+#[tokio::test]
+async fn snapshots_are_refreshed_while_used_and_dropped_when_idle() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let mut config = config();
+    config.snapshots.refresh = Duration::from_secs(1);
+    config.snapshots.idle = Duration::from_secs(3);
+    // like the server: start by dropping clones left behind (e.g. by an earlier failed run)
+    config.snapshots.sweep = true;
+    let server =
+        chlive_server::start("127.0.0.1:0", chlive_engine::Engine::connect(config)).await?;
+    let conn = LiveConn::connect(&server).await?;
+    conn.subscribe("o", "select order_id, amount from orders");
+    conn.wait_ready(&["o"], Duration::from_secs(60)).await?;
+    let first = orders_clones().await?;
+    assert_eq!(first.len(), 1, "{first:?}");
+    // refreshed: a new clone replaces it, and the replaced one is dropped
+    until_clones("refreshed", |c| c.len() == 1 && c[0] != first[0]).await?;
+    // no subscriptions for longer than the idle time: no clone left
+    drop(conn);
+    until_clones("dropped when idle", |c| c.is_empty()).await?;
+    server.shutdown().await;
     Ok(())
 }
