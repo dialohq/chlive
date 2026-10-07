@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use chlive_engine::history::{ClickHouseHttp, HistorySource};
 use chlive_engine::{Config, Engine};
 use chlive_server::Server;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -67,8 +67,21 @@ pub fn config() -> Config {
     }
 }
 
-pub async fn start_server() -> Result<Server> {
-    Ok(chlive_server::start("127.0.0.1:0", Engine::connect(config())).await?)
+/// Run `test` against a server on `config`, then shut the server down (dropping its snapshots),
+/// also when the test fails or panics.
+pub async fn with_server<F>(config: Config, test: F) -> Result<()>
+where
+    F: for<'a> FnOnce(&'a Server) -> futures::future::BoxFuture<'a, Result<()>>,
+{
+    let server = chlive_server::start("127.0.0.1:0", Engine::connect(config)).await?;
+    let result = std::panic::AssertUnwindSafe(test(&server))
+        .catch_unwind()
+        .await;
+    server.shutdown().await;
+    match result {
+        Ok(r) => r,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 pub fn producer() -> Result<producer::Producer> {

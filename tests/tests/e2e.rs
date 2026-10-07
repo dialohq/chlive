@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use chlive_e2e::*;
 use chlive_engine::history::HistorySource;
+use futures::FutureExt;
 
 /// Dialect queries over `events`, covering numbers, strings, IN, NOT and AND/OR.
 /// (id, query, its ORDER BY columns): numbers, strings, IN, NOT, AND/OR, and ORDER BY.
@@ -30,9 +31,9 @@ async fn live_results_match_direct_queries() -> Result<()> {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let server = start_server().await?;
+    with_server(config(), |server| async move {
     let producer = producer()?;
-    let conn = LiveConn::connect(&server).await?;
+    let conn = LiveConn::connect(server).await?;
 
     // Half the queries subscribe before the events, half while they're being produced, so
     // their watermarks land in the middle of the stream.
@@ -116,7 +117,7 @@ async fn live_results_match_direct_queries() -> Result<()> {
 
     // a fresh subscription gets the same result: a recent snapshot (shared, up to the refresh
     // interval old), then whatever came after it, replayed from Kafka
-    let fresh = LiveConn::connect(&server).await?;
+    let fresh = LiveConn::connect(server).await?;
     fresh.subscribe("slow", CASES[1].1);
     fresh.wait_ready(&["slow"], Duration::from_secs(60)).await?;
     fresh
@@ -129,6 +130,9 @@ async fn live_results_match_direct_queries() -> Result<()> {
     );
     Ok(())
 }
+.boxed())
+.await
+}
 
 #[tokio::test]
 async fn rejections_over_websocket() -> Result<()> {
@@ -137,49 +141,54 @@ async fn rejections_over_websocket() -> Result<()> {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let server = start_server().await?;
-    let conn = LiveConn::connect(&server).await?;
-    let cases = [
-        ("syntax", "select * form events", "SYNTAX_ERROR", "at 1:10"),
-        (
-            "table",
-            "select * from nope",
-            "INVALID_QUERY",
-            "unknown table nope in ClickHouse (default.nope) at 1:15",
-        ),
-        (
-            "column",
-            "select nope from events",
-            "INVALID_QUERY",
-            "unknown column nope in table events",
-        ),
-        (
-            "type",
-            "select * from events where latency_ms > 'x'",
-            "INVALID_QUERY",
-            "cannot compare UInt32 with a string at 1:41",
-        ),
-        (
-            "group",
-            "select country, count() from events group by country having count() > 1",
-            "SYNTAX_ERROR",
-            "HAVING is not supported yet",
-        ),
-    ];
-    for (id, sql, _, _) in &cases {
-        conn.subscribe(id, sql);
-    }
-    conn.wait_ready(
-        &cases.iter().map(|c| c.0).collect::<Vec<_>>(),
-        Duration::from_secs(30),
-    )
-    .await?;
-    for (id, _, code, message) in cases {
-        let (got_code, got_message) = conn.result(id).unwrap().error.expect("an error");
-        assert_eq!(got_code, code, "{id}: {got_message}");
-        assert!(got_message.contains(message), "{id}: {got_message}");
-    }
-    Ok(())
+    with_server(config(), |server| {
+        async move {
+            let conn = LiveConn::connect(server).await?;
+            let cases = [
+                ("syntax", "select * form events", "SYNTAX_ERROR", "at 1:10"),
+                (
+                    "table",
+                    "select * from nope",
+                    "INVALID_QUERY",
+                    "unknown table nope in ClickHouse (default.nope) at 1:15",
+                ),
+                (
+                    "column",
+                    "select nope from events",
+                    "INVALID_QUERY",
+                    "unknown column nope in table events",
+                ),
+                (
+                    "type",
+                    "select * from events where latency_ms > 'x'",
+                    "INVALID_QUERY",
+                    "cannot compare UInt32 with a string at 1:41",
+                ),
+                (
+                    "group",
+                    "select country, count() from events group by country having count() > 1",
+                    "SYNTAX_ERROR",
+                    "HAVING is not supported yet",
+                ),
+            ];
+            for (id, sql, _, _) in &cases {
+                conn.subscribe(id, sql);
+            }
+            conn.wait_ready(
+                &cases.iter().map(|c| c.0).collect::<Vec<_>>(),
+                Duration::from_secs(30),
+            )
+            .await?;
+            for (id, _, code, message) in cases {
+                let (got_code, got_message) = conn.result(id).unwrap().error.expect("an error");
+                assert_eq!(got_code, code, "{id}: {got_message}");
+                assert!(got_message.contains(message), "{id}: {got_message}");
+            }
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
 }
 
 #[tokio::test]
@@ -189,22 +198,27 @@ async fn unsubscribe_stops_the_stream() -> Result<()> {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let server = start_server().await?;
-    let producer = producer()?;
-    let conn = LiveConn::connect(&server).await?;
-    conn.subscribe("kept", "select user_id from events");
-    conn.subscribe("dropped", "select user_id from events");
-    conn.wait_ready(&["kept", "dropped"], Duration::from_secs(60))
-        .await?;
-    conn.unsubscribe("dropped");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let before = conn.result("dropped").unwrap().rows.len();
+    with_server(config(), |server| {
+        async move {
+            let producer = producer()?;
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("kept", "select user_id from events");
+            conn.subscribe("dropped", "select user_id from events");
+            conn.wait_ready(&["kept", "dropped"], Duration::from_secs(60))
+                .await?;
+            conn.unsubscribe("dropped");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let before = conn.result("dropped").unwrap().rows.len();
 
-    let produced = producer.produce(200, None).await?;
-    settle(&conn, &produced).await?;
-    assert_eq!(conn.result("kept").unwrap().inserted, 200);
-    assert_eq!(conn.result("dropped").unwrap().rows.len(), before);
-    Ok(())
+            let produced = producer.produce(200, None).await?;
+            settle(&conn, &produced).await?;
+            assert_eq!(conn.result("kept").unwrap().inserted, 200);
+            assert_eq!(conn.result("dropped").unwrap().rows.len(), before);
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
 }
 
 /// LIMIT: never more rows than the limit (checked after every diff by the harness).
@@ -256,92 +270,97 @@ async fn resume_after_being_away() -> Result<()> {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let server = start_server().await?;
-    let producer = producer()?;
-    const QUERIES: &[(&str, &str, &[&str])] = &[
-        (
-            "pl",
-            "select ts, user_id, latency_ms from events where country = 'PL'",
-            &[],
-        ),
-        (
-            "top",
-            "select ts, user_id, latency_ms from events order by latency_ms desc limit 30",
-            &["latency_ms"],
-        ),
-        (
-            "ordered",
-            "select user_id, country from events where latency_ms > 800 order by country",
-            &["country"],
-        ),
-    ];
+    with_server(config(), |server| {
+        async move {
+            let producer = producer()?;
+            const QUERIES: &[(&str, &str, &[&str])] = &[
+                (
+                    "pl",
+                    "select ts, user_id, latency_ms from events where country = 'PL'",
+                    &[],
+                ),
+                (
+                    "top",
+                    "select ts, user_id, latency_ms from events order by latency_ms desc limit 30",
+                    &["latency_ms"],
+                ),
+                (
+                    "ordered",
+                    "select user_id, country from events where latency_ms > 800 order by country",
+                    &["country"],
+                ),
+            ];
 
-    // a first session: subscribe, take in some live events, remember where we are
-    let conn = LiveConn::connect(&server).await?;
-    for (id, sql, _) in QUERIES {
-        conn.subscribe(id, sql);
-    }
-    conn.wait_ready(
-        &QUERIES.iter().map(|q| q.0).collect::<Vec<_>>(),
-        Duration::from_secs(60),
-    )
-    .await?;
-    let produced = producer.produce(300, None).await?;
-    settle(&conn, &produced).await?;
-    let kept: Vec<_> = QUERIES.iter().map(|q| conn.result(q.0).unwrap()).collect();
-    drop(conn);
+            // a first session: subscribe, take in some live events, remember where we are
+            let conn = LiveConn::connect(server).await?;
+            for (id, sql, _) in QUERIES {
+                conn.subscribe(id, sql);
+            }
+            conn.wait_ready(
+                &QUERIES.iter().map(|q| q.0).collect::<Vec<_>>(),
+                Duration::from_secs(60),
+            )
+            .await?;
+            let produced = producer.produce(300, None).await?;
+            settle(&conn, &produced).await?;
+            let kept: Vec<_> = QUERIES.iter().map(|q| conn.result(q.0).unwrap()).collect();
+            drop(conn);
 
-    // away: more events arrive
-    let produced = producer.produce(600, None).await?;
+            // away: more events arrive
+            let produced = producer.produce(600, None).await?;
 
-    // back: resume each query from its cursor
-    let conn = LiveConn::connect(&server).await?;
-    for ((id, sql, _), r) in QUERIES.iter().zip(&kept) {
-        conn.resume(id, sql, r.at.as_deref().expect("a cursor"), r.rows.clone());
-    }
-    conn.wait_ready(
-        &QUERIES.iter().map(|q| q.0).collect::<Vec<_>>(),
-        Duration::from_secs(60),
-    )
-    .await?;
-    settle(&conn, &produced).await?;
-    for ((id, sql, keys), before) in QUERIES.iter().zip(&kept) {
-        let live = conn.result(id).unwrap();
-        assert!(live.error.is_none(), "{id}: {:?}", live.error);
-        assert!(
-            live.protocol_violations.is_empty(),
-            "{id}: {:?}",
-            live.protocol_violations
-        );
-        assert!(live.resumed, "{id}: got a snapshot instead of a resume");
-        let direct = direct(sql).await?;
-        eprintln!(
-            "{id:>8}: {} rows kept, {} changes on resume, {} rows now (ClickHouse {})",
-            before.rows.len(),
-            live.inserted,
-            live.rows.len(),
-            direct.len()
-        );
-        if keys.is_empty() {
-            assert_eq!(multiset(&live.rows), multiset(&direct), "{id}");
-        } else if sql.contains(" limit ") {
-            let boundary = |rows: &[Row]| {
-                let mut g = tie_groups(rows, keys);
-                if let Some((k, rows)) = g.last_mut() {
-                    *rows = vec![format!("{k}: {}", rows.len())];
+            // back: resume each query from its cursor
+            let conn = LiveConn::connect(server).await?;
+            for ((id, sql, _), r) in QUERIES.iter().zip(&kept) {
+                conn.resume(id, sql, r.at.as_deref().expect("a cursor"), r.rows.clone());
+            }
+            conn.wait_ready(
+                &QUERIES.iter().map(|q| q.0).collect::<Vec<_>>(),
+                Duration::from_secs(60),
+            )
+            .await?;
+            settle(&conn, &produced).await?;
+            for ((id, sql, keys), before) in QUERIES.iter().zip(&kept) {
+                let live = conn.result(id).unwrap();
+                assert!(live.error.is_none(), "{id}: {:?}", live.error);
+                assert!(
+                    live.protocol_violations.is_empty(),
+                    "{id}: {:?}",
+                    live.protocol_violations
+                );
+                assert!(live.resumed, "{id}: got a snapshot instead of a resume");
+                let direct = direct(sql).await?;
+                eprintln!(
+                    "{id:>8}: {} rows kept, {} changes on resume, {} rows now (ClickHouse {})",
+                    before.rows.len(),
+                    live.inserted,
+                    live.rows.len(),
+                    direct.len()
+                );
+                if keys.is_empty() {
+                    assert_eq!(multiset(&live.rows), multiset(&direct), "{id}");
+                } else if sql.contains(" limit ") {
+                    let boundary = |rows: &[Row]| {
+                        let mut g = tie_groups(rows, keys);
+                        if let Some((k, rows)) = g.last_mut() {
+                            *rows = vec![format!("{k}: {}", rows.len())];
+                        }
+                        g
+                    };
+                    assert_eq!(boundary(&live.rows), boundary(&direct), "{id}");
+                } else {
+                    assert_eq!(
+                        tie_groups(&live.rows, keys),
+                        tie_groups(&direct, keys),
+                        "{id}"
+                    );
                 }
-                g
-            };
-            assert_eq!(boundary(&live.rows), boundary(&direct), "{id}");
-        } else {
-            assert_eq!(
-                tie_groups(&live.rows, keys),
-                tie_groups(&direct, keys),
-                "{id}"
-            );
+            }
+            Ok(())
         }
-    }
-    Ok(())
+        .boxed()
+    })
+    .await
 }
 
 /// GROUP BY over the full stack (chDB in the server): after events arrive live, the result
@@ -353,7 +372,7 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let server = start_server().await?;
+    with_server(config(), |server| async move {
     let producer = producer()?;
     const QUERIES: &[(&str, &str)] = &[
         ("total", "select count() as n, sum(amount), avg(latency_ms) from events"),
@@ -362,7 +381,7 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
         // no native uniqExact: runs in chDB
         ("users", "select country, uniqExact(user_id) as users, count() as n from events group by country"),
     ];
-    let conn = LiveConn::connect(&server).await?;
+    let conn = LiveConn::connect(server).await?;
     for (id, sql) in QUERIES {
         conn.subscribe(id, sql);
     }
@@ -410,7 +429,10 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
         assert_eq!(canon(&live.rows), canon(&direct), "{id}");
     }
     drop(conn);
-    server.shutdown().await;
+    Ok(())
+}
+.boxed())
+.await?;
     // the only test here using chDB: close it, or the test process crashes on exit
     tokio::time::sleep(Duration::from_millis(200)).await;
     chlive_engine::chdb::shutdown();
@@ -459,18 +481,21 @@ async fn snapshots_are_refreshed_while_used_and_dropped_when_idle() -> Result<()
     config.snapshots.idle = Duration::from_secs(3);
     // like the server: start by dropping clones left behind (e.g. by an earlier failed run)
     config.snapshots.sweep = true;
-    let server =
-        chlive_server::start("127.0.0.1:0", chlive_engine::Engine::connect(config)).await?;
-    let conn = LiveConn::connect(&server).await?;
-    conn.subscribe("o", "select order_id, amount from orders");
-    conn.wait_ready(&["o"], Duration::from_secs(60)).await?;
-    let first = orders_clones().await?;
-    assert_eq!(first.len(), 1, "{first:?}");
-    // refreshed: a new clone replaces it, and the replaced one is dropped
-    until_clones("refreshed", |c| c.len() == 1 && c[0] != first[0]).await?;
-    // no subscriptions for longer than the idle time: no clone left
-    drop(conn);
-    until_clones("dropped when idle", |c| c.is_empty()).await?;
-    server.shutdown().await;
-    Ok(())
+    with_server(config, |server| {
+        async move {
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("o", "select order_id, amount from orders");
+            conn.wait_ready(&["o"], Duration::from_secs(60)).await?;
+            let first = orders_clones().await?;
+            assert_eq!(first.len(), 1, "{first:?}");
+            // refreshed: a new clone replaces it, and the replaced one is dropped
+            until_clones("refreshed", |c| c.len() == 1 && c[0] != first[0]).await?;
+            // no subscriptions for longer than the idle time: no clone left
+            drop(conn);
+            until_clones("dropped when idle", |c| c.is_empty()).await?;
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
 }
