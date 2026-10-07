@@ -380,6 +380,8 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
         ("pl_paths", "select path, count(), min(ts), max(amount) from events where country = 'PL' group by path"),
         // no native uniqExact: runs in chDB
         ("users", "select country, uniqExact(user_id) as users, count() as n from events group by country"),
+        // ordered and limited: groups move and come in and out
+        ("top_paths", "select path, count() as n, sum(amount) as revenue from events group by path order by n desc limit 5"),
     ];
     let conn = LiveConn::connect(server).await?;
     for (id, sql) in QUERIES {
@@ -426,7 +428,11 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
             live.rows.len(),
             live.updated
         );
-        assert_eq!(canon(&live.rows), canon(&direct), "{id}");
+        if sql.contains(" limit ") {
+            check_limited(id, sql, &["n"], &live, &direct);
+        } else {
+            assert_eq!(canon(&live.rows), canon(&direct), "{id}");
+        }
     }
     drop(conn);
     Ok(())

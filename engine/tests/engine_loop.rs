@@ -78,6 +78,14 @@ impl HistorySource for FakeHistory {
                      FROM default.requests GROUP BY __k0" => Ok(vec![row(
                 json!({"__k0": "u1", "__a0_0": 1, "__a1_0": 900, "__a2_0": 900, "__a2_1": 1}),
             )]),
+            // top groups by total latency
+            "SELECT user_id AS __k0, sum(latency_ms) AS __a0_0 FROM default.requests GROUP BY __k0" => {
+                Ok(vec![
+                    row(json!({"__k0": "u1", "__a0_0": 900})),
+                    row(json!({"__k0": "u2", "__a0_0": 500})),
+                    row(json!({"__k0": "u3", "__a0_0": 100})),
+                ])
+            }
             // the same top 3, with aliases
             "SELECT user_id AS who, latency_ms AS ms FROM default.requests \
                      WHERE latency_ms > 100 \
@@ -606,5 +614,39 @@ async fn unordered_resume_continues_from_the_cursor_without_clickhouse() {
     assert_eq!(
         lines,
         ["caught up: 0 changes", "events/0:1 + {\"user_id\":\"u2\"}"]
+    );
+}
+
+#[tokio::test]
+async fn ordered_groups_move_and_come_in_and_out_of_the_limit() {
+    let mut source = MemorySource::new();
+    source
+        .push("requests", 0, r#"{"user_id": "h", "latency_ms": 1}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "u3", "latency_ms": 1000}"#) // 1100: climbs to the top
+        .push("requests", 0, r#"{"user_id": "u1", "latency_ms": 300}"#) // 1200: overtakes u3
+        .push("requests", 0, r#"{"user_id": "u2", "latency_ms": 10}"#) // 510: still out
+        .push("requests", 0, r#"{"user_id": "u4", "latency_ms": 5}"#); // new, out
+    let sql = "select user_id, sum(latency_ms) as total from requests \
+               group by user_id order by total desc limit 2";
+    let subscription = engine(source)
+        .with_max_batch(1)
+        .subscribe(sql)
+        .await
+        .unwrap();
+    let lines: Vec<String> = subscription.map(|i| i.unwrap().to_string()).collect().await;
+    assert_eq!(
+        lines,
+        [
+            // the top 2 of the history (u3, at 100, is kept for later)
+            "+ [\"u1\"] {\"user_id\":\"u1\",\"total\":900}\n\
+             + [\"u2\"] {\"user_id\":\"u2\",\"total\":500}\nhistory: 2 rows",
+            // u3 climbs in at the top and pushes u2 out
+            "requests/0:1 + @0 [\"u3\"] {\"user_id\":\"u3\",\"total\":1100}\nrequests/0:1 - @2",
+            // u1 overtakes u3: an update that moves it
+            "requests/0:2 ~ [\"u1\"] @0 {\"total\":1200}",
+            // below the LIMIT: nothing to send
+            "",
+            "",
+        ]
     );
 }

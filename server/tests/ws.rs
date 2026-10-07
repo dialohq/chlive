@@ -546,3 +546,47 @@ async fn aggregates_are_a_snapshot_with_ids_then_new_groups() {
     );
     assert_eq!(c.next().await, None);
 }
+
+#[tokio::test]
+async fn ordered_aggregates_report_their_order_and_place_new_groups() {
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe(
+        "g",
+        "select user_id, count() as n, max(latency_ms) as top from requests \
+         where latency_ms > 100 group by user_id order by top desc limit 2",
+    )
+    .await;
+    let mut snapshot = c.expect().await;
+    snapshot.as_object_mut().unwrap().remove("at");
+    assert_eq!(
+        snapshot,
+        json!({"type": "snapshot", "id": "g",
+               "columns": [{"name": "user_id", "type": "String"}, {"name": "n", "type": "UInt64"},
+                           {"name": "top", "type": "UInt32"}],
+               "rows": [{"user_id": "h1", "n": 1, "top": 900}],
+               "order": [{"column": "top", "direction": "desc", "nulls": "last"}],
+               "limit": 2,
+               "ids": ["[\"h1\"]"]})
+    );
+    let mut changes = Vec::new();
+    while changes.len() < 3 {
+        let m = c.expect().await;
+        assert_eq!(
+            (m["type"].as_str(), m["id"].as_str()),
+            (Some("diff"), Some("g")),
+            "{m}"
+        );
+        changes.extend(m["changes"].as_array().unwrap().iter().cloned());
+    }
+    assert_eq!(
+        changes,
+        [
+            json!({"op": "insert", "index": 1, "id": "[\"slow\"]", "row": {"user_id": "slow", "n": 1, "top": 500}}),
+            // 700 goes between 900 and 500, and pushes 500 past the LIMIT
+            json!({"op": "insert", "index": 1, "id": "[\"slower\"]", "row": {"user_id": "slower", "n": 1, "top": 700}}),
+            json!({"op": "delete", "index": 2}),
+        ]
+    );
+    assert_eq!(c.next().await, None);
+}

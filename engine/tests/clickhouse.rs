@@ -846,6 +846,18 @@ async fn aggregates_match_clickhouse() {
         "select country, uniqExact(name), uniq(n), median(amount) from events group by country",
         "select country, any(country), anyLast(country), uniqExact(score) from events group by country",
         "select median(score), uniqExact(flag) from events",
+        // ordered and limited: checked in order, tie groups compared as sets, and with LIMIT
+        // the last tie group by key and size only (which of its rows make it is arbitrary)
+        "select country, count() as n from events group by country order by n desc, country",
+        "select country, count() as n, sum(amount) as s from events group by country order by n desc limit 2",
+        "select country, flag, avg(amount) as a from events group by country, flag order by a desc nulls first limit 3",
+        "select country, flag, max(score) from events group by country, flag order by max(score) desc nulls first, country, flag",
+        "select country, flag from events group by country, flag order by all desc",
+        "select country, uniqExact(name) as u from events where n > 0 group by country order by u, country limit 3",
+        // by a hidden aggregate: the order isn't visible in the rows, only the groups
+        "select country, count() from events group by country order by sum(amount)",
+        // LIMIT alone: any (the first) groups
+        "select country from events group by country limit 2",
     ];
     let mut engines = Vec::new();
     for (database, in_clickhouse) in [
@@ -896,8 +908,63 @@ async fn aggregates_match_clickhouse() {
         v.sort();
         v
     };
+    // a row as comparable text: floats to 9 significant digits (ClickHouse adds in parallel)
+    let canon_row = |r: &chlive_engine::diff::Row| -> String {
+        r.iter()
+            .map(|(k, v)| match v.as_f64() {
+                Some(f) if !v.is_i64() && !v.is_u64() => format!("{k}={f:.9e}"),
+                _ => format!("{k}={v}"),
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    // the output columns an ordered case is ordered by (none: hidden, or unordered)
+    let order_columns = |sql: &str| -> Vec<String> {
+        let Some((_, order)) = sql.split_once(" order by ") else {
+            return Vec::new();
+        };
+        let order = order.split(" limit ").next().unwrap();
+        if order.starts_with("sum(") {
+            return Vec::new();
+        }
+        if order.starts_with("all") {
+            return vec!["country".into(), "flag".into()];
+        }
+        order
+            .split(", ")
+            .map(|t| t.split(' ').next().unwrap().to_string())
+            .collect()
+    };
+    // in order, ties as sets; with LIMIT the last tie group by key and size
+    let tie_groups = |rows: &[chlive_engine::diff::Row], keys: &[String], limited: bool| {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for r in rows {
+            let key: Vec<String> = keys
+                .iter()
+                .map(|k| canon_row(&[(k.clone(), r[k].clone())].into_iter().collect()))
+                .collect();
+            let key = key.join("|");
+            match out.last_mut() {
+                Some((last, rs)) if *last == key => rs.push(canon_row(r)),
+                _ => out.push((key, vec![canon_row(r)])),
+            }
+        }
+        for (_, rs) in &mut out {
+            rs.sort();
+        }
+        if limited {
+            if let Some((k, rs)) = out.last_mut() {
+                *rs = vec![format!("{k}: {} rows", rs.len())];
+            }
+        }
+        out
+    };
     for sql in CASES {
         use chlive_engine::history::HistorySource;
+        let limit = sql
+            .split_once(" limit ")
+            .map(|(_, n)| n.parse::<usize>().unwrap());
+        let keys = order_columns(sql);
         let want = direct
             .fetch(&sql.replace("from events", "from chlive_engine_agg_history.events"))
             .await
@@ -917,7 +984,7 @@ async fn aggregates_match_clickhouse() {
                     match d {
                         Diff::Insert { .. } => inserts += 1,
                         Diff::Update { .. } => updates += 1,
-                        Diff::Delete { .. } => panic!("{sql}: a delete"),
+                        Diff::Delete { .. } => assert!(limit.is_some(), "{sql}: a delete"),
                     }
                     list.apply(d)
                         .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
@@ -931,7 +998,33 @@ async fn aggregates_match_clickhouse() {
                 list.rows.len(),
                 "{database}: {sql}: ids not unique"
             );
-            assert_eq!(canon(&list.rows), canon(&want), "{database}: {sql}");
+            if !keys.is_empty() {
+                assert_eq!(
+                    tie_groups(&list.rows, &keys, limit.is_some()),
+                    tie_groups(&want, &keys, limit.is_some()),
+                    "{database}: {sql}\n  live   {:?}\n  direct {:?}",
+                    canon(&list.rows),
+                    canon(&want)
+                );
+            } else if let Some(n) = limit {
+                // any n groups: as many, each one of the whole result's
+                let all = direct
+                    .fetch(
+                        &sql.split(" limit ")
+                            .next()
+                            .unwrap()
+                            .replace("from events", "from chlive_engine_agg_history.events"),
+                    )
+                    .await
+                    .unwrap();
+                let all = canon(&all);
+                assert_eq!(list.rows.len(), n.min(all.len()), "{database}: {sql}");
+                for r in canon(&list.rows) {
+                    assert!(all.contains(&r), "{database}: {sql}: {r} isn't a group");
+                }
+            } else {
+                assert_eq!(canon(&list.rows), canon(&want), "{database}: {sql}");
+            }
             eprintln!(
                 "{database:>28}: {sql}: {} groups, {inserts} inserts, {updates} updates",
                 list.rows.len()

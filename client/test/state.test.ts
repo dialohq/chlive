@@ -108,3 +108,35 @@ test("aggregated results: rows by id, updated in place", () => {
   );
   assert.equal(s.rows()[2].n, 2);
 });
+
+test("ordered aggregates: an update with an index moves the row", () => {
+  const s = new ResultStore<{ country: string; n: number }>();
+  s.applySnapshot({
+    type: "snapshot",
+    id: "a",
+    columns,
+    rows: [{ country: "PL", n: 5 }, { country: "DE", n: 3 }, { country: "FR", n: 1 }],
+    ids: ['["PL"]', '["DE"]', '["FR"]'],
+    at: "c1",
+  });
+  s.applyDiff({
+    type: "diff",
+    id: "a",
+    at: "c2",
+    changes: [
+      { op: "update", id: '["FR"]', set: { n: 9 }, index: 0 }, // to the top
+      { op: "update", id: '["PL"]', set: {}, index: 2 }, // only moves (a hidden sort column changed)
+      { op: "update", id: '["FR"]', set: { n: 10 } }, // found by id after moving
+    ],
+  });
+  assert.deepEqual(s.rows(), [
+    { country: "FR", n: 10 },
+    { country: "DE", n: 3 },
+    { country: "PL", n: 5 },
+  ]);
+  assert.deepEqual(s.ids(), ['["FR"]', '["DE"]', '["PL"]']);
+  assert.throws(
+    () => s.applyDiff({ type: "diff", id: "a", at: "c3", changes: [{ op: "update", id: '["DE"]', set: {}, index: 3 }] }),
+    /move to index 3 of a result with 3 rows/,
+  );
+});
