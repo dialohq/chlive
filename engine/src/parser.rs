@@ -129,53 +129,64 @@ impl Parser {
 
     /// `column` or `name(arg)`, then an optional `AS alias`.
     fn select_item(&mut self) -> Result<SelectItem, SyntaxError> {
+        let expr = self.select_expr()?;
+        self.alias_for(expr)
+    }
+
+    /// `column` or `name(arg)` (`name()`, `name(*)`).
+    fn select_expr(&mut self) -> Result<SelectExpr, SyntaxError> {
         let t = self.peek().clone();
-        let expr = match (&t.kind, &self.tokens.get(self.pos + 1).map(|t| &t.kind)) {
-            (TokenKind::Ident(name), Some(TokenKind::LParen)) => {
-                self.next();
-                self.next();
-                let arg = match self.peek().kind.clone() {
-                    TokenKind::RParen => CallArg::None,
-                    TokenKind::Star => {
-                        self.next();
-                        CallArg::Star
-                    }
-                    TokenKind::Ident(_) => {
-                        if self.tokens.get(self.pos + 1).map(|t| &t.kind)
-                            == Some(&TokenKind::LParen)
-                        {
-                            return Err(SyntaxError::new(
-                                "nested functions are not supported yet",
-                                self.peek().span,
-                            ));
+        Ok(
+            match (&t.kind, &self.tokens.get(self.pos + 1).map(|t| &t.kind)) {
+                (TokenKind::Ident(name), Some(TokenKind::LParen)) => {
+                    self.next();
+                    self.next();
+                    let arg = match self.peek().kind.clone() {
+                        TokenKind::RParen => CallArg::None,
+                        TokenKind::Star => {
+                            self.next();
+                            CallArg::Star
                         }
-                        CallArg::Column(self.column()?)
-                    }
-                    _ => {
+                        TokenKind::Ident(_) => {
+                            if self.tokens.get(self.pos + 1).map(|t| &t.kind)
+                                == Some(&TokenKind::LParen)
+                            {
+                                return Err(SyntaxError::new(
+                                    "nested functions are not supported yet",
+                                    self.peek().span,
+                                ));
+                            }
+                            CallArg::Column(self.column()?)
+                        }
+                        _ => {
+                            return Err(SyntaxError::new(
+                                "function arguments other than a column are not supported yet",
+                                self.peek().span,
+                            ))
+                        }
+                    };
+                    if self.peek().kind == TokenKind::Comma {
                         return Err(SyntaxError::new(
-                            "function arguments other than a column are not supported yet",
+                            "functions with more than one argument are not supported yet",
                             self.peek().span,
-                        ))
+                        ));
                     }
-                };
-                if self.peek().kind == TokenKind::Comma {
-                    return Err(SyntaxError::new(
-                        "functions with more than one argument are not supported yet",
-                        self.peek().span,
-                    ));
+                    if self.peek().kind != TokenKind::RParen {
+                        return Err(self.expected("`)`"));
+                    }
+                    self.next();
+                    SelectExpr::Call {
+                        name: name.clone(),
+                        arg,
+                        span: t.span,
+                    }
                 }
-                if self.peek().kind != TokenKind::RParen {
-                    return Err(self.expected("`)`"));
-                }
-                self.next();
-                SelectExpr::Call {
-                    name: name.clone(),
-                    arg,
-                    span: t.span,
-                }
-            }
-            _ => SelectExpr::Column(self.column()?),
-        };
+                _ => SelectExpr::Column(self.column()?),
+            },
+        )
+    }
+
+    fn alias_for(&mut self, expr: SelectExpr) -> Result<SelectItem, SyntaxError> {
         let alias = if self.peek().kind == TokenKind::Keyword("AS") {
             self.next();
             match self.peek().kind.clone() {
@@ -276,7 +287,7 @@ impl Parser {
                 ))
             }
         }
-        let column = self.column()?;
+        let expr = self.select_expr()?;
         match self.peek().kind {
             TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash => {
                 return Err(SyntaxError::new(
@@ -288,7 +299,7 @@ impl Parser {
         }
         let (direction, nulls) = self.order_modifiers()?;
         Ok(OrderItem {
-            column,
+            expr,
             direction,
             nulls,
         })
@@ -845,10 +856,10 @@ mod tests {
     #[test]
     fn order_by_forms() {
         let item = |name: &str, d, n| OrderItem {
-            column: ColumnRef {
+            expr: SelectExpr::Column(ColumnRef {
                 name: name.into(),
                 span: Span::default(),
-            },
+            }),
             direction: d,
             nulls: n,
         };
@@ -857,7 +868,10 @@ mod tests {
                 items
                     .into_iter()
                     .map(|mut i| {
-                        i.column.span = Span::default();
+                        match &mut i.expr {
+                            SelectExpr::Column(c) => c.span = Span::default(),
+                            SelectExpr::Call { span, .. } => *span = Span::default(),
+                        }
                         i
                     })
                     .collect(),
@@ -907,9 +921,15 @@ mod tests {
             error("select * from t order by a + 1"),
             "ordering by expressions is not supported yet; name a column at 1:28"
         );
+        // calls are fine (the binder decides where); expressions around them aren't
+        assert!(matches!(
+            &parse("select * from t order by count() desc").unwrap().order,
+            Some(Order::Items(items)) if matches!(&items[0].expr, SelectExpr::Call { name, .. } if name == "count")
+                && items[0].direction == Some(Direction::Desc)
+        ));
         assert_eq!(
-            error("select * from t order by f(a)"),
-            "expressions are not supported yet; list column names at 1:26"
+            error("select * from t order by f(a) + 1"),
+            "ordering by expressions is not supported yet; name a column at 1:31"
         );
         assert_eq!(
             error("select * from t order by a nulls"),

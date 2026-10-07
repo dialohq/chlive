@@ -7,9 +7,9 @@ use std::sync::Arc;
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::Value;
 
-use super::GroupDiffer;
+use super::result::GroupResult;
 use crate::chdb::Chdb;
-use crate::diff::{Diff, Row};
+use crate::diff::Row;
 use crate::engine::{EngineError, Iteration, Origin};
 use crate::plan::{AggregatePlan, StreamPlan};
 use crate::source::Event;
@@ -48,7 +48,7 @@ pub(crate) struct AggregateRun {
     pub(crate) aggregate: AggregatePlan,
     pub(crate) stream: StreamPlan,
     pub(crate) events: BoxStream<'static, Vec<Event>>,
-    pub(crate) sent: GroupDiffer,
+    pub(crate) result: GroupResult,
     pub(crate) at: Watermark,
     pub(crate) batches: u64,
     pub(crate) failed: bool,
@@ -82,7 +82,10 @@ impl AggregateRun {
             .await?;
         Ok(Iteration {
             origin: Origin::History,
-            diffs: self.diffs(rows),
+            diffs: {
+                let groups = self.groups(rows);
+                self.result.history(groups)
+            },
             at: self.at.clone(),
         })
     }
@@ -145,19 +148,22 @@ impl AggregateRun {
         }
         Ok(Iteration {
             origin,
-            diffs: self.diffs(rows),
+            diffs: {
+                let groups = self.groups(rows);
+                self.result.batch(groups)
+            },
             at: self.at.clone(),
         })
     }
 
-    /// Finalized group rows (with their keys as `__k0…`) into inserts and updates.
-    fn diffs(&mut self, rows: Vec<Row>) -> Vec<Diff> {
+    /// Finalized group rows (with their keys as `__k0…`), by group id.
+    fn groups(&self, rows: Vec<Row>) -> Vec<(String, Row)> {
         rows.into_iter()
-            .filter_map(|mut row| {
+            .map(|mut row| {
                 let key: Vec<Value> = (0..self.aggregate.keys)
                     .map(|i| row.shift_remove(&format!("__k{i}")).unwrap_or(Value::Null))
                     .collect();
-                self.sent.diff(Value::Array(key).to_string(), row)
+                (Value::Array(key).to_string(), row)
             })
             .collect()
     }

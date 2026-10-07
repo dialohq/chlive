@@ -8,7 +8,8 @@ use std::sync::Arc;
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::Value as Json;
 
-use super::{AggregateState, GroupDiffer};
+use super::result::GroupResult;
+use super::AggregateState;
 use crate::diff::{Diff, Row};
 use crate::engine::{EngineError, Iteration, Origin};
 use crate::history::{HistoryError, HistorySource};
@@ -34,11 +35,12 @@ pub(crate) struct NativeRun {
     events: BoxStream<'static, Vec<Event>>,
     at: Watermark,
     groups: HashMap<String, Group>,
-    sent: GroupDiffer,
+    result: GroupResult,
     failed: bool,
 }
 
 impl NativeRun {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         history: Arc<dyn HistorySource>,
         history_sql: String,
@@ -47,6 +49,7 @@ impl NativeRun {
         stream: StreamPlan,
         events: BoxStream<'static, Vec<Event>>,
         at: Watermark,
+        result: GroupResult,
     ) -> Self {
         Self {
             history,
@@ -57,7 +60,7 @@ impl NativeRun {
             events,
             at,
             groups: HashMap::new(),
-            sent: GroupDiffer::default(),
+            result,
             failed: false,
         }
     }
@@ -112,7 +115,8 @@ impl NativeRun {
             ids.push(id.clone());
             self.groups.insert(id, Group { key, states });
         }
-        let diffs = ids.into_iter().filter_map(|id| self.diff(id)).collect();
+        let rows = ids.into_iter().map(|id| self.row(id)).collect();
+        let diffs = self.result.history(rows);
         Ok(Iteration {
             origin: Origin::History,
             diffs,
@@ -155,7 +159,8 @@ impl NativeRun {
                 touched.push(id);
             }
         }
-        let diffs: Vec<Diff> = touched.into_iter().filter_map(|id| self.diff(id)).collect();
+        let rows = touched.into_iter().map(|id| self.row(id)).collect();
+        let diffs: Vec<Diff> = self.result.batch(rows);
         Iteration {
             origin,
             diffs,
@@ -163,8 +168,8 @@ impl NativeRun {
         }
     }
 
-    /// The group's row now, against what was sent.
-    fn diff(&mut self, id: String) -> Option<Diff> {
+    /// The group's row now (hidden ORDER BY columns included).
+    fn row(&self, id: String) -> (String, Row) {
         let group = &self.groups[&id];
         let row: Row = self
             .plan
@@ -175,6 +180,6 @@ impl NativeRun {
                 NativeItem::Agg(j, name) => (name.clone(), group.states[*j].finalize().to_json()),
             })
             .collect();
-        self.sent.diff(id, row)
+        (id, row)
     }
 }

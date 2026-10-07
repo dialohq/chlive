@@ -98,7 +98,18 @@ export class ResultStore<R extends Row = Row> {
         case "update": {
           const i = indexOf(change.id);
           if (i === undefined) throw new Error(`update of unknown row ${change.id}`);
-          next[i] = { ...next[i], ...change.set } as R;
+          const row = { ...next[i], ...change.set } as R;
+          if (change.index === undefined || change.index === i) {
+            next[i] = row;
+          } else if (Number.isInteger(change.index) && change.index >= 0 && change.index < next.length) {
+            next.splice(i, 1);
+            ids.splice(i, 1);
+            next.splice(change.index, 0, row);
+            ids.splice(change.index, 0, change.id);
+            moved = true;
+          } else {
+            throw new Error(`move to index ${change.index} of a result with ${next.length} rows`);
+          }
           break;
         }
         default:

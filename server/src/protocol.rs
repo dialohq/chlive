@@ -9,8 +9,13 @@
 //! `index` the row takes: the row at that index and all after it move one down. Without ORDER BY
 //! there is no index and rows are appended.
 //!
+//! Aggregated results (GROUP BY or aggregates) have row ids, their group's key: new groups
+//! are inserts with an `id`, changed ones `update`s of the changed columns by `id`. Ordered,
+//! a group can move: its `update` then has an `index`, where the row is after the move.
+//!
 //! With LIMIT (`limit` in the snapshot), a row pushed out is a `delete` of its index, right
-//! after the insert that pushed it. Each `diff` is atomic: its changes apply in sequence (each
+//! after the insert that pushed it; for aggregates, a group falling out is deleted and the one
+//! taking the last place inserted. Each `diff` is atomic: its changes apply in sequence (each
 //! index is into the list as the previous change left it), and only the state after the whole
 //! diff is meaningful. In between, an insert and its delete can briefly make one row more than
 //! the LIMIT, so clients must not expose results mid-diff.
@@ -22,7 +27,7 @@
 //! normal `snapshot` that replaces them.
 
 use chlive_engine::diff::{Diff, Row};
-use chlive_engine::plan::OrderPlan;
+use chlive_engine::plan::{OrderPlan, Plan};
 use chlive_engine::EngineError;
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +111,25 @@ pub struct OrderTerm {
 }
 
 impl OrderTerm {
+    /// The query's ORDER BY, plain or aggregated; `None` when unordered.
+    pub fn for_plan(plan: &Plan) -> Option<Vec<OrderTerm>> {
+        let term = |column: &str, desc: bool, nulls_first: bool| OrderTerm {
+            column: column.to_string(),
+            direction: if desc { "desc" } else { "asc" },
+            nulls: if nulls_first { "first" } else { "last" },
+        };
+        match &plan.aggregate {
+            Some(a) if a.order.is_empty() => None,
+            Some(a) => Some(
+                a.order
+                    .iter()
+                    .map(|t| term(&t.column, t.desc, t.nulls_first))
+                    .collect(),
+            ),
+            None => plan.stream.order.as_ref().map(OrderTerm::of),
+        }
+    }
+
     pub fn of(plan: &OrderPlan) -> Vec<OrderTerm> {
         plan.keys
             .0
@@ -136,8 +160,14 @@ pub enum Change {
     },
     /// The row at `index` leaves the result (pushed out by LIMIT); the rows after it move up.
     Delete { index: usize },
-    /// The row with this `id` has these new values (only the columns that changed).
-    Update { id: String, set: Row },
+    /// The row with this `id` has these new values (only the columns that changed), and, with
+    /// an `index`, moves: it's taken out and put back so that it's at `index`.
+    Update {
+        id: String,
+        set: Row,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+    },
 }
 
 impl From<Diff> for Change {
@@ -145,7 +175,7 @@ impl From<Diff> for Change {
         match d {
             Diff::Insert { row, index, id } => Change::Insert { row, index, id },
             Diff::Delete { index } => Change::Delete { index },
-            Diff::Update { id, set } => Change::Update { id, set },
+            Diff::Update { id, set, index } => Change::Update { id, set, index },
         }
     }
 }
@@ -256,7 +286,14 @@ mod tests {
                 .into(),
                 Diff::Update {
                     id: "[\"PL\"]".into(),
-                    set: row,
+                    set: row.clone(),
+                    index: None,
+                }
+                .into(),
+                Diff::Update {
+                    id: "[\"DE\"]".into(),
+                    set: Row::new(),
+                    index: Some(0),
                 }
                 .into(),
                 Diff::Delete { index: 0 }.into(),
@@ -269,6 +306,7 @@ mod tests {
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}},
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}, "index": 2},
                 {"op": "update", "id": "[\"PL\"]", "set": {"user_id": "u1", "latency_ms": 10}},
+                {"op": "update", "id": "[\"DE\"]", "set": {}, "index": 0},
                 {"op": "delete", "index": 0}
             ], "at": "c2"})
         );

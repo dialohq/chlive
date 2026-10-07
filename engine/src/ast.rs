@@ -46,10 +46,10 @@ pub enum Order {
     Items(Vec<OrderItem>),
 }
 
-/// `column [ASC|DESC] [NULLS FIRST|LAST]`
+/// `column|name(arg) [ASC|DESC] [NULLS FIRST|LAST]` (calls: with GROUP BY or aggregates)
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderItem {
-    pub column: ColumnRef,
+    pub expr: SelectExpr,
     pub direction: Option<Direction>,
     pub nulls: Option<NullsOrder>,
 }

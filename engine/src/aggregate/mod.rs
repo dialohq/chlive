@@ -9,12 +9,11 @@
 pub mod chdb_run;
 pub mod native;
 pub mod native_run;
+pub mod result;
 
 use std::any::Any;
-use std::collections::HashMap;
 
 use crate::binder::AggFunc;
-use crate::diff::{Diff, Row};
 use crate::types::{Kind, Type, Value};
 
 /// One aggregate function, implemented natively.
@@ -122,41 +121,6 @@ pub fn result_type(func: AggFunc, arg: Option<&Type>) -> Result<Type, String> {
                 Err(format!("{}() of this type is not supported", func.name()))
             } else {
                 Ok(nullable(&bare(ty)))
-            }
-        }
-    }
-}
-
-/// What the client has of each group, to send only what changed: an `insert` (with the group's
-/// id) for a new group, an `update` of the changed columns for a known one.
-#[derive(Default)]
-pub struct GroupDiffer {
-    sent: HashMap<String, Row>,
-}
-
-impl GroupDiffer {
-    pub fn diff(&mut self, id: String, row: Row) -> Option<Diff> {
-        match self.sent.get_mut(&id) {
-            None => {
-                self.sent.insert(id.clone(), row.clone());
-                Some(Diff::Insert {
-                    row,
-                    index: None,
-                    id: Some(id),
-                })
-            }
-            Some(old) => {
-                let set: Row = row
-                    .into_iter()
-                    .filter(|(k, v)| old.get(k) != Some(v))
-                    .collect();
-                if set.is_empty() {
-                    return None;
-                }
-                for (k, v) in &set {
-                    old.insert(k.clone(), v.clone());
-                }
-                Some(Diff::Update { id, set })
             }
         }
     }

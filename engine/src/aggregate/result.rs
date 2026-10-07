@@ -1,0 +1,410 @@
+//! What the client has of an aggregated result, kept in order: every group ranked by the
+//! ORDER BY values of its finalized row, the first `limit` of them sent.
+//!
+//! A group's values change as events arrive, so with ORDER BY rows move, up or down. Each batch
+//! re-ranks the groups it touched and says how the client's list changes, one change at a time
+//! (each index is into the list as the previous change left it):
+//! - a sent group that stays in the result: `update` of the changed columns, with an `index`
+//!   when it moved;
+//! - one that falls out (LIMIT): `delete`, then the group that takes the last place comes in;
+//! - one that comes in (new, or climbing into the LIMIT): `insert` at its place, then the one
+//!   pushed past the LIMIT goes.
+//!
+//! A group whose sort key changes goes after the groups it ties with, as new rows do in plain
+//! ORDER BY results. Without ORDER BY groups are in the order they first appeared and never
+//! move; with LIMIT alone, the first `limit` of them are the result.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+use serde_json::Value as Json;
+
+use crate::binder::{ColumnId, OrderKey};
+use crate::diff::{Diff, Row};
+use crate::order::{KeyOrder, SortKey};
+use crate::types::{decode, Type, Value};
+
+/// An ORDER BY term of an aggregated result: the row column holding its value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupOrderTerm {
+    pub column: String,
+    pub ty: Type,
+    pub desc: bool,
+    pub nulls_first: bool,
+}
+
+struct Entry {
+    key: SortKey,
+    /// Ties are broken by when the group got its key: later goes after.
+    seq: u64,
+    id: String,
+}
+
+pub struct GroupResult {
+    terms: Vec<GroupOrderTerm>,
+    order: KeyOrder,
+    limit: usize,
+    /// Columns computed only to order by (`__o0`, …), never sent.
+    hidden: Vec<String>,
+    /// Every group, in result order.
+    ranked: Vec<Entry>,
+    /// Each group's place in `ranked`: its key and seq.
+    keys: HashMap<String, (SortKey, u64)>,
+    /// Each group's latest row (without hidden columns).
+    rows: HashMap<String, Row>,
+    /// What the client has: the rows of the groups in the result, as sent.
+    sent: HashMap<String, Row>,
+    seq: u64,
+}
+
+impl GroupResult {
+    pub fn new(terms: Vec<GroupOrderTerm>, limit: Option<u64>, hidden: Vec<String>) -> Self {
+        let order = KeyOrder(
+            terms
+                .iter()
+                .enumerate()
+                .map(|(i, t)| OrderKey {
+                    column: ColumnId(i),
+                    desc: t.desc,
+                    nulls_first: t.nulls_first,
+                })
+                .collect(),
+        );
+        Self {
+            terms,
+            order,
+            limit: limit.map_or(usize::MAX, |n| n as usize),
+            hidden,
+            ranked: Vec::new(),
+            keys: HashMap::new(),
+            rows: HashMap::new(),
+            sent: HashMap::new(),
+            seq: 0,
+        }
+    }
+
+    fn ordered(&self) -> bool {
+        !self.terms.is_empty()
+    }
+
+    /// The history: every group ranked; the first `limit`, in order, as appended inserts.
+    pub fn history(&mut self, groups: Vec<(String, Row)>) -> Vec<Diff> {
+        for (id, row) in groups {
+            let (key, row) = self.split(row);
+            self.place(&id, key);
+            self.rows.insert(id, row);
+        }
+        let mut diffs = Vec::new();
+        for e in self.ranked.iter().take(self.limit) {
+            let row = self.rows[&e.id].clone();
+            self.sent.insert(e.id.clone(), row.clone());
+            diffs.push(Diff::Insert {
+                row,
+                index: None,
+                id: Some(e.id.clone()),
+            });
+        }
+        diffs
+    }
+
+    /// The groups a batch touched, with their new rows, in the order they were touched.
+    pub fn batch(&mut self, groups: Vec<(String, Row)>) -> Vec<Diff> {
+        let mut diffs = Vec::new();
+        for (id, row) in groups {
+            self.touch(id, row, &mut diffs);
+        }
+        diffs
+    }
+
+    fn touch(&mut self, id: String, row: Row, diffs: &mut Vec<Diff>) {
+        let (key, row) = self.split(row);
+        let old = self.position(&id);
+        let moved = match old {
+            Some(p) => self.order.cmp(&self.ranked[p].key, &key) != Ordering::Equal,
+            None => true,
+        };
+        if moved {
+            if let Some(p) = old {
+                self.ranked.remove(p);
+            }
+            self.place(&id, key);
+        }
+        let new = self.position(&id).expect("just placed");
+        self.rows.insert(id.clone(), row.clone());
+        let n = self.limit;
+        let ordered = self.ordered();
+        let index = move |i: usize| ordered.then_some(i);
+        let was_in = self.sent.contains_key(&id);
+        match (was_in, new < n) {
+            (true, true) => {
+                let sent = self.sent.get_mut(&id).expect("sent");
+                let set: Row = row
+                    .into_iter()
+                    .filter(|(k, v)| sent.get(k) != Some(v))
+                    .collect();
+                for (k, v) in &set {
+                    sent.insert(k.clone(), v.clone());
+                }
+                let to = (old != Some(new)).then_some(new);
+                if !set.is_empty() || to.is_some() {
+                    diffs.push(Diff::Update { id, set, index: to });
+                }
+            }
+            (true, false) => {
+                // out of the LIMIT: the group now last in it comes in
+                diffs.push(Diff::Delete {
+                    index: old.expect("a sent group is ranked"),
+                });
+                self.sent.remove(&id);
+                if let Some(next) = self.ranked.get(n - 1).map(|e| e.id.clone()) {
+                    let row = self.rows[&next].clone();
+                    self.sent.insert(next.clone(), row.clone());
+                    diffs.push(Diff::Insert {
+                        row,
+                        index: index(n - 1),
+                        id: Some(next),
+                    });
+                }
+            }
+            (false, true) => {
+                self.sent.insert(id.clone(), row.clone());
+                diffs.push(Diff::Insert {
+                    row,
+                    index: index(new),
+                    id: Some(id),
+                });
+                // the group pushed past the LIMIT goes
+                if let Some(out) = self.ranked.get(n).map(|e| e.id.clone()) {
+                    if self.sent.remove(&out).is_some() {
+                        diffs.push(Diff::Delete { index: n });
+                    }
+                }
+            }
+            (false, false) => {}
+        }
+    }
+
+    /// The sort key of a finalized row, and the row as sent (without hidden columns).
+    fn split(&self, mut row: Row) -> (SortKey, Row) {
+        let key = self
+            .terms
+            .iter()
+            .map(|t| decode(row.get(&t.column), &t.ty).unwrap_or(Value::Null))
+            .collect();
+        for h in &self.hidden {
+            row.shift_remove(h);
+        }
+        (key, row)
+    }
+
+    fn cmp(&self, a: &SortKey, a_seq: u64, b: &Entry) -> Ordering {
+        self.order.cmp(a, &b.key).then(a_seq.cmp(&b.seq))
+    }
+
+    /// Rank a group by `key`, after the groups it ties with.
+    fn place(&mut self, id: &str, key: SortKey) {
+        self.seq += 1;
+        let seq = self.seq;
+        let at = self
+            .ranked
+            .partition_point(|e| self.cmp(&key, seq, e) == Ordering::Greater);
+        self.keys.insert(id.to_string(), (key.clone(), seq));
+        self.ranked.insert(
+            at,
+            Entry {
+                key,
+                seq,
+                id: id.to_string(),
+            },
+        );
+    }
+
+    /// Where a group is in `ranked`: a binary search by its (key, seq), which are unique.
+    fn position(&self, id: &str) -> Option<usize> {
+        let (key, seq) = self.keys.get(id)?;
+        let at = self
+            .ranked
+            .partition_point(|e| self.cmp(key, *seq, e) == Ordering::Greater);
+        debug_assert_eq!(self.ranked[at].id, id);
+        Some(at)
+    }
+}
+
+/// A group's id: its key values as a JSON array, e.g. `["PL"]`.
+pub fn group_id(key: &[Json]) -> String {
+    Json::Array(key.to_vec()).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::ResultList;
+    use serde_json::json;
+
+    fn int() -> Type {
+        Type::parse("Int64")
+    }
+
+    fn term(column: &str, desc: bool) -> GroupOrderTerm {
+        GroupOrderTerm {
+            column: column.into(),
+            ty: int(),
+            desc,
+            nulls_first: false,
+        }
+    }
+
+    fn row(g: &str, n: i64) -> (String, Row) {
+        let r = json!({"g": g, "n": n}).as_object().unwrap().clone();
+        (format!("[\"{g}\"]"), r)
+    }
+
+    fn lines(diffs: &[Diff]) -> Vec<String> {
+        diffs.iter().map(|d| d.to_string()).collect()
+    }
+
+    #[test]
+    fn moves_within_an_ordered_result() {
+        let mut r = GroupResult::new(vec![term("n", true)], None, vec![]);
+        assert_eq!(
+            lines(&r.history(vec![row("a", 1), row("b", 5), row("c", 3)])),
+            [
+                r#"+ ["b"] {"g":"b","n":5}"#,
+                r#"+ ["c"] {"g":"c","n":3}"#,
+                r#"+ ["a"] {"g":"a","n":1}"#
+            ]
+        );
+        assert_eq!(
+            lines(&r.batch(vec![
+                row("a", 4), // up, past c
+                row("b", 6), // stays first: no index
+                row("d", 3), // new, after c (ties go after)
+            ])),
+            [
+                r#"~ ["a"] @1 {"n":4}"#,
+                r#"~ ["b"] {"n":6}"#,
+                r#"+ @3 ["d"] {"g":"d","n":3}"#
+            ]
+        );
+        // down, to the end; and a touch that changes nothing sends nothing
+        assert_eq!(
+            lines(&r.batch(vec![row("b", 0), row("c", 3)])),
+            [r#"~ ["b"] @3 {"n":0}"#]
+        );
+    }
+
+    #[test]
+    fn a_limit_brings_groups_in_and_out() {
+        let mut r = GroupResult::new(vec![term("n", true)], Some(2), vec![]);
+        assert_eq!(
+            lines(&r.history(vec![row("a", 1), row("b", 5), row("c", 3)])),
+            [r#"+ ["b"] {"g":"b","n":5}"#, r#"+ ["c"] {"g":"c","n":3}"#]
+        );
+        assert_eq!(
+            lines(&r.batch(vec![row("a", 9)])),
+            // in at the top; the last one goes
+            [r#"+ @0 ["a"] {"g":"a","n":9}"#, "- @2"]
+        );
+        assert_eq!(
+            lines(&r.batch(vec![row("a", 0)])),
+            // out; the next one comes back, with its full row
+            ["- @0", r#"+ @1 ["c"] {"g":"c","n":3}"#]
+        );
+        // below the LIMIT: nothing to send, but remembered
+        assert_eq!(
+            lines(&r.batch(vec![row("d", 1), row("a", 2)])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            lines(&r.batch(vec![row("b", 1)])),
+            ["- @0", r#"+ @1 ["a"] {"g":"a","n":2}"#]
+        );
+    }
+
+    #[test]
+    fn unordered_results_append_and_a_limit_keeps_the_first_groups() {
+        let mut r = GroupResult::new(vec![], None, vec![]);
+        r.history(vec![row("a", 1)]);
+        assert_eq!(
+            lines(&r.batch(vec![row("b", 2), row("a", 7)])),
+            [r#"+ ["b"] {"g":"b","n":2}"#, r#"~ ["a"] {"n":7}"#]
+        );
+        let mut r = GroupResult::new(vec![], Some(1), vec![]);
+        assert_eq!(lines(&r.history(vec![row("a", 1), row("b", 1)])).len(), 1);
+        assert_eq!(
+            lines(&r.batch(vec![row("b", 5), row("c", 1), row("a", 2)])),
+            [r#"~ ["a"] {"n":2}"#]
+        );
+    }
+
+    #[test]
+    fn hidden_order_columns_are_not_sent() {
+        let mut r = GroupResult::new(vec![term("__o0", false)], None, vec!["__o0".into()]);
+        let with = |g: &str, o: i64| {
+            let (id, mut r) = row(g, 1);
+            r.insert("__o0".into(), json!(o));
+            (id, r)
+        };
+        assert_eq!(
+            lines(&r.history(vec![with("a", 2), with("b", 1)])),
+            [r#"+ ["b"] {"g":"b","n":1}"#, r#"+ ["a"] {"g":"a","n":1}"#]
+        );
+        // only the hidden column changed: the row moves, with nothing to set
+        assert_eq!(lines(&r.batch(vec![with("a", 0)])), [r#"~ ["a"] @0 {}"#]);
+    }
+
+    /// Random batches: the client's list, built from the diffs alone, is always the first
+    /// `limit` groups in order, each with its latest row.
+    #[test]
+    fn diffs_rebuild_the_ordered_result() {
+        let mut seed: u64 = 42;
+        let mut rand = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for (desc, limit) in [
+            (true, None),
+            (false, Some(3)),
+            (true, Some(5)),
+            (true, Some(1)),
+        ] {
+            let mut r = GroupResult::new(vec![term("n", desc)], limit, vec![]);
+            let mut latest: HashMap<String, i64> = HashMap::new();
+            let mut list = ResultList::default();
+            for d in r.history(vec![row("g0", 5), row("g1", 5)]) {
+                list.apply(&d).unwrap();
+            }
+            latest.insert("[\"g0\"]".into(), 5);
+            latest.insert("[\"g1\"]".into(), 5);
+            for _ in 0..300 {
+                let batch: Vec<(String, Row)> = (0..1 + rand(4))
+                    .map(|_| {
+                        let g = format!("g{}", rand(8));
+                        let n = rand(10) as i64 - 3; // sums can go down
+                        row(&g, n)
+                    })
+                    .collect();
+                for (id, row) in &batch {
+                    latest.insert(id.clone(), row["n"].as_i64().unwrap());
+                }
+                for d in r.batch(batch) {
+                    list.apply(&d).unwrap_or_else(|e| panic!("{d}: {e}"));
+                }
+                let mut want: Vec<i64> = latest.values().copied().collect();
+                want.sort_by(|a, b| if desc { b.cmp(a) } else { a.cmp(b) });
+                want.truncate(limit.map_or(usize::MAX, |n| n as usize));
+                let got: Vec<i64> = list.rows.iter().map(|r| r["n"].as_i64().unwrap()).collect();
+                assert_eq!(got, want, "desc {desc}, limit {limit:?}");
+                for (id, r) in list.ids.iter().zip(&list.rows) {
+                    assert_eq!(latest[id.as_ref().unwrap()], r["n"].as_i64().unwrap());
+                }
+                let mut ids = list.ids.clone();
+                ids.sort();
+                ids.dedup();
+                assert_eq!(ids.len(), list.rows.len(), "ids unique");
+            }
+        }
+    }
+}

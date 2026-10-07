@@ -257,8 +257,11 @@ async fn run(
             })
             .collect(),
     };
-    let order = plan.stream.order.as_ref().map(OrderTerm::of);
-    let limit = plan.stream.limit;
+    let order = OrderTerm::for_plan(&plan);
+    let limit = plan
+        .aggregate
+        .as_ref()
+        .map_or(plan.stream.limit, |a| a.limit);
     let mut columns = Some(columns);
     if subscription.resumed {
         let resume = ServerMsg::Resume {

@@ -26,12 +26,13 @@ export type ClientMessage =
  *   without, appended. Rows of aggregated results carry an `id` (their group's key, e.g.
  *   `["PL"]`) that updates refer to.
  * - `delete`: the row at `index` leaves the result (pushed out by LIMIT); the rows after it move up.
- * - `update`: the row with this `id` has these new values (only the columns that changed).
+ * - `update`: the row with this `id` has these new values (only the columns that changed); with
+ *   an `index` (ordered aggregates), it also moves: taken out, and put back so it's at `index`.
  */
 export type Change =
   | { op: "insert"; row: Row; index?: number; id?: string }
   | { op: "delete"; index: number }
-  | { op: "update"; id: string; set: Row };
+  | { op: "update"; id: string; set: Row; index?: number };
 
 /** One ORDER BY key the result is kept in. */
 export interface OrderTerm {

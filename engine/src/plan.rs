@@ -50,6 +50,12 @@ pub struct AggregatePlan {
     /// `'country LowCardinality(String), latency_ms UInt32'`, for `format()`.
     structure: String,
     filter: Option<String>,
+    /// ORDER BY: the row columns (output or hidden) to order groups by.
+    pub order: Vec<crate::aggregate::result::GroupOrderTerm>,
+    /// LIMIT: how many groups the result has (by `order`, or the first seen).
+    pub limit: Option<u64>,
+    /// Columns computed only for ORDER BY (`__o0`, …), not output.
+    pub hidden: Vec<String>,
     /// When every aggregate has a native implementation: how to run without chDB.
     pub native: Option<NativeAggregates>,
 }
@@ -86,6 +92,15 @@ pub enum NativeItem {
 }
 
 impl AggregatePlan {
+    /// The result as the client gets it: ordered and limited.
+    pub fn result(&self) -> crate::aggregate::result::GroupResult {
+        crate::aggregate::result::GroupResult::new(
+            self.order.clone(),
+            self.limit,
+            self.hidden.clone(),
+        )
+    }
+
     /// Native: the history's per-group states from main ClickHouse, read from `from` (a
     /// snapshot of the table).
     pub fn native_history_sql(&self, from: &str) -> Option<String> {
@@ -298,7 +313,25 @@ fn aggregate_plan(agg: &Aggregation, table: &BoundTable, filter: Option<String>)
         columns: agg
             .items
             .iter()
+            .filter(|i| !i.hidden)
             .map(|i| (i.name.clone(), i.ty.clone()))
+            .collect(),
+        order: agg
+            .order
+            .iter()
+            .map(|k| crate::aggregate::result::GroupOrderTerm {
+                column: agg.items[k.item].name.clone(),
+                ty: agg.items[k.item].ty.clone(),
+                desc: k.desc,
+                nulls_first: k.nulls_first,
+            })
+            .collect(),
+        limit: agg.limit,
+        hidden: agg
+            .items
+            .iter()
+            .filter(|i| i.hidden)
+            .map(|i| i.name.clone())
             .collect(),
         keys: agg.keys.len(),
         state_select: state.join(", "),
@@ -673,6 +706,36 @@ impl std::fmt::Display for Plan {
                     f,
                     "native:  no (an aggregate has no native implementation: chDB)"
                 )?,
+            }
+            if !a.order.is_empty() {
+                let terms: Vec<String> = a
+                    .order
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{} {} NULLS {}",
+                            t.column,
+                            if t.desc { "DESC" } else { "ASC" },
+                            if t.nulls_first { "FIRST" } else { "LAST" }
+                        )
+                    })
+                    .collect();
+                writeln!(
+                    f,
+                    "order:   {} (groups move as their values change)",
+                    terms.join(", ")
+                )?;
+            }
+            if let Some(n) = a.limit {
+                writeln!(
+                    f,
+                    "limit:   {n} groups ({}; the others are kept, to come in later)",
+                    if a.order.is_empty() {
+                        "the first seen"
+                    } else {
+                        "the first by order"
+                    }
+                )?;
             }
             let batch: Vec<&str> = a.batch_columns.iter().map(|(_, n)| n.as_str()).collect();
             writeln!(

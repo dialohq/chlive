@@ -91,17 +91,32 @@ pub struct Projected {
 pub struct Aggregation {
     /// The grouping columns (none: one global group).
     pub keys: Vec<ColumnId>,
-    /// The output columns, in SELECT order.
+    /// The output columns, in SELECT order, then any hidden ones ORDER BY needs.
     pub items: Vec<AggItem>,
+    /// ORDER BY, most significant first; empty when unordered.
+    pub order: Vec<AggOrderKey>,
+    /// LIMIT: the first groups by `order` (without one: the first groups seen).
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggItem {
-    /// Output name: the alias, or ClickHouse's default (`count()`, `avg(latency_ms)`).
+    /// Output name: the alias, or ClickHouse's default (`count()`, `avg(latency_ms)`); hidden
+    /// items are `__o0`, `__o1`, ….
     pub name: String,
     /// Its type, as ClickHouse gives it.
     pub ty: Type,
     pub expr: AggExpr,
+    /// Computed for ORDER BY only, not output.
+    pub hidden: bool,
+}
+
+/// One ORDER BY key of an aggregate query: an item, by index into [`Aggregation::items`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AggOrderKey {
+    pub item: usize,
+    pub desc: bool,
+    pub nulls_first: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,23 +273,11 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
         Some(expr) => Some(bind_where(expr, &table)?),
         None => None,
     };
-    if let Some(aggregation) = bind_aggregation(query, &table)? {
+    if let Some(mut aggregation) = bind_aggregation(query, &table)? {
         if let Some(order) = &query.order {
-            let span = match order {
-                Order::All { span, .. } => *span,
-                Order::Items(items) => items[0].column.span,
-            };
-            return Err(BindError::at(
-                "ORDER BY with GROUP BY or aggregates is not supported yet",
-                span,
-            ));
+            bind_aggregate_order(order, &table, &mut aggregation)?;
         }
-        if let Some(limit) = &query.limit {
-            return Err(BindError::at(
-                "LIMIT with GROUP BY or aggregates is not supported yet",
-                limit.span,
-            ));
-        }
+        aggregation.limit = query.limit.map(|l| l.value);
         return Ok(BoundQuery {
             table,
             filter,
@@ -366,39 +369,8 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
                 (col.name.clone(), col.ty.clone(), AggExpr::Key(id), c.span)
             }
             SelectExpr::Call { name, arg, span } => {
-                let Some(func) = crate::aggregate::lookup(&name) else {
-                    return Err(BindError::at(
-                        format!(
-                            "unknown function {name} (supported: {})",
-                            crate::aggregate::SUPPORTED
-                        ),
-                        span,
-                    ));
-                };
-                let arg = match (func, arg) {
-                    (AggFunc::Count, CallArg::None | CallArg::Star) => None,
-                    (_, CallArg::Column(c)) => Some((resolve_column(table, &c.name, c.span)?, c)),
-                    (f, _) => {
-                        return Err(BindError::at(
-                            format!("{}() needs a column", f.name()),
-                            span,
-                        ))
-                    }
-                };
-                let ty = result_type(func, arg.as_ref().map(|(id, c)| (table.column(*id), c)))?;
-                let default_name = match &arg {
-                    None => format!("{}()", func.name()),
-                    Some((id, _)) => format!("{}({})", func.name(), table.column(*id).name),
-                };
-                (
-                    default_name,
-                    ty,
-                    AggExpr::Call {
-                        func,
-                        arg: arg.map(|(id, _)| id),
-                    },
-                    span,
-                )
+                let (default_name, ty, expr) = bind_call(&name, &arg, span, table)?;
+                (default_name, ty, expr, span)
             }
         };
         if let Some(alias) = &alias {
@@ -411,9 +383,150 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
                 span,
             ));
         }
-        out.push(AggItem { name, ty, expr });
+        out.push(AggItem {
+            name,
+            ty,
+            expr,
+            hidden: false,
+        });
     }
-    Ok(Some(Aggregation { keys, items: out }))
+    Ok(Some(Aggregation {
+        keys,
+        items: out,
+        order: Vec::new(),
+        limit: None,
+    }))
+}
+
+/// An aggregate call: its default name (`count()`, `avg(latency_ms)`), type and expression.
+fn bind_call(
+    name: &str,
+    arg: &CallArg,
+    span: Span,
+    table: &BoundTable,
+) -> Result<(String, Type, AggExpr), BindError> {
+    let Some(func) = crate::aggregate::lookup(name) else {
+        return Err(BindError::at(
+            format!(
+                "unknown function {name} (supported: {})",
+                crate::aggregate::SUPPORTED
+            ),
+            span,
+        ));
+    };
+    let arg = match (func, arg) {
+        (AggFunc::Count, CallArg::None | CallArg::Star) => None,
+        (_, CallArg::Column(c)) => Some((resolve_column(table, &c.name, c.span)?, c)),
+        (f, _) => {
+            return Err(BindError::at(
+                format!("{}() needs a column", f.name()),
+                span,
+            ))
+        }
+    };
+    let ty = result_type(func, arg.as_ref().map(|(id, c)| (table.column(*id), *c)))?;
+    let default_name = match &arg {
+        None => format!("{}()", func.name()),
+        Some((id, _)) => format!("{}({})", func.name(), table.column(*id).name),
+    };
+    let expr = AggExpr::Call {
+        func,
+        arg: arg.map(|(id, _)| id),
+    };
+    Ok((default_name, ty, expr))
+}
+
+/// ORDER BY of an aggregate query. A name is an output column (its alias or default name) or
+/// else a grouping column; a call is an aggregate, the selected one if it's the same, else
+/// computed hidden. As in ClickHouse, a column that is neither grouped nor aggregated can't be
+/// ordered by.
+fn bind_aggregate_order(
+    order: &Order,
+    table: &BoundTable,
+    agg: &mut Aggregation,
+) -> Result<(), BindError> {
+    let mut keys = Vec::new();
+    let mut key = |agg: &mut Aggregation,
+                   item: usize,
+                   d: Option<Direction>,
+                   n: Option<NullsOrder>,
+                   span: Span|
+     -> Result<(), BindError> {
+        let it = &agg.items[item];
+        if it.ty.kind == Kind::Other {
+            return Err(BindError::at(
+                format!("ordering by {} of type {} is not supported", it.name, it.ty),
+                span,
+            ));
+        }
+        keys.push(AggOrderKey {
+            item,
+            desc: d == Some(Direction::Desc),
+            nulls_first: n == Some(NullsOrder::First),
+        });
+        Ok(())
+    };
+    // the item computing `expr`: a selected one, else a new hidden one
+    let item_for = |agg: &mut Aggregation, expr: AggExpr, ty: Type| -> usize {
+        if let Some(i) = agg.items.iter().position(|i| i.expr == expr) {
+            return i;
+        }
+        let n = agg.items.iter().filter(|i| i.hidden).count();
+        agg.items.push(AggItem {
+            name: format!("__o{n}"),
+            ty,
+            expr,
+            hidden: true,
+        });
+        agg.items.len() - 1
+    };
+    match order {
+        Order::All {
+            direction,
+            nulls,
+            span,
+        } => {
+            for i in 0..agg.items.len() {
+                if !agg.items[i].hidden {
+                    key(agg, i, *direction, *nulls, *span)?;
+                }
+            }
+        }
+        Order::Items(items) => {
+            for o in items {
+                let (item, span) = match &o.expr {
+                    SelectExpr::Column(c) => {
+                        let output = agg.items.iter().position(|i| !i.hidden && i.name == c.name);
+                        let item = match output {
+                            Some(i) => i,
+                            None => {
+                                let id = resolve_column(table, &c.name, c.span)?;
+                                if !agg.keys.contains(&id) {
+                                    return Err(BindError::at(
+                                        format!(
+                                            "column {} must be in GROUP BY or inside an aggregate function",
+                                            c.name
+                                        ),
+                                        c.span,
+                                    ));
+                                }
+                                let ty = table.column(id).ty.clone();
+                                item_for(agg, AggExpr::Key(id), ty)
+                            }
+                        };
+                        (item, c.span)
+                    }
+                    SelectExpr::Call { name, arg, span } => {
+                        let (_, ty, expr) = bind_call(name, arg, *span, table)?;
+                        (item_for(agg, expr, ty), *span)
+                    }
+                };
+                key(agg, item, o.direction, o.nulls, span)?;
+            }
+        }
+    }
+    agg.order = keys;
+    Ok(())
 }
 
 /// An aggregate's result type (see [`crate::aggregate::result_type`]), with the error pointing
@@ -464,9 +577,15 @@ fn bind_order(
             .collect(),
         Order::Items(items) => items
             .iter()
-            .map(|item| {
-                let id = resolve_column(table, &item.column.name, item.column.span)?;
-                key(id, item.direction, item.nulls, item.column.span)
+            .map(|item| match &item.expr {
+                SelectExpr::Column(c) => {
+                    let id = resolve_column(table, &c.name, c.span)?;
+                    key(id, item.direction, item.nulls, c.span)
+                }
+                SelectExpr::Call { span, .. } => Err(BindError::at(
+                    "aggregate functions in ORDER BY need GROUP BY or aggregates in SELECT",
+                    *span,
+                )),
             })
             .collect(),
     }
@@ -1257,11 +1376,15 @@ mod tests {
         );
         assert_eq!(
             e("select count() from events order by ts").await,
-            "ORDER BY with GROUP BY or aggregates is not supported yet at 1:37"
+            "column ts must be in GROUP BY or inside an aggregate function at 1:37"
         );
         assert_eq!(
-            e("select count() from events limit 5").await,
-            "LIMIT with GROUP BY or aggregates is not supported yet at 1:34"
+            e("select user_id from events order by count()").await,
+            "aggregate functions in ORDER BY need GROUP BY or aggregates in SELECT at 1:37"
+        );
+        assert_eq!(
+            e("select user_id, count() from events group by user_id order by nope").await,
+            "unknown column nope in table events (columns: ts, user_id, latency_ms, coupon, paid, tags) at 1:63"
         );
         assert_eq!(
             e("select ts as t, user_id as t from events").await,
@@ -1283,5 +1406,78 @@ mod tests {
             e("select count() from events group by tags").await,
             "grouping by column tags of type Array(String) is not supported at 1:37"
         );
+    }
+
+    #[tokio::test]
+    async fn aggregate_order_by_and_limit() {
+        let agg =
+            |sql: &'static str| async move { bind_sql(sql).await.unwrap().aggregation.unwrap() };
+        let keys = |a: &Aggregation| -> Vec<(String, bool, bool)> {
+            a.order
+                .iter()
+                .map(|k| (a.items[k.item].name.clone(), k.desc, k.nulls_first))
+                .collect()
+        };
+        // an alias, a default name, a selected grouping column; LIMIT
+        let a = agg(
+            "select user_id, count() as n, max(latency_ms) from events group by user_id \
+                     order by n desc, max(latency_ms), user_id limit 5",
+        )
+        .await;
+        assert_eq!(
+            keys(&a),
+            [
+                ("n".into(), true, false),
+                ("max(latency_ms)".into(), false, false),
+                ("user_id".into(), false, false)
+            ]
+        );
+        assert_eq!(a.limit, Some(5));
+        assert!(a.items.iter().all(|i| !i.hidden));
+        // a call matching a selected item uses it; others, and an unselected grouping column,
+        // are computed hidden
+        let a = agg("select count() as n from events group by user_id \
+                     order by count() desc, sum(latency_ms), user_id nulls first")
+        .await;
+        assert_eq!(
+            keys(&a),
+            [
+                ("n".into(), true, false),
+                ("__o0".into(), false, false),
+                ("__o1".into(), false, true)
+            ]
+        );
+        let hidden: Vec<(&str, &AggExpr)> = a
+            .items
+            .iter()
+            .filter(|i| i.hidden)
+            .map(|i| (i.name.as_str(), &i.expr))
+            .collect();
+        assert_eq!(
+            hidden,
+            [
+                (
+                    "__o0",
+                    &AggExpr::Call {
+                        func: AggFunc::Sum,
+                        arg: Some(ColumnId(2))
+                    }
+                ),
+                ("__o1", &AggExpr::Key(ColumnId(1)))
+            ]
+        );
+        // ALL: the output columns, in SELECT order
+        let a = agg("select user_id, count() from events group by user_id order by all desc").await;
+        assert_eq!(
+            keys(&a),
+            [
+                ("user_id".into(), true, false),
+                ("count()".into(), true, false)
+            ]
+        );
+        // LIMIT alone
+        let a = agg("select user_id from events group by user_id limit 3").await;
+        assert!(a.order.is_empty());
+        assert_eq!(a.limit, Some(3));
     }
 }

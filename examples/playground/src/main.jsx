@@ -15,6 +15,7 @@ const QUERY_PRESETS = [
   "select count() as events, sum(amount) as revenue, max(latency_ms) from events",
   "select path, min(latency_ms), max(latency_ms), sum(amount) from events where country = 'PL' group by path",
   "select country, uniqExact(user_id) as users, median(latency_ms) from events group by country",
+  "select country, count() as n, avg(latency_ms) from events group by country order by n desc limit 5",
   "select ts, user_id, country, path, latency_ms from events where latency_ms > 500",
   "select ts, user_id, country, latency_ms from events order by latency_ms desc",
   "select ts, user_id, country, path from events where country in ('PL', 'DE') order by country, ts desc",
@@ -315,7 +316,7 @@ function summarize(msg) {
       : c.op === "delete"
         ? `-@${c.index}`
         : c.op === "update"
-          ? `~${c.id}`
+          ? `~${c.id}${c.index !== undefined ? `@${c.index}` : ""}`
           : c.op,
   );
   const shown = ops.length > 12 ? [...ops.slice(0, 12), `… ${ops.length - 12} more`] : ops;

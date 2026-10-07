@@ -14,7 +14,6 @@ use futures::stream::{self, BoxStream, Stream, StreamExt};
 
 use crate::aggregate::chdb_run::{AggregateRun, ChdbTable};
 use crate::aggregate::native_run::NativeRun;
-use crate::aggregate::GroupDiffer;
 use crate::binder::{bind, BindError, Catalog};
 use crate::chdb::{Chdb, ChdbError};
 use crate::cursor;
@@ -395,6 +394,7 @@ impl Engine {
                     plan.stream.clone(),
                     events,
                     watermark.clone(),
+                    aggregate.result(),
                 );
                 let iterations = stream::unfold(run, |mut run| async move {
                     let next = run.step().await?;
@@ -419,6 +419,7 @@ impl Engine {
                 );
                 let create = aggregate.create_sql(&table, &remote);
                 tracing::info!(table, create = %create.replace(&self.native.password, "***"), "subscribed (aggregate, chDB)");
+                let result = aggregate.result();
                 let run = AggregateRun {
                     table: Arc::new(ChdbTable {
                         chdb: chdb.clone(),
@@ -430,7 +431,7 @@ impl Engine {
                     aggregate,
                     stream: plan.stream.clone(),
                     events,
-                    sent: GroupDiffer::default(),
+                    result,
                     at: watermark.clone(),
                     batches: 0,
                     failed: false,

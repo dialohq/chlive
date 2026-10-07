@@ -172,6 +172,20 @@ impl LiveResult {
                                         self.rows[i].insert(k.clone(), v.clone());
                                     }
                                     self.updated += 1;
+                                    // ordered aggregates: the row moves to `index`
+                                    match change["index"].as_u64().map(|t| t as usize) {
+                                        None => {}
+                                        Some(to) if to < self.rows.len() => {
+                                            let (row, id) =
+                                                (self.rows.remove(i), self.ids.remove(i));
+                                            self.rows.insert(to, row);
+                                            self.ids.insert(to, id);
+                                        }
+                                        Some(to) => self.protocol_violations.push(format!(
+                                            "move to {to} of {} rows",
+                                            self.rows.len()
+                                        )),
+                                    }
                                 }
                                 None => self
                                     .protocol_violations
@@ -402,7 +416,15 @@ pub fn tie_groups(rows: &[Row], keys: &[&str]) -> Vec<(String, Vec<String>)> {
     for row in rows {
         let key: Vec<String> = keys.iter().map(|k| row[*k].to_string()).collect();
         let key = key.join(" | ");
-        let text = serde_json::to_string(row).unwrap();
+        // floats to 9 significant digits: ClickHouse adds in parallel, in no particular order
+        let text = row
+            .iter()
+            .map(|(k, v)| match v.as_f64() {
+                Some(f) if !v.is_i64() && !v.is_u64() => format!("{k}={f:.9e}"),
+                _ => format!("{k}={v}"),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         match out.last_mut() {
             Some((last, rows)) if *last == key => rows.push(text),
             _ => out.push((key, vec![text])),

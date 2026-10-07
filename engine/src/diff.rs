@@ -16,8 +16,14 @@ pub enum Diff {
     },
     /// The row at `index` was removed (pushed out by LIMIT); the rows after it move one up.
     Delete { index: usize },
-    /// The row with this `id` has new values in these columns (aggregated results).
-    Update { id: String, set: Row },
+    /// The row with this `id` has new values in these columns (aggregated results), and, with
+    /// an `index` (ordered results), it moves: it's taken out, and put back so that it is at
+    /// `index`.
+    Update {
+        id: String,
+        set: Row,
+        index: Option<usize>,
+    },
 }
 
 impl Diff {
@@ -66,7 +72,7 @@ pub struct ResultList {
 impl ResultList {
     pub fn apply(&mut self, diff: &Diff) -> Result<(), String> {
         match diff {
-            Diff::Update { id, set } => {
+            Diff::Update { id, set, index } => {
                 let i = self
                     .ids
                     .iter()
@@ -74,6 +80,18 @@ impl ResultList {
                     .ok_or_else(|| format!("update of unknown row {id}"))?;
                 for (k, v) in set {
                     self.rows[i].insert(k.clone(), v.clone());
+                }
+                if let Some(to) = *index {
+                    if to >= self.rows.len() {
+                        return Err(format!(
+                            "move to index {to} of a result with {} rows",
+                            self.rows.len()
+                        ));
+                    }
+                    let row = self.rows.remove(i);
+                    let id = self.ids.remove(i);
+                    self.rows.insert(to, row);
+                    self.ids.insert(to, id);
                 }
             }
             Diff::Insert { index, id, .. } => {
@@ -99,7 +117,7 @@ impl ResultList {
 }
 
 /// `+ {row}`, `+ @2 {row}` with an index, `+ ["PL"] {row}` with an id, `- @3` for a delete,
-/// `~ ["PL"] {set}` for an update.
+/// `~ ["PL"] {set}` for an update, `~ ["PL"] @1 {set}` if it moves.
 impl std::fmt::Display for Diff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -114,7 +132,13 @@ impl std::fmt::Display for Diff {
                 write!(f, " {}", Value::Object(row.clone()))
             }
             Diff::Delete { index } => write!(f, "- @{index}"),
-            Diff::Update { id, set } => write!(f, "~ {id} {}", Value::Object(set.clone())),
+            Diff::Update { id, set, index } => {
+                write!(f, "~ {id}")?;
+                if let Some(i) = index {
+                    write!(f, " @{i}")?;
+                }
+                write!(f, " {}", Value::Object(set.clone()))
+            }
         }
     }
 }
