@@ -127,6 +127,28 @@ impl Producer {
     }
 }
 
+impl Producer {
+    /// Produce these messages (JSON), spread over the partitions. Returns the highest
+    /// acknowledged offset per partition.
+    pub async fn produce_json(&self, messages: &[String]) -> Result<Offsets> {
+        let mut offsets = Offsets::new();
+        for (i, payload) in messages.iter().enumerate() {
+            let d = self
+                .producer
+                .send(
+                    FutureRecord::<(), _>::to(&self.topic)
+                        .payload(payload)
+                        .partition(i as i32 % self.partitions),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|(e, _)| anyhow::anyhow!("kafka delivery failed: {e}"))?;
+            record(&mut offsets, d);
+        }
+        Ok(offsets)
+    }
+}
+
 fn record(offsets: &mut Offsets, d: rdkafka::producer::future_producer::Delivery) {
     let e = offsets.entry(d.partition).or_insert(-1);
     *e = (*e).max(d.offset);

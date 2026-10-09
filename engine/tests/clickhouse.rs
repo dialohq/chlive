@@ -23,15 +23,15 @@ fn url() -> String {
 
 /// Stands in for the pause server: ingestion is "paused" with the offsets the test put in
 /// ClickHouse. The clone is real.
-struct FixedPause(Watermark);
+struct FixedPause(Watermark, std::collections::HashMap<String, Watermark>);
 
 #[async_trait]
 impl Pauser for FixedPause {
-    async fn pause(&self, _: &SnapshotTable) -> Result<Paused, SnapshotError> {
+    async fn pause(&self, table: &SnapshotTable) -> Result<Paused, SnapshotError> {
         Ok(Paused {
             token: "t".into(),
             ttl: Duration::from_secs(60),
-            watermark: self.0.clone(),
+            watermark: self.1.get(&table.table).unwrap_or(&self.0).clone(),
         })
     }
     async fn resume(&self, _: &str) -> Result<(), SnapshotError> {
@@ -44,8 +44,18 @@ impl Pauser for FixedPause {
 
 /// An engine over `database`, whose tables hold the offsets in `watermark`.
 fn engine_at(database: String, source: MemorySource, watermark: Watermark) -> Engine {
+    engine_with(database, source, watermark, Default::default())
+}
+
+/// Like [`engine_at`], with other watermarks for some tables.
+fn engine_with(
+    database: String,
+    source: MemorySource,
+    watermark: Watermark,
+    tables: std::collections::HashMap<String, Watermark>,
+) -> Engine {
     let snapshots = SnapshotManager::start(
-        Arc::new(FixedPause(watermark)),
+        Arc::new(FixedPause(watermark, tables)),
         Arc::new(ClickHouseCloner::new(&url(), "default", "")),
         SnapshotConfig {
             refresh: Duration::from_secs(3600),
@@ -1035,4 +1045,168 @@ async fn aggregates_match_clickhouse() {
         exec(&format!("DROP DATABASE {database}")).await;
     } // the only test here using chDB: close it, or the test process crashes on exit
     chlive_engine::chdb::shutdown();
+}
+
+/// `IN (SELECT …)` over two tables, in every split of history and stream for both: the live
+/// result (history, then events, then users entering S with back-fills) equals ClickHouse's
+/// answer over all the data.
+#[tokio::test]
+async fn semi_joins_match_clickhouse() {
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    let users = ["PL", "DE", "PL", "FR", "PL", "DE", "US", "PL"];
+    let users: Vec<String> = users
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!(r#"{{"id":"u{i}","country":"{c}"}}"#))
+        .collect();
+    let events: Vec<String> = (0..30)
+        .map(|i| {
+            format!(
+                r#"{{"ts":"2026-10-01 12:00:{:02}.000","name":"e{i}","user_id":"u{}","amount":{}}}"#,
+                i % 60,
+                (i * 5) % 9, // u8 never has a user row: never in S
+                (i * 17 % 60) as f64
+            )
+        })
+        .collect();
+    const CASES: &[(&str, &[&str])] = &[
+        ("select name, user_id from events where user_id in (select id from users where country = 'PL')", &[]),
+        ("select name from events where amount > 10 and user_id in (select id from users where country != 'DE')", &[]),
+        ("select name, amount from events where user_id in (select id from users where country = 'PL') order by amount desc limit 4", &["amount"]),
+        ("select name, ts from events where user_id in (select id from users) order by ts", &["ts"]),
+        // the same table on both sides
+        ("select name from events where user_id in (select user_id from events where amount > 40)", &[]),
+    ];
+    let create = |db: &str| {
+        [
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!(
+                "CREATE TABLE {db}.events (ts DateTime64(3), name String, user_id String, \
+                 amount Float64) ENGINE = MergeTree ORDER BY tuple()"
+            ),
+            format!("CREATE TABLE {db}.users (id String, country String) ENGINE = MergeTree ORDER BY id"),
+        ]
+    };
+    let insert = |db: &str, table: &str, rows: &[String]| {
+        (!rows.is_empty()).then(|| {
+            format!(
+                "INSERT INTO {db}.{table} FORMAT JSONEachRow\n{}",
+                rows.join("\n")
+            )
+        })
+    };
+    // the reference: everything in ClickHouse
+    for sql in create("chlive_engine_semi_ref") {
+        exec(&sql).await;
+    }
+    exec(&insert("chlive_engine_semi_ref", "events", &events).unwrap()).await;
+    exec(&insert("chlive_engine_semi_ref", "users", &users).unwrap()).await;
+    let direct = ClickHouseHttp::new(&url(), "default", "");
+    let (ne, nu) = (events.len(), users.len());
+    let setups = [
+        ("chlive_engine_semi_history", ne, nu),
+        ("chlive_engine_semi_stream", 0, 0),
+        ("chlive_engine_semi_split", ne / 2, nu / 2),
+        ("chlive_engine_semi_users_later", ne, 0),
+        ("chlive_engine_semi_events_later", 0, nu),
+    ];
+    for (sql, keys) in CASES {
+        use chlive_engine::history::HistorySource;
+        let want = direct
+            .fetch(
+                &sql.replace("from events", "from chlive_engine_semi_ref.events")
+                    .replace("from users", "from chlive_engine_semi_ref.users"),
+            )
+            .await
+            .unwrap();
+        let limit = sql
+            .split_once(" limit ")
+            .map(|(_, n)| n.parse::<usize>().unwrap());
+        for (db, in_events, in_users) in setups {
+            for q in create(db) {
+                exec(&q).await;
+            }
+            if let Some(q) = insert(db, "events", &events[..in_events]) {
+                exec(&q).await;
+            }
+            if let Some(q) = insert(db, "users", &users[..in_users]) {
+                exec(&q).await;
+            }
+            let mut source = MemorySource::new();
+            for e in &events {
+                source.push("events", 0, e.as_str());
+            }
+            for u in &users {
+                source.push("users", 0, u.as_str());
+            }
+            let engine = engine_with(
+                db.into(),
+                source,
+                upto(in_events),
+                [("users".to_string(), upto(in_users))].into(),
+            );
+            let iterations: Vec<_> = engine
+                .subscribe(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{db}: {sql}: {e}"))
+                .map(|i| i.unwrap_or_else(|e| panic!("{db}: {sql}: {e}")))
+                .collect()
+                .await;
+            let mut rows = Vec::new();
+            for it in &iterations {
+                for d in &it.diffs {
+                    d.apply(&mut rows)
+                        .unwrap_or_else(|e| panic!("{db}: {sql}: {e}"));
+                }
+                if let Some(n) = limit {
+                    assert!(rows.len() <= n, "{db}: {sql}: {} rows", rows.len());
+                }
+            }
+            let canon = |rows: &[chlive_engine::diff::Row]| -> Vec<String> {
+                let mut v: Vec<String> = rows
+                    .iter()
+                    .map(|r| serde_json::to_string(r).unwrap())
+                    .collect();
+                v.sort();
+                v
+            };
+            if keys.is_empty() {
+                assert_eq!(canon(&rows), canon(&want), "{db}: {sql}");
+            } else {
+                // in order; ties as sets; with LIMIT, the last tie group by key and size
+                let groups = |rows: &[chlive_engine::diff::Row]| {
+                    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+                    for r in rows {
+                        let k: Vec<String> = keys.iter().map(|k| r[*k].to_string()).collect();
+                        let k = k.join("|");
+                        let text = serde_json::to_string(r).unwrap();
+                        match out.last_mut() {
+                            Some((last, rs)) if *last == k => rs.push(text),
+                            _ => out.push((k, vec![text])),
+                        }
+                    }
+                    for (_, rs) in &mut out {
+                        rs.sort();
+                    }
+                    if limit.is_some() {
+                        if let Some((k, rs)) = out.last_mut() {
+                            *rs = vec![format!("{k}: {}", rs.len())];
+                        }
+                    }
+                    out
+                };
+                assert_eq!(groups(&rows), groups(&want), "{db}: {sql}");
+            }
+            engine.shutdown().await;
+            eprintln!("{db:>32}: {sql}: {} rows", rows.len());
+        }
+    }
+    for (db, _, _) in setups {
+        exec(&format!("DROP DATABASE IF EXISTS {db}")).await;
+    }
+    exec("DROP DATABASE chlive_engine_semi_ref").await;
 }

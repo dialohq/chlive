@@ -505,3 +505,83 @@ async fn snapshots_are_refreshed_while_used_and_dropped_when_idle() -> Result<()
     })
     .await
 }
+
+/// A semi-join over two topics: events kept back until their user enters the sub-query (as a
+/// customer of this run's country), then back-filled from the snapshot and the kept-back tail.
+#[tokio::test]
+async fn semi_join_matches_clickhouse() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    // a country of this run only: the sub-query starts empty
+    let country = format!(
+        "X{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            % 1_000_000_000
+    );
+    let sql = format!(
+        "select ts, user_id, path from events \
+         where user_id in (select customer_id from customers where country = '{country}')"
+    );
+    with_server(config(), |server| {
+        async move {
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("semi", &sql);
+            conn.wait_ready(&["semi"], Duration::from_secs(60)).await?;
+            let events = producer()?;
+            let customers = producer::Producer::new(&config().kafka_brokers, "customers")?;
+            // events of users not in the sub-query yet: kept back
+            let mut produced = events.produce(500, Some(2000.0)).await?;
+            // 40 of the 5000 users become customers of this country: their events so far come
+            let new: Vec<String> = (0..40)
+                .map(|i| {
+                    format!(
+                        r#"{{"ts":"2026-10-09 00:00:00.000","customer_id":"u{}","name":"n","country":"{country}"}}"#,
+                        i * 125
+                    )
+                })
+                .collect();
+            let joined = customers.produce_json(&new).await?;
+            // and their later events pass
+            for (p, o) in events.produce(500, Some(2000.0)).await? {
+                let e = produced.entry(p).or_insert(o);
+                *e = (*e).max(o);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                let have = ingested_from("customers").await?;
+                if joined
+                    .iter()
+                    .all(|(p, o)| have.get(p).is_some_and(|h| h >= o))
+                {
+                    break;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "customers not ingested: {have:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            settle(&conn, &produced).await?;
+            let live = conn.result("semi").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert!(live.protocol_violations.is_empty(), "{:?}", live.protocol_violations);
+            let direct = clickhouse()
+                .fetch(
+                    &sql.replace("from events", "from default.events")
+                        .replace("from customers", "from default.customers"),
+                )
+                .await?;
+            eprintln!("semi: {} rows (inserted live {})", live.rows.len(), live.inserted);
+            assert!(!direct.is_empty());
+            assert_eq!(multiset(&live.rows), multiset(&direct));
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}

@@ -355,11 +355,16 @@ pub fn clickhouse() -> ClickHouseHttp {
 /// Highest offset per partition that ClickHouse has ingested into `default.events`, from the
 /// sink connector's exactly-once state (KeeperMap, keyed `events-<partition>`).
 pub async fn ingested() -> Result<BTreeMap<i32, i64>> {
+    ingested_from("events").await
+}
+
+/// The same for another topic's table.
+pub async fn ingested_from(topic: &str) -> Result<BTreeMap<i32, i64>> {
     let rows = clickhouse()
-        .fetch(
+        .fetch(&format!(
             "SELECT toInt32(splitByChar('-', key)[-1]) AS p, maxOffset AS o \
-             FROM default.chlive_sink_events_state WHERE state = 'AFTER_PROCESSING'",
-        )
+             FROM default.chlive_sink_{topic}_state WHERE state = 'AFTER_PROCESSING'"
+        ))
         .await?;
     Ok(rows
         .iter()
