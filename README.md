@@ -171,6 +171,18 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 - **Cost:** see [docs/bench/group-by.md](docs/bench/group-by.md). Natively ~1 M events/s per subscription one at a time, up to several M/s batched. chDB costs ~2–5 ms per batch, so ~500 events/s one at a time and ~150–500 k/s in batches of 1000.
 - Binaries call `chlive_engine::chdb::shutdown()` before exiting: with chDB open, its exit handlers crash the process.
 
+### IN sub-queries
+
+`SELECT … FROM events WHERE user_id IN (SELECT customer_id FROM customers WHERE country = 'PL')`: both tables are append-only, so the sub-query's keys (`S`) only grow, and outer rows only enter the result.
+
+- **History** is ClickHouse running the whole query over snapshots of both tables; `S` is read from the inner snapshot (`SELECT DISTINCT …`).
+- **Then both topics.** An inner event that passes the sub-query's WHERE adds its key to `S`. An outer event whose key is in `S` is placed as usual; one whose key isn't yet is **kept back**, by key.
+- **When a key enters `S`**, the outer rows of that key the result skipped come in, once each: those up to the outer table's latest snapshot from that snapshot (one query per batch of entering keys), those after it from the kept-back rows.
+- **The kept-back rows stay few:** every refresh interval (10 s), the subscription moves to the outer table's newest snapshot, once its stream is past it, and drops the kept-back rows that snapshot holds. So the state is the keys of `S` plus about one refresh interval of filtered, projected outer events. (Not before the stream is past it: back-filling from a snapshot ahead of the stream would send rows twice.)
+- An event of the same table in both roles counts for the sub-query first, so an event that brings its key into `S` is itself in the result, as in ClickHouse.
+- **Not yet:** resuming (a `since` gives a full snapshot), `NOT IN` (rows would have to leave the result), GROUP BY over a semi-join. Back-fills are cheap when the outer table's sort key (or a skip index) covers the key column.
+- In the dev stack, `customers` is a natural sub-query table: `produce customers '{"customer_id": "u7", "country": "PL"}'` brings u7's events into a query like the one above.
+
 ### Offline cache
 
 `new LiveClient({ url, cache: true })` keeps results between sessions in SQLite (sqlite-wasm) on OPFS, in a dedicated worker, using the `opfs-sahpool` VFS, so no COOP/COEP headers are needed. `cache: { budgetBytes }` sets its size (2 GB by default); `live.clearCache()` empties it (e.g. on logout). It's loaded only when enabled (`@sqlite.org/sqlite-wasm` is an optional peer dependency).
@@ -223,6 +235,7 @@ condition   := condition OR condition | condition AND condition | NOT condition 
              | operand {= | != | <> | < | <= | > | >=} operand
              | operand IS [NOT] NULL
              | operand [NOT] IN (literal [, literal ...])
+             | column IN (SELECT column FROM table [WHERE condition])   -- see below
              | operand
 operand     := column | literal
 literal     := number | -number | 'string' | TRUE | FALSE | NULL
@@ -235,4 +248,5 @@ column, table, alias := identifier | "identifier" | `identifier`
 - **GROUP BY / aggregates** (also without GROUP BY: one global group): selected columns must be grouping columns; no `SELECT *`. Groups are inserted, then updated.
   - **ORDER BY** takes an output name (an alias or a default name like `count()`), a grouping column, or an aggregate call (`order by count() desc`; one that isn't selected is computed anyway), or `ALL`. As values change, groups move: an `update` with an `index`. A group whose sort key changes goes after the groups it ties with.
   - **LIMIT n** keeps the first n groups by ORDER BY: a group falling out is deleted and the next one comes in, and the others are kept to come back in later. Without ORDER BY, it's the first n groups seen.
-- **Not yet:** OFFSET, `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, subqueries, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters.
+- **IN (subquery)**: one per query, as a top-level `AND` condition of the WHERE, over plain queries (with ORDER BY and LIMIT); the sub-query selects one column of one table, with an optional WHERE (the same table as the outer one is fine). See [IN sub-queries](#in-sub-queries).
+- **Not yet:** OFFSET, `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, `NOT IN (subquery)` and other sub-queries, IN sub-queries with GROUP BY, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters.
