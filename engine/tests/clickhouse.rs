@@ -439,6 +439,25 @@ async fn history_and_stream_agree_on_order_by() {
         ),
         ("select * from events order by label limit 6", &["label"]),
         ("select * from events order by score limit 0", &["score"]),
+        // OFFSET: the rows after the top M (with ties at both ends)
+        (
+            "select * from events order by score limit 4 offset 2",
+            &["score"],
+        ),
+        (
+            "select * from events order by n desc, score limit 3 offset 4",
+            &["n", "score"],
+        ),
+        (
+            "select name from events order by score desc nulls first offset 5",
+            &["score"],
+        ),
+        ("select * from events order by label limit 2, 3", &["label"]),
+        (
+            "select * from events where flag order by ts desc limit 2 offset 1",
+            &["ts"],
+        ),
+        ("select * from events order by n offset 20", &["n"]),
     ];
 
     let mut source = MemorySource::new();
@@ -561,11 +580,17 @@ async fn history_and_stream_agree_on_order_by() {
             out
         };
         // With LIMIT, which rows of the boundary tie group made it in is arbitrary (in ClickHouse
-        // too): compare that group by key and size only.
+        // too): compare that group by key and size only. With OFFSET, the first one too.
         let comparable = |list: &Vec<String>| -> Vec<(String, Vec<String>)> {
             let mut g = groups(list);
-            if limit_of(sql).is_some() {
+            let (limit, offset) = window_of(sql);
+            if limit.is_some() {
                 if let Some((key, names)) = g.last_mut() {
+                    *names = vec![format!("{key}: {} rows", names.len())];
+                }
+            }
+            if offset.is_some() {
+                if let Some((key, names)) = g.first_mut() {
                     *names = vec![format!("{key}: {} rows", names.len())];
                 }
             }
@@ -621,14 +646,86 @@ async fn history_and_stream_agree_on_order_by() {
     assert_eq!(lists[2].len(), 3);
     assert_eq!(lists[2][1..], ["n9", "n11"]);
 
+    // OFFSET without ORDER BY: the newest m rows are held back, the window is the n before them
+    // (the arrival order: the history in ClickHouse's order, then the stream)
+    for (sql, len, stream_only, split_tail) in [
+        // n1 n3 n5 n9 n11 match; the split has n1 n3 n5 in ClickHouse
+        (
+            "select name, n from events where n = 3 limit 2 offset 1",
+            2,
+            &["n5", "n9"][..],
+            &["n9"][..],
+        ),
+        (
+            "select name, n from events where n = 3 offset 2",
+            3,
+            &["n1", "n3", "n5"][..],
+            &[][..],
+        ),
+    ] {
+        let mut lists = Vec::new();
+        for (database, engine) in &engines {
+            let iterations: Vec<_> = engine
+                .subscribe(sql)
+                .await
+                .unwrap()
+                .map(|i| i.unwrap())
+                .collect()
+                .await;
+            let mut rows = Vec::new();
+            for it in &iterations {
+                for d in &it.diffs {
+                    d.apply(&mut rows).unwrap();
+                }
+            }
+            assert!(rows.iter().all(|r| r["n"] == 3), "{database}: {rows:?}");
+            let names: Vec<String> = rows
+                .iter()
+                .map(|r| r["name"].as_str().unwrap().to_string())
+                .collect();
+            eprintln!("{database}: {sql}: {}", names.join(" "));
+            assert_eq!(names.len(), len, "{database}: {sql}");
+            lists.push(names);
+        }
+        assert_eq!(lists[1], stream_only, "{sql}");
+        assert_eq!(
+            lists[2][lists[2].len() - split_tail.len()..],
+            *split_tail,
+            "{sql}"
+        );
+        // the split's history rows (n1 n3 n5, in ClickHouse's order) come first, all of them
+        // when nothing streamed is in the window
+        if split_tail.is_empty() {
+            let mut got = lists[2].clone();
+            got.sort();
+            assert_eq!(got, ["n1", "n3", "n5"], "{sql}");
+        }
+    }
+
     for (database, _) in &engines {
         exec(&format!("DROP DATABASE {database}")).await;
     }
 }
 
 fn limit_of(sql: &str) -> Option<usize> {
-    sql.split_once(" limit ")
-        .map(|(_, n)| n.trim().parse().unwrap())
+    window_of(sql).0
+}
+
+/// A case's LIMIT and OFFSET: `limit n [offset m]`, `limit m, n` or `offset m`.
+fn window_of(sql: &str) -> (Option<usize>, Option<usize>) {
+    let offset = sql
+        .split_once(" offset ")
+        .map(|(_, m)| m.trim().parse().unwrap());
+    match sql.split_once(" limit ") {
+        None => (None, offset),
+        Some((_, rest)) => {
+            let rest = rest.split(" offset ").next().unwrap().trim();
+            match rest.split_once(", ") {
+                Some((m, n)) => (Some(n.parse().unwrap()), Some(m.parse().unwrap())),
+                None => (Some(rest.parse().unwrap()), offset),
+            }
+        }
+    }
 }
 
 /// Resume: a client holds a result and its cursor; later it resumes with only what it missed.
@@ -868,6 +965,12 @@ async fn aggregates_match_clickhouse() {
         "select country, count() from events group by country order by sum(amount)",
         // LIMIT alone: any (the first) groups
         "select country from events group by country limit 2",
+        // OFFSET: groups come in and go out at both ends of the window
+        "select country, count() as n, sum(amount) as s from events group by country order by n desc limit 2 offset 1",
+        "select country, flag, avg(amount) as a from events group by country, flag order by a desc nulls first limit 3 offset 2",
+        "select country, flag, count() as c from events group by country, flag order by c, country, flag offset 3",
+        "select country, flag from events group by country, flag order by all desc limit 2, 3",
+        "select country from events group by country limit 2 offset 1",
     ];
     let mut engines = Vec::new();
     for (database, in_clickhouse) in [
@@ -933,7 +1036,13 @@ async fn aggregates_match_clickhouse() {
         let Some((_, order)) = sql.split_once(" order by ") else {
             return Vec::new();
         };
-        let order = order.split(" limit ").next().unwrap();
+        let order = order
+            .split(" limit ")
+            .next()
+            .unwrap()
+            .split(" offset ")
+            .next()
+            .unwrap();
         if order.starts_with("sum(") {
             return Vec::new();
         }
@@ -945,35 +1054,39 @@ async fn aggregates_match_clickhouse() {
             .map(|t| t.split(' ').next().unwrap().to_string())
             .collect()
     };
-    // in order, ties as sets; with LIMIT the last tie group by key and size
-    let tie_groups = |rows: &[chlive_engine::diff::Row], keys: &[String], limited: bool| {
-        let mut out: Vec<(String, Vec<String>)> = Vec::new();
-        for r in rows {
-            let key: Vec<String> = keys
-                .iter()
-                .map(|k| canon_row(&[(k.clone(), r[k].clone())].into_iter().collect()))
-                .collect();
-            let key = key.join("|");
-            match out.last_mut() {
-                Some((last, rs)) if *last == key => rs.push(canon_row(r)),
-                _ => out.push((key, vec![canon_row(r)])),
+    // in order, ties as sets; with LIMIT the last tie group by key and size, with OFFSET the first
+    let tie_groups =
+        |rows: &[chlive_engine::diff::Row], keys: &[String], limited: bool, offset: bool| {
+            let mut out: Vec<(String, Vec<String>)> = Vec::new();
+            for r in rows {
+                let key: Vec<String> = keys
+                    .iter()
+                    .map(|k| canon_row(&[(k.clone(), r[k].clone())].into_iter().collect()))
+                    .collect();
+                let key = key.join("|");
+                match out.last_mut() {
+                    Some((last, rs)) if *last == key => rs.push(canon_row(r)),
+                    _ => out.push((key, vec![canon_row(r)])),
+                }
             }
-        }
-        for (_, rs) in &mut out {
-            rs.sort();
-        }
-        if limited {
-            if let Some((k, rs)) = out.last_mut() {
-                *rs = vec![format!("{k}: {} rows", rs.len())];
+            for (_, rs) in &mut out {
+                rs.sort();
             }
-        }
-        out
-    };
+            if limited {
+                if let Some((k, rs)) = out.last_mut() {
+                    *rs = vec![format!("{k}: {} rows", rs.len())];
+                }
+            }
+            if offset {
+                if let Some((k, rs)) = out.first_mut() {
+                    *rs = vec![format!("{k}: {} rows", rs.len())];
+                }
+            }
+            out
+        };
     for sql in CASES {
         use chlive_engine::history::HistorySource;
-        let limit = sql
-            .split_once(" limit ")
-            .map(|(_, n)| n.parse::<usize>().unwrap());
+        let (limit, offset) = window_of(sql);
         let keys = order_columns(sql);
         let want = direct
             .fetch(&sql.replace("from events", "from chlive_engine_agg_history.events"))
@@ -994,7 +1107,9 @@ async fn aggregates_match_clickhouse() {
                     match d {
                         Diff::Insert { .. } => inserts += 1,
                         Diff::Update { .. } => updates += 1,
-                        Diff::Delete { .. } => assert!(limit.is_some(), "{sql}: a delete"),
+                        Diff::Delete { .. } => {
+                            assert!(limit.is_some() || offset.is_some(), "{sql}: a delete")
+                        }
                     }
                     list.apply(d)
                         .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
@@ -1010,17 +1125,20 @@ async fn aggregates_match_clickhouse() {
             );
             if !keys.is_empty() {
                 assert_eq!(
-                    tie_groups(&list.rows, &keys, limit.is_some()),
-                    tie_groups(&want, &keys, limit.is_some()),
+                    tie_groups(&list.rows, &keys, limit.is_some(), offset.is_some()),
+                    tie_groups(&want, &keys, limit.is_some(), offset.is_some()),
                     "{database}: {sql}\n  live   {:?}\n  direct {:?}",
                     canon(&list.rows),
                     canon(&want)
                 );
-            } else if let Some(n) = limit {
-                // any n groups: as many, each one of the whole result's
+            } else if limit.is_some() || offset.is_some() {
+                // any n groups (after any m): as many, each one of the whole result's
                 let all = direct
                     .fetch(
                         &sql.split(" limit ")
+                            .next()
+                            .unwrap()
+                            .split(" offset ")
                             .next()
                             .unwrap()
                             .replace("from events", "from chlive_engine_agg_history.events"),
@@ -1028,7 +1146,12 @@ async fn aggregates_match_clickhouse() {
                     .await
                     .unwrap();
                 let all = canon(&all);
-                assert_eq!(list.rows.len(), n.min(all.len()), "{database}: {sql}");
+                let after = all.len().saturating_sub(offset.unwrap_or(0));
+                assert_eq!(
+                    list.rows.len(),
+                    limit.map_or(after, |n| n.min(after)),
+                    "{database}: {sql}"
+                );
                 for r in canon(&list.rows) {
                     assert!(all.contains(&r), "{database}: {sql}: {r} isn't a group");
                 }
@@ -1078,6 +1201,7 @@ async fn semi_joins_match_clickhouse() {
         ("select name from events where amount > 10 and user_id in (select id from users where country != 'DE')", &[], None),
         ("select name, amount from events where user_id in (select id from users where country = 'PL') order by amount desc limit 4", &["amount"], None),
         ("select name, ts from events where user_id in (select id from users) order by ts", &["ts"], None),
+        ("select name, amount from events where user_id in (select id from users where country = 'PL') order by amount desc limit 3 offset 2", &["amount"], None),
         // the same table on both sides
         ("select name from events where user_id in (select user_id from events where amount > 40)", &[], None),
         // correlated EXISTS, with aliases: the same semi-join (ClickHouse answers the IN form)
@@ -1142,9 +1266,7 @@ async fn semi_joins_match_clickhouse() {
             )
             .await
             .unwrap();
-        let limit = sql
-            .split_once(" limit ")
-            .map(|(_, n)| n.parse::<usize>().unwrap());
+        let (limit, offset) = window_of(sql);
         for (db, in_events, in_users) in setups {
             for q in create(db) {
                 exec(&q).await;
@@ -1213,6 +1335,11 @@ async fn semi_joins_match_clickhouse() {
                     }
                     if limit.is_some() {
                         if let Some((k, rs)) = out.last_mut() {
+                            *rs = vec![format!("{k}: {}", rs.len())];
+                        }
+                    }
+                    if offset.is_some() {
+                        if let Some((k, rs)) = out.first_mut() {
                             *rs = vec![format!("{k}: {}", rs.len())];
                         }
                     }

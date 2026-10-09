@@ -433,6 +433,25 @@ async fn limit_sends_deletes_in_the_same_diff() {
 }
 
 #[tokio::test]
+async fn offset_holds_back_rows_and_is_in_the_snapshot() {
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+    // without ORDER BY: the newest row is held back; the history's only row is it
+    c.subscribe("o", "select user_id from requests limit 1 offset 1")
+        .await;
+    let snapshot = c.expect().await;
+    assert_eq!(snapshot["limit"], 1);
+    assert_eq!(snapshot["offset"], 1);
+    assert_eq!(snapshot["rows"], json!([]));
+    // the next event is held back instead, and h1 comes into the result
+    let m = c.expect().await;
+    assert_eq!(
+        m["changes"][0],
+        json!({"op": "insert", "row": {"user_id": "h1"}})
+    );
+}
+
+#[tokio::test]
 async fn resume_from_a_cursor_sends_only_what_is_missing() {
     let server = server().await;
     let sql = "select user_id from requests";

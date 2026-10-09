@@ -70,6 +70,12 @@ impl HistorySource for FakeHistory {
                 row(json!({"user_id": "h500b", "__order_0": 500})),
             ]),
             s if s == format!("{slow} LIMIT 2") => Ok(vec![row(json!({"user_id": "h900"}))]),
+            // LIMIT 2 OFFSET 1 without ORDER BY: the first 3, in ClickHouse's order
+            s if s == format!("{slow} LIMIT 3") => Ok(vec![
+                row(json!({"user_id": "h1"})),
+                row(json!({"user_id": "h2"})),
+                row(json!({"user_id": "h3"})),
+            ]),
             "SELECT user_id FROM default.requests" => {
                 Ok(vec![row(json!({"user_id": "slow-history"}))])
             }
@@ -412,6 +418,77 @@ async fn limit_without_order_by_is_a_window_of_the_latest_rows() {
         ]
     );
     assert_eq!(names_within(&iterations, Some(2)), ["e2", "e3"]);
+}
+
+#[tokio::test]
+async fn offset_without_order_by_holds_back_the_newest_rows() {
+    let mut source = MemorySource::new();
+    source
+        .push("requests", 0, r#"{"user_id": "h1", "latency_ms": 900}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "e1", "latency_ms": 200}"#)
+        .push("requests", 0, r#"{"user_id": "fast", "latency_ms": 5}"#)
+        .push("requests", 0, r#"{"user_id": "e2", "latency_ms": 300}"#);
+    let subscription = engine(source)
+        .subscribe("select user_id from requests where latency_ms > 100 limit 2 offset 1")
+        .await
+        .unwrap();
+    // the rows held back come from ClickHouse too
+    assert!(
+        subscription.history_sql.ends_with(" LIMIT 3"),
+        "{}",
+        subscription.history_sql
+    );
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    let lines: Vec<String> = iterations
+        .iter()
+        .filter(|i| !i.diffs.is_empty())
+        .map(|i| i.to_string())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            // h3, the newest of the history, is held back
+            "+ {\"user_id\":\"h1\"}\n+ {\"user_id\":\"h2\"}\nhistory: 2 rows",
+            // each new row is held back, and the oldest held one slides in
+            "requests/0:1 + {\"user_id\":\"h3\"}\nrequests/0:1 - @0",
+            "requests/0:3 + {\"user_id\":\"e1\"}\nrequests/0:3 - @0",
+        ]
+    );
+    assert_eq!(names_within(&iterations, Some(2)), ["h3", "e1"]);
+}
+
+#[tokio::test]
+async fn order_by_with_offset_slides_rows_in_from_above() {
+    let mut source = MemorySource::new();
+    source
+        .push("requests", 0, r#"{"user_id": "h900", "latency_ms": 900}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "e1000", "latency_ms": 1000}"#) // above the result
+        .push("requests", 0, r#"{"user_id": "e700", "latency_ms": 700}"#) // inside it
+        .push("requests", 0, r#"{"user_id": "e150", "latency_ms": 150}"#); // below it
+    let subscription = engine(source)
+        .subscribe(
+            "select user_id from requests where latency_ms > 100 \
+             order by latency_ms desc limit 2 offset 1",
+        )
+        .await
+        .unwrap();
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    let lines: Vec<String> = iterations
+        .iter()
+        .filter(|i| !i.diffs.is_empty())
+        .map(|i| i.to_string())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            // the top 3 fetched; h900 is above the result
+            "+ {\"user_id\":\"h500\"}\n+ {\"user_id\":\"h500b\"}\nhistory: 2 rows",
+            // e1000 lands above: h900 slides in at the top, h500b out at the bottom
+            "requests/0:1 + @0 {\"user_id\":\"h900\"}\nrequests/0:1 - @2",
+            "requests/0:2 + @1 {\"user_id\":\"e700\"}\nrequests/0:2 - @2",
+        ]
+    );
+    assert_eq!(names_within(&iterations, Some(2)), ["h900", "e700"]);
 }
 
 #[tokio::test]

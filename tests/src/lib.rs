@@ -399,9 +399,13 @@ pub async fn direct(sql: &str) -> Result<Vec<Row>> {
         .explain(sql)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(clickhouse()
+    let rows = clickhouse()
         .fetch(&plan.history.sql(&plan.history.table))
-        .await?)
+        .await?;
+    // the history has the rows above an OFFSET too (the engine holds them): skip them, as
+    // ClickHouse's OFFSET would
+    let skip = plan.stream.offset.unwrap_or(0) as usize;
+    Ok(rows.into_iter().skip(skip).collect())
 }
 
 /// Rows as a sorted list of their JSON, to compare results as multisets (duplicates count).

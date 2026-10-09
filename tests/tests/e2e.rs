@@ -22,6 +22,8 @@ const CASES: &[(&str, &str, &[&str])] = &[
     ("by_all", "select country, path, amount from events where amount > 0 order by all", &["country", "path", "amount"]),
     ("top_latency", "select ts, user_id, latency_ms from events order by latency_ms desc limit 50", &["latency_ms"]),
     ("window", "select ts, user_id, latency_ms from events where latency_ms > 100 limit 100", &[]),
+    ("top_offset", "select ts, user_id, latency_ms from events order by latency_ms desc limit 10 offset 5", &["latency_ms"]),
+    ("window_offset", "select ts, user_id, latency_ms from events where latency_ms > 100 limit 20 offset 7", &[]),
 ];
 
 #[tokio::test]
@@ -221,18 +223,14 @@ async fn unsubscribe_stops_the_stream() -> Result<()> {
     .await
 }
 
-/// LIMIT: never more rows than the limit (checked after every diff by the harness).
-/// - With ORDER BY, the same tie groups as ClickHouse's top N, except which rows of the last
-///   (boundary) group made it in, which is arbitrary in ClickHouse too.
+/// LIMIT (and OFFSET): never more rows than the limit (checked after every diff by the harness).
+/// - With ORDER BY, the same tie groups as ClickHouse's top N (after the top M), except which
+///   rows of the boundary groups made it in, which is arbitrary in ClickHouse too.
 /// - Without, a window: full, every row matching, the streamed rows last.
 fn check_limited(id: &str, sql: &str, keys: &[&str], live: &LiveResult, direct: &[Row]) {
-    let limit: usize = sql
-        .rsplit(" limit ")
-        .next()
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let (_, window) = sql.rsplit_once(" limit ").unwrap();
+    let limit: usize = window.split_whitespace().next().unwrap().parse().unwrap();
+    let offset = window.contains(" offset ");
     assert_eq!(live.limit, Some(limit), "{id}");
     if keys.is_empty() {
         assert_eq!(live.rows.len(), limit, "{id}: window not full");
@@ -249,6 +247,11 @@ fn check_limited(id: &str, sql: &str, keys: &[&str], live: &LiveResult, direct: 
         let mut g = tie_groups(rows, keys);
         if let Some((key, rows)) = g.last_mut() {
             *rows = vec![format!("{key}: {} rows", rows.len())];
+        }
+        if offset {
+            if let Some((key, rows)) = g.first_mut() {
+                *rows = vec![format!("{key}: {} rows", rows.len())];
+            }
         }
         g
     };
