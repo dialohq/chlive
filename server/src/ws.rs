@@ -262,6 +262,10 @@ async fn run(
         .aggregate
         .as_ref()
         .map_or(plan.stream.limit, |a| a.limit);
+    let offset = plan
+        .aggregate
+        .as_ref()
+        .map_or(plan.stream.offset, |a| a.offset);
     let mut columns = Some(columns);
     if subscription.resumed {
         let resume = ServerMsg::Resume {
@@ -310,6 +314,7 @@ async fn run(
                             .collect(),
                         order: order.clone(),
                         limit,
+                        offset,
                         at: cursor::encode(&plan, &it.at),
                         ids: plan.aggregate.is_some().then_some(ids),
                     });

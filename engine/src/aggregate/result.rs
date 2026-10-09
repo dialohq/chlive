@@ -44,6 +44,8 @@ pub struct GroupResult {
     terms: Vec<GroupOrderTerm>,
     order: KeyOrder,
     limit: usize,
+    /// The window starts after this many groups (OFFSET).
+    offset: usize,
     /// Columns computed only to order by (`__o0`, …), never sent.
     hidden: Vec<String>,
     /// Every group, in result order.
@@ -58,7 +60,12 @@ pub struct GroupResult {
 }
 
 impl GroupResult {
-    pub fn new(terms: Vec<GroupOrderTerm>, limit: Option<u64>, hidden: Vec<String>) -> Self {
+    pub fn new(
+        terms: Vec<GroupOrderTerm>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+        hidden: Vec<String>,
+    ) -> Self {
         let order = KeyOrder(
             terms
                 .iter()
@@ -74,6 +81,7 @@ impl GroupResult {
             terms,
             order,
             limit: limit.map_or(usize::MAX, |n| n as usize),
+            offset: offset.map_or(0, |m| m as usize),
             hidden,
             ranked: Vec::new(),
             keys: HashMap::new(),
@@ -87,7 +95,8 @@ impl GroupResult {
         !self.terms.is_empty()
     }
 
-    /// The history: every group ranked; the first `limit`, in order, as appended inserts.
+    /// The history: every group ranked; the window (`limit` after `offset`), in order, as
+    /// appended inserts.
     pub fn history(&mut self, groups: Vec<(String, Row)>) -> Vec<Diff> {
         for (id, row) in groups {
             let (key, row) = self.split(row);
@@ -95,7 +104,7 @@ impl GroupResult {
             self.rows.insert(id, row);
         }
         let mut diffs = Vec::new();
-        for e in self.ranked.iter().take(self.limit) {
+        for e in self.ranked.iter().skip(self.offset).take(self.limit) {
             let row = self.rows[&e.id].clone();
             self.sent.insert(e.id.clone(), row.clone());
             diffs.push(Diff::Insert {
@@ -117,6 +126,9 @@ impl GroupResult {
     }
 
     fn touch(&mut self, id: String, row: Row, diffs: &mut Vec<Diff>) {
+        if self.offset > 0 {
+            return self.touch_window(id, row, diffs);
+        }
         let (key, row) = self.split(row);
         let old = self.position(&id);
         let moved = match old {
@@ -181,6 +193,90 @@ impl GroupResult {
                 }
             }
             (false, false) => {}
+        }
+    }
+
+    /// The ids in the window, in order.
+    fn window(&self) -> Vec<String> {
+        self.ranked
+            .iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .map(|e| e.id.clone())
+            .collect()
+    }
+
+    /// With an OFFSET, a group moving can bring groups into the window, or take them out, at
+    /// either end. From the window before and after: delete the groups that left, move the
+    /// touched group if it stayed, insert the groups that came in (each change into the list
+    /// as the previous one left it).
+    fn touch_window(&mut self, id: String, row: Row, diffs: &mut Vec<Diff>) {
+        use std::collections::HashSet;
+        let before = self.window();
+        let (key, row) = self.split(row);
+        let old = self.position(&id);
+        let moved = match old {
+            Some(p) => self.order.cmp(&self.ranked[p].key, &key) != Ordering::Equal,
+            None => true,
+        };
+        if moved {
+            if let Some(p) = old {
+                self.ranked.remove(p);
+            }
+            self.place(&id, key);
+        }
+        self.rows.insert(id.clone(), row);
+        let after = self.window();
+        let staying: HashSet<&String> = after.iter().collect();
+        let mut list = before;
+        for i in (0..list.len()).rev() {
+            if !staying.contains(&list[i]) {
+                diffs.push(Diff::Delete { index: i });
+                self.sent.remove(&list[i]);
+                list.remove(i);
+            }
+        }
+        if let Some(cur) = list.iter().position(|x| *x == id) {
+            let kept: HashSet<&String> = list.iter().collect();
+            let target = after
+                .iter()
+                .filter(|x| kept.contains(x))
+                .position(|x| *x == id)
+                .expect("stays");
+            let sent = self.sent.get_mut(&id).expect("sent");
+            let set: Row = self.rows[&id]
+                .iter()
+                .filter(|(k, v)| sent.get(*k) != Some(*v))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (k, v) in &set {
+                sent.insert(k.clone(), v.clone());
+            }
+            let to = (target != cur).then_some(target);
+            if let Some(t) = to {
+                let x = list.remove(cur);
+                list.insert(t, x);
+            }
+            if !set.is_empty() || to.is_some() {
+                diffs.push(Diff::Update {
+                    id: id.clone(),
+                    set,
+                    index: to,
+                });
+            }
+        }
+        let ordered = self.ordered();
+        let present: HashSet<String> = list.iter().cloned().collect();
+        for (j, x) in after.iter().enumerate() {
+            if !present.contains(x) {
+                let row = self.rows[x].clone();
+                self.sent.insert(x.clone(), row.clone());
+                diffs.push(Diff::Insert {
+                    row,
+                    index: ordered.then_some(j),
+                    id: Some(x.clone()),
+                });
+            }
         }
     }
 
@@ -265,7 +361,7 @@ mod tests {
 
     #[test]
     fn moves_within_an_ordered_result() {
-        let mut r = GroupResult::new(vec![term("n", true)], None, vec![]);
+        let mut r = GroupResult::new(vec![term("n", true)], None, None, vec![]);
         assert_eq!(
             lines(&r.history(vec![row("a", 1), row("b", 5), row("c", 3)])),
             [
@@ -295,7 +391,7 @@ mod tests {
 
     #[test]
     fn a_limit_brings_groups_in_and_out() {
-        let mut r = GroupResult::new(vec![term("n", true)], Some(2), vec![]);
+        let mut r = GroupResult::new(vec![term("n", true)], Some(2), None, vec![]);
         assert_eq!(
             lines(&r.history(vec![row("a", 1), row("b", 5), row("c", 3)])),
             [r#"+ ["b"] {"g":"b","n":5}"#, r#"+ ["c"] {"g":"c","n":3}"#]
@@ -323,23 +419,33 @@ mod tests {
 
     #[test]
     fn unordered_results_append_and_a_limit_keeps_the_first_groups() {
-        let mut r = GroupResult::new(vec![], None, vec![]);
+        let mut r = GroupResult::new(vec![], None, None, vec![]);
         r.history(vec![row("a", 1)]);
         assert_eq!(
             lines(&r.batch(vec![row("b", 2), row("a", 7)])),
             [r#"+ ["b"] {"g":"b","n":2}"#, r#"~ ["a"] {"n":7}"#]
         );
-        let mut r = GroupResult::new(vec![], Some(1), vec![]);
+        let mut r = GroupResult::new(vec![], Some(1), None, vec![]);
         assert_eq!(lines(&r.history(vec![row("a", 1), row("b", 1)])).len(), 1);
         assert_eq!(
             lines(&r.batch(vec![row("b", 5), row("c", 1), row("a", 2)])),
             [r#"~ ["a"] {"n":2}"#]
         );
+        // OFFSET 1 LIMIT 2: the 2nd and 3rd groups seen; they never move
+        let mut r = GroupResult::new(vec![], Some(2), Some(1), vec![]);
+        assert_eq!(
+            lines(&r.history(vec![row("a", 1), row("b", 1)])),
+            [r#"+ ["b"] {"g":"b","n":1}"#]
+        );
+        assert_eq!(
+            lines(&r.batch(vec![row("a", 3), row("c", 1), row("d", 1), row("b", 4)])),
+            [r#"+ ["c"] {"g":"c","n":1}"#, r#"~ ["b"] {"n":4}"#]
+        );
     }
 
     #[test]
     fn hidden_order_columns_are_not_sent() {
-        let mut r = GroupResult::new(vec![term("__o0", false)], None, vec!["__o0".into()]);
+        let mut r = GroupResult::new(vec![term("__o0", false)], None, None, vec!["__o0".into()]);
         let with = |g: &str, o: i64| {
             let (id, mut r) = row(g, 1);
             r.insert("__o0".into(), json!(o));
@@ -364,13 +470,16 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) % n
         };
-        for (desc, limit) in [
-            (true, None),
-            (false, Some(3)),
-            (true, Some(5)),
-            (true, Some(1)),
+        for (desc, limit, offset) in [
+            (true, None, None),
+            (false, Some(3), None),
+            (true, Some(5), None),
+            (true, Some(1), None),
+            (true, Some(3), Some(2)),
+            (false, None, Some(3)),
+            (true, Some(1), Some(4)),
         ] {
-            let mut r = GroupResult::new(vec![term("n", desc)], limit, vec![]);
+            let mut r = GroupResult::new(vec![term("n", desc)], limit, offset, vec![]);
             let mut latest: HashMap<String, i64> = HashMap::new();
             let mut list = ResultList::default();
             for d in r.history(vec![row("g0", 5), row("g1", 5)]) {
@@ -394,9 +503,13 @@ mod tests {
                 }
                 let mut want: Vec<i64> = latest.values().copied().collect();
                 want.sort_by(|a, b| if desc { b.cmp(a) } else { a.cmp(b) });
-                want.truncate(limit.map_or(usize::MAX, |n| n as usize));
+                let want: Vec<i64> = want
+                    .into_iter()
+                    .skip(offset.map_or(0, |m| m as usize))
+                    .take(limit.map_or(usize::MAX, |n| n as usize))
+                    .collect();
                 let got: Vec<i64> = list.rows.iter().map(|r| r["n"].as_i64().unwrap()).collect();
-                assert_eq!(got, want, "desc {desc}, limit {limit:?}");
+                assert_eq!(got, want, "desc {desc}, limit {limit:?}, offset {offset:?}");
                 for (id, r) in list.ids.iter().zip(&list.rows) {
                     assert_eq!(latest[id.as_ref().unwrap()], r["n"].as_i64().unwrap());
                 }

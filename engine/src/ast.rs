@@ -14,6 +14,8 @@ pub struct Query {
     pub order: Option<Order>,
     /// `LIMIT n`.
     pub limit: Option<Limit>,
+    /// `OFFSET m` (also `LIMIT m, n`): the rows the result starts after.
+    pub offset: Option<Limit>,
 }
 
 /// `LIMIT n`; `span` is the number's.

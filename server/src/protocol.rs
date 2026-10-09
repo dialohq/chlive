@@ -60,6 +60,10 @@ pub enum ServerMsg {
         /// The LIMIT: the result never has more rows (at the end of each diff).
         #[serde(skip_serializing_if = "Option::is_none")]
         limit: Option<u64>,
+        /// The OFFSET: the rows (or groups) the result starts after, which the client never
+        /// sees. Informational; the diffs already account for it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
         /// The cursor of this result.
         at: String,
         /// Aggregated results: each row's id (its group's key), in row order.
@@ -266,6 +270,7 @@ mod tests {
             rows: vec![row.clone()],
             order: None,
             limit: None,
+            offset: None,
             at: "c".into(),
             ids: None,
         };

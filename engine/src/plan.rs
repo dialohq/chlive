@@ -124,6 +124,8 @@ pub struct AggregatePlan {
     pub order: Vec<crate::aggregate::result::GroupOrderTerm>,
     /// LIMIT: how many groups the result has (by `order`, or the first seen).
     pub limit: Option<u64>,
+    /// OFFSET: how many groups (by `order`, or the first seen) come before the result.
+    pub offset: Option<u64>,
     /// Columns computed only for ORDER BY (`__o0`, …), not output.
     pub hidden: Vec<String>,
     /// When every aggregate has a native implementation: how to run without chDB.
@@ -167,6 +169,7 @@ impl AggregatePlan {
         crate::aggregate::result::GroupResult::new(
             self.order.clone(),
             self.limit,
+            self.offset,
             self.hidden.clone(),
         )
     }
@@ -397,6 +400,7 @@ fn aggregate_plan(agg: &Aggregation, table: &BoundTable, filter: Option<String>)
             })
             .collect(),
         limit: agg.limit,
+        offset: agg.offset,
         hidden: agg
             .items
             .iter()
@@ -513,6 +517,9 @@ pub struct StreamPlan {
     pub order: Option<OrderPlan>,
     /// LIMIT: with ORDER BY, the top N; without, a window of the latest N rows.
     pub limit: Option<u64>,
+    /// OFFSET: with ORDER BY, the result starts after the top M; without, the newest M rows
+    /// are held back.
+    pub offset: Option<u64>,
 }
 
 /// ORDER BY for the stream: the keys, and where each key's value is found in a history row.
@@ -813,6 +820,9 @@ impl std::fmt::Display for Plan {
                     terms.join(", ")
                 )?;
             }
+            if let Some(m) = a.offset {
+                writeln!(f, "offset:  {m} groups come before the result")?;
+            }
             if let Some(n) = a.limit {
                 writeln!(
                     f,
@@ -891,6 +901,19 @@ impl std::fmt::Display for Plan {
             )?,
             (None, _) => {}
         }
+        match (self.stream.offset, &self.stream.order) {
+            (Some(m), Some(_)) => write!(
+                f,
+                "\noffset:  {m} (the result starts after the top {m}, whose rows are held to \
+                 slide in when a row lands above)"
+            )?,
+            (Some(m), None) => write!(
+                f,
+                "\noffset:  {m} (the newest {m} rows are held back; each new one moves the oldest \
+                 of them into the window)"
+            )?,
+            (None, _) => {}
+        }
         Ok(())
     }
 }
@@ -966,7 +989,8 @@ pub fn plan(bound: &BoundQuery) -> Plan {
         select: select_list.join(", "),
         filter: bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
         order: order_sql,
-        limit: bound.limit,
+        // with OFFSET the engine needs the rows above the window too: the first m + n
+        limit: bound.limit.map(|n| n + bound.offset.unwrap_or(0)),
         keys_select: (!order_columns.is_empty()).then(|| {
             let mut fields: Vec<String> = Vec::new();
             for o in &order_columns {
@@ -1057,6 +1081,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             hidden,
         }),
         limit: bound.limit,
+        offset: bound.offset,
     };
     Plan {
         table: table.name.clone(),
@@ -1105,6 +1130,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
         },
         order: None,
         limit: None,
+        offset: None,
     };
     let float = |t: &Type| t.kind == crate::types::Kind::Float;
     SemiPlan {
@@ -1172,6 +1198,7 @@ mod tests {
                 .collect(),
             order: Vec::new(),
             limit: None,
+            offset: None,
             aggregation: None,
             semi_join: None,
         }

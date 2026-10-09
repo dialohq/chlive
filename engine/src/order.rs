@@ -9,7 +9,10 @@
 
 use std::cmp::Ordering;
 
+use std::collections::VecDeque;
+
 use crate::binder::OrderKey;
+use crate::diff::{Diff, Row};
 use crate::types::Value;
 
 /// The ORDER BY values of one row, most significant first.
@@ -186,6 +189,153 @@ impl WindowState {
     }
 }
 
+/// ORDER BY with OFFSET m (and maybe LIMIT n): the result is ranks `[m, m + n)`. The state
+/// holds the sort keys of the top `m + n`, and the rows of the top `m`: a row landing above the
+/// result shifts it, and the row at rank `m - 1` slides in at its top. Ties: a new row goes after
+/// the rows it ties with, as in [`OrderedState`].
+#[derive(Debug, Clone)]
+pub struct OffsetState {
+    order: KeyOrder,
+    entries: Vec<OffsetEntry>,
+    offset: usize,
+    /// `m + n`; unbounded without LIMIT.
+    cap: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct OffsetEntry {
+    key: SortKey,
+    /// Only for ranks `< m`: the rows the client doesn't have, which may slide in.
+    row: Option<Row>,
+}
+
+impl OffsetState {
+    pub fn new(order: KeyOrder, offset: u64, limit: Option<u64>) -> Self {
+        let offset = offset as usize;
+        let limit = limit.map(|n| n as usize);
+        Self {
+            order,
+            entries: Vec::new(),
+            offset,
+            cap: limit.map(|n| offset + n),
+            limit,
+        }
+    }
+
+    /// The next row of the (ordered, `LIMIT m + n`) history: `Some` if it's in the result, to
+    /// send; `None` if it's above it (kept, to slide in later).
+    pub fn push_history(&mut self, key: SortKey, row: Row) -> Option<Row> {
+        if self.cap.is_some_and(|c| self.entries.len() >= c) {
+            return None;
+        }
+        let above = self.entries.len() < self.offset;
+        self.entries.push(OffsetEntry {
+            key,
+            row: above.then(|| row.clone()),
+        });
+        (!above).then_some(row)
+    }
+
+    /// A new row: placed after every row that sorts before it or ties with it.
+    pub fn insert(&mut self, key: SortKey, row: Row) -> Vec<Diff> {
+        let p = self
+            .entries
+            .partition_point(|e| self.order.cmp(&e.key, &key) != Ordering::Greater);
+        if self.cap.is_some_and(|c| p >= c) {
+            return Vec::new(); // below the result
+        }
+        let m = self.offset;
+        let mut diffs = Vec::new();
+        if p < m {
+            self.entries.insert(
+                p,
+                OffsetEntry {
+                    key,
+                    row: Some(row),
+                },
+            );
+            // the row pushed from rank m - 1 to m comes into the result, at its top
+            if let Some(e) = self.entries.get_mut(m) {
+                let row = e.row.take().expect("rows are kept above the result");
+                diffs.push(Diff::Insert {
+                    row,
+                    index: Some(0),
+                    id: None,
+                });
+            }
+        } else {
+            self.entries.insert(p, OffsetEntry { key, row: None });
+            diffs.push(Diff::Insert {
+                row,
+                index: Some(p - m),
+                id: None,
+            });
+        }
+        if let (Some(c), Some(n)) = (self.cap, self.limit) {
+            if self.entries.len() > c {
+                self.entries.pop();
+                diffs.push(Diff::Delete { index: n });
+            }
+        }
+        diffs
+    }
+}
+
+/// No ORDER BY, with OFFSET m (and maybe LIMIT n): a sliding window over the arrival order. The
+/// newest `m` rows are held back; the result is the `n` before them. A new row is held back,
+/// the oldest held-back row comes into the result at its bottom, and, with a full result, the
+/// oldest one leaves at the top.
+#[derive(Debug, Clone)]
+pub struct HeldWindow {
+    held: VecDeque<Row>,
+    offset: usize,
+    limit: Option<u64>,
+    visible: u64,
+}
+
+impl HeldWindow {
+    pub fn new(offset: u64, limit: Option<u64>) -> Self {
+        Self {
+            held: VecDeque::new(),
+            offset: offset as usize,
+            limit,
+            visible: 0,
+        }
+    }
+
+    /// The history (`LIMIT m + n`, in ClickHouse's order, as the arrival order): its last `m`
+    /// rows are held back; the rows before them are the result, returned to send.
+    pub fn history(&mut self, rows: Vec<Row>) -> Vec<Row> {
+        let mut rows = rows;
+        let split = rows.len().saturating_sub(self.offset);
+        self.held = rows.split_off(split).into();
+        if let Some(n) = self.limit {
+            // the n before the held-back ones
+            let extra = rows.len().saturating_sub(n as usize);
+            rows.drain(..extra);
+        }
+        self.visible = rows.len() as u64;
+        rows
+    }
+
+    pub fn push(&mut self, row: Row) -> Vec<Diff> {
+        self.held.push_back(row);
+        if self.held.len() <= self.offset {
+            return Vec::new();
+        }
+        let row = self.held.pop_front().expect("more than offset");
+        match self.limit {
+            Some(0) => Vec::new(),
+            Some(n) if self.visible >= n => vec![Diff::insert(row), Diff::Delete { index: 0 }],
+            _ => {
+                self.visible += 1;
+                vec![Diff::insert(row)]
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +505,91 @@ mod tests {
         assert_eq!(w.push(), Some(true)); // append, then delete the first
         assert_eq!(w.push(), Some(true));
         assert_eq!(WindowState::new(0).push(), None);
+    }
+
+    fn row(n: i64, tag: usize) -> Row {
+        serde_json::json!({"n": n, "tag": tag})
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    /// Random rows: the result built from the diffs alone always has the sort keys of ranks
+    /// [m, m + n) of everything so far (ties in any order, as in ClickHouse).
+    #[test]
+    fn offset_state_matches_a_full_recompute() {
+        let mut seed: u64 = 7;
+        let mut rand = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for (desc, offset, limit) in [
+            (true, 2, Some(3)),
+            (false, 3, None),
+            (true, 1, Some(1)),
+            (false, 4, Some(2)),
+        ] {
+            let o = order(&[(desc, false)]);
+            let mut s = OffsetState::new(o.clone(), offset, limit);
+            let mut all: Vec<i64> = Vec::new();
+            // history: the first 6, ordered, LIMIT m + n
+            let mut history: Vec<i64> = (0..6).map(|_| rand(10) as i64).collect();
+            history.sort_by(|a, b| if desc { b.cmp(a) } else { a.cmp(b) });
+            all.extend(&history);
+            let cap = limit.map(|n| (offset + n) as usize).unwrap_or(usize::MAX);
+            let mut list: Vec<Row> = Vec::new();
+            for (i, n) in history.iter().take(cap).enumerate() {
+                if let Some(r) = s.push_history(vec![Value::Int(*n as i128)], row(*n, i)) {
+                    list.push(r);
+                }
+            }
+            for i in 0..200 {
+                let n = rand(10) as i64;
+                all.push(n);
+                for d in s.insert(vec![Value::Int(n as i128)], row(n, 100 + i)) {
+                    d.apply(&mut list).unwrap_or_else(|e| panic!("{d}: {e}"));
+                }
+                let mut want = all.clone();
+                want.sort_by(|a, b| if desc { b.cmp(a) } else { a.cmp(b) });
+                let want: Vec<i64> = want
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit.map_or(usize::MAX, |n| n as usize))
+                    .collect();
+                let got: Vec<i64> = list.iter().map(|r| r["n"].as_i64().unwrap()).collect();
+                assert_eq!(got, want, "desc {desc}, offset {offset}, limit {limit:?}");
+            }
+        }
+    }
+
+    /// Random arrivals: the result is the `n` rows before the newest `m`, in arrival order.
+    #[test]
+    fn held_window_slides_over_the_arrival_order() {
+        for (offset, limit) in [
+            (2, Some(3)),
+            (3, None),
+            (1, Some(1)),
+            (0, Some(2)),
+            (4, Some(0)),
+        ] {
+            let mut w = HeldWindow::new(offset, limit);
+            let history: Vec<Row> = (0..5).map(|i| row(i, i as usize)).collect();
+            let take = limit.map_or(5, |n| (offset + n).min(5) as usize);
+            let mut arrived: Vec<i64> = (0..take as i64).collect();
+            let mut list = w.history(history.into_iter().take(take).collect());
+            for i in 5..60 {
+                arrived.push(i);
+                for d in w.push(row(i, i as usize)) {
+                    d.apply(&mut list).unwrap();
+                }
+                let end = arrived.len().saturating_sub(offset as usize);
+                let start = limit.map_or(0, |n| end.saturating_sub(n as usize));
+                let want = &arrived[start..end];
+                let got: Vec<i64> = list.iter().map(|r| r["n"].as_i64().unwrap()).collect();
+                assert_eq!(got, want, "offset {offset}, limit {limit:?}");
+            }
+        }
     }
 }

@@ -81,6 +81,8 @@ pub struct BoundQuery {
     pub order: Vec<OrderKey>,
     /// LIMIT: at most this many rows.
     pub limit: Option<u64>,
+    /// OFFSET: the rows the result starts after (never 0).
+    pub offset: Option<u64>,
     /// With GROUP BY or aggregate functions: the groups and what to compute per group. Then
     /// `projection` is empty and the output is `aggregation.items`.
     pub aggregation: Option<Aggregation>,
@@ -117,6 +119,8 @@ pub struct Aggregation {
     pub order: Vec<AggOrderKey>,
     /// LIMIT: the first groups by `order` (without one: the first groups seen).
     pub limit: Option<u64>,
+    /// OFFSET: the groups the result starts after (never 0).
+    pub offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -315,12 +319,14 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
             bind_aggregate_order(order, &table, &mut aggregation)?;
         }
         aggregation.limit = query.limit.map(|l| l.value);
+        aggregation.offset = offset_of(query);
         return Ok(BoundQuery {
             table,
             filter,
             projection: Vec::new(),
             order: Vec::new(),
             limit: None,
+            offset: None,
             aggregation: Some(aggregation),
             semi_join: None,
         });
@@ -339,9 +345,15 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
         projection,
         order,
         limit: query.limit.map(|l| l.value),
+        offset: offset_of(query),
         aggregation: None,
         semi_join,
     })
+}
+
+/// `OFFSET m`, with `OFFSET 0` as none.
+fn offset_of(query: &Query) -> Option<u64> {
+    query.offset.map(|o| o.value).filter(|m| *m > 0)
 }
 
 /// The WHERE without its `IN (subquery)`, and that sub-query (key, query, the IN's span). It
@@ -756,6 +768,7 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
         items: out,
         order: Vec::new(),
         limit: None,
+        offset: None,
     }))
 }
 
@@ -1786,6 +1799,32 @@ mod tests {
             e("select count() from events group by tags").await,
             "grouping by column tags of type Array(String) is not supported at 1:37"
         );
+    }
+
+    #[tokio::test]
+    async fn offset_binds_for_rows_and_groups() {
+        let q = bind_sql("select user_id from events order by latency_ms limit 5 offset 10")
+            .await
+            .unwrap();
+        assert_eq!((q.limit, q.offset), (Some(5), Some(10)));
+        let q = bind_sql("select user_id from events limit 10, 5")
+            .await
+            .unwrap();
+        assert_eq!((q.limit, q.offset), (Some(5), Some(10)));
+        // OFFSET 0 is no offset
+        let q = bind_sql("select user_id from events offset 0")
+            .await
+            .unwrap();
+        assert_eq!((q.limit, q.offset), (None, None));
+        let q = bind_sql(
+            "select user_id, count() as n from events group by user_id \
+             order by n desc limit 3 offset 2",
+        )
+        .await
+        .unwrap();
+        let a = q.aggregation.unwrap();
+        assert_eq!((a.limit, a.offset), (Some(3), Some(2)));
+        assert_eq!(q.offset, None);
     }
 
     #[tokio::test]

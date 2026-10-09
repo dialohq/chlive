@@ -86,12 +86,23 @@ impl Parser {
         } else {
             None
         };
-        let limit = if self.peek().kind == TokenKind::Keyword("LIMIT") {
+        let (mut limit, mut offset) = (None, None);
+        if self.peek().kind == TokenKind::Keyword("LIMIT") {
             self.next();
-            Some(self.limit()?)
-        } else {
-            None
-        };
+            let first = self.limit()?;
+            if self.peek().kind == TokenKind::Comma {
+                // ClickHouse's `LIMIT m, n`: the offset first
+                self.next();
+                offset = Some(first);
+                limit = Some(self.limit()?);
+            } else {
+                limit = Some(first);
+            }
+        }
+        if offset.is_none() && self.at_word("OFFSET") {
+            self.next();
+            offset = Some(self.count("OFFSET")?);
+        }
         Ok(Query {
             projection,
             from,
@@ -99,6 +110,7 @@ impl Parser {
             group_by,
             order,
             limit,
+            offset,
         })
     }
 
@@ -219,7 +231,8 @@ impl Parser {
     }
 
     /// `LIMIT n`, a whole number; OFFSET, `LIMIT m, n`, WITH TIES and BY aren't supported yet.
-    fn limit(&mut self) -> Result<Limit, SyntaxError> {
+    /// A non-negative whole number, after LIMIT or OFFSET.
+    fn count(&mut self, what: &str) -> Result<Limit, SyntaxError> {
         let t = self.peek().clone();
         let value = match &t.kind {
             TokenKind::Number(n) => n.parse::<u64>().ok(),
@@ -227,15 +240,20 @@ impl Parser {
         };
         let Some(value) = value else {
             return Err(SyntaxError::new(
-                "LIMIT needs a non-negative whole number",
+                format!("{what} needs a non-negative whole number"),
                 t.span,
             ));
         };
         self.next();
+        Ok(Limit {
+            value,
+            span: t.span,
+        })
+    }
+
+    fn limit(&mut self) -> Result<Limit, SyntaxError> {
+        let limit = self.count("LIMIT")?;
         let next = self.peek().clone();
-        if next.kind == TokenKind::Comma || self.at_word("OFFSET") {
-            return Err(SyntaxError::new("OFFSET is not supported yet", next.span));
-        }
         if self.at_word("WITH") {
             return Err(SyntaxError::new(
                 "LIMIT … WITH TIES is not supported yet",
@@ -248,10 +266,7 @@ impl Parser {
                 next.span,
             ));
         }
-        Ok(Limit {
-            value,
-            span: t.span,
-        })
+        Ok(limit)
     }
 
     /// Is the next token the (unreserved) word `word`? ASC, DESC, NULLS, FIRST, LAST and ALL
@@ -685,7 +700,9 @@ impl Parser {
                 }
                 _ => return Err(self.expected("an alias for the table")),
             }
-        } else if let TokenKind::Ident(a) = self.peek().kind.clone() {
+        } else if let (TokenKind::Ident(a), false) =
+            (self.peek().kind.clone(), self.at_word("OFFSET"))
+        {
             self.next();
             Some(a)
         } else {
@@ -1193,13 +1210,33 @@ mod tests {
             error("select * from t limit"),
             "LIMIT needs a non-negative whole number at 1:22"
         );
+        // OFFSET: after LIMIT, alone, or ClickHouse's `LIMIT m, n` (the offset first)
+        let both = |src: &str| {
+            let q = parse(src).unwrap();
+            (q.limit.map(|l| l.value), q.offset.map(|o| o.value))
+        };
+        assert_eq!(both("select * from t limit 2 offset 1"), (Some(2), Some(1)));
+        assert_eq!(both("select * from t limit 1, 2"), (Some(2), Some(1)));
+        assert_eq!(both("select * from t order by a offset 3"), (None, Some(3)));
+        assert_eq!(both("select * from t offset 0"), (None, Some(0)));
+        // OFFSET isn't taken as a table alias
+        assert_eq!(both("select * from t offset 5").1, Some(5));
+        assert_eq!(parse("select * from t offset 5").unwrap().from.alias, None);
         assert_eq!(
-            error("select * from t limit 1, 2"),
-            "OFFSET is not supported yet at 1:24"
+            error("select * from t limit 2 offset x"),
+            "OFFSET needs a non-negative whole number at 1:32"
         );
         assert_eq!(
-            error("select * from t limit 2 offset 1"),
-            "OFFSET is not supported yet at 1:25"
+            error("select * from t limit 1, -2"),
+            "LIMIT needs a non-negative whole number at 1:26"
+        );
+        assert_eq!(
+            error("select * from t limit 1, 2 offset 3"),
+            "expected end of query, found identifier `offset` at 1:28"
+        );
+        assert_eq!(
+            error("select * from t offset 1 limit 2"),
+            "expected end of query, found LIMIT at 1:26"
         );
         assert_eq!(
             error("select * from t order by a limit 2 with ties"),

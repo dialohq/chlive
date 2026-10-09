@@ -19,7 +19,7 @@ use crate::chdb::{Chdb, ChdbError};
 use crate::cursor;
 use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
-use crate::order::{OrderedState, SortKey, WindowState};
+use crate::order::{HeldWindow, OffsetState, OrderedState, SortKey, WindowState};
 use crate::parser::parse;
 use crate::plan::{plan, AggregatePlan, Plan, StreamPlan};
 use crate::rules::{HardcodedRules, NamingRules, TopicId};
@@ -243,7 +243,9 @@ impl Engine {
         }
         // With ORDER BY or LIMIT the server rebuilds the client's state, which needs every row
         // the client holds; without, there's nothing to rebuild, nor any snapshot to read.
-        let stateful = plan.stream.order.is_some() || plan.stream.limit.is_some();
+        let stateful = plan.stream.order.is_some()
+            || plan.stream.limit.is_some()
+            || plan.stream.offset.is_some();
         if let (Some(token), false) = (since, stateful) {
             if let Some(cursor) = self.resumable(&plan, token, None).await? {
                 let first = First::CatchUp {
@@ -552,6 +554,10 @@ impl Engine {
         token: &str,
         snapshot: Option<&Watermark>,
     ) -> Result<Option<Watermark>, EngineError> {
+        if plan.stream.offset.is_some() {
+            tracing::info!("queries with OFFSET don't resume yet; starting over");
+            return Ok(None);
+        }
         let Some(cursor) = cursor::decode(plan, token) else {
             tracing::info!("resume cursor is for another plan or malformed; starting over");
             return Ok(None);
@@ -727,14 +733,22 @@ pub(crate) enum ResultState {
     Window(WindowState),
     /// ORDER BY (and maybe LIMIT): the sort keys of the result, in tie groups.
     Ordered(OrderedState),
+    /// ORDER BY with OFFSET: the sort keys of the top `m + n`, and the rows above the result.
+    Offset(OffsetState),
+    /// OFFSET without ORDER BY: the newest `m` rows held back, the window before them.
+    Held(HeldWindow),
 }
 
 impl ResultState {
     pub(crate) fn for_plan(plan: &StreamPlan) -> Self {
-        match (&plan.order, plan.limit) {
-            (Some(o), limit) => Self::Ordered(OrderedState::with_limit(o.keys.clone(), limit)),
-            (None, Some(n)) => Self::Window(WindowState::new(n)),
-            (None, None) => Self::Append,
+        match (&plan.order, plan.limit, plan.offset) {
+            (Some(o), limit, Some(m)) => Self::Offset(OffsetState::new(o.keys.clone(), m, limit)),
+            (None, limit, Some(m)) => Self::Held(HeldWindow::new(m, limit)),
+            (Some(o), limit, None) => {
+                Self::Ordered(OrderedState::with_limit(o.keys.clone(), limit))
+            }
+            (None, Some(n), None) => Self::Window(WindowState::new(n)),
+            (None, None, None) => Self::Append,
         }
     }
 
@@ -762,6 +776,8 @@ impl ResultState {
                     diffs
                 }
             },
+            ResultState::Offset(s) => s.insert(key.expect("a sort key"), row),
+            ResultState::Held(w) => w.push(row),
         }
     }
 }
@@ -786,6 +802,16 @@ pub(crate) fn history_iteration(
             }
         }
         (ResultState::Window(w), _) => rows.iter().for_each(|_| w.push_history()),
+        (ResultState::Offset(state), Some(order)) => {
+            // the rows above the result are kept, not sent
+            let mut shown = Vec::new();
+            for mut row in rows {
+                let key = order.history_key(&mut row).map_err(bad_history_row)?;
+                shown.extend(state.push_history(key, row));
+            }
+            rows = shown;
+        }
+        (ResultState::Held(w), _) => rows = w.history(rows),
         _ => {}
     }
     Ok(Iteration {

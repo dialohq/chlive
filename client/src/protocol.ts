@@ -50,6 +50,9 @@ export interface SnapshotMessage {
   order?: OrderTerm[];
   /** The LIMIT: the result never has more rows at the end of a diff. */
   limit?: number;
+  /** The OFFSET: the rows (or groups) the result starts after. Informational: the diffs
+   * already account for it. */
+  offset?: number;
   /** An opaque cursor: how far this result is complete. Resume from it with `since`. */
   at: string;
   /** Aggregated results: each row's id (its group's key), in row order. */
