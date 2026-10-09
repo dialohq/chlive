@@ -25,6 +25,8 @@ const QUERY_PRESETS = [
   "select ts, user_id, country, latency_ms from events order by latency_ms desc limit 10",
   "select * from events where country = 'PL' order by ts desc limit 15",
   "select ts, user_id, path, latency_ms from events limit 20",
+  "select ts, user_id, country, latency_ms from events order by latency_ms desc limit 5 offset 3",
+  "select ts, user_id, path, latency_ms from events limit 5 offset 2",
   "select * from events where country = 'PL'",
   "select ts, user_id, path, amount from events where amount > 0 and country in ('DE', 'FR')",
   "select ts, order_id, customer_id, amount from orders where amount > 100",

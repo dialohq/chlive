@@ -94,12 +94,18 @@ Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 - **Semantics match ClickHouse.** NULLs default to last in both directions; NaN sits between the values and the NULLs; strings compare by bytes; `-0` ties with `0`. The history query always spells out each key's direction and NULL placement.
 - **State.** Per subscription, the engine keeps only the ORDER BY values of the result, with equal keys merged into tie groups, never the rows. Order-only columns are fetched from ClickHouse under hidden aliases (`__order_0`, …) and stripped from the output.
 - **Placement.** The history arrives in ClickHouse's order. Each new matching row goes after the last row it ties with, and its insert carries that `index`. So the live list has the same sequence of keys as a fresh query; only the order of rows within a tie group can differ.
-- **Tested.** `engine/tests/clickhouse.rs` checks 20 orderings (6 of them with LIMIT) (NULL, NaN, ±inf, `-0`, byte-order strings, DateTime precision, Bool, duplicates, DESC, NULLS FIRST/LAST, several keys, `ALL`, an unselected column, with WHERE) in the same three setups as WHERE.
+- **Tested.** `engine/tests/clickhouse.rs` checks 26 orderings (6 of them with LIMIT, 6 with OFFSET) (NULL, NaN, ±inf, `-0`, byte-order strings, DateTime precision, Bool, duplicates, DESC, NULLS FIRST/LAST, several keys, `ALL`, an unselected column, with WHERE) in the same three setups as WHERE.
 
-**LIMIT n** (a whole number; OFFSET, `WITH TIES` and `LIMIT … BY` aren't supported yet) goes into the history query and bounds the result:
+**LIMIT n** (a whole number; `WITH TIES` and `LIMIT … BY` aren't supported yet) goes into the history query and bounds the result:
 - **With ORDER BY: the top N.** The state holds at most N sort keys. A new row placed inside the top N is inserted at its index, and the row pushed past the end is deleted (`delete @N`). A row placed at or past the end, including one tying with the last row, changes nothing and sends nothing. Which rows of the boundary tie group make it in is arbitrary, as it is in ClickHouse.
 - **Without ORDER BY: a window of the latest N rows.** History is whatever N rows ClickHouse returns. Each new matching row is appended, and once the window is full, the first row is deleted (`delete @0`). Only a row count is kept.
 - **Atomic diffs.** An insert and the delete it causes are in the same iteration, so always in the same `diff`. The result has at most N rows after every diff, and the client only ever exposes whole diffs.
+
+**OFFSET m** (`LIMIT n OFFSET m`, ClickHouse's `LIMIT m, n`, or `OFFSET m` alone) starts the result after m rows. The history query fetches `LIMIT m + n` (everything without LIMIT) and the engine keeps the first m rows itself, because they can come into the result later:
+- **With ORDER BY: ranks m to m + n.** The state holds the sort keys of the top m + n, and the rows of the top m. A row landing above the result shifts it down: the row at rank m slides in at the top (`insert @0`), and, with LIMIT, the last one leaves (`delete @n`). A row landing inside is inserted at its index, as with LIMIT alone; one below changes nothing. Which rows of the tie groups at either boundary make it in is arbitrary, as in ClickHouse.
+- **Without ORDER BY: a sliding window that holds back the newest m rows.** The arrival order is the history in ClickHouse's order, then the stream. The newest m rows are held back, and the result is the n rows before them. Each new row is held back, the oldest held-back row is appended to the result, and once the result has n rows, the first one leaves (`delete @0`). With `OFFSET 0`, this is LIMIT's window.
+- **Memory.** A subscription holds m rows (plus m + n sort keys when ordered), whatever m is.
+- **Not resumable yet:** a `since` gives a full snapshot.
 
 **WHERE runs in two places, which must agree on every row.** ClickHouse evaluates it for history; the engine evaluates it for each event.
 - **Typed decoding.** Each event's needed JSON fields are decoded by their ClickHouse column types, following ClickHouse's input rules: a quoted number is read as a number, and a DateTime string is parsed.
@@ -154,7 +160,7 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 
 - `snapshot` comes first and once; `diff`s follow, each with the changes of the events that were ready (never empty). Only `insert` exists so far; clients reject ops they don't know.
 - With an `index`, the row is inserted there: the row at that index and every row after it move one down. Without one, it's appended.
-- `{"op": "delete", "index": k}` removes the row at `k`; the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes.
+- `{"op": "delete", "index": k}` removes the row at `k`; the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes. With OFFSET (`"offset": m` in the snapshot, informational), the diffs already account for the rows above the result: a row sliding in from above is an ordinary insert.
 - A `diff` is atomic: its changes apply in sequence, each index into the list as the previous change left it, and only the state after all of them is meaningful (in between, an insert and its delete can briefly make one row more than the LIMIT). The client applies a whole diff to one copy of the rows before its listeners see it.
 - **Resuming.** `snapshot`, `diff` and `{"type": "progress", "id", "at"}` carry `at`, an opaque cursor: how far the result is complete, per Kafka partition, counting events that didn't match. A client that kept a result subscribes with `"since": <at>`; the server answers `{"type": "resume", "id", "columns", "order"?, "limit"?}` instead of a snapshot (the client's rows are still valid), then diffs with only what was missed. If it can't resume (another query or schema, a topic recreated since, …), it sends a normal `snapshot`.
 - Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`. After an error, that subscription is over.
@@ -162,7 +168,7 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 
 ### GROUP BY and aggregates
 
-`SELECT keys, agg(c) [AS name], … FROM t [WHERE …] [GROUP BY keys] [ORDER BY …] [LIMIT n]`, with ClickHouse's result types and output names (see [Supported queries](#supported-queries)). Functions: `count()`, `count(c)`, `sum`, `avg`, `min`, `max` (native), and `uniq`, `uniqExact`, `median`, `any`, `anyLast` (chDB). Not yet: HAVING, expressions as arguments, and resuming aggregates (they start from a snapshot).
+`SELECT keys, agg(c) [AS name], … FROM t [WHERE …] [GROUP BY keys] [ORDER BY …] [LIMIT n] [OFFSET m]`, with ClickHouse's result types and output names (see [Supported queries](#supported-queries)). Functions: `count()`, `count(c)`, `sum`, `avg`, `min`, `max` (native), and `uniq`, `uniqExact`, `median`, `any`, `anyLast` (chDB). Not yet: HAVING, expressions as arguments, and resuming aggregates (they start from a snapshot).
 
 - **Native** when every aggregate in the query has a native implementation (`engine/src/aggregate/`: the `AggregateFunction` and `AggregateState` traits). ClickHouse computes the parts of each group's state over HTTP (`avg(x)` → `sum(x)`, `count(x)`), and the engine keeps the states in memory and updates them per event. `--explain` says which way a query runs.
 - **chDB** (ClickHouse as a library, inside the engine) otherwise. Main ClickHouse computes the history's aggregate states (`uniqExactState(x)`, …) with `remote()` into a chDB table per subscription; each batch of events (up to 1000 that arrived together) adds its states, and the groups it touched are read back finalized with `…Merge`.
@@ -220,7 +226,7 @@ FROM table [[AS] alias]
 [WHERE condition]
 [GROUP BY column [, column ...]]
 [ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST] | order_item [ASC|DESC] [NULLS FIRST|LAST] [, ...]]
-[LIMIT n]
+[LIMIT n [OFFSET m] | LIMIT m, n | OFFSET m]
 [;]
 
 order_item  := column
@@ -248,10 +254,11 @@ name, table, alias := identifier | "identifier" | `identifier`
 - **Tables:** a table needs a ClickHouse table, ingested by one sink connector (known to the pause server) from a Kafka topic of the same name.
 - **Table aliases and qualified names:** `FROM events e` (or `AS e`); `e.user_id` or `events.user_id` anywhere a column goes. In a sub-query, an unqualified name is its own table's column first, then the outer query's.
 - **Aliases** only name output columns: WHERE and (plain queries') ORDER BY refer to table columns. Output names must be unique; an alias can't be another column's name or start with `_`.
-- **ORDER BY / LIMIT:** with `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot. `LIMIT` keeps the top N (with `ORDER BY`) or the latest N (without), deleting the rows that fall out. Without `LIMIT`, plain results only grow.
+- **ORDER BY / LIMIT:** with `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot. `LIMIT` keeps the top N (with `ORDER BY`) or the latest N (without), deleting the rows that fall out. Without `LIMIT`, plain results only grow. `OFFSET m` starts after the top m (with `ORDER BY`; rows above shift the result) or holds back the newest m (without); see [OFFSET](#engine-custom-dialect).
 - **GROUP BY / aggregates** (also without GROUP BY: one global group): selected columns must be grouping columns; no `SELECT *`. Groups are inserted, then updated.
   - **ORDER BY** takes an output name (an alias or a default name like `count()`), a grouping column, or an aggregate call (`order by count() desc`; one that isn't selected is computed anyway), or `ALL`. As values change, groups move: an `update` with an `index`. A group whose sort key changes goes after the groups it ties with.
   - **LIMIT n** keeps the first n groups by ORDER BY: a group falling out is deleted and the next one comes in, and the others are kept to come back in later. Without ORDER BY, it's the first n groups seen.
+  - **OFFSET m** starts the result after the first m groups: with ORDER BY, groups come in and go out at both ends as they move; without, it's the groups after the first m seen.
 - **EXISTS (subquery)**: correlated (`… WHERE c.customer_id = e.user_id AND …`) it is the same semi-join as the matching `IN`: exactly one `inner = outer` equality, a top-level `AND` condition of the sub-query, is the key; the rest of its WHERE may only use its own table. Uncorrelated (no such equality), it's true for every row once the sub-query has a row: until then outer rows are kept back, and then they all come in. Its SELECT list doesn't matter (`SELECT 1`, `SELECT *`).
-- **IN (subquery)**: one per query (IN or EXISTS), as a top-level `AND` condition of the WHERE, over plain queries (with ORDER BY and LIMIT); the sub-query selects one column of one table, with an optional WHERE (the same table as the outer one is fine). See [IN and EXISTS sub-queries](#in-and-exists-sub-queries).
-- **Not yet:** OFFSET, `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, `NOT IN (subquery)`, `NOT EXISTS`, EXISTS with several correlations (composite keys), constants as output columns, and other sub-queries, IN sub-queries with GROUP BY, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters.
+- **IN (subquery)**: one per query (IN or EXISTS), as a top-level `AND` condition of the WHERE, over plain queries (with ORDER BY, LIMIT and OFFSET); the sub-query selects one column of one table, with an optional WHERE (the same table as the outer one is fine). See [IN and EXISTS sub-queries](#in-and-exists-sub-queries).
+- **Not yet:** `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, `NOT IN (subquery)`, `NOT EXISTS`, EXISTS with several correlations (composite keys), constants as output columns, and other sub-queries, IN sub-queries with GROUP BY, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters.
