@@ -125,11 +125,13 @@ impl SemiRun {
         let keys = self.history.fetch(&start.keys_sql).await?;
         drop(start.inner_lease);
         let semi = self.semi();
-        let key_ty = semi.inner_stream.columns[0].ty.clone();
-        let float = semi.float_keys;
+        let (key_ty, float) = (semi.inner_key_ty.clone(), semi.float_keys);
         for row in keys {
-            let k = decode(row.get("k"), &key_ty).map_err(bad_history_row)?;
-            self.keys.insert(key_string(&k, float));
+            let s = match &key_ty {
+                Some(ty) => key_string(&decode(row.get("k"), ty).map_err(bad_history_row)?, float),
+                None => String::new(), // uncorrelated: the one key, if the sub-query has a row
+            };
+            self.keys.insert(s);
         }
         history_iteration(&self.plan.stream, &mut self.state, &self.at, rows)
     }
@@ -178,10 +180,17 @@ impl SemiRun {
                 advance(&mut self.inner_at, &event);
                 match semi.inner_stream.decode(&event.value) {
                     Ok(row) if semi.inner_stream.matches(&row) => {
-                        let k = &row[semi.inner_key.0];
-                        let s = key_string(k, semi.float_keys);
+                        let (k, s) = match semi.inner_key {
+                            Some(ik) => {
+                                let k = row[ik.0].clone();
+                                let s = key_string(&k, semi.float_keys);
+                                (k, s)
+                            }
+                            // uncorrelated: every row has the one key
+                            None => (Value::String(String::new()), String::new()),
+                        };
                         if !matches!(k, Value::Null) && self.keys.insert(s.clone()) {
-                            entering.push((s, k.clone()));
+                            entering.push((s, k));
                         }
                     }
                     Ok(_) => {}
@@ -193,7 +202,10 @@ impl SemiRun {
                 let stream = &self.plan.stream;
                 match stream.decode(&event.value) {
                     Ok(row) if stream.matches(&row) => {
-                        let s = key_string(&row[semi.outer_key.0], semi.float_keys);
+                        let s = match semi.outer_key {
+                            Some(ok) => key_string(&row[ok.0], semi.float_keys),
+                            None => String::new(),
+                        };
                         let key = stream.order.as_ref().map(|o| o.event_key(&row));
                         let projected = stream.project(&row);
                         if self.keys.contains(&s) {
@@ -233,10 +245,12 @@ impl SemiRun {
             .iter()
             .map(|(_, v)| v.to_clickhouse_sql())
             .collect();
-        let sql = self
-            .plan
-            .history
-            .sql_where(&self.lease.sql_table(), &semi.keys_condition(&literals));
+        let from = self.lease.sql_table();
+        let sql = match semi.keys_condition(&literals) {
+            Some(c) => self.plan.history.sql_where(&from, &c),
+            // uncorrelated: the sub-query just got its first row; every row comes
+            None => self.plan.history.sql(&from),
+        };
         let rows = self.history.fetch(&sql).await?;
         let mut diffs = Vec::new();
         for mut row in rows {

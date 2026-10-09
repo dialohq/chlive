@@ -7,7 +7,7 @@ use crate::error::{Span, SyntaxError};
 /// identifiers.
 pub const KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "LIMIT", "JOIN", "UNION", "AS",
-    "AND", "OR", "NOT", "IS", "IN", "NULL", "TRUE", "FALSE", "LIKE", "ILIKE", "BETWEEN",
+    "AND", "OR", "NOT", "IS", "IN", "NULL", "TRUE", "FALSE", "LIKE", "ILIKE", "BETWEEN", "EXISTS",
 ];
 
 #[derive(Debug, Clone, PartialEq)]

@@ -40,42 +40,54 @@ pub struct SemiPlan {
     pub inner_topic: TopicId,
     /// The inner table, quoted (`db.t`), for explain and the cursor.
     pub inner_table: String,
-    /// Decodes the inner topic's events: the key and the filter's columns; `output` is the key.
+    /// Decodes the inner topic's events: the key (if any) and the filter's columns.
     pub inner_stream: StreamPlan,
-    /// The inner key, in `inner_stream`'s decoded rows.
-    pub inner_key: ColumnId,
-    /// The outer key, in the outer stream's decoded rows.
-    pub outer_key: ColumnId,
+    /// The inner key, in `inner_stream`'s decoded rows; `None`: an uncorrelated EXISTS, where
+    /// every row has the same (constant) key.
+    pub inner_key: Option<ColumnId>,
+    /// The outer key, in the outer stream's decoded rows (`None` likewise).
+    pub outer_key: Option<ColumnId>,
+    /// The inner key's type, to read the key set from ClickHouse.
+    pub inner_key_ty: Option<Type>,
     /// Keys compare as numbers when either side is a float (`5` = `5.0`).
     pub float_keys: bool,
-    outer_key_sql: String,
-    inner_key_sql: String,
+    /// (outer, inner) key columns, quoted.
+    keys_sql: Option<(String, String)>,
     inner_filter_sql: Option<String>,
 }
 
 impl SemiPlan {
     /// The outer rows' condition, over a snapshot of the inner table (`inner_from`).
     pub fn condition(&self, inner_from: &str) -> String {
-        format!(
-            "{} IN (SELECT {} FROM {inner_from}{})",
-            self.outer_key_sql,
-            self.inner_key_sql,
-            self.inner_where()
-        )
+        match &self.keys_sql {
+            Some((outer, inner)) => format!(
+                "{outer} IN (SELECT {inner} FROM {inner_from}{})",
+                self.inner_where()
+            ),
+            None => format!("EXISTS (SELECT 1 FROM {inner_from}{})", self.inner_where()),
+        }
     }
 
-    /// The sub-query's keys in a snapshot of the inner table, as `k`.
+    /// The sub-query's keys in a snapshot of the inner table, as `k`; uncorrelated, a row if
+    /// it has one.
     pub fn keys_sql(&self, inner_from: &str) -> String {
-        format!(
-            "SELECT DISTINCT {} AS k FROM {inner_from}{}",
-            self.inner_key_sql,
-            self.inner_where()
-        )
+        match &self.keys_sql {
+            Some((_, inner)) => format!(
+                "SELECT DISTINCT {inner} AS k FROM {inner_from}{}",
+                self.inner_where()
+            ),
+            None => format!(
+                "SELECT 1 AS k FROM {inner_from}{} LIMIT 1",
+                self.inner_where()
+            ),
+        }
     }
 
-    /// Back-fill: the outer rows of these keys (rendered literals).
-    pub fn keys_condition(&self, literals: &[String]) -> String {
-        format!("{} IN ({})", self.outer_key_sql, literals.join(", "))
+    /// Back-fill: the outer rows of these keys (rendered literals); uncorrelated, `None`: all
+    /// of them.
+    pub fn keys_condition(&self, literals: &[String]) -> Option<String> {
+        let (outer, _) = self.keys_sql.as_ref()?;
+        Some(format!("{outer} IN ({})", literals.join(", ")))
     }
 
     fn inner_where(&self) -> String {
@@ -834,14 +846,22 @@ impl std::fmt::Display for Plan {
                 s.condition("<inner snapshot>"),
                 s.inner_table
             )?;
-            writeln!(
-                f,
-                "         keys: {}, then from topic {}; a key's earlier rows come from the latest \
-                 snapshot ({}) and a tail of the events kept back since",
-                s.keys_sql("<inner snapshot>"),
-                s.inner_topic,
-                s.keys_condition(&["…".into()])
-            )?;
+            match s.keys_condition(&["…".into()]) {
+                Some(c) => writeln!(
+                    f,
+                    "         keys: {}, then from topic {}; a key's earlier rows come from the \
+                     latest snapshot ({c}) and a tail of the events kept back since",
+                    s.keys_sql("<inner snapshot>"),
+                    s.inner_topic,
+                )?,
+                None => writeln!(
+                    f,
+                    "         uncorrelated: all rows once the sub-query has one ({}, then topic \
+                     {}); until then rows are kept back",
+                    s.keys_sql("<inner snapshot>"),
+                    s.inner_topic,
+                )?,
+            }
         }
         writeln!(
             f,
@@ -997,9 +1017,9 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             }
         }
     }
-    if let Some(semi) = &bound.semi_join {
-        if !needed.contains(&semi.outer_key) {
-            needed.push(semi.outer_key);
+    if let Some((outer_key, _)) = bound.semi_join.as_ref().and_then(|s| s.keys) {
+        if !needed.contains(&outer_key) {
+            needed.push(outer_key);
         }
     }
     let semi = bound.semi_join.as_ref().map(|s| semi_plan(s, table));
@@ -1051,7 +1071,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
 
 fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
     let inner = &s.inner;
-    let mut needed = vec![s.inner_key];
+    let mut needed: Vec<ColumnId> = s.keys.iter().map(|(_, ik)| *ik).collect();
     if let Some(f) = &s.inner_filter {
         let mut cols = Vec::new();
         f.columns(&mut cols);
@@ -1061,7 +1081,6 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
             }
         }
     }
-    let key = inner.column(s.inner_key);
     let inner_stream = StreamPlan {
         topics: vec![inner.topic.clone()],
         columns: needed
@@ -1076,7 +1095,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
             })
             .collect(),
         width: inner.columns.len(),
-        output: vec![(key.name.clone(), s.inner_key)],
+        output: Vec::new(),
         filter: match &s.inner_filter {
             None => Filter::All,
             Some(expr) => Filter::Where {
@@ -1093,11 +1112,18 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
         inner_topic: inner.topic.clone(),
         inner_table: inner.clickhouse_table.clone(),
         inner_stream,
-        inner_key: s.inner_key,
-        outer_key: s.outer_key,
-        float_keys: float(&key.ty) || float(&outer.column(s.outer_key).ty),
-        outer_key_sql: quote_ident(&outer.column(s.outer_key).clickhouse),
-        inner_key_sql: quote_ident(&key.clickhouse),
+        inner_key: s.keys.map(|(_, ik)| ik),
+        outer_key: s.keys.map(|(ok, _)| ok),
+        inner_key_ty: s.keys.map(|(_, ik)| inner.column(ik).ty.clone()),
+        float_keys: s
+            .keys
+            .is_some_and(|(ok, ik)| float(&inner.column(ik).ty) || float(&outer.column(ok).ty)),
+        keys_sql: s.keys.map(|(ok, ik)| {
+            (
+                quote_ident(&outer.column(ok).clickhouse),
+                quote_ident(&inner.column(ik).clickhouse),
+            )
+        }),
         inner_filter_sql: s.inner_filter.as_ref().map(|f| to_clickhouse(f, inner)),
     }
 }
@@ -1119,6 +1145,7 @@ mod tests {
         };
         BoundTable {
             name: "events".into(),
+            alias: None,
             clickhouse_table: "default.events".into(),
             database: "default".into(),
             clickhouse_name: "events".into(),

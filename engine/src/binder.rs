@@ -43,6 +43,8 @@ pub struct BoundColumn {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundTable {
     pub name: String,
+    /// `FROM events e`: what qualified names may call it, besides `name`.
+    pub alias: Option<String>,
     /// The ClickHouse table, quoted for SQL (`db.table`).
     pub clickhouse_table: String,
     /// The same, unquoted.
@@ -53,6 +55,11 @@ pub struct BoundTable {
 }
 
 impl BoundTable {
+    /// Whether `q` (in `q.column`) names this table: its name or its alias.
+    pub fn names(&self, q: &str) -> bool {
+        q == self.name || self.alias.as_deref() == Some(q)
+    }
+
     /// What to snapshot for this table's history.
     pub fn snapshot_table(&self) -> crate::snapshot::SnapshotTable {
         crate::snapshot::SnapshotTable::new(&self.database, &self.clickhouse_name, &self.topic.0)
@@ -82,12 +89,13 @@ pub struct BoundQuery {
 }
 
 /// `outer_key IN (SELECT inner_key FROM inner [WHERE inner_filter])`: the rows whose key is
-/// one of the sub-query's.
+/// one of the sub-query's; also a correlated `EXISTS (… WHERE inner_key = outer_key …)`. Without
+/// keys, an uncorrelated `EXISTS`: every row, once the sub-query has one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemiJoin {
-    pub outer_key: ColumnId,
+    /// (outer key, inner key); `None` for an uncorrelated EXISTS.
+    pub keys: Option<(ColumnId, ColumnId)>,
     pub inner: BoundTable,
-    pub inner_key: ColumnId,
     pub inner_filter: Option<BoundExpr>,
 }
 
@@ -290,11 +298,14 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
         None => None,
     };
     let semi_join = match sub {
-        Some((key, sub, span)) => Some(bind_semi_join(key, sub, span, &table, catalog).await?),
+        Some(Sub::In(key, sub, span)) => {
+            Some(bind_semi_join(key, sub, span, &table, catalog).await?)
+        }
+        Some(Sub::Exists(sub, _)) => Some(bind_exists(sub, &table, catalog).await?),
         None => None,
     };
     if let Some(mut aggregation) = bind_aggregation(query, &table)? {
-        if let Some((_, _, span)) = sub {
+        if let Some(Sub::In(_, _, span) | Sub::Exists(_, span)) = sub {
             return Err(BindError::at(
                 "IN (subquery) with GROUP BY or aggregates is not supported yet",
                 span,
@@ -335,8 +346,16 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
 
 /// The WHERE without its `IN (subquery)`, and that sub-query (key, query, the IN's span). It
 /// must be a top-level AND condition (anywhere else, `bind_where` rejects it), and only one.
-#[allow(clippy::type_complexity)]
-fn split_subquery(expr: &Expr) -> Result<(Option<Expr>, Option<(&Expr, &Query, Span)>), BindError> {
+/// A query's one sub-query condition.
+#[derive(Clone, Copy)]
+enum Sub<'a> {
+    /// `key IN (SELECT …)`
+    In(&'a Expr, &'a Query, Span),
+    /// `EXISTS (SELECT …)`
+    Exists(&'a Query, Span),
+}
+
+fn split_subquery(expr: &Expr) -> Result<(Option<Expr>, Option<Sub<'_>>), BindError> {
     fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         match e {
             Expr::And(l, r) => {
@@ -367,7 +386,20 @@ fn split_subquery(expr: &Expr) -> Result<(Option<Expr>, Option<(&Expr, &Query, S
                 if sub.is_some() {
                     return Err(BindError::at(SUBQUERY_PLACE, *span));
                 }
-                sub = Some((expr.as_ref(), query.as_ref(), *span));
+                sub = Some(Sub::In(expr.as_ref(), query.as_ref(), *span));
+            }
+            Expr::Exists {
+                query,
+                negated,
+                span,
+            } => {
+                if *negated {
+                    return Err(BindError::at("NOT EXISTS is not supported yet", *span));
+                }
+                if sub.is_some() {
+                    return Err(BindError::at(SUBQUERY_PLACE, *span));
+                }
+                sub = Some(Sub::Exists(query.as_ref(), *span));
             }
             other => {
                 rest = Some(match rest {
@@ -380,7 +412,8 @@ fn split_subquery(expr: &Expr) -> Result<(Option<Expr>, Option<(&Expr, &Query, S
     Ok((rest, sub))
 }
 
-const SUBQUERY_PLACE: &str = "IN (subquery) is only supported as a top-level AND condition, once";
+const SUBQUERY_PLACE: &str =
+    "a sub-query (IN or EXISTS) is only supported as a top-level AND condition, once";
 
 /// `key IN (SELECT col FROM t [WHERE …])`: one column of one table, optionally filtered.
 async fn bind_semi_join(
@@ -396,12 +429,67 @@ async fn bind_semi_join(
             key.span(),
         ));
     };
-    let outer_key = resolve_column(outer, &k.name, k.span)?;
+    let outer_key = resolve_column(outer, k)?;
     let unsupported = |what: &str, at: Span| {
         BindError::at(
             format!("{what} in an IN sub-query is not supported yet; select one column"),
             at,
         )
+    };
+    check_subquery_clauses(sub, "an IN sub-query")?;
+    let column = match &sub.projection {
+        Projection::Columns(cols) if cols.len() == 1 => &cols[0],
+        Projection::Items(items) if items.len() == 1 => match &items[0].expr {
+            SelectExpr::Column(c) => c,
+            SelectExpr::Call { span, .. } => return Err(unsupported("an aggregate", *span)),
+            SelectExpr::Literal(_, at) => {
+                return Err(BindError::at(
+                    "an IN sub-query must select exactly one column",
+                    *at,
+                ))
+            }
+        },
+        _ => {
+            return Err(BindError::at(
+                "an IN sub-query must select exactly one column",
+                span,
+            ))
+        }
+    };
+    let inner = bind_from(sub, catalog).await?;
+    let inner_key = resolve_column(&inner, column)?;
+    check_key_types(
+        outer,
+        outer_key,
+        &inner,
+        inner_key,
+        &k.name,
+        &column.name,
+        span,
+    )?;
+    let inner_filter = match &sub.selection {
+        Some(e) => {
+            if let Some(at) = outer_ref(e, &inner, outer) {
+                return Err(BindError::at(
+                    "this refers to the outer query; only EXISTS sub-queries can, as `inner = outer`",
+                    at,
+                ));
+            }
+            Some(bind_where(e, &inner)?)
+        }
+        None => None,
+    };
+    Ok(SemiJoin {
+        keys: Some((outer_key, inner_key)),
+        inner,
+        inner_filter,
+    })
+}
+
+/// GROUP BY, ORDER BY and LIMIT aren't supported in sub-queries.
+fn check_subquery_clauses(sub: &Query, what: &str) -> Result<(), BindError> {
+    let unsupported = |clause: &str, at: Span| {
+        BindError::at(format!("{clause} in {what} is not supported yet"), at)
     };
     if let Some((_, at)) = &sub.group_by {
         return Err(unsupported("GROUP BY", *at));
@@ -414,51 +502,162 @@ async fn bind_semi_join(
             Order::All { span, .. } => *span,
             Order::Items(items) => match &items[0].expr {
                 SelectExpr::Column(c) => c.span,
-                SelectExpr::Call { span, .. } => *span,
+                SelectExpr::Call { span, .. } | SelectExpr::Literal(_, span) => *span,
             },
         };
         return Err(unsupported("ORDER BY", at));
     }
-    let column = match &sub.projection {
-        Projection::Columns(cols) if cols.len() == 1 => &cols[0],
-        Projection::Items(items) if items.len() == 1 => match &items[0].expr {
-            SelectExpr::Column(c) => c,
-            SelectExpr::Call { span, .. } => return Err(unsupported("an aggregate", *span)),
-        },
-        _ => {
-            return Err(BindError::at(
-                "an IN sub-query must select exactly one column",
-                span,
-            ))
+    Ok(())
+}
+
+/// Which query a column of a sub-query refers to: its own table first, then the outer one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Side {
+    Inner,
+    Outer,
+}
+
+fn side(c: &ColumnRef, inner: &BoundTable, outer: &BoundTable) -> Option<Side> {
+    let has = |t: &BoundTable| t.columns.iter().any(|col| col.name == c.name);
+    match &c.qualifier {
+        Some(q) if inner.names(q) => Some(Side::Inner),
+        Some(q) if outer.names(q) => Some(Side::Outer),
+        Some(_) => None,
+        None if has(inner) => Some(Side::Inner),
+        None if has(outer) => Some(Side::Outer),
+        None => None,
+    }
+}
+
+/// The first column of `expr` that refers to the outer query, if any.
+fn outer_ref(expr: &Expr, inner: &BoundTable, outer: &BoundTable) -> Option<Span> {
+    match expr {
+        Expr::Column(c) => (side(c, inner, outer) == Some(Side::Outer)).then_some(c.span),
+        Expr::Literal { .. } => None,
+        Expr::Compare { left, right, .. } => {
+            outer_ref(left, inner, outer).or_else(|| outer_ref(right, inner, outer))
         }
-    };
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            outer_ref(l, inner, outer).or_else(|| outer_ref(r, inner, outer))
+        }
+        Expr::Not { expr, .. } | Expr::IsNull { expr, .. } | Expr::InList { expr, .. } => {
+            outer_ref(expr, inner, outer)
+        }
+        Expr::InSubquery { expr, .. } => outer_ref(expr, inner, outer),
+        Expr::Exists { .. } => None,
+    }
+}
+
+/// `EXISTS (SELECT … FROM inner WHERE inner.k = outer.k AND …)`: the same semi-join as
+/// `outer.k IN (SELECT k FROM inner WHERE …)`. Its SELECT list doesn't matter. Without a
+/// correlation, it's true for every row once the sub-query has a row.
+async fn bind_exists(
+    sub: &Query,
+    outer: &BoundTable,
+    catalog: &Catalog<'_>,
+) -> Result<SemiJoin, BindError> {
+    check_subquery_clauses(sub, "an EXISTS sub-query")?;
     let inner = bind_from(sub, catalog).await?;
-    let inner_key = resolve_column(&inner, &column.name, column.span)?;
-    let (ok, ik) = (&outer.column(outer_key).ty, &inner.column(inner_key).ty);
-    let comparable = match (&ok.kind, &ik.kind) {
+    let mut conjuncts = Vec::new();
+    if let Some(e) = &sub.selection {
+        fn split<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+            match e {
+                Expr::And(l, r) => {
+                    split(l, out);
+                    split(r, out);
+                }
+                e => out.push(e),
+            }
+        }
+        split(e, &mut conjuncts);
+    }
+    let mut keys: Option<(ColumnId, ColumnId)> = None;
+    let mut filter: Option<Expr> = None;
+    for c in conjuncts {
+        // `inner = outer` (either way round): the correlation
+        if let Expr::Compare {
+            op: CmpOp::Eq,
+            left,
+            right,
+            span: at,
+        } = c
+        {
+            if let (Expr::Column(a), Expr::Column(b)) = (left.as_ref(), right.as_ref()) {
+                let pair = match (side(a, &inner, outer), side(b, &inner, outer)) {
+                    (Some(Side::Inner), Some(Side::Outer)) => Some((b, a)),
+                    (Some(Side::Outer), Some(Side::Inner)) => Some((a, b)),
+                    _ => None,
+                };
+                if let Some((o, i)) = pair {
+                    if keys.is_some() {
+                        return Err(BindError::at(
+                            "EXISTS with more than one correlation is not supported yet",
+                            *at,
+                        ));
+                    }
+                    let (ok, ik) = (
+                        resolve_column(outer, &unqualified(o))?,
+                        resolve_column(&inner, &unqualified(i))?,
+                    );
+                    check_key_types(outer, ok, &inner, ik, &o.name, &i.name, *at)?;
+                    keys = Some((ok, ik));
+                    continue;
+                }
+            }
+        }
+        if let Some(at) = outer_ref(c, &inner, outer) {
+            return Err(BindError::at(
+                "only `inner = outer` equalities can refer to the outer query",
+                at,
+            ));
+        }
+        filter = Some(match filter {
+            None => c.clone(),
+            Some(f) => Expr::And(Box::new(f), Box::new(c.clone())),
+        });
+    }
+    let inner_filter = match &filter {
+        Some(e) => Some(bind_where(e, &inner)?),
+        None => None,
+    };
+    Ok(SemiJoin {
+        keys,
+        inner,
+        inner_filter,
+    })
+}
+
+/// The column without its qualifier (already checked to name its table).
+fn unqualified(c: &ColumnRef) -> ColumnRef {
+    ColumnRef {
+        qualifier: None,
+        ..c.clone()
+    }
+}
+
+/// Keys of an IN or EXISTS must be comparable: numbers with numbers, otherwise the same kind.
+fn check_key_types(
+    outer: &BoundTable,
+    ok: ColumnId,
+    inner: &BoundTable,
+    ik: ColumnId,
+    oname: &str,
+    iname: &str,
+    at: Span,
+) -> Result<(), BindError> {
+    let (ot, it) = (&outer.column(ok).ty, &inner.column(ik).ty);
+    let comparable = match (&ot.kind, &it.kind) {
         (Kind::Other, _) | (_, Kind::Other) => false,
         (Kind::Int { .. } | Kind::Float, Kind::Int { .. } | Kind::Float) => true,
         (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
     };
     if !comparable {
         return Err(BindError::at(
-            format!(
-                "{} ({ok}) can't be compared with the sub-query's {} ({ik})",
-                k.name, column.name
-            ),
-            span,
+            format!("{oname} ({ot}) can't be compared with the sub-query's {iname} ({it})"),
+            at,
         ));
     }
-    let inner_filter = match &sub.selection {
-        Some(e) => Some(bind_where(e, &inner)?),
-        None => None,
-    };
-    Ok(SemiJoin {
-        outer_key,
-        inner,
-        inner_key,
-        inner_filter,
-    })
+    Ok(())
 }
 
 /// GROUP BY and aggregate functions, if the query has either. Selected columns must be grouping
@@ -476,7 +675,7 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
     };
     let mut keys = Vec::new();
     for k in group_refs {
-        let id = resolve_column(table, &k.name, k.span)?;
+        let id = resolve_column(table, k)?;
         if table.column(id).ty.kind == Kind::Other {
             return Err(BindError::at(
                 format!(
@@ -510,8 +709,14 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
     let mut out: Vec<AggItem> = Vec::new();
     for (expr, alias) in items {
         let (default_name, ty, expr, span) = match expr {
+            SelectExpr::Literal(_, span) => {
+                return Err(BindError::at(
+                    "selecting constants is not supported yet",
+                    span,
+                ))
+            }
             SelectExpr::Column(c) => {
-                let id = resolve_column(table, &c.name, c.span)?;
+                let id = resolve_column(table, &c)?;
                 if !keys.contains(&id) {
                     return Err(BindError::at(
                         format!(
@@ -572,7 +777,7 @@ fn bind_call(
     };
     let arg = match (func, arg) {
         (AggFunc::Count, CallArg::None | CallArg::Star) => None,
-        (_, CallArg::Column(c)) => Some((resolve_column(table, &c.name, c.span)?, c)),
+        (_, CallArg::Column(c)) => Some((resolve_column(table, c)?, c)),
         (f, _) => {
             return Err(BindError::at(
                 format!("{}() needs a column", f.name()),
@@ -651,12 +856,21 @@ fn bind_aggregate_order(
         Order::Items(items) => {
             for o in items {
                 let (item, span) = match &o.expr {
+                    SelectExpr::Literal(_, span) => {
+                        return Err(BindError::at(
+                            "ordering by a constant is not supported",
+                            *span,
+                        ))
+                    }
                     SelectExpr::Column(c) => {
-                        let output = agg.items.iter().position(|i| !i.hidden && i.name == c.name);
+                        let output = agg
+                            .items
+                            .iter()
+                            .position(|i| !i.hidden && c.qualifier.is_none() && i.name == c.name);
                         let item = match output {
                             Some(i) => i,
                             None => {
-                                let id = resolve_column(table, &c.name, c.span)?;
+                                let id = resolve_column(table, c)?;
                                 if !agg.keys.contains(&id) {
                                     return Err(BindError::at(
                                         format!(
@@ -735,11 +949,15 @@ fn bind_order(
             .iter()
             .map(|item| match &item.expr {
                 SelectExpr::Column(c) => {
-                    let id = resolve_column(table, &c.name, c.span)?;
+                    let id = resolve_column(table, c)?;
                     key(id, item.direction, item.nulls, c.span)
                 }
                 SelectExpr::Call { span, .. } => Err(BindError::at(
                     "aggregate functions in ORDER BY need GROUP BY or aggregates in SELECT",
+                    *span,
+                )),
+                SelectExpr::Literal(_, span) => Err(BindError::at(
+                    "ordering by a constant is not supported",
                     *span,
                 )),
             })
@@ -747,8 +965,10 @@ fn bind_order(
     }
 }
 
-fn resolve_column(table: &BoundTable, name: &str, span: Span) -> Result<ColumnId, BindError> {
-    match table.columns.iter().find(|c| c.name == name) {
+fn resolve_column(table: &BoundTable, c: &ColumnRef) -> Result<ColumnId, BindError> {
+    check_qualifier(table, c)?;
+    let (name, span) = (&c.name, c.span);
+    match table.columns.iter().find(|c| &c.name == name) {
         Some(c) => Ok(c.id),
         None => {
             let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
@@ -761,6 +981,16 @@ fn resolve_column(table: &BoundTable, name: &str, span: Span) -> Result<ColumnId
                 span,
             ))
         }
+    }
+}
+
+/// `t.col`: `t` must be the table's name or alias.
+fn check_qualifier(table: &BoundTable, c: &ColumnRef) -> Result<(), BindError> {
+    match &c.qualifier {
+        Some(q) if !table.names(q) => {
+            Err(BindError::at(format!("unknown table or alias {q}"), c.span))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -819,6 +1049,7 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
         .collect();
     Ok(BoundTable {
         name: from.name.clone(),
+        alias: from.alias.clone(),
         clickhouse_table,
         database,
         clickhouse_name,
@@ -831,7 +1062,9 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
 /// literals are coerced to the other side's type here, once, not per event.
 fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
     match expr {
-        Expr::InSubquery { span, .. } => Err(BindError::at(SUBQUERY_PLACE, *span)),
+        Expr::InSubquery { span, .. } | Expr::Exists { span, .. } => {
+            Err(BindError::at(SUBQUERY_PLACE, *span))
+        }
         Expr::And(l, r) => Ok(BoundExpr::And(
             Box::new(bind_where(l, table)?),
             Box::new(bind_where(r, table)?),
@@ -943,7 +1176,7 @@ fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
             })
         }
         Expr::Column(c) => {
-            let col = column(table, &c.name, c.span)?;
+            let col = column(table, c)?;
             if col.ty.kind != Kind::Bool {
                 return Err(BindError::at(
                     format!(
@@ -972,7 +1205,7 @@ enum Operand {
 fn operand(expr: &Expr, table: &BoundTable) -> Result<Operand, BindError> {
     match expr {
         Expr::Column(c) => {
-            let col = column(table, &c.name, c.span)?;
+            let col = column(table, c)?;
             if col.ty.kind == Kind::Other {
                 return Err(BindError::at(
                     format!(
@@ -992,22 +1225,8 @@ fn operand(expr: &Expr, table: &BoundTable) -> Result<Operand, BindError> {
     }
 }
 
-fn column<'a>(table: &'a BoundTable, name: &str, span: Span) -> Result<&'a BoundColumn, BindError> {
-    table
-        .columns
-        .iter()
-        .find(|c| c.name == name)
-        .ok_or_else(|| {
-            let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
-            BindError::at(
-                format!(
-                    "unknown column {name} in table {} (columns: {})",
-                    table.name,
-                    names.join(", ")
-                ),
-                span,
-            )
-        })
+fn column<'a>(table: &'a BoundTable, c: &ColumnRef) -> Result<&'a BoundColumn, BindError> {
+    Ok(table.column(resolve_column(table, c)?))
 }
 
 /// What kind of values can be compared with each other.
@@ -1116,14 +1335,18 @@ fn bind_select(query: &Query, table: &BoundTable) -> Result<Vec<Projected>, Bind
         Projection::Items(items) => items
             .iter()
             .map(|i| match &i.expr {
-                SelectExpr::Column(c) => (c, i.alias.as_ref()),
+                SelectExpr::Column(c) => Ok((c, i.alias.as_ref())),
+                SelectExpr::Literal(_, span) => Err(BindError::at(
+                    "selecting constants is not supported yet",
+                    *span,
+                )),
                 SelectExpr::Call { .. } => unreachable!("lists with calls are aggregations"),
             })
-            .collect(),
+            .collect::<Result<_, _>>()?,
     };
     let mut out: Vec<Projected> = Vec::with_capacity(items.len());
     for (r, alias) in items {
-        let column = resolve_column(table, &r.name, r.span)?;
+        let column = resolve_column(table, r)?;
         let name = match alias {
             None => r.name.clone(),
             Some(alias) => {
@@ -1647,9 +1870,10 @@ mod tests {
         .await
         .unwrap();
         let semi = b.semi_join.as_ref().unwrap();
-        assert_eq!(semi.outer_key, ColumnId(1));
+        let (outer_key, inner_key) = semi.keys.unwrap();
+        assert_eq!(outer_key, ColumnId(1));
         assert_eq!(semi.inner.name, "plain");
-        assert_eq!(semi.inner.column(semi.inner_key).name, "id");
+        assert_eq!(semi.inner.column(inner_key).name, "id");
         assert!(semi.inner_filter.is_some());
         // the rest of the WHERE stays the filter, without the IN
         let mut cols = Vec::new();
@@ -1674,7 +1898,7 @@ mod tests {
         );
         assert_eq!(
             e("select ts from events where paid or user_id in (select id from plain)").await,
-            "IN (subquery) is only supported as a top-level AND condition, once at 1:45"
+            "a sub-query (IN or EXISTS) is only supported as a top-level AND condition, once at 1:45"
         );
         assert_eq!(
             e(
@@ -1682,7 +1906,7 @@ mod tests {
                and ts in (select id from plain)"
             )
             .await,
-            "IN (subquery) is only supported as a top-level AND condition, once at 1:70"
+            "a sub-query (IN or EXISTS) is only supported as a top-level AND condition, once at 1:70"
         );
         assert_eq!(
             e("select count() from events where user_id in (select id from plain)").await,
@@ -1690,7 +1914,7 @@ mod tests {
         );
         assert_eq!(
             e("select ts from events where user_id in (select id from plain limit 5)").await,
-            "LIMIT in an IN sub-query is not supported yet; select one column at 1:68"
+            "LIMIT in an IN sub-query is not supported yet at 1:68"
         );
         assert_eq!(
             e("select ts from events where user_id in (select * from plain)").await,
@@ -1704,6 +1928,108 @@ mod tests {
             e("select ts from events where user_id in (select nope from plain)")
                 .await
                 .starts_with("unknown column nope in table plain")
+        );
+    }
+
+    #[tokio::test]
+    async fn aliases_and_qualified_names() {
+        let b = bind_sql("select e.ts, events.user_id from events e where e.paid order by e.ts")
+            .await
+            .unwrap();
+        assert_eq!(names(&b), ["ts", "user_id"]);
+        assert_eq!(
+            bind_sql("select x.ts from events e").await.unwrap_err(),
+            "unknown table or alias x at 1:8"
+        );
+        assert_eq!(
+            bind_sql("select ts from events where e.paid")
+                .await
+                .unwrap_err(),
+            "unknown table or alias e at 1:29"
+        );
+        assert_eq!(
+            bind_sql("select 1 from events").await.unwrap_err(),
+            "selecting constants is not supported yet at 1:8"
+        );
+        assert_eq!(
+            bind_sql("select ts from events order by 'x'")
+                .await
+                .unwrap_err(),
+            "ordering by expressions is not supported yet; name a column at 1:32"
+        );
+    }
+
+    #[tokio::test]
+    async fn exists_is_the_same_semi_join_as_in() {
+        let key = |b: &BoundQuery| {
+            let s = b.semi_join.as_ref().unwrap();
+            (
+                s.keys,
+                s.inner.name.clone(),
+                s.inner_filter.clone(),
+                b.filter.clone(),
+            )
+        };
+        let want = key(
+            &bind_sql("select ts from events where paid and user_id in (select id from plain where id != 'x')")
+                .await
+                .unwrap(),
+        );
+        for sql in [
+            "select ts from events e where e.paid and exists (select 1 from plain p where p.id = e.user_id and p.id != 'x')",
+            "select ts from events e where paid and exists (select * from plain where e.user_id = id and id != 'x')",
+            "select ts from events where exists (select id from plain p where p.id != 'x' and user_id = p.id) and paid",
+        ] {
+            assert_eq!(key(&bind_sql(sql).await.unwrap()), want, "{sql}");
+        }
+        // the same table on both sides, told apart by aliases
+        let b = bind_sql(
+            "select ts from events a where exists (select 1 from events b where b.user_id = a.user_id and b.paid)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.semi_join.unwrap().keys, Some((ColumnId(1), ColumnId(1))));
+        // uncorrelated: no keys
+        let b = bind_sql("select ts from events where exists (select 1 from plain where id = 'x')")
+            .await
+            .unwrap();
+        let semi = b.semi_join.unwrap();
+        assert_eq!(semi.keys, None);
+        assert!(semi.inner_filter.is_some());
+    }
+
+    #[tokio::test]
+    async fn exists_errors() {
+        let e = |sql: &'static str| async move { bind_sql(sql).await.unwrap_err() };
+        assert_eq!(
+            e("select ts from events where not exists (select 1 from plain)").await,
+            "NOT EXISTS is not supported yet at 1:33"
+        );
+        assert_eq!(
+            e(
+                "select ts from events a where exists (select 1 from events b \
+               where b.user_id = a.user_id and b.ts = a.ts)"
+            )
+            .await,
+            "EXISTS with more than one correlation is not supported yet at 1:99"
+        );
+        assert_eq!(
+            e("select ts from events e where exists (select 1 from plain p where p.id = e.user_id or e.paid)")
+                .await,
+            "only `inner = outer` equalities can refer to the outer query at 1:74"
+        );
+        assert_eq!(
+            e("select ts from events e where user_id in (select id from plain where id = e.user_id)")
+                .await,
+            "this refers to the outer query; only EXISTS sub-queries can, as `inner = outer` at 1:75"
+        );
+        assert_eq!(
+            e("select count() from events where exists (select 1 from plain)").await,
+            "IN (subquery) with GROUP BY or aggregates is not supported yet at 1:34"
+        );
+        assert_eq!(
+            e("select ts from events where exists (select 1 from plain limit 1)").await,
+            "LIMIT in an EXISTS sub-query is not supported yet at 1:63"
         );
     }
 }

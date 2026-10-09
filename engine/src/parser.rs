@@ -4,7 +4,7 @@
 
 use crate::ast::{CallArg, Direction, Limit, NullsOrder, Order, OrderItem, SelectExpr, SelectItem};
 use crate::ast::{CmpOp, ColumnRef, Expr, Literal, Projection, Query, TableRef};
-use crate::error::SyntaxError;
+use crate::error::{Span, SyntaxError};
 use crate::lexer::{tokenize, Token, TokenKind};
 
 pub fn parse(src: &str) -> Result<Query, SyntaxError> {
@@ -144,6 +144,16 @@ impl Parser {
         let t = self.peek().clone();
         Ok(
             match (&t.kind, &self.tokens.get(self.pos + 1).map(|t| &t.kind)) {
+                (
+                    TokenKind::Number(_)
+                    | TokenKind::String(_)
+                    | TokenKind::Minus
+                    | TokenKind::Keyword("TRUE" | "FALSE" | "NULL"),
+                    _,
+                ) => {
+                    let (value, span) = self.literal()?;
+                    SelectExpr::Literal(value, span)
+                }
                 (TokenKind::Ident(name), Some(TokenKind::LParen)) => {
                     self.next();
                     self.next();
@@ -367,6 +377,12 @@ impl Parser {
     }
 
     fn not_expr(&mut self) -> Result<Expr, SyntaxError> {
+        if self.peek().kind == TokenKind::Keyword("NOT")
+            && self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::Keyword("EXISTS"))
+        {
+            self.next();
+            return self.exists(true);
+        }
         if self.peek().kind == TokenKind::Keyword("NOT") {
             let span = self.next().span;
             let expr = self.not_expr()?;
@@ -501,19 +517,13 @@ impl Parser {
     fn operand(&mut self) -> Result<Expr, SyntaxError> {
         let t = self.peek().clone();
         match t.kind {
-            TokenKind::Ident(name) => {
-                self.next();
-                match self.peek().kind {
-                    TokenKind::LParen => {
-                        Err(SyntaxError::new("functions are not supported yet", t.span))
-                    }
-                    TokenKind::Dot => Err(SyntaxError::new(
-                        "qualified column names are not supported",
-                        self.peek().span,
-                    )),
-                    _ => Ok(Expr::Column(ColumnRef { name, span: t.span })),
+            TokenKind::Ident(_) => {
+                if self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::LParen) {
+                    return Err(SyntaxError::new("functions are not supported yet", t.span));
                 }
+                Ok(Expr::Column(self.qualified()?))
             }
+            TokenKind::Keyword("EXISTS") => self.exists(false),
             TokenKind::LParen => {
                 self.next();
                 let inner = self.or_expr()?;
@@ -569,7 +579,7 @@ impl Parser {
                     .into_iter()
                     .map(|i| match i.expr {
                         SelectExpr::Column(c) => c,
-                        SelectExpr::Call { .. } => unreachable!(),
+                        _ => unreachable!("only columns here"),
                     })
                     .collect(),
             ));
@@ -579,7 +589,7 @@ impl Parser {
 
     fn column(&mut self) -> Result<ColumnRef, SyntaxError> {
         let t = self.peek().clone();
-        let TokenKind::Ident(name) = t.kind else {
+        let TokenKind::Ident(_) = t.kind else {
             return Err(self.expected(
                 if self.pos > 0 && self.tokens[self.pos - 1].kind == TokenKind::Comma {
                     "a column name"
@@ -588,18 +598,70 @@ impl Parser {
                 },
             ));
         };
-        self.next();
-        match self.peek().kind {
-            TokenKind::LParen => Err(SyntaxError::new(
+        if self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::LParen) {
+            return Err(SyntaxError::new(
                 "expressions are not supported yet; list column names",
                 t.span,
-            )),
-            TokenKind::Dot => Err(SyntaxError::new(
-                "qualified column names are not supported",
-                self.peek().span,
-            )),
-            _ => Ok(ColumnRef { name, span: t.span }),
+            ));
         }
+        self.qualified()
+    }
+
+    /// `name` or `table.name` (a table or its alias), at an identifier.
+    fn qualified(&mut self) -> Result<ColumnRef, SyntaxError> {
+        let t = self.next();
+        let TokenKind::Ident(first) = t.kind else {
+            unreachable!("called at an identifier")
+        };
+        if self.peek().kind != TokenKind::Dot {
+            return Ok(ColumnRef {
+                qualifier: None,
+                name: first,
+                span: t.span,
+            });
+        }
+        self.next();
+        let n = self.peek().clone();
+        let TokenKind::Ident(name) = n.kind else {
+            return Err(self.expected("a column name after `.`"));
+        };
+        self.next();
+        if self.peek().kind == TokenKind::Dot {
+            return Err(SyntaxError::new(
+                "names are `column` or `table.column`; `db.table.column` is not supported",
+                self.peek().span,
+            ));
+        }
+        Ok(ColumnRef {
+            qualifier: Some(first),
+            name,
+            span: Span {
+                start: t.span.start,
+                end: n.span.end,
+            },
+        })
+    }
+
+    /// At `EXISTS`: `EXISTS (SELECT …)`.
+    fn exists(&mut self, negated: bool) -> Result<Expr, SyntaxError> {
+        let span = self.next().span;
+        if self.peek().kind != TokenKind::LParen {
+            return Err(self.expected("`(` and a sub-query after EXISTS"));
+        }
+        self.next();
+        if self.peek().kind != TokenKind::Keyword("SELECT") {
+            return Err(self.expected("a sub-query (SELECT …) after EXISTS"));
+        }
+        let query = self.query_body()?;
+        if self.peek().kind != TokenKind::RParen {
+            return Err(self.expected("`)` after the sub-query"));
+        }
+        self.next();
+        Ok(Expr::Exists {
+            query: Box::new(query),
+            negated,
+            span,
+        })
     }
 
     fn table(&mut self) -> Result<TableRef, SyntaxError> {
@@ -614,7 +676,26 @@ impl Parser {
                 self.peek().span,
             ));
         }
-        Ok(TableRef { name, span: t.span })
+        let alias = if self.peek().kind == TokenKind::Keyword("AS") {
+            self.next();
+            match self.peek().kind.clone() {
+                TokenKind::Ident(a) => {
+                    self.next();
+                    Some(a)
+                }
+                _ => return Err(self.expected("an alias for the table")),
+            }
+        } else if let TokenKind::Ident(a) = self.peek().kind.clone() {
+            self.next();
+            Some(a)
+        } else {
+            None
+        };
+        Ok(TableRef {
+            name,
+            alias,
+            span: t.span,
+        })
     }
 
     fn end(&mut self) -> Result<(), SyntaxError> {
@@ -716,8 +797,8 @@ mod tests {
             "nested functions are not supported yet at 1:14"
         );
         assert_eq!(
-            error("select e.ts from events"),
-            "qualified column names are not supported at 1:9"
+            error("select a.e.ts from events"),
+            "names are `column` or `table.column`; `db.table.column` is not supported at 1:11"
         );
         assert_eq!(
             error("select ts user_id from events"),
@@ -752,6 +833,16 @@ mod tests {
                     if *negated { " NOT" } else { "" },
                     list.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>()
                 ),
+                Expr::Exists { query, negated, .. } => format!(
+                    "({}EXISTS (SELECT … FROM {}{}))",
+                    if *negated { "NOT " } else { "" },
+                    query.from.name,
+                    query
+                        .selection
+                        .as_ref()
+                        .map(|w| format!(" WHERE {}", show(w)))
+                        .unwrap_or_default()
+                ),
                 Expr::InSubquery {
                     expr,
                     query,
@@ -777,6 +868,67 @@ mod tests {
                 .as_ref()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn aliases_qualified_names_and_constants() {
+        let q = parse("select e.ts, user_id from events e where e.x > 1 order by e.ts").unwrap();
+        assert_eq!(q.from.alias.as_deref(), Some("e"));
+        let Projection::Columns(cols) = &q.projection else {
+            panic!("columns")
+        };
+        assert_eq!(
+            (
+                cols[0].qualifier.as_deref(),
+                cols[0].name.as_str(),
+                cols[0].span.start,
+                cols[0].span.end
+            ),
+            (Some("e"), "ts", 7, 11)
+        );
+        assert_eq!(cols[1].qualifier, None);
+        assert_eq!(
+            parse("select * from events as ev")
+                .unwrap()
+                .from
+                .alias
+                .as_deref(),
+            Some("ev")
+        );
+        assert_eq!(
+            parse("select * from events where a = 1")
+                .unwrap()
+                .from
+                .alias,
+            None
+        );
+        let Projection::Items(items) = parse("select 1, 'x' from t").unwrap().projection else {
+            panic!("items")
+        };
+        assert!(matches!(
+            items[0].expr,
+            SelectExpr::Literal(Literal::Number(_), _)
+        ));
+        assert_eq!(
+            where_of("select * from events e where exists (select 1 from c where c.k = e.k)"),
+            "(EXISTS (SELECT … FROM c WHERE (k = k)))"
+        );
+        assert_eq!(
+            where_of("select * from e where not exists (select * from c)"),
+            "(NOT EXISTS (SELECT … FROM c))"
+        );
+        assert_eq!(
+            error("select * from e where exists c"),
+            "expected `(` and a sub-query after EXISTS, found identifier `c` at 1:30"
+        );
+        assert_eq!(
+            error("select * from e where exists (1)"),
+            "expected a sub-query (SELECT …) after EXISTS, found number `1` at 1:31"
+        );
+        assert_eq!(
+            error("select * from e as"),
+            "expected an alias for the table, found end of input at 1:19"
+        );
     }
 
     #[test]
@@ -854,9 +1006,9 @@ mod tests {
             "expected `(`, found number `1` at 1:28"
         );
         assert_eq!(
-            // a sub-query now, and `1` isn't a column
+            // a sub-query now (selecting a constant), missing its FROM
             error("select * from t where a in (select 1)"),
-            "expected `*` or a column name, found number `1` at 1:36"
+            "expected FROM, found `)` at 1:37"
         );
         assert_eq!(
             error("select * from t where (a = 1"),
@@ -908,6 +1060,7 @@ mod tests {
     fn order_by_forms() {
         let item = |name: &str, d, n| OrderItem {
             expr: SelectExpr::Column(ColumnRef {
+                qualifier: None,
                 name: name.into(),
                 span: Span::default(),
             }),
@@ -921,7 +1074,9 @@ mod tests {
                     .map(|mut i| {
                         match &mut i.expr {
                             SelectExpr::Column(c) => c.span = Span::default(),
-                            SelectExpr::Call { span, .. } => *span = Span::default(),
+                            SelectExpr::Call { span, .. } | SelectExpr::Literal(_, span) => {
+                                *span = Span::default()
+                            }
                         }
                         i
                     })

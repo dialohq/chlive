@@ -73,6 +73,8 @@ pub struct SelectItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectExpr {
     Column(ColumnRef),
+    /// A constant (`SELECT 1`): only in EXISTS sub-queries, which ignore their SELECT list.
+    Literal(Literal, Span),
     /// `name(arg)`, `name()` or `name(*)`; `span` is the name's.
     Call {
         name: String,
@@ -90,13 +92,18 @@ pub enum CallArg {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnRef {
+    /// `e` in `e.user_id`: a table or its alias.
+    pub qualifier: Option<String>,
     pub name: String,
+    /// The whole reference (`e.user_id`).
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
     pub name: String,
+    /// `FROM events e` / `FROM events AS e`.
+    pub alias: Option<String>,
     pub span: Span,
 }
 
@@ -165,6 +172,12 @@ pub enum Expr {
         negated: bool,
         span: Span,
     },
+    /// `[NOT] EXISTS (SELECT …)`; `span` is the `EXISTS`'s.
+    Exists {
+        query: Box<Query>,
+        negated: bool,
+        span: Span,
+    },
     /// `expr [NOT] IN (SELECT …)`; `span` is the `IN`'s.
     InSubquery {
         expr: Box<Expr>,
@@ -184,6 +197,7 @@ impl Expr {
             | Expr::Not { span, .. }
             | Expr::IsNull { span, .. }
             | Expr::InList { span, .. }
+            | Expr::Exists { span, .. }
             | Expr::InSubquery { span, .. } => *span,
             Expr::And(l, _) | Expr::Or(l, _) => l.span(),
         }
