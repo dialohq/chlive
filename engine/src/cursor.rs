@@ -17,6 +17,9 @@ const VERSION: u64 = 1;
 /// (table, columns, filter, ORDER BY, LIMIT), the output column types and the topics.
 pub fn fingerprint(plan: &Plan) -> String {
     let mut text = plan.history.sql(&plan.history.table);
+    if let Some(s) = &plan.semi {
+        text.push_str(&format!("|semi:{}", s.condition(&s.inner_table)));
+    }
     for c in &plan.columns {
         text.push_str(&format!("|{}:{}", c.name, c.ty.clickhouse));
     }

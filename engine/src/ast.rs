@@ -165,6 +165,13 @@ pub enum Expr {
         negated: bool,
         span: Span,
     },
+    /// `expr [NOT] IN (SELECT …)`; `span` is the `IN`'s.
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<Query>,
+        negated: bool,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -176,7 +183,8 @@ impl Expr {
             | Expr::Compare { span, .. }
             | Expr::Not { span, .. }
             | Expr::IsNull { span, .. }
-            | Expr::InList { span, .. } => *span,
+            | Expr::InList { span, .. }
+            | Expr::InSubquery { span, .. } => *span,
             Expr::And(l, _) | Expr::Or(l, _) => l.span(),
         }
     }

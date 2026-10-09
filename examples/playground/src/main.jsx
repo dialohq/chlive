@@ -16,6 +16,7 @@ const QUERY_PRESETS = [
   "select path, min(latency_ms), max(latency_ms), sum(amount) from events where country = 'PL' group by path",
   "select country, uniqExact(user_id) as users, median(latency_ms) from events group by country",
   "select country, count() as n, avg(latency_ms) from events group by country order by n desc limit 5",
+  "select ts, user_id, path from events where user_id in (select customer_id from customers where country = 'PL')",
   "select ts, user_id, country, path, latency_ms from events where latency_ms > 500",
   "select ts, user_id, country, latency_ms from events order by latency_ms desc",
   "select ts, user_id, country, path from events where country in ('PL', 'DE') order by country, ts desc",

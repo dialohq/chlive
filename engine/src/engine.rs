@@ -99,6 +99,8 @@ pub struct Engine {
     snapshots: Arc<dyn Snapshots>,
     native: Native,
     max_batch: usize,
+    /// How often a semi-join looks for a newer snapshot of its outer table.
+    semi_refresh: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +131,7 @@ impl Engine {
             KafkaSource::new(&config.kafka_brokers),
             snapshots,
         )
+        .with_semi_refresh(config.snapshots.refresh)
         .with_clickhouse_native(&config.clickhouse_native, &config.user, &config.password)
     }
 
@@ -168,7 +171,15 @@ impl Engine {
                 password: String::new(),
             },
             max_batch: 1000,
+            semi_refresh: Duration::from_secs(10),
         }
+    }
+
+    /// How often a semi-join (`IN (SELECT …)`) moves to a newer snapshot of its outer table,
+    /// so the rows it keeps back stay few (default 10 s, the snapshots' refresh).
+    pub fn with_semi_refresh(mut self, every: Duration) -> Self {
+        self.semi_refresh = every;
+        self
     }
 
     /// Stop taking snapshots and drop the ones no subscription is reading. Call before exiting.
@@ -221,6 +232,10 @@ impl Engine {
         since: Option<&str>,
     ) -> Result<Subscription, EngineError> {
         let plan = self.explain(sql).await?;
+        if plan.semi.is_some() {
+            // a semi-join always starts from history (no resume yet)
+            return self.subscribe_semi(plan).await;
+        }
         if let Some(aggregate) = plan.aggregate.clone() {
             // aggregates always start from history (no resume yet)
             let lease = self.snapshot(&plan.source).await?;
@@ -295,6 +310,80 @@ impl Engine {
         let resumed = matches!(first, First::CatchUp { .. });
         self.start(plan, Some(lease), begin, at, first, history_sql, resumed)
             .await
+    }
+
+    /// `key IN (SELECT …)`: history over snapshots of both tables, then both topics, the
+    /// sub-query's keys growing and the outer rows kept back until their key comes (see
+    /// [`crate::semi`]).
+    async fn subscribe_semi(&self, plan: Plan) -> Result<Subscription, EngineError> {
+        let semi = plan.semi.clone().expect("a semi-join plan");
+        let outer = self.snapshot(&plan.source).await?;
+        let same = semi.inner == plan.source;
+        let inner = if same {
+            outer.clone()
+        } else {
+            self.snapshot(&semi.inner).await?
+        };
+        let history_sql = plan
+            .history
+            .sql_where(&outer.sql_table(), &semi.condition(&inner.sql_table()));
+        let keys_sql = semi.keys_sql(&inner.sql_table());
+        let mut starts = Vec::new();
+        let mut topics = vec![(plan.stream.topics[0].clone(), outer.watermark.clone())];
+        if !same {
+            topics.push((semi.inner_topic.clone(), inner.watermark.clone()));
+        }
+        for (topic, w) in topics {
+            let partitions = self
+                .source
+                .partitions(&topic)
+                .await?
+                .ok_or_else(|| SourceError(format!("topic {topic} disappeared")))?;
+            starts.push(TopicStart {
+                topic,
+                partitions: partitions.into_iter().map(|p| (p, w.start(p))).collect(),
+            });
+        }
+        let mut keys = plan.stream.required_keys();
+        for k in semi.inner_stream.required_keys() {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        let events = self
+            .source
+            .subscribe(&starts, &keys)
+            .await?
+            .ready_chunks(self.max_batch)
+            .boxed();
+        tracing::info!(history = %history_sql, keys = %keys_sql, "subscribed (semi-join)");
+        let watermark = outer.watermark.clone();
+        let run = crate::semi::SemiRun::new(
+            self.history.clone(),
+            self.snapshots.clone(),
+            plan.clone(),
+            crate::semi::SemiStart {
+                history_sql: history_sql.clone(),
+                keys_sql,
+                inner_lease: inner.clone(),
+            },
+            outer,
+            inner.watermark.clone(),
+            events,
+            self.semi_refresh,
+        );
+        let iterations = stream::unfold(run, |mut run| async move {
+            let next = run.step().await?;
+            Some((next, run))
+        })
+        .boxed();
+        Ok(Subscription {
+            plan,
+            watermark,
+            history_sql,
+            resumed: false,
+            iterations,
+        })
     }
 
     async fn snapshot(&self, table: &crate::snapshot::SnapshotTable) -> Result<Lease, EngineError> {
@@ -631,7 +720,7 @@ enum Seed {
 }
 
 /// What a subscription keeps about its result to place new rows.
-enum ResultState {
+pub(crate) enum ResultState {
     /// Unordered, unlimited: every row is appended.
     Append,
     /// LIMIT without ORDER BY: the latest N rows.
@@ -641,7 +730,7 @@ enum ResultState {
 }
 
 impl ResultState {
-    fn for_plan(plan: &StreamPlan) -> Self {
+    pub(crate) fn for_plan(plan: &StreamPlan) -> Self {
         match (&plan.order, plan.limit) {
             (Some(o), limit) => Self::Ordered(OrderedState::with_limit(o.keys.clone(), limit)),
             (None, Some(n)) => Self::Window(WindowState::new(n)),
@@ -651,7 +740,7 @@ impl ResultState {
 
     /// Where a new row goes: an insert (at an index with ORDER BY) and the delete it causes, or
     /// nothing when it falls outside a LIMIT. `key` is its sort key with ORDER BY.
-    fn place(&mut self, row: Row, key: Option<SortKey>) -> Vec<Diff> {
+    pub(crate) fn place(&mut self, row: Row, key: Option<SortKey>) -> Vec<Diff> {
         match self {
             ResultState::Append => vec![Diff::insert(row)],
             ResultState::Window(w) => match w.push() {
@@ -677,13 +766,13 @@ impl ResultState {
     }
 }
 
-fn bad_history_row(e: impl std::fmt::Display) -> EngineError {
+pub(crate) fn bad_history_row(e: impl std::fmt::Display) -> EngineError {
     HistoryError::ClickHouse(format!("history row: {e}")).into()
 }
 
 /// The history as one iteration. Seeds the state: with ORDER BY the sort keys, in ClickHouse's
 /// order (dropping the hidden ORDER BY fields from the rows); with only a LIMIT the row count.
-fn history_iteration(
+pub(crate) fn history_iteration(
     plan: &StreamPlan,
     state: &mut ResultState,
     at: &Watermark,

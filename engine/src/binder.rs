@@ -77,6 +77,18 @@ pub struct BoundQuery {
     /// With GROUP BY or aggregate functions: the groups and what to compute per group. Then
     /// `projection` is empty and the output is `aggregation.items`.
     pub aggregation: Option<Aggregation>,
+    /// `key IN (SELECT …)`, a top-level AND condition of the WHERE (not part of `filter`).
+    pub semi_join: Option<SemiJoin>,
+}
+
+/// `outer_key IN (SELECT inner_key FROM inner [WHERE inner_filter])`: the rows whose key is
+/// one of the sub-query's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemiJoin {
+    pub outer_key: ColumnId,
+    pub inner: BoundTable,
+    pub inner_key: ColumnId,
+    pub inner_filter: Option<BoundExpr>,
 }
 
 /// A selected column and its output name (its alias, or its own name).
@@ -269,11 +281,25 @@ impl std::error::Error for BindError {}
 
 pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, BindError> {
     let table = bind_from(query, catalog).await?;
-    let filter = match &query.selection {
+    let (selection, sub) = match &query.selection {
+        Some(expr) => split_subquery(expr)?,
+        None => (None, None),
+    };
+    let filter = match &selection {
         Some(expr) => Some(bind_where(expr, &table)?),
         None => None,
     };
+    let semi_join = match sub {
+        Some((key, sub, span)) => Some(bind_semi_join(key, sub, span, &table, catalog).await?),
+        None => None,
+    };
     if let Some(mut aggregation) = bind_aggregation(query, &table)? {
+        if let Some((_, _, span)) = sub {
+            return Err(BindError::at(
+                "IN (subquery) with GROUP BY or aggregates is not supported yet",
+                span,
+            ));
+        }
         if let Some(order) = &query.order {
             bind_aggregate_order(order, &table, &mut aggregation)?;
         }
@@ -285,6 +311,7 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
             order: Vec::new(),
             limit: None,
             aggregation: Some(aggregation),
+            semi_join: None,
         });
     }
     let projection = bind_select(query, &table)?;
@@ -302,6 +329,135 @@ pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, Bi
         order,
         limit: query.limit.map(|l| l.value),
         aggregation: None,
+        semi_join,
+    })
+}
+
+/// The WHERE without its `IN (subquery)`, and that sub-query (key, query, the IN's span). It
+/// must be a top-level AND condition (anywhere else, `bind_where` rejects it), and only one.
+#[allow(clippy::type_complexity)]
+fn split_subquery(expr: &Expr) -> Result<(Option<Expr>, Option<(&Expr, &Query, Span)>), BindError> {
+    fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::And(l, r) => {
+                conjuncts(l, out);
+                conjuncts(r, out);
+            }
+            e => out.push(e),
+        }
+    }
+    let mut all = Vec::new();
+    conjuncts(expr, &mut all);
+    let mut rest: Option<Expr> = None;
+    let mut sub = None;
+    for c in all {
+        match c {
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+                span,
+            } => {
+                if *negated {
+                    return Err(BindError::at(
+                        "NOT IN (subquery) is not supported yet",
+                        *span,
+                    ));
+                }
+                if sub.is_some() {
+                    return Err(BindError::at(SUBQUERY_PLACE, *span));
+                }
+                sub = Some((expr.as_ref(), query.as_ref(), *span));
+            }
+            other => {
+                rest = Some(match rest {
+                    None => other.clone(),
+                    Some(r) => Expr::And(Box::new(r), Box::new(other.clone())),
+                })
+            }
+        }
+    }
+    Ok((rest, sub))
+}
+
+const SUBQUERY_PLACE: &str = "IN (subquery) is only supported as a top-level AND condition, once";
+
+/// `key IN (SELECT col FROM t [WHERE …])`: one column of one table, optionally filtered.
+async fn bind_semi_join(
+    key: &Expr,
+    sub: &Query,
+    span: Span,
+    outer: &BoundTable,
+    catalog: &Catalog<'_>,
+) -> Result<SemiJoin, BindError> {
+    let Expr::Column(k) = key else {
+        return Err(BindError::at(
+            "IN (subquery) needs a column on its left",
+            key.span(),
+        ));
+    };
+    let outer_key = resolve_column(outer, &k.name, k.span)?;
+    let unsupported = |what: &str, at: Span| {
+        BindError::at(
+            format!("{what} in an IN sub-query is not supported yet; select one column"),
+            at,
+        )
+    };
+    if let Some((_, at)) = &sub.group_by {
+        return Err(unsupported("GROUP BY", *at));
+    }
+    if let Some(l) = &sub.limit {
+        return Err(unsupported("LIMIT", l.span));
+    }
+    if let Some(o) = &sub.order {
+        let at = match o {
+            Order::All { span, .. } => *span,
+            Order::Items(items) => match &items[0].expr {
+                SelectExpr::Column(c) => c.span,
+                SelectExpr::Call { span, .. } => *span,
+            },
+        };
+        return Err(unsupported("ORDER BY", at));
+    }
+    let column = match &sub.projection {
+        Projection::Columns(cols) if cols.len() == 1 => &cols[0],
+        Projection::Items(items) if items.len() == 1 => match &items[0].expr {
+            SelectExpr::Column(c) => c,
+            SelectExpr::Call { span, .. } => return Err(unsupported("an aggregate", *span)),
+        },
+        _ => {
+            return Err(BindError::at(
+                "an IN sub-query must select exactly one column",
+                span,
+            ))
+        }
+    };
+    let inner = bind_from(sub, catalog).await?;
+    let inner_key = resolve_column(&inner, &column.name, column.span)?;
+    let (ok, ik) = (&outer.column(outer_key).ty, &inner.column(inner_key).ty);
+    let comparable = match (&ok.kind, &ik.kind) {
+        (Kind::Other, _) | (_, Kind::Other) => false,
+        (Kind::Int { .. } | Kind::Float, Kind::Int { .. } | Kind::Float) => true,
+        (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+    };
+    if !comparable {
+        return Err(BindError::at(
+            format!(
+                "{} ({ok}) can't be compared with the sub-query's {} ({ik})",
+                k.name, column.name
+            ),
+            span,
+        ));
+    }
+    let inner_filter = match &sub.selection {
+        Some(e) => Some(bind_where(e, &inner)?),
+        None => None,
+    };
+    Ok(SemiJoin {
+        outer_key,
+        inner,
+        inner_key,
+        inner_filter,
     })
 }
 
@@ -675,6 +831,7 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
 /// literals are coerced to the other side's type here, once, not per event.
 fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
     match expr {
+        Expr::InSubquery { span, .. } => Err(BindError::at(SUBQUERY_PLACE, *span)),
         Expr::And(l, r) => Ok(BoundExpr::And(
             Box::new(bind_where(l, table)?),
             Box::new(bind_where(r, table)?),
@@ -1479,5 +1636,74 @@ mod tests {
         let a = agg("select user_id from events group by user_id limit 3").await;
         assert!(a.order.is_empty());
         assert_eq!(a.limit, Some(3));
+    }
+
+    #[tokio::test]
+    async fn in_subquery_is_a_semi_join() {
+        let b = bind_sql(
+            "select ts from events where latency_ms > 1 \
+             and user_id in (select id from plain where id != 'x') and coupon is null",
+        )
+        .await
+        .unwrap();
+        let semi = b.semi_join.as_ref().unwrap();
+        assert_eq!(semi.outer_key, ColumnId(1));
+        assert_eq!(semi.inner.name, "plain");
+        assert_eq!(semi.inner.column(semi.inner_key).name, "id");
+        assert!(semi.inner_filter.is_some());
+        // the rest of the WHERE stays the filter, without the IN
+        let mut cols = Vec::new();
+        b.filter.as_ref().unwrap().columns(&mut cols);
+        assert_eq!(cols, [ColumnId(2), ColumnId(3)]);
+        // the same table on both sides
+        let b = bind_sql(
+            "select ts from events where user_id in (select user_id from events where paid)",
+        )
+        .await
+        .unwrap();
+        assert!(b.filter.is_none());
+        assert_eq!(b.semi_join.unwrap().inner.name, "events");
+    }
+
+    #[tokio::test]
+    async fn in_subquery_errors() {
+        let e = |sql: &'static str| async move { bind_sql(sql).await.unwrap_err() };
+        assert_eq!(
+            e("select ts from events where user_id not in (select id from plain)").await,
+            "NOT IN (subquery) is not supported yet at 1:41"
+        );
+        assert_eq!(
+            e("select ts from events where paid or user_id in (select id from plain)").await,
+            "IN (subquery) is only supported as a top-level AND condition, once at 1:45"
+        );
+        assert_eq!(
+            e(
+                "select ts from events where user_id in (select id from plain) \
+               and ts in (select id from plain)"
+            )
+            .await,
+            "IN (subquery) is only supported as a top-level AND condition, once at 1:70"
+        );
+        assert_eq!(
+            e("select count() from events where user_id in (select id from plain)").await,
+            "IN (subquery) with GROUP BY or aggregates is not supported yet at 1:42"
+        );
+        assert_eq!(
+            e("select ts from events where user_id in (select id from plain limit 5)").await,
+            "LIMIT in an IN sub-query is not supported yet; select one column at 1:68"
+        );
+        assert_eq!(
+            e("select ts from events where user_id in (select * from plain)").await,
+            "an IN sub-query must select exactly one column at 1:37"
+        );
+        assert_eq!(
+            e("select ts from events where latency_ms in (select id from plain)").await,
+            "latency_ms (UInt32) can't be compared with the sub-query's id (String) at 1:40"
+        );
+        assert!(
+            e("select ts from events where user_id in (select nope from plain)")
+                .await
+                .starts_with("unknown column nope in table plain")
+        );
     }
 }

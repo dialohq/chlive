@@ -26,6 +26,64 @@ pub struct Plan {
     pub stream: StreamPlan,
     /// With GROUP BY or aggregates: how chDB keeps and merges the per-group states.
     pub aggregate: Option<AggregatePlan>,
+    /// With `key IN (SELECT …)`: the sub-query, and how its keys are found and followed.
+    pub semi: Option<SemiPlan>,
+}
+
+/// `outer_key IN (SELECT inner_key FROM inner [WHERE …])`. The sub-query's keys (`S`) come from
+/// a snapshot of the inner table, then from its topic; outer rows whose key isn't in `S` yet
+/// are kept back until it is (see `engine::semi`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemiPlan {
+    /// The inner table's snapshots, and its topic.
+    pub inner: crate::snapshot::SnapshotTable,
+    pub inner_topic: TopicId,
+    /// The inner table, quoted (`db.t`), for explain and the cursor.
+    pub inner_table: String,
+    /// Decodes the inner topic's events: the key and the filter's columns; `output` is the key.
+    pub inner_stream: StreamPlan,
+    /// The inner key, in `inner_stream`'s decoded rows.
+    pub inner_key: ColumnId,
+    /// The outer key, in the outer stream's decoded rows.
+    pub outer_key: ColumnId,
+    /// Keys compare as numbers when either side is a float (`5` = `5.0`).
+    pub float_keys: bool,
+    outer_key_sql: String,
+    inner_key_sql: String,
+    inner_filter_sql: Option<String>,
+}
+
+impl SemiPlan {
+    /// The outer rows' condition, over a snapshot of the inner table (`inner_from`).
+    pub fn condition(&self, inner_from: &str) -> String {
+        format!(
+            "{} IN (SELECT {} FROM {inner_from}{})",
+            self.outer_key_sql,
+            self.inner_key_sql,
+            self.inner_where()
+        )
+    }
+
+    /// The sub-query's keys in a snapshot of the inner table, as `k`.
+    pub fn keys_sql(&self, inner_from: &str) -> String {
+        format!(
+            "SELECT DISTINCT {} AS k FROM {inner_from}{}",
+            self.inner_key_sql,
+            self.inner_where()
+        )
+    }
+
+    /// Back-fill: the outer rows of these keys (rendered literals).
+    pub fn keys_condition(&self, literals: &[String]) -> String {
+        format!("{} IN ({})", self.outer_key_sql, literals.join(", "))
+    }
+
+    fn inner_where(&self) -> String {
+        match &self.inner_filter_sql {
+            Some(f) => format!(" WHERE {f}"),
+            None => String::new(),
+        }
+    }
 }
 
 /// GROUP BY and aggregates, run in chDB: main ClickHouse computes the history's aggregate
@@ -372,6 +430,23 @@ impl HistoryPlan {
     /// The query, reading `from` (a snapshot of [`Self::table`]).
     pub fn sql(&self, from: &str) -> String {
         self.build(&self.select, from, self.order.as_deref(), self.limit)
+    }
+
+    /// The query with one more condition (a semi-join's, or a back-fill's keys).
+    pub fn sql_where(&self, from: &str, extra: &str) -> String {
+        let mut sql = format!("SELECT {} FROM {from}", self.select);
+        match &self.filter {
+            Some(f) => sql.push_str(&format!(" WHERE ({f}) AND ({extra})")),
+            None => sql.push_str(&format!(" WHERE {extra}")),
+        }
+        if let Some(order) = &self.order {
+            sql.push(' ');
+            sql.push_str(order);
+        }
+        if let Some(limit) = self.limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+        sql
     }
 
     /// Resume: the sort keys of the result (with ORDER BY), in order.
@@ -752,6 +827,22 @@ impl std::fmt::Display for Plan {
              offsets it holds",
             self.history.table
         )?;
+        if let Some(s) = &self.semi {
+            writeln!(
+                f,
+                "semi:    {} (history over a snapshot of {} too)",
+                s.condition("<inner snapshot>"),
+                s.inner_table
+            )?;
+            writeln!(
+                f,
+                "         keys: {}, then from topic {}; a key's earlier rows come from the latest \
+                 snapshot ({}) and a tail of the events kept back since",
+                s.keys_sql("<inner snapshot>"),
+                s.inner_topic,
+                s.keys_condition(&["…".into()])
+            )?;
+        }
         writeln!(
             f,
             "topics:  {} (each partition from right after that)",
@@ -906,6 +997,12 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             }
         }
     }
+    if let Some(semi) = &bound.semi_join {
+        if !needed.contains(&semi.outer_key) {
+            needed.push(semi.outer_key);
+        }
+    }
+    let semi = bound.semi_join.as_ref().map(|s| semi_plan(s, table));
     let stream = StreamPlan {
         topics: vec![table.topic.clone()],
         columns: needed
@@ -948,6 +1045,60 @@ pub fn plan(bound: &BoundQuery) -> Plan {
         history,
         stream,
         aggregate,
+        semi,
+    }
+}
+
+fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
+    let inner = &s.inner;
+    let mut needed = vec![s.inner_key];
+    if let Some(f) = &s.inner_filter {
+        let mut cols = Vec::new();
+        f.columns(&mut cols);
+        for c in cols {
+            if !needed.contains(&c) {
+                needed.push(c);
+            }
+        }
+    }
+    let key = inner.column(s.inner_key);
+    let inner_stream = StreamPlan {
+        topics: vec![inner.topic.clone()],
+        columns: needed
+            .iter()
+            .map(|id| {
+                let c = inner.column(*id);
+                StreamColumn {
+                    id: *id,
+                    json_key: c.json_key.clone(),
+                    ty: c.ty.clone(),
+                }
+            })
+            .collect(),
+        width: inner.columns.len(),
+        output: vec![(key.name.clone(), s.inner_key)],
+        filter: match &s.inner_filter {
+            None => Filter::All,
+            Some(expr) => Filter::Where {
+                expr: expr.clone(),
+                text: to_dialect(expr, inner),
+            },
+        },
+        order: None,
+        limit: None,
+    };
+    let float = |t: &Type| t.kind == crate::types::Kind::Float;
+    SemiPlan {
+        inner: inner.snapshot_table(),
+        inner_topic: inner.topic.clone(),
+        inner_table: inner.clickhouse_table.clone(),
+        inner_stream,
+        inner_key: s.inner_key,
+        outer_key: s.outer_key,
+        float_keys: float(&key.ty) || float(&outer.column(s.outer_key).ty),
+        outer_key_sql: quote_ident(&outer.column(s.outer_key).clickhouse),
+        inner_key_sql: quote_ident(&key.clickhouse),
+        inner_filter_sql: s.inner_filter.as_ref().map(|f| to_clickhouse(f, inner)),
     }
 }
 
@@ -995,6 +1146,7 @@ mod tests {
             order: Vec::new(),
             limit: None,
             aggregation: None,
+            semi_join: None,
         }
     }
 

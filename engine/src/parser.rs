@@ -50,6 +50,13 @@ impl Parser {
     }
 
     fn query(&mut self) -> Result<Query, SyntaxError> {
+        let query = self.query_body()?;
+        self.end()?;
+        Ok(query)
+    }
+
+    /// A query without what may follow it (the end, or a sub-query's `)`).
+    fn query_body(&mut self) -> Result<Query, SyntaxError> {
         self.keyword("SELECT")?;
         let projection = self.projection()?;
         self.keyword("FROM")?;
@@ -85,7 +92,6 @@ impl Parser {
         } else {
             None
         };
-        self.end()?;
         Ok(Query {
             projection,
             from,
@@ -436,6 +442,19 @@ impl Parser {
             return Err(self.expected("`(`"));
         }
         self.next();
+        if self.peek().kind == TokenKind::Keyword("SELECT") {
+            let query = self.query_body()?;
+            if self.peek().kind != TokenKind::RParen {
+                return Err(self.expected("`)` after the sub-query"));
+            }
+            self.next();
+            return Ok(Expr::InSubquery {
+                expr: Box::new(expr),
+                query: Box::new(query),
+                negated,
+                span,
+            });
+        }
         let mut list = vec![self.literal()?];
         while self.peek().kind == TokenKind::Comma {
             self.next();
@@ -733,6 +752,22 @@ mod tests {
                     if *negated { " NOT" } else { "" },
                     list.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>()
                 ),
+                Expr::InSubquery {
+                    expr,
+                    query,
+                    negated,
+                    ..
+                } => format!(
+                    "({}{} IN (SELECT … FROM {}{}))",
+                    show(expr),
+                    if *negated { " NOT" } else { "" },
+                    query.from.name,
+                    query
+                        .selection
+                        .as_ref()
+                        .map(|w| format!(" WHERE {}", show(w)))
+                        .unwrap_or_default()
+                ),
             }
         }
         show(
@@ -744,6 +779,21 @@ mod tests {
         )
     }
 
+    #[test]
+    fn in_subqueries() {
+        assert_eq!(
+            where_of("select * from events where a > 1 and user_id in (select id from users where country = 'PL')"),
+            "((a > Number(\"1\")) AND (user_id IN (SELECT … FROM users WHERE (country = String(\"PL\")))))"
+        );
+        assert_eq!(
+            where_of("select * from e where k not in (select k from f)"),
+            "(k NOT IN (SELECT … FROM f))"
+        );
+        assert_eq!(
+            error("select * from e where k in (select k from f"),
+            "expected `)` after the sub-query, found end of input at 1:44"
+        );
+    }
     #[test]
     fn where_precedence_and_forms() {
         assert_eq!(
@@ -804,8 +854,9 @@ mod tests {
             "expected `(`, found number `1` at 1:28"
         );
         assert_eq!(
+            // a sub-query now, and `1` isn't a column
             error("select * from t where a in (select 1)"),
-            "expected a value, found SELECT at 1:29"
+            "expected `*` or a column name, found number `1` at 1:36"
         );
         assert_eq!(
             error("select * from t where (a = 1"),
