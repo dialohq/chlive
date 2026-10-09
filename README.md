@@ -171,9 +171,9 @@ JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/p
 - **Cost:** see [docs/bench/group-by.md](docs/bench/group-by.md). Natively ~1 M events/s per subscription one at a time, up to several M/s batched. chDB costs ~2–5 ms per batch, so ~500 events/s one at a time and ~150–500 k/s in batches of 1000.
 - Binaries call `chlive_engine::chdb::shutdown()` before exiting: with chDB open, its exit handlers crash the process.
 
-### IN sub-queries
+### IN and EXISTS sub-queries
 
-`SELECT … FROM events WHERE user_id IN (SELECT customer_id FROM customers WHERE country = 'PL')`: both tables are append-only, so the sub-query's keys (`S`) only grow, and outer rows only enter the result.
+`SELECT … FROM events WHERE user_id IN (SELECT customer_id FROM customers WHERE country = 'PL')`: both tables are append-only, so the sub-query's keys (`S`) only grow, and outer rows only enter the result. A correlated `EXISTS (SELECT 1 FROM customers c WHERE c.customer_id = e.user_id AND c.country = 'PL')` is bound to exactly this; an uncorrelated `EXISTS` is the same with one constant key, so the first matching inner row lets every outer row in.
 
 - **History** is ClickHouse running the whole query over snapshots of both tables; `S` is read from the inner snapshot (`SELECT DISTINCT …`).
 - **Then both topics.** An inner event that passes the sub-query's WHERE adds its key to `S`. An outer event whose key is in `S` is placed as usual; one whose key isn't yet is **kept back**, by key.
@@ -216,7 +216,7 @@ The engine's dialect, in full (keywords are case-insensitive):
 
 ```
 SELECT * | select_item [, select_item ...]
-FROM table
+FROM table [[AS] alias]
 [WHERE condition]
 [GROUP BY column [, column ...]]
 [ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST] | order_item [ASC|DESC] [NULLS FIRST|LAST] [, ...]]
@@ -229,6 +229,7 @@ order_item  := column
 select_item := column [AS alias]
              | aggregate(column) [AS alias]
              | count() | count(*) [AS alias]
+             | literal                                        -- only in EXISTS sub-queries
 aggregate   := count | sum | avg | min | max                   -- native, in the engine
              | uniq | uniqExact | median | any | anyLast       -- through chDB
 condition   := condition OR condition | condition AND condition | NOT condition | (condition)
@@ -236,17 +237,21 @@ condition   := condition OR condition | condition AND condition | NOT condition 
              | operand IS [NOT] NULL
              | operand [NOT] IN (literal [, literal ...])
              | column IN (SELECT column FROM table [WHERE condition])   -- see below
+             | EXISTS (SELECT … FROM table [[AS] alias] [WHERE inner.col = outer.col] [AND condition …])
              | operand
 operand     := column | literal
 literal     := number | -number | 'string' | TRUE | FALSE | NULL
-column, table, alias := identifier | "identifier" | `identifier`
+column      := [table_or_alias.]name
+name, table, alias := identifier | "identifier" | `identifier`
 ```
 
 - **Tables:** a table needs a ClickHouse table, ingested by one sink connector (known to the pause server) from a Kafka topic of the same name.
+- **Table aliases and qualified names:** `FROM events e` (or `AS e`); `e.user_id` or `events.user_id` anywhere a column goes. In a sub-query, an unqualified name is its own table's column first, then the outer query's.
 - **Aliases** only name output columns: WHERE and (plain queries') ORDER BY refer to table columns. Output names must be unique; an alias can't be another column's name or start with `_`.
 - **ORDER BY / LIMIT:** with `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot. `LIMIT` keeps the top N (with `ORDER BY`) or the latest N (without), deleting the rows that fall out. Without `LIMIT`, plain results only grow.
 - **GROUP BY / aggregates** (also without GROUP BY: one global group): selected columns must be grouping columns; no `SELECT *`. Groups are inserted, then updated.
   - **ORDER BY** takes an output name (an alias or a default name like `count()`), a grouping column, or an aggregate call (`order by count() desc`; one that isn't selected is computed anyway), or `ALL`. As values change, groups move: an `update` with an `index`. A group whose sort key changes goes after the groups it ties with.
   - **LIMIT n** keeps the first n groups by ORDER BY: a group falling out is deleted and the next one comes in, and the others are kept to come back in later. Without ORDER BY, it's the first n groups seen.
-- **IN (subquery)**: one per query, as a top-level `AND` condition of the WHERE, over plain queries (with ORDER BY and LIMIT); the sub-query selects one column of one table, with an optional WHERE (the same table as the outer one is fine). See [IN sub-queries](#in-sub-queries).
-- **Not yet:** OFFSET, `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, `NOT IN (subquery)` and other sub-queries, IN sub-queries with GROUP BY, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters.
+- **EXISTS (subquery)**: correlated (`… WHERE c.customer_id = e.user_id AND …`) it is the same semi-join as the matching `IN`: exactly one `inner = outer` equality, a top-level `AND` condition of the sub-query, is the key; the rest of its WHERE may only use its own table. Uncorrelated (no such equality), it's true for every row once the sub-query has a row: until then outer rows are kept back, and then they all come in. Its SELECT list doesn't matter (`SELECT 1`, `SELECT *`).
+- **IN (subquery)**: one per query (IN or EXISTS), as a top-level `AND` condition of the WHERE, over plain queries (with ORDER BY and LIMIT); the sub-query selects one column of one table, with an optional WHERE (the same table as the outer one is fine). See [IN and EXISTS sub-queries](#in-and-exists-sub-queries).
+- **Not yet:** OFFSET, `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, `NOT IN (subquery)`, `NOT EXISTS`, EXISTS with several correlations (composite keys), constants as output columns, and other sub-queries, IN sub-queries with GROUP BY, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters.
