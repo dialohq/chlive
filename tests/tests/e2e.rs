@@ -527,11 +527,17 @@ async fn semi_join_matches_clickhouse() -> Result<()> {
         "select ts, user_id, path from events \
          where user_id in (select customer_id from customers where country = '{country}')"
     );
+    // the same semi-join as a correlated EXISTS, with aliases
+    let exists = format!(
+        "select e.ts, e.user_id, e.path from events e where exists \
+         (select 1 from customers c where c.customer_id = e.user_id and c.country = '{country}')"
+    );
     with_server(config(), |server| {
         async move {
             let conn = LiveConn::connect(server).await?;
             conn.subscribe("semi", &sql);
-            conn.wait_ready(&["semi"], Duration::from_secs(60)).await?;
+            conn.subscribe("exists", &exists);
+            conn.wait_ready(&["semi", "exists"], Duration::from_secs(60)).await?;
             let events = producer()?;
             let customers = producer::Producer::new(&config().kafka_brokers, "customers")?;
             // events of users not in the sub-query yet: kept back
@@ -579,6 +585,9 @@ async fn semi_join_matches_clickhouse() -> Result<()> {
             eprintln!("semi: {} rows (inserted live {})", live.rows.len(), live.inserted);
             assert!(!direct.is_empty());
             assert_eq!(multiset(&live.rows), multiset(&direct));
+            let live = conn.result("exists").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert_eq!(multiset(&live.rows), multiset(&direct), "EXISTS");
             Ok(())
         }
         .boxed()

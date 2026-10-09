@@ -85,6 +85,22 @@ impl HistorySource for Fake {
                 row(json!({"ts": "h0", "user_id": "u3"})),
                 row(json!({"ts": "e1", "user_id": "u3"})),
             ]),
+            // uncorrelated EXISTS: whether the sub-query has a row, then all rows of events
+            "SELECT 1 AS k FROM default.users_v1 WHERE country = 'PL' LIMIT 1" => {
+                Ok(vec![row(json!({"k": 1}))])
+            }
+            "SELECT 1 AS k FROM default.users_v1 WHERE country = 'XX' LIMIT 1" => Ok(vec![]),
+            "SELECT ts, user_id FROM default.events_v1 \
+             WHERE EXISTS (SELECT 1 FROM default.users_v1 WHERE country = 'PL')" => Ok(vec![
+                row(json!({"ts": "h1", "user_id": "u1"})),
+                row(json!({"ts": "h2", "user_id": "u2"})),
+            ]),
+            "SELECT ts, user_id FROM default.events_v1 \
+             WHERE EXISTS (SELECT 1 FROM default.users_v1 WHERE country = 'XX')" => Ok(vec![]),
+            "SELECT ts, user_id FROM default.events_v1" => Ok(vec![
+                row(json!({"ts": "h1", "user_id": "u1"})),
+                row(json!({"ts": "h2", "user_id": "u2"})),
+            ]),
             other => panic!("unexpected query: {other}"),
         }
     }
@@ -185,5 +201,92 @@ async fn not_while_the_newer_snapshot_is_ahead_of_the_stream() {
     assert!(
         !queries.iter().any(|q| q.contains("events_v9")),
         "{queries:?}"
+    );
+}
+
+#[tokio::test]
+async fn exists_plans_like_in() {
+    let fake = Fake::default();
+    let engine = Engine::new(
+        HardcodedRules::default(),
+        fake.clone(),
+        source(),
+        fake.clone(),
+    );
+    let in_plan = engine.explain(SQL).await.unwrap();
+    for sql in [
+        "select e.ts, e.user_id from events e \
+         where exists (select 1 from users u where u.id = e.user_id and u.country = 'PL')",
+        "select ts, user_id from events where exists (select * from users where country = 'PL' and user_id = id)",
+    ] {
+        let p = engine.explain(sql).await.unwrap();
+        assert_eq!(p.history, in_plan.history, "{sql}");
+        assert_eq!(p.semi, in_plan.semi, "{sql}");
+        assert_eq!(
+            chlive_engine::cursor::fingerprint(&p),
+            chlive_engine::cursor::fingerprint(&in_plan)
+        );
+    }
+}
+
+#[tokio::test]
+async fn uncorrelated_exists_lets_everything_in_once_the_sub_query_has_a_row() {
+    // no user in XX at subscribe time; then one arrives
+    let fake = Fake::default();
+    let mut with_xx = source();
+    with_xx.push("users", 0, r#"{"id": "u9", "country": "XX"}"#);
+    let engine = Engine::new(
+        HardcodedRules::default(),
+        fake.clone(),
+        with_xx,
+        fake.clone(),
+    )
+    .with_max_batch(1);
+    let lines: Vec<String> = engine
+        .subscribe("select ts, user_id from events where exists (select 1 from users where country = 'XX')")
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines,
+        [
+            "history: 0 rows",
+            // e1, e2: kept back, nothing matches XX yet
+            "",
+            "",
+            // users after the snapshot: u3 (PL), u2 (DE): still nothing
+            "",
+            "",
+            // u9 in XX: every row comes, the snapshot's then the kept-back ones
+            "users/0:3 + {\"ts\":\"h1\",\"user_id\":\"u1\"}\nusers/0:3 + {\"ts\":\"h2\",\"user_id\":\"u2\"}\n\
+             users/0:3 + {\"ts\":\"e1\",\"user_id\":\"u3\"}\nusers/0:3 + {\"ts\":\"e2\",\"user_id\":\"u1\"}",
+        ]
+    );
+
+    // already true at subscribe time: the history has everything, nothing is kept back
+    let fake = Fake::default();
+    let engine = Engine::new(
+        HardcodedRules::default(),
+        fake.clone(),
+        source(),
+        fake.clone(),
+    )
+    .with_max_batch(1);
+    let lines: Vec<String> = engine
+        .subscribe("select ts, user_id from events where exists (select 1 from users where country = 'PL')")
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines[..3],
+        [
+            "+ {\"ts\":\"h1\",\"user_id\":\"u1\"}\n+ {\"ts\":\"h2\",\"user_id\":\"u2\"}\nhistory: 2 rows",
+            "events/0:2 + {\"ts\":\"e1\",\"user_id\":\"u3\"}",
+            "events/0:3 + {\"ts\":\"e2\",\"user_id\":\"u1\"}",
+        ]
     );
 }

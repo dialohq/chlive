@@ -1072,13 +1072,30 @@ async fn semi_joins_match_clickhouse() {
             )
         })
         .collect();
-    const CASES: &[(&str, &[&str])] = &[
-        ("select name, user_id from events where user_id in (select id from users where country = 'PL')", &[]),
-        ("select name from events where amount > 10 and user_id in (select id from users where country != 'DE')", &[]),
-        ("select name, amount from events where user_id in (select id from users where country = 'PL') order by amount desc limit 4", &["amount"]),
-        ("select name, ts from events where user_id in (select id from users) order by ts", &["ts"]),
+    // (query, ORDER BY columns, the reference query when ClickHouse needs another form)
+    const CASES: &[(&str, &[&str], Option<&str>)] = &[
+        ("select name, user_id from events where user_id in (select id from users where country = 'PL')", &[], None),
+        ("select name from events where amount > 10 and user_id in (select id from users where country != 'DE')", &[], None),
+        ("select name, amount from events where user_id in (select id from users where country = 'PL') order by amount desc limit 4", &["amount"], None),
+        ("select name, ts from events where user_id in (select id from users) order by ts", &["ts"], None),
         // the same table on both sides
-        ("select name from events where user_id in (select user_id from events where amount > 40)", &[]),
+        ("select name from events where user_id in (select user_id from events where amount > 40)", &[], None),
+        // correlated EXISTS, with aliases: the same semi-join (ClickHouse answers the IN form)
+        (
+            "select e.name, e.user_id from events e where exists (select 1 from users u where u.id = e.user_id and u.country = 'PL')",
+            &[],
+            Some("select name, user_id from events where user_id in (select id from users where country = 'PL')"),
+        ),
+        (
+            "select e.name, e.amount from events e where exists (select * from users where country = 'PL' and id = e.user_id) order by e.amount desc limit 4",
+            &["amount"],
+            Some("select name, amount from events where user_id in (select id from users where country = 'PL') order by amount desc limit 4"),
+        ),
+        // uncorrelated EXISTS: u6 (US) arrives late in most setups; nobody is in ZZ
+        ("select name from events where exists (select 1 from users where country = 'US')", &[], None),
+        ("select name from events where exists (select 1 from users where country = 'ZZ')", &[], None),
+        // an ordinary query with an alias and qualified names
+        ("select e.name, e.amount from events e where e.amount > 30 order by e.amount, e.name", &["amount", "name"], None),
     ];
     let create = |db: &str| {
         [
@@ -1114,11 +1131,13 @@ async fn semi_joins_match_clickhouse() {
         ("chlive_engine_semi_users_later", ne, 0),
         ("chlive_engine_semi_events_later", 0, nu),
     ];
-    for (sql, keys) in CASES {
+    for (sql, keys, reference) in CASES {
         use chlive_engine::history::HistorySource;
         let want = direct
             .fetch(
-                &sql.replace("from events", "from chlive_engine_semi_ref.events")
+                &reference
+                    .unwrap_or(sql)
+                    .replace("from events", "from chlive_engine_semi_ref.events")
                     .replace("from users", "from chlive_engine_semi_ref.users"),
             )
             .await
