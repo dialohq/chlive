@@ -1,5 +1,5 @@
 /**
- * The chlive WebSocket protocol (v1), mirroring `server/src/protocol.rs`.
+ * The chlive WebSocket protocol (v1), mirroring `protocol/src/lib.rs` (the `chlive-protocol` crate).
  *
  * The client subscribes with an id of its choosing (scoped to the connection) and a query in the
  * chlive dialect. The server answers with one `snapshot` (the result as of subscribing), then

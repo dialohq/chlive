@@ -1,0 +1,10 @@
+[package]
+name = "chlive-protocol"
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+description = "The chlive WebSocket protocol: messages between chlive-server and its clients"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }

@@ -25,7 +25,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::protocol::{Change, ClientMsg, Column, OrderTerm, ServerMsg, BAD_MESSAGE, DUPLICATE_ID};
+use crate::protocol::{
+    change, engine_error, order_terms, Change, ClientMsg, Column, ServerMsg, BAD_MESSAGE,
+    DUPLICATE_ID,
+};
 
 /// Iterations already waiting are sent together, in one `diff`, up to this many.
 const MAX_ITERATIONS_PER_MESSAGE: usize = 256;
@@ -232,7 +235,7 @@ async fn run(
         Err(e) => {
             debug!(conn, id, error = %e, "subscribe failed");
             registry.remove(conn, &id);
-            let _ = tx.send(ServerMsg::engine_error(&id, &e)).await;
+            let _ = tx.send(engine_error(&id, &e)).await;
             return;
         }
     };
@@ -257,7 +260,7 @@ async fn run(
             })
             .collect(),
     };
-    let order = OrderTerm::for_plan(&plan);
+    let order = order_terms(&plan);
     let limit = plan
         .aggregate
         .as_ref()
@@ -322,7 +325,7 @@ async fn run(
                 }
                 Ok(it) => {
                     catch_up |= it.origin == Origin::CatchUp;
-                    changes.extend(it.diffs.into_iter().map(Change::from));
+                    changes.extend(it.diffs.into_iter().map(change));
                     at = Some(it.at);
                 }
                 Err(e) => {
@@ -334,7 +337,7 @@ async fn run(
                             at: cursor::encode(&plan, a),
                         });
                     }
-                    out.push(ServerMsg::engine_error(&id, &e));
+                    out.push(engine_error(&id, &e));
                     failed = true;
                     break;
                 }
