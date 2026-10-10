@@ -1,0 +1,13 @@
+[package]
+name = "chlive-example-rust-alerts"
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+publish = false
+description = "An event-driven service on chlive-client: alerts on the slowest requests and country stats"
+
+[dependencies]
+chlive-client = { path = "../../client-rs" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }

@@ -422,6 +422,15 @@
                     exec bun --bun run --cwd examples/playground dev --port ${toString settings.playgroundPort} --strictPort
                   '';
                 };
+
+                # The Rust client's example: alerts on the slowest requests, per-country stats.
+                # It connects (and reconnects) on its own once the server is up.
+                rust-alerts = {
+                  command = ''
+                    cd "$DNVR_ROOT"
+                    exec cargo run --release -q -p chlive-example-rust-alerts
+                  '';
+                };
               };
 
               scripts = {
