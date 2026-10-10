@@ -375,6 +375,13 @@ pub async fn ingested_from(topic: &str) -> Result<BTreeMap<i32, i64>> {
 /// Wait until ClickHouse has ingested everything up to `produced`, then until the connection
 /// has been quiet for a while (the stream has delivered the rest).
 pub async fn settle(conn: &LiveConn, produced: &BTreeMap<i32, i64>) -> Result<()> {
+    wait_ingested(produced).await?;
+    conn.wait_quiet(Duration::from_millis(1000), Duration::from_secs(60))
+        .await
+}
+
+/// Wait until ClickHouse has ingested everything up to `produced`.
+pub async fn wait_ingested(produced: &BTreeMap<i32, i64>) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let have = ingested().await?;
@@ -389,8 +396,7 @@ pub async fn settle(conn: &LiveConn, produced: &BTreeMap<i32, i64>) -> Result<()
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    conn.wait_quiet(Duration::from_millis(1000), Duration::from_secs(60))
-        .await
+    Ok(())
 }
 
 /// The query run directly on ClickHouse, unbounded: the SQL the engine plans for its history.

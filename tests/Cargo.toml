@@ -13,6 +13,7 @@ futures = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chlive-engine = { path = "../engine" }
 chlive-server = { path = "../server" }
+chlive-client = { path = "../client-rs" }
 rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dynamic-linking"] }
 rand = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

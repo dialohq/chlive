@@ -597,3 +597,133 @@ async fn semi_join_matches_clickhouse() -> Result<()> {
     })
     .await
 }
+
+/// The Rust client (`chlive-client`) over the real server: a plain, an ordered and limited, and
+/// an aggregated query, kept up to date by its diffs, equal ClickHouse's answers.
+#[tokio::test]
+async fn rust_client_matches_direct_queries() -> Result<()> {
+    use chlive_client::{ClientOptions, Kind, LiveClient, Status};
+    use futures::StreamExt;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    with_server(config(), |server| async move {
+    const QUERIES: &[(&str, &str, Option<usize>)] = &[
+        ("slow", "select ts, user_id, latency_ms from events where latency_ms > 500", None),
+        ("top_latency", "select ts, user_id, latency_ms from events order by latency_ms desc limit 20", Some(20)),
+        ("by_country", "select country, count() as n, avg(latency_ms) as avg_latency from events group by country", None),
+    ];
+    let client = LiveClient::new(ClientOptions::new(format!("ws://{}/live", server.addr)));
+    #[derive(Default)]
+    struct Seen {
+        live: bool,
+        rows: Vec<Row>,
+        changes: usize,
+        error: Option<String>,
+    }
+    let seen: Vec<Arc<Mutex<Seen>>> = QUERIES.iter().map(|_| Default::default()).collect();
+    let last = Arc::new(Mutex::new(Instant::now()));
+    let mut tasks = Vec::new();
+    for ((id, sql, limit), seen) in QUERIES.iter().zip(&seen) {
+        let mut sub = client.subscribe::<Row>(*sql);
+        let (seen, last, id, limit) = (seen.clone(), last.clone(), *id, *limit);
+        tasks.push(tokio::spawn(async move {
+            while let Some(u) = sub.next().await {
+                if let Some(n) = limit {
+                    assert!(u.rows.len() <= n, "{id}: {} rows", u.rows.len());
+                }
+                let mut s = seen.lock().unwrap();
+                s.live |= u.kind == Kind::Snapshot;
+                s.rows = u.rows.iter().map(|r| (**r).clone()).collect();
+                s.changes += u.changes.len();
+                if let Status::Error(e) = &u.status {
+                    s.error = Some(e.to_string());
+                }
+                *last.lock().unwrap() = Instant::now();
+            }
+        }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !seen.iter().all(|s| s.lock().unwrap().live) {
+        anyhow::ensure!(Instant::now() < deadline, "no snapshots");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let producer = producer()?;
+    let mut produced = producer.produce(1500, Some(2000.0)).await?;
+    // and three just slower than anything so far, so the top 20 changes
+    let max = clickhouse()
+        .fetch("SELECT max(latency_ms) AS m FROM default.events")
+        .await?;
+    let base = max[0]["m"].as_u64().unwrap_or(0) + 1;
+    let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let slowest: Vec<String> = (0..3)
+        .map(|i| {
+            serde_json::json!({"ts": ts.to_string(), "user_id": format!("rust-client-{i}"),
+                "country": "PL", "path": "/slow", "latency_ms": base + i, "amount": 0})
+            .to_string()
+        })
+        .collect();
+    for (p, o) in producer.produce_json(&slowest).await? {
+        let e = produced.entry(p).or_insert(o);
+        *e = (*e).max(o);
+    }
+    wait_ingested(&produced).await?;
+    // then until the client has been quiet for a second
+    while last.lock().unwrap().elapsed() < Duration::from_secs(1) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // floats to 9 significant digits: ClickHouse adds in parallel, in no particular order
+    let canon = |rows: &[Row]| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|(k, v)| match v.as_f64() {
+                        Some(f) if !v.is_i64() && !v.is_u64() => format!("{k}={f:.9e}"),
+                        _ => format!("{k}={v}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    for ((id, sql, limit), seen) in QUERIES.iter().zip(&seen) {
+        let direct = if sql.contains(" group by ") {
+            clickhouse()
+                .fetch(&sql.replace("from events", "from default.events"))
+                .await?
+        } else {
+            direct(sql).await?
+        };
+        let s = seen.lock().unwrap();
+        assert!(s.error.is_none(), "{id}: {:?}", s.error);
+        assert!(s.changes > 0, "{id}: no changes");
+        eprintln!("{id:>12}: {} rows, {} changes", s.rows.len(), s.changes);
+        if limit.is_some() {
+            let live = LiveResult {
+                rows: s.rows.clone(),
+                limit: *limit,
+                inserted: s.changes,
+                ..Default::default()
+            };
+            check_limited(id, sql, &["latency_ms"], &live, &direct);
+        } else {
+            assert_eq!(canon(&s.rows), canon(&direct), "{id}");
+        }
+    }
+    client.close().await;
+    for t in tasks {
+        t.await?;
+    }
+    Ok(())
+}
+.boxed())
+.await
+}
