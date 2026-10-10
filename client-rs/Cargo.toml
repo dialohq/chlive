@@ -1,0 +1,24 @@
+[package]
+name = "chlive-client"
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+description = "Rust client for chlive: live ClickHouse queries over WebSocket"
+
+[features]
+default = ["rustls"]
+# `wss://` URLs
+rustls = ["tokio-tungstenite/rustls-tls-webpki-roots"]
+
+[dependencies]
+chlive-protocol = { path = "../protocol" }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
+tokio-tungstenite = "0.30"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
