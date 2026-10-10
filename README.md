@@ -41,6 +41,14 @@ State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 
 Writes go **straight to Kafka** through Redpanda's HTTP proxy (`127.0.0.1:8082`, proxied as `/kafka`), so you can watch each one travel Kafka → server → UI.
 
+### Example: an event-driven Rust service
+
+`examples/rust-alerts` (`chlive-example-rust-alerts`, run by the `rust-alerts` process; `cargo run -p chlive-example-rust-alerts` on its own) reacts to what changes in two live queries over one `chlive-client` connection, with typed rows:
+- **the 5 slowest requests:** `ALERT: <user> entered the top 5 slowest at #<rank>` for each insert, and which request was pushed out (the client hands back the row that left);
+- **requests per country, top 3:** each country's new count and average latency as its group updates, and its new rank when it moves.
+
+It reconnects on its own when the server restarts (the fresh snapshots replace its rows). To see an alert, produce a request slower than the current top 5, e.g. on freshly seeded data `produce events '{"user_id": "u7", "country": "PL", "path": "/checkout", "latency_ms": 99999}'`, and watch the process's log (`dnvr logs rust-alerts`).
+
 ## How it works
 
 Ingestion is Kafka Connect's ClickHouse sink, exactly once, which keeps no Kafka offsets in the rows. The **engine** (`engine/`, see [Engine](#engine-custom-dialect)) parses and binds the query against ClickHouse's schema, runs the history query on a **snapshot** of the table, and consumes the table's Kafka topic from right after the snapshot's offsets, decoding, filtering and projecting each event itself. Every event is in exactly one of history and stream.
@@ -66,9 +74,11 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `nix/packages/` | custom derivations: `clickhouse.nix` (26.7.2), `redpanda.nix` (the Docker-run Redpanda process) |
 | `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
 | `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka; also a CLI that prints each iteration's diffs |
+| `protocol/` | `chlive-protocol` (Rust): the WebSocket protocol's messages, shared by the server and the Rust client |
 | `server/` | `chlive-server` (Rust): the WebSocket protocol over the engine |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
-| `examples/` | example apps; `examples/playground`, the query playground |
+| `client-rs/` | `chlive-client` (Rust): the client for services; `examples/watch.rs` prints any query's updates |
+| `examples/` | example apps: `playground`, the query playground (React); `rust-alerts`, an event-driven service on `chlive-client` |
 | `tests/` | end-to-end tests (`chlive-e2e`): the server over the full stack, with a small Kafka producer |
 
 ## Engine (custom dialect)
@@ -141,9 +151,41 @@ sub.unsubscribe();
 
 For dev tools, `useLiveQueryDebug` (and `subscribe`'s listener) also give `stats`: per-subscription counters (snapshots, diffs, inserts, deletes, bytes, the last message and how long it took to apply, what the cache did).
 
+### Rust client
+
+`chlive-client` (`client-rs/`) does what `@chlive/client` does, for services: one WebSocket (tokio, `ws://` or `wss://`) shared by any number of subscriptions, results kept by applying each diff atomically, and reconnecting with backoff. It has no offline cache and doesn't resume: after a reconnect, a fresh snapshot replaces the rows.
+
+```rust
+use chlive_client::{Change, ClientOptions, LiveClient, Status};
+use futures::StreamExt;
+
+#[derive(serde::Deserialize)]
+struct Slow { user_id: String, latency_ms: u32 }
+
+let client = LiveClient::new(ClientOptions::new("ws://127.0.0.1:8080/live"));
+let mut sub = client.subscribe::<Slow>("select user_id, latency_ms from events order by latency_ms desc limit 5");
+while let Some(u) = sub.next().await {
+    if let Status::Error(e) = &u.status { eprintln!("{e}"); break; }
+    for change in &u.changes {
+        match change {
+            Change::Insert { row, index, .. } => println!("{} is now #{}", row.user_id, index.unwrap_or(0) + 1),
+            Change::Delete { row, .. } => println!("{} dropped out", row.user_id),
+            Change::Update { id, row, index } => {} // aggregated rows, by group key
+        }
+    }
+    // u.rows: the whole result after this update
+}
+```
+
+- **A subscription is a `Stream` of `Update`s.** Each has a `kind`: `Subscribed` (the first), `Snapshot` (the whole result; again after each reconnect), `Diff`, `Disconnected` (the rows are kept until the next snapshot), or `Error` (the last; the stream ends). Each also has a `status` (`Loading`, `Live` or `Error { code, message }`), `rows` (the result after it), `changes`, `columns`, the cursor `at`, and `stats` (as in TS, without the cache's).
+- **Changes are resolved against the client's rows.** A `Delete` carries the row that left (the wire only has its index), and an `Update` carries the whole row after it, not just the changed columns.
+- **Rows** are deserialized into the type you subscribe with, once per row. `subscribe::<Row>` keeps them as JSON objects. A row that doesn't fit the type fails the subscription with `CLIENT_ERROR`, as an unknown change op or an index outside the result does, and the rows stay as they were before that diff.
+- **Backpressure.** Messages are applied when the stream is polled. A subscription that isn't read fills a small buffer, and then the connection waits for it. Nothing is dropped, and the server just falls behind on Kafka. Subscriptions sharing a client should all be read, e.g. with `tokio::select!` as in `examples/rust-alerts`. Use a client per subscription where one might lag.
+- **Cancelling:** dropping a subscription unsubscribes; `client.close().await` ends every stream.
+
 ### Protocol
 
-JSON text frames on `/live` (`server/src/protocol.rs`, mirrored by `client/src/protocol.ts`). Ids are the client's, per connection:
+JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate the server and the Rust client share; mirrored by `client/src/protocol.ts`). Ids are the client's, per connection:
 
 ```jsonc
 // client → server
@@ -209,12 +251,13 @@ The playground uses it: the "Client state" panel shows a hit or miss, whether th
 ## Tests
 
 ```sh
-cargo test --workspace     # engine (lexer, parser, binder, planner, types, watermark), server protocol over a real WebSocket
+cargo test --workspace     # engine (lexer, parser, binder, planner, types, watermark), server protocol over a real WebSocket,
+                           # the protocol's messages, the Rust client's result store and connection (against a fake server)
 bun run test               # client state, reconnect/resume, the cache store on bun:sqlite (bun test)
 e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chlive-e2e, against `dnvr up`
 ```
 
-`e2e` runs the engine's ClickHouse and Kafka tests, then the server end to end. The latter subscribe over WebSocket while producing events, and check that each live result (snapshot plus inserts) equals the same query run directly on ClickHouse once everything is ingested. They count rows across the whole `events` table, so don't produce other events (e.g. with the playground's buttons) while they run.
+`e2e` runs the engine's ClickHouse and Kafka tests, then the server end to end. The latter subscribe over WebSocket while producing events, and check that each live result (snapshot plus inserts) equals the same query run directly on ClickHouse once everything is ingested; one does so through the Rust client. They count rows across the whole `events` table, so don't produce other events (e.g. with the playground's buttons) while they run.
 
 ## Supported queries
 
