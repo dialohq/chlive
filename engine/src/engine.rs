@@ -336,15 +336,7 @@ impl Engine {
             topics.push((semi.inner_topic.clone(), inner.watermark.clone()));
         }
         for (topic, w) in topics {
-            let partitions = self
-                .source
-                .partitions(&topic)
-                .await?
-                .ok_or_else(|| SourceError(format!("topic {topic} disappeared")))?;
-            starts.push(TopicStart {
-                topic,
-                partitions: partitions.into_iter().map(|p| (p, w.start(p))).collect(),
-            });
+            starts.push(self.topic_start(&topic, &w).await?);
         }
         let mut keys = plan.stream.required_keys();
         for k in semi.inner_stream.required_keys() {
@@ -392,6 +384,28 @@ impl Engine {
         Ok(self.snapshots.acquire(table).await?)
     }
 
+    /// Where to read `topic` from: every partition, right after `from`. The partitions usually
+    /// come from the source's cache; if `from` knows one it doesn't (partitions were added
+    /// since), they're read anew, so no partition is skipped.
+    async fn topic_start(
+        &self,
+        topic: &TopicId,
+        from: &Watermark,
+    ) -> Result<TopicStart, EngineError> {
+        let mut partitions = self.source.partitions(topic).await?;
+        if let Some(known) = &partitions {
+            if from.0.keys().any(|p| !known.contains(p)) {
+                partitions = self.source.refresh_partitions(topic).await?;
+            }
+        }
+        let partitions =
+            partitions.ok_or_else(|| SourceError(format!("topic {topic} disappeared")))?;
+        Ok(TopicStart {
+            topic: topic.clone(),
+            partitions: partitions.into_iter().map(|p| (p, from.start(p))).collect(),
+        })
+    }
+
     /// Subscribe to the topics from `begin` and run: `first`, then the events.
     #[allow(clippy::too_many_arguments)]
     async fn start(
@@ -406,18 +420,7 @@ impl Engine {
     ) -> Result<Subscription, EngineError> {
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
-            let partitions = self
-                .source
-                .partitions(topic)
-                .await?
-                .ok_or_else(|| SourceError(format!("topic {topic} disappeared")))?;
-            starts.push(TopicStart {
-                topic: topic.clone(),
-                partitions: partitions
-                    .into_iter()
-                    .map(|p| (p, begin.start(p)))
-                    .collect(),
-            });
+            starts.push(self.topic_start(topic, &begin).await?);
         }
         tracing::info!(
             history = %history_sql,
@@ -452,18 +455,7 @@ impl Engine {
         let from = lease.sql_table();
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
-            let partitions = self
-                .source
-                .partitions(topic)
-                .await?
-                .ok_or_else(|| SourceError(format!("topic {topic} disappeared")))?;
-            starts.push(TopicStart {
-                topic: topic.clone(),
-                partitions: partitions
-                    .into_iter()
-                    .map(|p| (p, watermark.start(p)))
-                    .collect(),
-            });
+            starts.push(self.topic_start(topic, &watermark).await?);
         }
         let events = self
             .source

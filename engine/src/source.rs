@@ -3,14 +3,17 @@
 //! A source is asked for exactly the topics a query needs, starting each partition at a given
 //! offset (right after the history watermark), and decodes only the JSON keys the query needs.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
-use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
+use rdkafka::admin::AdminClient;
+use rdkafka::client::DefaultClientContext;
+use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
@@ -54,6 +57,12 @@ pub trait EventSource: Send + Sync {
         Ok(None)
     }
 
+    /// The topic's partitions, read anew from the source rather than from any cache: for when
+    /// a snapshot knows a partition [`EventSource::partitions`] doesn't (partitions were added).
+    async fn refresh_partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
+        self.partitions(topic).await
+    }
+
     /// Events of exactly these topics and partitions, from the given offsets on; each decoded
     /// keeping only `keys`. Undecodable messages are skipped with a warning.
     async fn subscribe(
@@ -63,18 +72,185 @@ pub trait EventSource: Send + Sync {
     ) -> Result<BoxStream<'static, Event>, SourceError>;
 }
 
+/// How often [`KafkaSource`] reloads the topics' partitions in the background.
+pub const METADATA_REFRESH: Duration = Duration::from_secs(30);
+/// A topic missing from metadata fetched longer ago than this is looked up again (it may have
+/// been created since); a more recent miss means it doesn't exist.
+const MISS_RETRY: Duration = Duration::from_secs(1);
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Every topic's partitions, as of one metadata fetch.
+#[derive(Debug, Default)]
+struct TopicCache {
+    partitions: HashMap<String, Vec<i32>>,
+    fetched_at: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Lookup {
+    /// The answer: the partitions, or `None` if the topic doesn't exist.
+    Known(Option<Vec<i32>>),
+    /// The cache can't answer: fetch the metadata.
+    Fetch,
+}
+
+impl TopicCache {
+    /// What the cache knows of `topic` at `now`, if it's younger than `max_age`.
+    fn lookup(&self, topic: &str, now: Instant, max_age: Duration) -> Lookup {
+        let Some(at) = self.fetched_at else {
+            return Lookup::Fetch;
+        };
+        let age = now.saturating_duration_since(at);
+        match self.partitions.get(topic) {
+            _ if age >= max_age => Lookup::Fetch,
+            Some(p) => Lookup::Known(Some(p.clone())),
+            None if age < MISS_RETRY => Lookup::Known(None),
+            None => Lookup::Fetch,
+        }
+    }
+
+    /// The topics of a new fetch, replacing all others (deleted topics go).
+    fn replace(&mut self, partitions: HashMap<String, Vec<i32>>, now: Instant) {
+        self.partitions = partitions;
+        self.fetched_at = Some(now);
+    }
+}
+
+/// Topic metadata for a [`KafkaSource`]: one long-lived client, and every topic's partitions,
+/// fetched at start and refreshed in the background.
+struct Metadata {
+    brokers: String,
+    /// Created on first use. An admin client polls itself (a consumer would have to be polled).
+    client: Mutex<Option<Arc<AdminClient<DefaultClientContext>>>>,
+    cache: RwLock<TopicCache>,
+    /// Held while fetching, so concurrent misses fetch once.
+    fetching: tokio::sync::Mutex<()>,
+    /// The cache is trusted for this long (a few refresh intervals).
+    max_age: Duration,
+    fetches: AtomicU64,
+}
+
+impl Metadata {
+    fn client(&self) -> Result<Arc<AdminClient<DefaultClientContext>>, SourceError> {
+        let mut client = self.client.lock().unwrap();
+        if let Some(c) = client.as_ref() {
+            return Ok(c.clone());
+        }
+        let c: AdminClient<DefaultClientContext> = ClientConfig::new()
+            .set("bootstrap.servers", &self.brokers)
+            .create()
+            .map_err(|e| SourceError(format!("creating the metadata client: {e}")))?;
+        let c = Arc::new(c);
+        *client = Some(c.clone());
+        Ok(c)
+    }
+
+    /// Fetch every topic's partitions (one request) into the cache, unless a fetch finished at
+    /// or after `since` (e.g. while this one waited for it).
+    async fn fetch(&self, since: Instant) -> Result<(), SourceError> {
+        let _fetching = self.fetching.lock().await;
+        let fetched_at = self.cache.read().unwrap().fetched_at;
+        if fetched_at.is_some_and(|at| at >= since) {
+            return Ok(());
+        }
+        let client = self.client()?;
+        let partitions = tokio::task::spawn_blocking(move || {
+            let md = client
+                .inner()
+                .fetch_metadata(None, METADATA_TIMEOUT)
+                .map_err(|e| SourceError(format!("fetching metadata: {e}")))?;
+            Ok::<_, SourceError>(
+                md.topics()
+                    .iter()
+                    .filter(|t| t.error().is_none() && !t.partitions().is_empty())
+                    .map(|t| {
+                        let parts = t.partitions().iter().map(|p| p.id()).collect();
+                        (t.name().to_string(), parts)
+                    })
+                    .collect(),
+            )
+        })
+        .await
+        .map_err(|e| SourceError(e.to_string()))??;
+        self.fetches.fetch_add(1, Ordering::Relaxed);
+        self.cache
+            .write()
+            .unwrap()
+            .replace(partitions, Instant::now());
+        Ok(())
+    }
+
+    async fn partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
+        let lookup = self
+            .cache
+            .read()
+            .unwrap()
+            .lookup(&topic.0, Instant::now(), self.max_age);
+        if let Lookup::Known(p) = lookup {
+            return Ok(p);
+        }
+        self.fetch(Instant::now()).await?;
+        Ok(self.cache.read().unwrap().partitions.get(&topic.0).cloned())
+    }
+}
+
+/// Reload the metadata now and every `every`, until the source is dropped.
+async fn refresh(metadata: Weak<Metadata>, every: Duration) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(m) = metadata.upgrade() else { return };
+        // not again if a lookup just fetched (e.g. the first one, racing the load at start)
+        let since = Instant::now()
+            .checked_sub(every / 2)
+            .unwrap_or_else(Instant::now);
+        if let Err(e) = m.fetch(since).await {
+            warn!(error = %e, "refreshing Kafka topic metadata");
+        }
+    }
+}
+
 /// Kafka (or Redpanda) via rdkafka. Partitions are assigned explicitly at the requested offsets;
 /// nothing is ever committed, so subscriptions don't interfere with each other or with other
-/// consumers.
+/// consumers. Each subscription has its own consumer; topic metadata (partitions, offsets)
+/// goes through one shared client, and the partitions are cached: read at start and every
+/// [`METADATA_REFRESH`], so subscribing doesn't ask Kafka.
 pub struct KafkaSource {
     brokers: String,
+    metadata: Arc<Metadata>,
 }
 
 impl KafkaSource {
     pub fn new(brokers: &str) -> Self {
+        Self::with_metadata_refresh(brokers, METADATA_REFRESH)
+    }
+
+    /// Reload the topics' partitions every `every`. The background reload runs when created
+    /// inside a tokio runtime; otherwise (and if it falls behind) a lookup on a cache older
+    /// than three intervals fetches anew.
+    pub fn with_metadata_refresh(brokers: &str, every: Duration) -> Self {
+        let metadata = Arc::new(Metadata {
+            brokers: brokers.to_string(),
+            client: Mutex::new(None),
+            cache: RwLock::new(TopicCache::default()),
+            fetching: tokio::sync::Mutex::new(()),
+            max_age: every * 3,
+            fetches: AtomicU64::new(0),
+        });
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(refresh(Arc::downgrade(&metadata), every));
+        }
         Self {
             brokers: brokers.to_string(),
+            metadata,
         }
+    }
+
+    /// How many metadata fetches this source has made (for tests).
+    #[doc(hidden)]
+    pub fn metadata_fetches(&self) -> u64 {
+        self.metadata.fetches.load(Ordering::Relaxed)
     }
 
     fn config(&self) -> ClientConfig {
@@ -93,21 +269,19 @@ impl KafkaSource {
 #[async_trait]
 impl EventSource for KafkaSource {
     async fn partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
-        let config = self.config();
-        let name = topic.0.clone();
-        tokio::task::spawn_blocking(move || {
-            let consumer: BaseConsumer = config.create().map_err(|e| SourceError(e.to_string()))?;
-            let md = consumer
-                .fetch_metadata(Some(&name), Duration::from_secs(10))
-                .map_err(|e| SourceError(format!("fetching metadata: {e}")))?;
-            Ok(md
-                .topics()
-                .iter()
-                .find(|t| t.name() == name && t.error().is_none() && !t.partitions().is_empty())
-                .map(|t| t.partitions().iter().map(|p| p.id()).collect()))
-        })
-        .await
-        .map_err(|e| SourceError(e.to_string()))?
+        self.metadata.partitions(topic).await
+    }
+
+    async fn refresh_partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
+        self.metadata.fetch(Instant::now()).await?;
+        Ok(self
+            .metadata
+            .cache
+            .read()
+            .unwrap()
+            .partitions
+            .get(&topic.0)
+            .cloned())
     }
 
     async fn offset_bounds(
@@ -117,14 +291,14 @@ impl EventSource for KafkaSource {
         let Some(partitions) = self.partitions(topic).await? else {
             return Ok(None);
         };
-        let config = self.config();
+        let client = self.metadata.client()?;
         let name = topic.0.clone();
         tokio::task::spawn_blocking(move || {
-            let consumer: BaseConsumer = config.create().map_err(|e| SourceError(e.to_string()))?;
             let mut bounds = BTreeMap::new();
             for p in partitions {
-                let (low, high) = consumer
-                    .fetch_watermarks(&name, p, Duration::from_secs(10))
+                let (low, high) = client
+                    .inner()
+                    .fetch_watermarks(&name, p, METADATA_TIMEOUT)
                     .map_err(|e| SourceError(format!("fetching offsets: {e}")))?;
                 bounds.insert(p, (low, high));
             }
@@ -335,6 +509,40 @@ mod tests {
         assert!(decode_pruned(br#"{"ts": "t"} trailing"#, &keys(&["ts"])).is_err());
         // skipped values are still validated
         assert!(decode_pruned(br#"{"ts": "t", "x": [1,}"#, &keys(&["ts"])).is_err());
+    }
+
+    #[test]
+    fn the_topic_cache_answers_while_fresh_and_asks_again_after() {
+        let max_age = Duration::from_secs(90);
+        let t0 = Instant::now();
+        let mut cache = TopicCache::default();
+        assert_eq!(
+            cache.lookup("events", t0, max_age),
+            Lookup::Fetch,
+            "never fetched"
+        );
+        cache.replace([("events".to_string(), vec![0, 1, 2])].into(), t0);
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert_eq!(
+            cache.lookup("events", at(500), max_age),
+            Lookup::Known(Some(vec![0, 1, 2]))
+        );
+        // a miss right after a fetch: the topic doesn't exist
+        assert_eq!(cache.lookup("nope", at(500), max_age), Lookup::Known(None));
+        // later, it may have been created since
+        assert_eq!(cache.lookup("nope", at(1500), max_age), Lookup::Fetch);
+        // too old for anything
+        assert_eq!(cache.lookup("events", at(90_000), max_age), Lookup::Fetch);
+        // a fetch replaces every topic: deleted ones go
+        cache.replace([("orders".to_string(), vec![0])].into(), at(91_000));
+        assert_eq!(
+            cache.lookup("events", at(91_100), max_age),
+            Lookup::Known(None)
+        );
+        assert_eq!(
+            cache.lookup("orders", at(91_100), max_age),
+            Lookup::Known(Some(vec![0]))
+        );
     }
 
     #[tokio::test]

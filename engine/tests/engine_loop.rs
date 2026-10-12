@@ -5,9 +5,10 @@ use chlive_engine::diff::{Diff, Row};
 use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
 use chlive_engine::rules::{HardcodedRules, TopicId};
 use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Snapshots};
-use chlive_engine::source::MemorySource;
+use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
 use chlive_engine::watermark::Watermark;
 use chlive_engine::{Engine, Iteration, Origin};
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
@@ -726,4 +727,65 @@ async fn ordered_groups_move_and_come_in_and_out_of_the_limit() {
             "",
         ]
     );
+}
+
+/// A source whose cached partition list can lag: `partitions` lists only `cached`, while
+/// `refresh_partitions` reads the real ones, counting each call.
+struct LaggingSource {
+    inner: MemorySource,
+    cached: Vec<i32>,
+    refreshes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl EventSource for LaggingSource {
+    async fn partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
+        Ok(self
+            .inner
+            .partitions(topic)
+            .await?
+            .map(|_| self.cached.clone()))
+    }
+
+    async fn refresh_partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
+        self.refreshes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.partitions(topic).await
+    }
+
+    async fn subscribe(
+        &self,
+        starts: &[TopicStart],
+        keys: &[String],
+    ) -> Result<BoxStream<'static, Event>, SourceError> {
+        self.inner.subscribe(starts, keys).await
+    }
+}
+
+/// Events of a partition the snapshot knows but the cached list doesn't (added since) are read
+/// all the same: the partitions are read anew, once. With an up-to-date list, they aren't.
+#[tokio::test]
+async fn a_partition_missing_from_the_cached_list_is_read_anew() {
+    for (cached, refreshes, events) in [(vec![0], 1, 2), (vec![0, 1], 0, 2)] {
+        let mut inner = events_topic();
+        inner
+            .push("events", 0, r#"{"ts": "e1", "user_id": "u3"}"#)
+            .push("events", 1, r#"{"ts": "e2", "user_id": "u4"}"#);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = LaggingSource {
+            inner,
+            cached,
+            refreshes: count.clone(),
+        };
+        let engine = Engine::new(
+            HardcodedRules::default(),
+            FakeHistory,
+            source,
+            FakeSnapshots,
+        );
+        let subscription = engine.subscribe("select * from events").await.unwrap();
+        let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+        assert_eq!(iterations.len() - 1, events);
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), refreshes);
+    }
 }

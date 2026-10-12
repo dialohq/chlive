@@ -134,3 +134,46 @@ async fn every_event_exactly_once_across_the_watermark() {
     expected.sort();
     assert_eq!(all, expected, "each event exactly once");
 }
+
+/// Topic metadata is read once at start and cached: lookups don't ask Kafka again, a missing
+/// topic is `None`, and offsets come through the same shared client.
+#[tokio::test]
+async fn topic_partitions_are_cached() {
+    use chlive_engine::rules::TopicId;
+    use chlive_engine::source::{EventSource, KafkaSource};
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    let source = KafkaSource::new(&brokers());
+    let events = TopicId("events".into());
+    let first = source
+        .partitions(&events)
+        .await
+        .unwrap()
+        .expect("topic events");
+    assert!(!first.is_empty());
+    let started = Instant::now();
+    for _ in 0..50 {
+        assert_eq!(
+            source.partitions(&events).await.unwrap().as_ref(),
+            Some(&first)
+        );
+    }
+    let elapsed = started.elapsed();
+    // the background load at start, or the first lookup (whichever came first, the other waits)
+    assert_eq!(source.metadata_fetches(), 1);
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "50 cached lookups took {elapsed:?}"
+    );
+    let missing = TopicId(format!("chlive-no-such-topic-{}", std::process::id()));
+    assert_eq!(source.partitions(&missing).await.unwrap(), None);
+    let bounds = source
+        .offset_bounds(&events)
+        .await
+        .unwrap()
+        .expect("bounds");
+    assert_eq!(bounds.keys().copied().collect::<Vec<_>>(), first);
+    assert!(bounds.values().all(|(low, high)| low <= high));
+}
