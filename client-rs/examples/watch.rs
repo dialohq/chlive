@@ -1,5 +1,5 @@
 //! Print a live query's updates: `cargo run -p chlive-client --example watch -- "<sql>"`
-//! (against `CHLIVE_URL`, by default the dev server at ws://127.0.0.1:8080/live).
+//! (against `CHLIVE_URL`, by default ws://127.0.0.1:8080/live; the dev server: `dnvr-state get server.url`).
 
 use chlive_client::{Change, ClientOptions, Kind, LiveClient, Row, Status};
 use futures::StreamExt;

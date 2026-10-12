@@ -16,7 +16,7 @@ use futures::StreamExt;
 struct Cli {
     /// The query, e.g. "select * from events"
     query: String,
-    /// ClickHouse HTTP URL (default: the dev shell's ClickHouse)
+    /// ClickHouse HTTP URL (the dev shell: `dnvr-state get clickhouse.httpUrl`)
     #[arg(
         long,
         env = "CHLIVE_CLICKHOUSE_URL",
@@ -30,7 +30,7 @@ struct Cli {
     /// ClickHouse database that dialect tables map to
     #[arg(long, default_value = "default")]
     database: String,
-    /// Kafka bootstrap servers (default: the dev shell's Redpanda)
+    /// Kafka bootstrap servers (the dev shell: `dnvr-state get redpanda.bootstrap`)
     #[arg(long, env = "CHLIVE_KAFKA", default_value = "127.0.0.1:9092")]
     kafka: String,
     /// ClickHouse's native protocol address, for aggregates (chDB reads states with remote())

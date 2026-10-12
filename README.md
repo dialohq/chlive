@@ -13,25 +13,28 @@ dnvr up          # starts everything in a tmux dashboard
 
 `dnvr up` starts these processes; the arrows are the start-up order dnvr derives from `dnvr://` dependencies:
 
-| process | what | where |
+| process | what | publishes |
 |---|---|---|
-| `redpanda` | Redpanda in Docker (container `chlive-redpanda`, volume `chlive-redpanda`); creates topics `events`, `customers`, `orders` (3 partitions each) | Kafka `127.0.0.1:9092`, HTTP proxy `127.0.0.1:8082` |
-| `clickhouse` | ClickHouse 26.7.2 (dnvr's clickhouse preset), with an embedded Keeper (for KeeperMap) | HTTP `127.0.0.1:18123`, native `127.0.0.1:19000`, Keeper `19181` |
+| `redpanda` | Redpanda in Docker (container `chlive-redpanda`, volume `chlive-redpanda`); creates topics `events`, `customers`, `orders` (3 partitions each) | `bootstrap` (Kafka), `proxyUrl` (HTTP proxy), `topics` |
+| `clickhouse` | ClickHouse 26.7.2 (dnvr's clickhouse preset), with an embedded Keeper (for KeeperMap) | `host`, `httpPort`, `tcpPort`, `httpUrl`, then `database` once it answers |
 | `schema` → clickhouse | applies `scripts/schema.sql` (tables, the sink's KeeperMap state tables, the `chlive_ro` and `chlive_snap` users) | |
-| `connect` → redpanda | Kafka Connect, with the ClickHouse sink plugin | REST `127.0.0.1:18083` |
-| `connectors` → connect, schema | one sink connector per topic (`chlive-sink-<topic>`, exactly once), into the table of the same name; waits until they run | |
-| `pause-server` → connectors | continuous-backup's pause server: pauses a table's connector and reports its exact offsets, for snapshots | `127.0.0.1:18091` |
-| `seed` → connectors | if ClickHouse has fewer than `$SEED_COUNT` events: `scripts/seed.sql` generates backdated events, produced to Kafka and ingested by the sink | |
-| `server` → pause-server | chlive-server: WebSocket over chlive-engine, as `chlive_ro` (snapshots as `chlive_snap`), on its default ports | `:8080` (`/live`, `/debug/subscriptions`, `/healthz`) |
-| `playground` | the example query playground | <http://localhost:5174> |
+| `connect` → redpanda | Kafka Connect, with the ClickHouse sink plugin | `url` (REST) |
+| `connectors` → connect, schema, clickhouse | one sink connector per topic (`chlive-sink-<topic>`, exactly once), into the table of the same name; waits until they run | |
+| `pause-server` → connectors | continuous-backup's pause server: pauses a table's connector and reports its exact offsets, for snapshots | `url` |
+| `seed` → connectors, clickhouse, redpanda | if ClickHouse has fewer than `$SEED_COUNT` events: `scripts/seed.sql` generates backdated events, produced to Kafka and ingested by the sink | |
+| `server` → pause-server, clickhouse, redpanda | chlive-server: WebSocket over chlive-engine, as `chlive_ro` (snapshots as `chlive_snap`) | `url` (the WebSocket, `/live`), `httpUrl` (`/debug/subscriptions`, `/healthz`) |
+| `playground` → server, redpanda | the example query playground | `url` |
+| `rust-alerts` → server | the Rust client's example service | |
 
-Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `engine` (the engine CLI), `e2e` (the tests that need the stack), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
+Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `engine` (the engine CLI), `e2e` (the tests that need the stack), `bench` (the query benchmark), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
 
-State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume. Redpanda uses its standard ports (Kafka 9092, HTTP proxy 8082) and the server listens on 8080; ClickHouse uses 18123/19000 rather than 8123/9000, so it can run next to another local ClickHouse. These are the built-in defaults of the server, the engine CLI, the tests and the example, so nothing needs configuring; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_KAFKA` and `CHLIVE_LISTEN` override them.
+Every process picks free ports on each start (`dnvr-state pick-port`), so the stack runs next to anything else, and publishes its addresses; the processes get each other's through `dnvr://<process>/<key>` refs. From a terminal, read them with `dnvr-state get <process>.<key>` (e.g. `dnvr-state get playground.url`, `dnvr-state get server.url`), or list everything with `dnvr-state dump`. The `ch`, `produce`, `engine`, `e2e` and `bench` scripts look them up the same way; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_CLICKHOUSE_NATIVE`, `CHLIVE_KAFKA` and `CHLIVE_PAUSE_SERVER` (and `PROXY_URL` for `produce`, `CHLIVE_URL`/`CH_URL`/`PROXY_URL` for `bench`) override them.
+
+State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 
 ### Example: query playground
 
-`examples/playground` (plain React, Bun workspace) is served by the `playground` process at <http://localhost:5174>. Two panes:
+`examples/playground` (plain React, Bun workspace) is served by the `playground` process, at `dnvr-state get playground.url`. Two panes:
 
 - **Live query:** a query box with presets over `events`, `orders` and `customers` (⌘/Ctrl+Enter runs it), and the live result: newest rows first, with its status, row count and the engine's positioned error (e.g. `unknown column latency in table events (…) at 1:17`).
 - **Write to Kafka:** pick a topic, write JSON by hand (one object, an array, or JSON lines) or start from a preset: a slow checkout, numbers as strings, missing keys (zero values), an unreadable value that both ClickHouse and the engine skip, a batch, a big order, a customer rename… Each write reports the partition and offset it landed at; `Random` and `50 random` write generated rows.
@@ -39,7 +42,7 @@ State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 - **Client state** (under the query): what `@chlive/client` holds for the subscription, from `state.stats`: its wire id and how often it was (re)subscribed, the rows in state against the LIMIT and how many are rendered, counts of diffs, inserts and deletes and bytes received, the live insert rate, how long the last message took to apply, and a log of the last 30 messages (e.g. `diff: 2 changes · + -@0`); click one for its JSON.
 - **Generator:** a loop that writes generated rows to a topic, then sleeps, until stopped. Pick the rows per write, the interval, and how rows are drawn: uniform, spiky latency, Poland only, lots of ties, big spenders, past timestamps, ever-rising latency, or big orders.
 
-Writes go **straight to Kafka** through Redpanda's HTTP proxy (`127.0.0.1:8082`, proxied as `/kafka`), so you can watch each one travel Kafka → server → UI.
+Writes go **straight to Kafka** through Redpanda's HTTP proxy (proxied as `/kafka`), so you can watch each one travel Kafka → server → UI.
 
 ### Example: an event-driven Rust service
 
@@ -70,8 +73,10 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 
 | path | what |
 |---|---|
-| `flake.nix` | the dnvr dev shells: toolchain, env, the local stacks' processes (Redpanda in Docker, ClickHouse 26.7.2, Kafka Connect with the ClickHouse sink, the pause server, schema, seed, server, examples) and scripts |
-| `nix/packages/` | custom derivations: `clickhouse.nix` (26.7.2), `redpanda.nix` (the Docker-run Redpanda process) |
+| `flake.nix` | the flake: packages (`nix build` builds `chlive-server`) and the dnvr dev shell |
+| `nix/shell.nix` | the dnvr dev shell: toolchain, env, the local stack's processes (Redpanda in Docker, ClickHouse 26.7.2, Kafka Connect with the ClickHouse sink, the pause server, schema, seed, server, examples) and scripts |
+| `nix/settings.nix` | the local stack's ports, topics and seed size |
+| `nix/packages/` | custom derivations: `chlive-server.nix` (the server), `clickhouse.nix` (26.7.2), `libchdb.nix` (chDB, same version), `redpanda.nix` (the Docker-run Redpanda process) |
 | `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
 | `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka; also a CLI that prints each iteration's diffs |
 | `protocol/` | `chlive-protocol` (Rust): the WebSocket protocol's messages, shared by the server and the Rust client |

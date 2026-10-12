@@ -4,7 +4,7 @@
 //! - Requests per country (the top 3): each country's new count and average latency, and its
 //!   rank when it moves.
 //!
-//! `cargo run -p chlive-example-rust-alerts` (against `CHLIVE_URL`, by default the dev server),
+//! `cargo run -p chlive-example-rust-alerts` (against `CHLIVE_URL`, e.g. `dnvr-state get server.url`),
 //! then e.g. `produce events '{"user_id": "u7", "path": "/checkout", "latency_ms": 99999}'`.
 
 use chlive_client::{Change, ClientOptions, Kind, LiveClient, Status, Update};

@@ -2,6 +2,10 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+// The server and Redpanda's HTTP proxy, as the dnvr `playground` process gets them.
+const server = new URL(process.env.CHLIVE_URL ?? "ws://127.0.0.1:8080/live");
+const kafkaProxy = process.env.PROXY_URL ?? "http://127.0.0.1:8082";
+
 const src = (p) => fileURLToPath(new URL(`../../client/src/${p}`, import.meta.url));
 
 export default defineConfig({
@@ -17,11 +21,10 @@ export default defineConfig({
   optimizeDeps: { exclude: ["@sqlite.org/sqlite-wasm"] },
   worker: { format: "es" },
   server: {
-    port: 5174,
     proxy: {
-      "/live": { target: "ws://127.0.0.1:8080", ws: true },
+      "/live": { target: server.origin, ws: true },
       // Redpanda's HTTP proxy (dnvr `redpanda` process): writes go straight to Kafka
-      "/kafka": { target: "http://127.0.0.1:8082", rewrite: (p) => p.replace(/^\/kafka/, "") },
+      "/kafka": { target: kafkaProxy, rewrite: (p) => p.replace(/^\/kafka/, "") },
     },
   },
 });

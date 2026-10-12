@@ -47,8 +47,8 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// The dev shell's stack (or CHLIVE_CLICKHOUSE_URL / CHLIVE_KAFKA / CHLIVE_PAUSE_SERVER), as
-/// the server's ClickHouse users.
+/// The stack at CHLIVE_CLICKHOUSE_URL / CHLIVE_KAFKA / CHLIVE_PAUSE_SERVER (the `e2e` script
+/// sets them to the dev shell's), as the server's ClickHouse users.
 pub fn config() -> Config {
     let env = |k: &str, default: &str| std::env::var(k).unwrap_or_else(|_| default.into());
     Config {

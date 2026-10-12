@@ -1,5 +1,6 @@
-//! Against the dev shell's Redpanda and ClickHouse, which ingests the `events` topic into
-//! `default.events` (or CHLIVE_KAFKA / CHLIVE_CLICKHOUSE_URL); runs only with CHLIVE_E2E=1.
+//! Against the dev shell's Redpanda, its ClickHouse (which ingests the `events` topic into
+//! `default.events`) and its pause server, at CHLIVE_KAFKA / CHLIVE_CLICKHOUSE_URL /
+//! CHLIVE_PAUSE_SERVER, which the `e2e` script sets; runs only with CHLIVE_E2E=1.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,10 @@ fn clickhouse_url() -> String {
 
 fn brokers() -> String {
     std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:9092".into())
+}
+
+fn pause_server_url() -> String {
+    std::env::var("CHLIVE_PAUSE_SERVER").unwrap_or_else(|_| Config::default().pause_server_url)
 }
 
 async fn count(path: &str) -> u64 {
@@ -83,6 +88,7 @@ async fn every_event_exactly_once_across_the_watermark() {
     let engine = Engine::connect(Config {
         clickhouse_url: clickhouse_url(),
         kafka_brokers: brokers(),
+        pause_server_url: pause_server_url(),
         ..Config::default()
     });
     let mut subscription = engine
