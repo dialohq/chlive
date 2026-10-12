@@ -27,7 +27,7 @@ Each query comes with an event that's sure to change its result (a row above the
 
 ## Summary
 
-- **Subscribing costs ~220–300 ms whatever the query** (two tables: ~450 ms), while ClickHouse answers the same SQL in 2–28 ms. About 210 ms of it is the engine reading the topic's partition list twice per subscribe (once binding, once starting), each time through a new rdkafka client (~105 ms each, `KafkaSource::partitions` in `engine/src/source.rs`). Caching the partitions (or keeping one metadata client) would take ~200 ms off every subscribe.
+- **Subscribing cost ~220–300 ms whatever the query** (two tables: ~450 ms), while ClickHouse answers the same SQL in 2–28 ms. About 210 ms of it was the engine reading the topic's partition list twice per subscribe, each time through a new rdkafka client (~105 ms each). **Fixed:** `KafkaSource` now caches every topic's partitions (read at start, refreshed every 30 s) and keeps one metadata client; a warm subscribe is now 1–56 ms, mostly ClickHouse's own time (see section 1).
 - **Latency doesn't grow with complexity:** from producing an event to the client applying its diff, the median is 0.2–0.6 ms for every native query, plain or aggregated, with sub-queries or not; p99 ≤ 4 ms. Only chDB aggregates cost more (7–10 ms median, its per-batch cost). Unbounded results pay on the client: each diff copies the rows (`ResultStore.applyDiff`), so q03's 57k-row result has a 1.6 ms median, and a 500k-row result ~11 ms.
 - **Throughput:** a backlog of ~50k events is absorbed while subscribing for every native query (≈1–2 µs of server CPU per event); unbounded results are limited by the client copying the result for each diff; chDB aggregates go through ~37–75k events/s at 17–31 µs/event. Larger bursts sometimes stalled ~1 s, likely librdkafka's fetch backoff (section 3).
 - **A scaling problem with ordered GROUP BY over many groups:** `GroupResult::history` (`engine/src/aggregate/result.rs`) ranks the history's groups one at a time with `Vec::insert`, which is O(groups²). With ~113k users, q10 takes 7–15 s to subscribe (ClickHouse: 21 ms); the same GROUP BY without ORDER BY takes 0.3–0.6 s. Sorting them once (O(n log n)) should fix it.
@@ -54,10 +54,33 @@ On 1.0M events. Cold is the query's first subscription (the table already had a 
 | q13 | 100 | 8.9 kB | 451 ms | 456 ms | 7 ms | 0.04 ms |
 | q14 | 25 | 2.5 kB | 459 ms | 474 ms | 20 ms | 0.02 ms |
 
-- Complexity barely shows: ~210 ms is the partition lookups above, the rest is the history query, binding (a `DESCRIBE` per table) and the transfer. The two-table queries (q13, q14) look up two topics and read two snapshots.
+- Complexity barely shows: ~210 ms is the partition lookups (since fixed, below), the rest is the history query, binding (a `DESCRIBE` per table) and the transfer. The two-table queries (q13, q14) look up two topics and read two snapshots.
 - Size shows a little: q03's 57k rows (4.9 MB) take ~70 ms more than q01's 13.
 - The first subscription to a table without a snapshot also waits for one (pause, clone, resume): 2.5 s for `customers` in a first run here, 4.3 s for `events` in an engine started fresh.
 - With many groups, ordered GROUP BY gets slow (see the summary): q10 at ~5k users is 273 ms; later, at ~113k users (the latency runs' hits are new users), 7–15 s.
+
+### Since: cached topic metadata
+
+The same runs after caching the partitions and sharing one metadata client (fresh data, 1.0M events). Cold here is each table's first snapshot after a server restart (pause, clone, resume), not metadata.
+
+| query | rows | size | cold | warm | ClickHouse alone | client apply |
+|---|---|---|---|---|---|---|
+| q01 | 0 | 0.2 kB | 2136 ms | 2 ms | 1 ms | 0.00 ms |
+| q02 | 14628 | 1.7 MB | 38 ms | 37 ms | 11 ms | 0.05 ms |
+| q03 | 56856 | 4.8 MB | 62 ms | 56 ms | 19 ms | 0.08 ms |
+| q04 | 1000 | 112.9 kB | 5 ms | 3 ms | 2 ms | 0.00 ms |
+| q05 | 100 | 7.2 kB | 5 ms | 5 ms | 4 ms | 0.01 ms |
+| q06 | 50 | 4.7 kB | 12 ms | 9 ms | 6 ms | 0.01 ms |
+| q07 | 1 | 0.2 kB | 2 ms | 1 ms | 0 ms | 0.01 ms |
+| q08 | 5 | 0.8 kB | 4 ms | 13 ms | 3 ms | 0.01 ms |
+| q09 | 20 | 2.9 kB | 14 ms | 15 ms | 12 ms | 0.01 ms |
+| q10 | 10 | 0.9 kB | 19 ms | 19 ms | 6 ms | 0.01 ms |
+| q11 | 15 | 1.3 kB | 74 ms | 34 ms | 19 ms | 0.01 ms |
+| q12 | 10 | 1.6 kB | 64 ms | 55 ms | 22 ms | 0.01 ms |
+| q13 | 100 | 8.8 kB | 2828 ms | 10 ms | 4 ms | 0.01 ms |
+| q14 | 25 | 2.5 kB | 17 ms | 14 ms | 16 ms | 0.01 ms |
+
+Now the size of the result shows (q02, q03: transferring and parsing 1.7–4.8 MB), and chDB's setup (q11, q12: ~35–55 ms); the rest is within a few ms of ClickHouse.
 
 ## 2. Latency: produce → diff applied
 
