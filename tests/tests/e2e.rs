@@ -24,6 +24,9 @@ const CASES: &[(&str, &str, &[&str])] = &[
     ("window", "select ts, user_id, latency_ms from events where latency_ms > 100 limit 100", &[]),
     ("top_offset", "select ts, user_id, latency_ms from events order by latency_ms desc limit 10 offset 5", &["latency_ms"]),
     ("window_offset", "select ts, user_id, latency_ms from events where latency_ms > 100 limit 20 offset 7", &[]),
+    // UUIDs: events spell them in upper case or without dashes; ClickHouse's order isn't the text's
+    ("session", "select ts, user_id, session_id from events where session_id = '6F1D3A20-1B2C-4D5E-8F90-A1B2C3D4E5F6'", &[]),
+    ("by_session", "select ts, session_id, latency_ms from events where session_id > '0a0a0a0a00004000800000000000000a' order by session_id, latency_ms desc", &["session_id", "latency_ms"]),
 ];
 
 #[tokio::test]
@@ -385,6 +388,9 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
         ("users", "select country, uniqExact(user_id) as users, count() as n from events group by country"),
         // ordered and limited: groups move and come in and out
         ("top_paths", "select path, count() as n, sum(amount) as revenue from events group by path order by n desc limit 5"),
+        // UUIDs: grouped, ordered and as min/max, by ClickHouse's order
+        ("sessions", "select session_id, count() as n, max(latency_ms) from events group by session_id order by session_id desc"),
+        ("session_range", "select min(session_id), max(session_id), count(session_id) from events where country = 'PL'"),
     ];
     let conn = LiveConn::connect(server).await?;
     for (id, sql) in QUERIES {

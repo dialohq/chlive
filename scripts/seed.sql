@@ -18,6 +18,9 @@ SELECT
     -- long-tailed latency: mostly 10-200 ms, occasionally seconds
     toUInt32(200 * pow(-log(1 - randCanonical(5)), 1.6)) + 1 AS latency_ms,
     -- 60% of events carry no amount, the rest 1.00-500.00
-    if(randCanonical(6) < 0.6, 0, (100 + rand(7) % 49900) / 100) AS amount
+    if(randCanonical(6) < 0.6, 0, (100 + rand(7) % 49900) / 100) AS amount,
+    -- one of 2000 sessions, or none for 10% of events
+    if(rand(8) % 10 = 0, NULL,
+        toUUID(leftPad(lower(hex(sipHash128(rand(9) % 2000))), 32, '0'))) AS session_id
 FROM numbers({count:UInt64})
 FORMAT JSONEachRow;

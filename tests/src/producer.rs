@@ -40,6 +40,16 @@ const PATHS: &[&str] = &[
     "/api/orders",
 ];
 const USERS: u32 = 5_000;
+/// `session_id`s (Nullable(UUID)). They differ in both halves, because ClickHouse orders
+/// UUIDs by the second half first.
+pub const SESSIONS: &[&str] = &[
+    "6f1d3a20-1b2c-4d5e-8f90-a1b2c3d4e5f6",
+    "00000000-0000-0001-ffff-000000000001",
+    "ffffffff-ffff-ffff-0000-000000000000",
+    "0a0a0a0a-0000-4000-8000-00000000000a",
+    "9b8c7d6e-5f40-4321-9abc-def012345678",
+    "12345678-9abc-4def-8123-456789abcdef",
+];
 
 pub struct Producer {
     producer: FutureProducer,
@@ -178,6 +188,23 @@ pub fn random_event(rng: &mut impl Rng, ts: DateTime<Utc>) -> String {
     } else {
         (rng.random_range(100..50_000) as f64) / 100.0
     };
+    // none for 1 in 7; otherwise in any of the forms ClickHouse reads (upper case, no dashes)
+    let session = rng
+        .random_range(0..=SESSIONS.len())
+        .checked_sub(1)
+        .map(|i| {
+            let s = SESSIONS[i].to_string();
+            let s = if rng.random_bool(0.3) {
+                s.to_uppercase()
+            } else {
+                s
+            };
+            if rng.random_bool(0.3) {
+                s.replace('-', "")
+            } else {
+                s
+            }
+        });
     serde_json::json!({
         "ts": ts.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
         "user_id": format!("u{}", rng.random_range(0..USERS)),
@@ -185,6 +212,7 @@ pub fn random_event(rng: &mut impl Rng, ts: DateTime<Utc>) -> String {
         "path": path,
         "latency_ms": latency_ms,
         "amount": amount,
+        "session_id": session,
     })
     .to_string()
 }

@@ -28,6 +28,8 @@ const QUERY_PRESETS = [
   "select ts, user_id, country, latency_ms from events order by latency_ms desc limit 5 offset 3",
   "select ts, user_id, path, latency_ms from events limit 5 offset 2",
   "select * from events where country = 'PL'",
+  "select session_id, count() as n, max(latency_ms) from events group by session_id order by n desc limit 10",
+  "select ts, user_id, session_id, path from events where session_id = '0d1c2b3a-0000-4000-8000-00000000000a' order by ts desc",
   "select ts, user_id, path, amount from events where amount > 0 and country in ('DE', 'FR')",
   "select ts, order_id, customer_id, amount from orders where amount > 100",
   "select * from customers",
@@ -38,6 +40,8 @@ const now = () => new Date().toISOString().replace("T", " ").replace("Z", "");
 const pick = (xs) => xs[Math.floor(Math.random() * xs.length)];
 const id = (prefix) => prefix + Math.random().toString(36).slice(2, 7);
 const customer = () => "c" + (1 + Math.floor(Math.random() * 20));
+// a few sessions (UUIDs), so grouping by session_id shows something
+const SESSIONS = [10, 11, 12, 13, 14].map((n) => `0d1c2b3a-0000-4000-8000-0000000000${n.toString(16).padStart(2, "0")}`);
 
 // Random rows for each topic, shaped like its ClickHouse table.
 const RANDOM = {
@@ -48,6 +52,7 @@ const RANDOM = {
     path: pick(["/", "/cart", "/checkout", "/search"]),
     latency_ms: Math.floor(Math.random() * 1000),
     amount: pick([0, 0, Math.round(Math.random() * 20000) / 100]),
+    session_id: pick([...SESSIONS, null]),
   }),
   orders: () => ({ ts: now(), order_id: id("o"), customer_id: customer(), amount: Math.round(Math.random() * 20000) / 100 }),
   customers: () => ({ ts: now(), customer_id: customer(), name: pick(["Ada", "Linus", "Grace", "Alan", "Barbara"]), country: pick(["PL", "DE", "US"]) }),
@@ -99,6 +104,7 @@ const WRITE_PRESETS = {
     ["Paid order in DE", () => ({ ts: now(), user_id: "u-buyer", country: "DE", path: "/checkout", latency_ms: 140, amount: 59.9 })],
     ["Numbers as strings", () => ({ ts: now(), user_id: "u-text", country: "FR", path: "/", latency_ms: "750", amount: "19.99" })],
     ["Missing keys (zero values)", () => ({ user_id: "u-partial" })],
+    ["Session in uppercase (stored lowercase)", () => ({ ts: now(), user_id: "u-upper", country: "PL", path: "/", latency_ms: 80, amount: 0, session_id: SESSIONS[0].toUpperCase() })],
     ["Unreadable latency (skipped)", () => ({ ts: now(), user_id: "u-broken", country: "PL", path: "/", latency_ms: "fast", amount: 0 })],
     [
       "Batch of 3",

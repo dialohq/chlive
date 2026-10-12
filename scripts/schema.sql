@@ -9,8 +9,10 @@
 --    malformed events either way
 CREATE TABLE IF NOT EXISTS default.events (
   ts DateTime64(3), user_id String, country LowCardinality(String),
-  path String, latency_ms UInt32, amount Float64
+  path String, latency_ms UInt32, amount Float64, session_id Nullable(UUID)
 ) ENGINE = MergeTree ORDER BY ts;
+-- added later; for tables created before it (before the sink connectors start, so they see it)
+ALTER TABLE default.events ADD COLUMN IF NOT EXISTS session_id Nullable(UUID);
 
 -- Related tables for the example (same assumptions).
 CREATE TABLE IF NOT EXISTS default.customers (
