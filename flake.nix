@@ -453,6 +453,13 @@
                     CHLIVE_E2E=1 exec cargo test -p chlive-engine -p chlive-e2e "$@"
                   '';
                 };
+                bench = {
+                  description = "Benchmark a ladder of queries through @chlive/client against the stack (docs/bench/queries.md)";
+                  text = ''
+                    cd "$DNVR_ROOT"
+                    exec bun bench/queries.ts "$@"
+                  '';
+                };
                 reset-data = {
                   description = "Delete local Redpanda and ClickHouse data (run while `dnvr up` is stopped)";
                   text = ''
