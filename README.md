@@ -80,6 +80,7 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `client-rs/` | `chlive-client` (Rust): the client for services; `examples/watch.rs` prints any query's updates |
 | `examples/` | example apps: `playground`, the query playground (React); `rust-alerts`, an event-driven service on `chlive-client` |
 | `tests/` | end-to-end tests (`chlive-e2e`): the server over the full stack, with a small Kafka producer |
+| `bench/` | `queries.ts`: a ladder of queries, simple to most complex, benchmarked through `@chlive/client` against the stack; results in `docs/bench/` |
 
 ## Engine (custom dialect)
 
@@ -258,6 +259,14 @@ e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chliv
 ```
 
 `e2e` runs the engine's ClickHouse and Kafka tests, then the server end to end. The latter subscribe over WebSocket while producing events, and check that each live result (snapshot plus inserts) equals the same query run directly on ClickHouse once everything is ingested; one does so through the Rust client. They count rows across the whole `events` table, so don't produce other events (e.g. with the playground's buttons) while they run.
+
+## Benchmarks
+
+```sh
+bench                      # = bun bench/queries.ts, against `dnvr up`: subscribe time, latency and throughput per query
+```
+
+`bench` runs 14 queries, from one filtered column to the most complex plain and aggregated queries the dialect has, through `@chlive/client`, and prints a table per measure. It first tops `events` up to 1M rows (`--seed`) and `customers` to 5000; it adds its own events, so `reset-data` afterwards gives a fresh seed. Results and what they show: [docs/bench/queries.md](docs/bench/queries.md); aggregates natively vs in chDB: [docs/bench/group-by.md](docs/bench/group-by.md).
 
 ## Supported queries
 
