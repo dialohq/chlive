@@ -12,7 +12,7 @@ use crate::error::{render_at, Span};
 use crate::history::{HistoryError, HistorySource};
 use crate::rules::{NamingRules, TopicId};
 use crate::source::{EventSource, SourceError};
-use crate::types::{parse_date, parse_datetime, Kind, Type, Value};
+use crate::types::{Kind, LiteralError, Type, Value};
 
 /// What the binder can look things up in.
 pub struct Catalog<'a> {
@@ -658,11 +658,7 @@ fn check_key_types(
     at: Span,
 ) -> Result<(), BindError> {
     let (ot, it) = (&outer.column(ok).ty, &inner.column(ik).ty);
-    let comparable = match (&ot.kind, &it.kind) {
-        (Kind::Other, _) | (_, Kind::Other) => false,
-        (Kind::Int { .. } | Kind::Float, Kind::Int { .. } | Kind::Float) => true,
-        (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
-    };
+    let comparable = ot.class().is_some() && ot.class() == it.class();
     if !comparable {
         return Err(BindError::at(
             format!("{oname} ({ot}) can't be compared with the sub-query's {iname} ({it})"),
@@ -688,7 +684,7 @@ fn bind_aggregation(query: &Query, table: &BoundTable) -> Result<Option<Aggregat
     let mut keys = Vec::new();
     for k in group_refs {
         let id = resolve_column(table, k)?;
-        if table.column(id).ty.kind == Kind::Other {
+        if !table.column(id).ty.ops().group {
             return Err(BindError::at(
                 format!(
                     "grouping by column {} of type {} is not supported",
@@ -827,7 +823,7 @@ fn bind_aggregate_order(
                    span: Span|
      -> Result<(), BindError> {
         let it = &agg.items[item];
-        if it.ty.kind == Kind::Other {
+        if !it.ty.ops().order {
             return Err(BindError::at(
                 format!("ordering by {} of type {} is not supported", it.name, it.ty),
                 span,
@@ -934,7 +930,7 @@ fn bind_order(
 ) -> Result<Vec<OrderKey>, BindError> {
     let key = |id: ColumnId, d: Option<Direction>, n: Option<NullsOrder>, span: Span| {
         let col = table.column(id);
-        if col.ty.kind == Kind::Other {
+        if !col.ty.ops().order {
             return Err(BindError::at(
                 format!(
                     "ordering by column {} of type {} is not supported",
@@ -1133,7 +1129,7 @@ fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
                     )
                 }
             };
-            if ty.kind == Kind::Bool && !matches!(op, CmpOp::Eq | CmpOp::NotEq) {
+            if matches!(ty.kind, Kind::Bool(_)) && !matches!(op, CmpOp::Eq | CmpOp::NotEq) {
                 return Err(BindError::at(
                     "booleans can only be compared with = or !=",
                     *span,
@@ -1166,7 +1162,7 @@ fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
             let Operand::Column(c, ty) = operand(expr, table)? else {
                 return Err(BindError::at("IN needs a column on its left", *span));
             };
-            if ty.kind == Kind::Bool {
+            if matches!(ty.kind, Kind::Bool(_)) {
                 return Err(BindError::at(
                     "IN is not supported for booleans; use =",
                     *span,
@@ -1190,7 +1186,7 @@ fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
         }
         Expr::Column(c) => {
             let col = column(table, c)?;
-            if col.ty.kind != Kind::Bool {
+            if !matches!(col.ty.kind, Kind::Bool(_)) {
                 return Err(BindError::at(
                     format!(
                         "column {} ({}) is not a condition; compare it with something",
@@ -1219,7 +1215,7 @@ fn operand(expr: &Expr, table: &BoundTable) -> Result<Operand, BindError> {
     match expr {
         Expr::Column(c) => {
             let col = column(table, c)?;
-            if col.ty.kind == Kind::Other {
+            if !col.ty.ops().filter {
                 return Err(BindError::at(
                     format!(
                         "filtering on column {} of type {} is not supported",
@@ -1242,29 +1238,8 @@ fn column<'a>(table: &'a BoundTable, c: &ColumnRef) -> Result<&'a BoundColumn, B
     Ok(table.column(resolve_column(table, c)?))
 }
 
-/// What kind of values can be compared with each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
-    Number,
-    String,
-    DateTime,
-    Date,
-    Bool,
-}
-
-fn class(ty: &Type) -> Class {
-    match ty.kind {
-        Kind::Int { .. } | Kind::Float => Class::Number,
-        Kind::String => Class::String,
-        Kind::DateTime { .. } => Class::DateTime,
-        Kind::Date => Class::Date,
-        Kind::Bool => Class::Bool,
-        Kind::Other => unreachable!("rejected in operand()"),
-    }
-}
-
 fn check_comparable(a: &Type, b: &Type, span: Span) -> Result<(), BindError> {
-    if class(a) == class(b) {
+    if a.class().is_some() && a.class() == b.class() {
         Ok(())
     } else {
         Err(BindError::at(format!("cannot compare {a} with {b}"), span))
@@ -1293,42 +1268,10 @@ fn coerce(lit: &Literal, span: Span, ty: &Type) -> Result<Value, BindError> {
         };
         BindError::at(format!("cannot compare {ty} with {what}"), span)
     };
-    match (&ty.kind, lit) {
-        (_, Literal::Null) => Ok(Value::Null),
-        // A value outside the column's range is fine: it simply never (or always) matches, as
-        // in ClickHouse, which compares integers of different types exactly.
-        (Kind::Int { .. }, Literal::Number(n)) => {
-            if n.contains('.') {
-                return n.parse::<f64>().map(Value::Float).map_err(|_| mismatch());
-            }
-            n.parse::<i128>()
-                .map(Value::Int)
-                .map_err(|_| BindError::at(format!("number {n} is too large"), span))
-        }
-        (Kind::Float, Literal::Number(n)) => {
-            n.parse::<f64>().map(Value::Float).map_err(|_| mismatch())
-        }
-        (Kind::String, Literal::String(s)) => Ok(Value::String(s.clone())),
-        (Kind::DateTime { precision }, Literal::String(s)) => parse_datetime(s, *precision)
-            .map(|ticks| Value::DateTime {
-                ticks,
-                precision: *precision,
-            })
-            .ok_or_else(|| {
-                BindError::at(
-                    format!("invalid {ty} value '{s}' (expected YYYY-MM-DD[ hh:mm:ss[.fff]])"),
-                    span,
-                )
-            }),
-        (Kind::Date, Literal::String(s)) => parse_date(s).map(Value::Date).ok_or_else(|| {
-            BindError::at(
-                format!("invalid Date value '{s}' (expected YYYY-MM-DD)"),
-                span,
-            )
-        }),
-        (Kind::Bool, Literal::Bool(b)) => Ok(Value::Bool(*b)),
-        _ => Err(mismatch()),
-    }
+    ty.literal(lit).map_err(|e| match e {
+        LiteralError::Mismatch => mismatch(),
+        LiteralError::Invalid(message) => BindError::at(message, span),
+    })
 }
 
 /// SELECT: `*` is every column of the table; a list must name existing columns, once each.
@@ -1412,6 +1355,7 @@ mod tests {
     use crate::parser::parse;
     use crate::rules::HardcodedRules;
     use crate::source::MemorySource;
+    use crate::types::{parse_datetime, DateTime};
     use async_trait::async_trait;
 
     struct FakeHistory;
@@ -1436,6 +1380,11 @@ mod tests {
                 ]),
                 "default.orders" => Ok(vec![col("order_id", "String")]),
                 "default.plain" => Ok(vec![col("id", "String"), col("_partition", "UInt64")]),
+                "default.sessions" => Ok(vec![
+                    col("id", "UUID"),
+                    col("parent", "Nullable(UUID)"),
+                    col("user_id", "String"),
+                ]),
                 _ => Err(HistoryError::UnknownTable(table.into())),
             }
         }
@@ -1444,10 +1393,13 @@ mod tests {
         }
     }
 
-    /// Only `events` and `plain` have a stream.
+    /// Only `events`, `plain` and `sessions` have a stream.
     fn topics() -> MemorySource {
         let mut source = MemorySource::new();
-        source.partition("events", 0).partition("plain", 0);
+        source
+            .partition("events", 0)
+            .partition("plain", 0)
+            .partition("sessions", 0);
         source
     }
 
@@ -1505,6 +1457,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uuid_columns_filter_order_group_and_join() {
+        for sql in [
+            "select * from sessions where id = 'ABCDEF00-0000-0000-0000-000000000001'",
+            "select * from sessions where id in ('abcdef00000000000000000000000001') and parent is null",
+            "select * from sessions where id > parent order by id desc limit 3",
+            "select parent, count() from sessions group by parent order by parent",
+            "select min(id), max(parent) from sessions",
+            "select * from sessions where parent in (select id from sessions where user_id = 'u1')",
+        ] {
+            assert!(bind_sql(sql).await.is_ok(), "{sql}: {:?}", bind_sql(sql).await);
+        }
+        let b =
+            bind_sql("select * from sessions where id = 'ABCDEF00-0000-0000-0000-000000000001'")
+                .await
+                .unwrap();
+        assert!(b.filter.as_ref().is_some_and(|f| matches!(f,
+            BoundExpr::Compare { right, .. }
+                if right.as_ref() == &BoundExpr::Literal(Value::Uuid(crate::types::Uuid(0xabcdef00 << 96 | 1)))
+        )));
+        assert_eq!(
+            bind_sql("select * from sessions where id = 'nope'")
+                .await
+                .unwrap_err(),
+            "invalid UUID value 'nope' (expected 8-4-4-4-12 hex digits) at 1:35"
+        );
+        assert_eq!(
+            bind_sql("select * from sessions where id < 5")
+                .await
+                .unwrap_err(),
+            "cannot compare UUID with a number at 1:35"
+        );
+        assert_eq!(
+            bind_sql("select * from sessions where id = user_id")
+                .await
+                .unwrap_err(),
+            "cannot compare UUID with String at 1:33"
+        );
+        // other unsupported types keep their errors
+        assert_eq!(
+            bind_sql("select * from events where tags = 'a'")
+                .await
+                .unwrap_err(),
+            "filtering on column tags of type Array(String) is not supported at 1:28"
+        );
+    }
+
+    #[tokio::test]
     async fn errors_point_at_the_offending_name() {
         assert_eq!(
             bind_sql("select * from nope").await.unwrap_err(),
@@ -1558,10 +1557,10 @@ mod tests {
             BoundExpr::Compare {
                 op: CmpOp::GtEq,
                 left: Box::new(BoundExpr::Column(ColumnId(0))),
-                right: Box::new(BoundExpr::Literal(Value::DateTime {
+                right: Box::new(BoundExpr::Literal(Value::DateTime(DateTime {
                     ticks: parse_datetime("2026-10-01 00:00:00", 3).unwrap(),
                     precision: 3
-                })),
+                }))),
             }
         );
         assert!(

@@ -1132,7 +1132,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
         limit: None,
         offset: None,
     };
-    let float = |t: &Type| t.kind == crate::types::Kind::Float;
+    let float = |t: &Type| matches!(t.kind, crate::types::Kind::Float(_));
     SemiPlan {
         inner: inner.snapshot_table(),
         inner_topic: inner.topic.clone(),
@@ -1181,6 +1181,7 @@ mod tests {
                 col(1, "user_id", "String"),
                 col(2, "latency_ms", "UInt32"),
                 col(3, "coupon", "Nullable(String)"),
+                col(4, "session", "Nullable(UUID)"),
             ],
         }
     }
@@ -1229,6 +1230,42 @@ mod tests {
             ["ts", "user_id", "latency_ms", "coupon"]
         );
         assert_eq!(p.stream.filter, Filter::All);
+    }
+
+    #[test]
+    fn uuids_match_and_render_normalized() {
+        let session = crate::types::Uuid::parse("abcdef00-0000-0000-0000-000000000001").unwrap();
+        let f = BoundExpr::Compare {
+            op: CmpOp::Eq,
+            left: col(4),
+            right: lit(Value::Uuid(session)),
+        };
+        let p = plan(&bound(&[1, 4], Some(f)));
+        assert_eq!(
+            p.history.sql("default.events"),
+            "SELECT user_id, session FROM default.events \
+             WHERE session = toUUID('abcdef00-0000-0000-0000-000000000001')"
+        );
+        let upper = p
+            .stream
+            .decode(&row(
+                json!({"user_id": "a", "session": "ABCDEF00-0000-0000-0000-000000000001"}),
+            ))
+            .unwrap();
+        assert!(p.stream.matches(&upper));
+        assert_eq!(
+            serde_json::to_string(&p.stream.project(&upper)).unwrap(),
+            r#"{"user_id":"a","session":"abcdef00-0000-0000-0000-000000000001"}"#
+        );
+        let other = p
+            .stream
+            .decode(&row(json!({"user_id": "b", "session": null})))
+            .unwrap();
+        assert!(!p.stream.matches(&other));
+        assert!(p
+            .stream
+            .decode(&row(json!({"user_id": "c", "session": "{abcdef00}"})))
+            .is_err());
     }
 
     #[test]

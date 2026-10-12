@@ -14,7 +14,7 @@ pub mod result;
 use std::any::Any;
 
 use crate::binder::AggFunc;
-use crate::types::{Kind, Type, Value};
+use crate::types::{IntType, Kind, Type, Value};
 
 /// One aggregate function, implemented natively.
 pub trait AggregateFunction: Send + Sync + 'static {
@@ -104,20 +104,20 @@ pub fn result_type(func: AggFunc, arg: Option<&Type>) -> Result<Type, String> {
             t.to_string()
         })
     };
-    let numeric = matches!(ty.kind, Kind::Int { .. } | Kind::Float);
+    let numeric = ty.kind.is_numeric();
     match func {
         AggFunc::Count | AggFunc::Uniq | AggFunc::UniqExact => Ok(Type::parse("UInt64")),
         AggFunc::Sum | AggFunc::Avg | AggFunc::Median if !numeric => {
             Err(format!("{}() needs a number", func.name()))
         }
         AggFunc::Sum => Ok(nullable(match ty.kind {
-            Kind::Int { signed: true, .. } => "Int64",
-            Kind::Int { signed: false, .. } => "UInt64",
+            Kind::Int(IntType { signed: true, .. }) => "Int64",
+            Kind::Int(IntType { signed: false, .. }) => "UInt64",
             _ => "Float64",
         })),
         AggFunc::Avg | AggFunc::Median => Ok(nullable("Float64")),
         AggFunc::Min | AggFunc::Max | AggFunc::Any | AggFunc::AnyLast => {
-            if ty.kind == Kind::Other {
+            if !ty.ops().min_max {
                 Err(format!("{}() of this type is not supported", func.name()))
             } else {
                 Ok(nullable(&bare(ty)))

@@ -5,7 +5,7 @@ use std::any::Any;
 use std::cmp::Ordering;
 
 use super::{AggregateFunction, AggregateState};
-use crate::types::{Kind, Type, Value};
+use crate::types::{IntType, Kind, Type, Value};
 
 fn uint64() -> Type {
     Type::parse("UInt64")
@@ -79,8 +79,8 @@ enum Total {
 impl Total {
     fn zero(result_ty: &Type) -> Self {
         match result_ty.kind {
-            Kind::Int { signed: true, .. } => Total::Signed(0),
-            Kind::Int { signed: false, .. } => Total::Unsigned(0),
+            Kind::Int(IntType { signed: true, .. }) => Total::Signed(0),
+            Kind::Int(IntType { signed: false, .. }) => Total::Unsigned(0),
             _ => Total::Float(0.0),
         }
     }
@@ -124,8 +124,8 @@ impl Total {
 /// The type `sum(x)` has for an argument of type `arg` (what ClickHouse returns for it).
 fn sum_type(arg: &Type) -> Type {
     let base = match arg.kind {
-        Kind::Int { signed: true, .. } => "Int64",
-        Kind::Int { signed: false, .. } => "UInt64",
+        Kind::Int(IntType { signed: true, .. }) => "Int64",
+        Kind::Int(IntType { signed: false, .. }) => "UInt64",
         _ => "Float64",
     };
     Type::parse(&if arg.nullable {

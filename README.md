@@ -124,7 +124,7 @@ Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 - **Not resumable yet:** a `since` gives a full snapshot.
 
 **WHERE runs in two places, which must agree on every row.** ClickHouse evaluates it for history; the engine evaluates it for each event.
-- **Typed decoding.** Each event's needed JSON fields are decoded by their ClickHouse column types, following ClickHouse's input rules: a quoted number is read as a number, and a DateTime string is parsed.
+- **Typed decoding.** Each event's needed JSON fields are decoded by their ClickHouse column types, following ClickHouse's input rules: a quoted number is read as a number, a DateTime string is parsed, and a UUID is normalized to lowercase (see [Column types](#column-types)).
 - **Missing keys.** A missing key is NULL for a `Nullable` column, and the type's zero value otherwise, just as ClickHouse's ingestion stores it.
 - **Conditions.** They're evaluated with SQL's three-valued logic.
 - **Literals.** They're typed and checked at bind time; for example, comparing `latency_ms` with a string is a positioned error.
@@ -236,6 +236,31 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 - An event of the same table in both roles counts for the sub-query first, so an event that brings its key into `S` is itself in the result, as in ClickHouse.
 - **Not yet:** resuming (a `since` gives a full snapshot), `NOT IN` (rows would have to leave the result), GROUP BY over a semi-join. Back-fills are cheap when the outer table's sort key (or a skip index) covers the key column.
 - In the dev stack, `customers` is a natural sub-query table: `produce customers '{"customer_id": "u7", "country": "PL"}'` brings u7's events into a query like the one above.
+
+### Column types
+
+Each ClickHouse type the engine understands is one module in `engine/src/types/`. It implements two traits, with no defaults:
+- `ColumnType`: what a column of it accepts (an event's JSON, literals, its zero value for a missing field) and allows (filtering, ordering, grouping, `min`/`max`).
+- `Scalar`: how its values compare and render, as ClickHouse does.
+
+`engine/tests/types.rs` checks every type against ClickHouse. ClickHouse and the engine must read the same sample values, render them the same, sort them the same way and compare them the same way with literals.
+
+| type | events read as ClickHouse does | notes |
+|---|---|---|
+| `Int8`…`UInt64` | numbers, quoted numbers, booleans | out-of-range values wrap around; unsigned columns reject negatives |
+| `Float32`, `Float64` | numbers, quoted numbers (`"nan"`, `"inf"`, `"1e3"`), booleans | |
+| `String`, `FixedString`, `Enum8/16` | strings, numbers and booleans as text | byte order |
+| `DateTime`, `DateTime64(p)` | `YYYY-MM-DD[ hh:mm:ss[.f]]`; integers are ticks at the column's precision | UTC |
+| `Date`, `Date32` | `YYYY-MM-DD` | |
+| `Bool` | `true`/`false`, `0`/`1` | `=` and `!=` only |
+| `UUID` | 36 characters with dashes, or 32 hex digits, in either case | stored and sent lowercase. Ordered as ClickHouse orders them: by the last 8 bytes first, so not alphabetically |
+| others (`Array`, `Map`, `Decimal`, …) | passed through | can only be selected |
+
+Any of these can be `Nullable`, and `LowCardinality` is transparent. Literals follow the column's type: `session_id = 'ABCDEF00-…'` matches the lowercase value, and an invalid UUID or date is a positioned error.
+
+Known differences, where the engine skips an event that ClickHouse reads:
+- DateTime strings that are only digits, such as `"1700000000"` (Unix seconds) or `"2026"`;
+- partial DateTime strings, such as `" 7"`.
 
 ### Offline cache
 
