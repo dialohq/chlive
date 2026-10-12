@@ -97,12 +97,28 @@ impl GroupResult {
 
     /// The history: every group ranked; the window (`limit` after `offset`), in order, as
     /// appended inserts.
+    ///
+    /// The groups are sorted once by (key, arrival), the order [`Self::place`] keeps: placing
+    /// them one at a time would shift the list on every insert, O(groups²).
     pub fn history(&mut self, groups: Vec<(String, Row)>) -> Vec<Diff> {
+        debug_assert!(self.ranked.is_empty(), "history comes first");
+        let mut entries = Vec::with_capacity(groups.len());
         for (id, row) in groups {
             let (key, row) = self.split(row);
-            self.place(&id, key);
-            self.rows.insert(id, row);
+            self.seq += 1;
+            self.rows.insert(id.clone(), row);
+            entries.push(Entry {
+                key,
+                seq: self.seq,
+                id,
+            });
         }
+        let order = &self.order;
+        entries.sort_by(|a, b| order.cmp(&a.key, &b.key).then(a.seq.cmp(&b.seq)));
+        for e in &entries {
+            self.keys.insert(e.id.clone(), (e.key.clone(), e.seq));
+        }
+        self.ranked = entries;
         let mut diffs = Vec::new();
         for e in self.ranked.iter().skip(self.offset).take(self.limit) {
             let row = self.rows[&e.id].clone();
@@ -459,17 +475,80 @@ mod tests {
         assert_eq!(lines(&r.batch(vec![with("a", 0)])), [r#"~ ["a"] @0 {}"#]);
     }
 
-    /// Random batches: the client's list, built from the diffs alone, is always the first
-    /// `limit` groups in order, each with its latest row.
-    #[test]
-    fn diffs_rebuild_the_ordered_result() {
-        let mut seed: u64 = 42;
-        let mut rand = move |n: u64| {
+    /// A seeded generator of numbers below `n`.
+    fn lcg(mut seed: u64) -> impl FnMut(u64) -> u64 {
+        move |n: u64| {
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             (seed >> 33) % n
-        };
+        }
+    }
+
+    /// Sorting the history once gives exactly what placing its groups one at a time gave: the
+    /// same ranking (ties in arrival order, NULLs where the term puts them), seqs and window.
+    #[test]
+    fn history_ranks_like_placing_one_at_a_time() {
+        let mut rand = lcg(7);
+        for (desc, nulls_first, limit, offset) in [
+            (true, false, None, None),
+            (false, false, Some(10), None),
+            (true, true, Some(25), Some(40)),
+            (false, true, None, Some(3)),
+        ] {
+            let terms = vec![GroupOrderTerm {
+                nulls_first,
+                ..term("n", desc)
+            }];
+            let groups: Vec<(String, Row)> = (0..500)
+                .map(|i| {
+                    let g = format!("g{i}");
+                    // few distinct keys: many ties; some NULLs
+                    let n = match rand(12) {
+                        0 => Json::Null,
+                        k => json!(k),
+                    };
+                    let r = json!({"g": g, "n": n}).as_object().unwrap().clone();
+                    (format!("[\"{g}\"]"), r)
+                })
+                .collect();
+            let mut sorted = GroupResult::new(terms.clone(), limit, offset, vec![]);
+            let diffs = sorted.history(groups.clone());
+            let mut placed = GroupResult::new(terms, limit, offset, vec![]);
+            for (id, row) in groups {
+                let (key, row) = placed.split(row);
+                placed.place(&id, key);
+                placed.rows.insert(id, row);
+            }
+            let ranked = |r: &GroupResult| -> Vec<(String, u64)> {
+                r.ranked.iter().map(|e| (e.id.clone(), e.seq)).collect()
+            };
+            assert_eq!(ranked(&sorted), ranked(&placed));
+            assert_eq!(sorted.keys, placed.keys);
+            assert_eq!(sorted.seq, placed.seq);
+            let want: Vec<String> = placed
+                .ranked
+                .iter()
+                .skip(offset.map_or(0, |m| m as usize))
+                .take(limit.map_or(usize::MAX, |n| n as usize))
+                .map(|e| e.id.clone())
+                .collect();
+            let got: Vec<String> = diffs
+                .iter()
+                .map(|d| match d {
+                    Diff::Insert { id: Some(id), .. } => id.clone(),
+                    other => panic!("{other}"),
+                })
+                .collect();
+            assert_eq!(got, want);
+        }
+    }
+
+    /// Random batches: the client's list, built from the diffs alone, is always the first
+    /// `limit` groups in order, each with its latest row.
+    #[test]
+    fn diffs_rebuild_the_ordered_result() {
+        let mut rand = lcg(42);
         for (desc, limit, offset) in [
             (true, None, None),
             (false, Some(3), None),
@@ -482,11 +561,16 @@ mod tests {
             let mut r = GroupResult::new(vec![term("n", desc)], limit, offset, vec![]);
             let mut latest: HashMap<String, i64> = HashMap::new();
             let mut list = ResultList::default();
-            for d in r.history(vec![row("g0", 5), row("g1", 5)]) {
+            // a random history of most groups, with ties
+            let history: Vec<(String, Row)> = (0..6)
+                .map(|i| row(&format!("g{i}"), rand(4) as i64))
+                .collect();
+            for (id, row) in &history {
+                latest.insert(id.clone(), row["n"].as_i64().unwrap());
+            }
+            for d in r.history(history) {
                 list.apply(&d).unwrap();
             }
-            latest.insert("[\"g0\"]".into(), 5);
-            latest.insert("[\"g1\"]".into(), 5);
             for _ in 0..300 {
                 let batch: Vec<(String, Row)> = (0..1 + rand(4))
                     .map(|_| {
