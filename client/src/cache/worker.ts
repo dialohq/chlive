@@ -11,6 +11,7 @@ export type Request =
   | { id: number; method: "save"; args: [key: string, result: unknown] }
   | { id: number; method: "append"; args: [key: string, rows: unknown[], at: string] }
   | { id: number; method: "setCursor"; args: [key: string, at: string] }
+  | { id: number; method: "recent"; args: [maxRows: number] }
   | { id: number; method: "stats" | "clear" | "close"; args: [] };
 
 export type Response = { id: number; result?: unknown; error?: string };

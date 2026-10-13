@@ -96,6 +96,9 @@ export interface ResultCache {
   /** The rows are unchanged; only the cursor moved. */
   setCursor(key: string, at: string): Promise<void>;
   remove(key: string): Promise<void>;
+  /** The most recently used results fitting in `maxRows` rows together, most recent first,
+   * without marking them as used (warming the client's memory). */
+  recent?(maxRows: number): Promise<{ key: string; result: CachedResult }[]>;
   /** Forget every result (e.g. on logout). */
   clear?(): Promise<void>;
   /** For dev tools: why the cache isn't available, if it isn't, and what it holds. */
@@ -118,6 +121,9 @@ export interface CacheInfo {
 export interface CacheOptions {
   /** Total size of cached results before the least recently used go (default 2 GB). */
   budgetBytes?: number;
+  /** Rows of the most recently used results to read into memory as soon as the cache opens,
+   * so their first subscribers get them synchronously (default 10 000; 0: none). */
+  warmRows?: number;
 }
 
 export type Listener<R extends Row = Row> = (state: LiveState<R>) => void;
@@ -151,6 +157,15 @@ export interface LiveClientOptions {
   cache?: boolean | CacheOptions | ResultCache;
   /** Full saves of a result are batched for this long after a change (default 1000 ms). */
   saveDelayMs?: number;
+  /** How long a query's server subscription outlives its last subscriber (default 5000 ms), so
+   * a remount (StrictMode, a route change) picks it up live. */
+  keepAliveMs?: number;
+  /** How long its rows (and cursor) then stay in memory, to show at once and resume from
+   * (default 5 min). */
+  gcTimeMs?: number;
+  /** Rows that results nobody subscribes to may hold in memory in all; the oldest go first
+   * (default 100 000). */
+  memoryRows?: number;
   /**
    * How column values become row values, by ClickHouse type (the base name: `DateTime64`,
    * `UUID`, …), merged over `defaultParsers`, which make `Date`, `Date32`, `DateTime` and
@@ -161,17 +176,19 @@ export interface LiveClientOptions {
   parsers?: ValueParsers | false;
 }
 
-interface SubRecord {
-  id: string;
+/** A query's result, shared by everyone subscribed to the same query and params. */
+interface Result {
   sql: string;
   /** As sent (serialized); undefined without any. */
   params: Params | undefined;
-  /** What the cache keeps the result under: the query, with its params if any. */
+  /** The query with its params: what memory and the cache keep the result under. */
   key: string;
   store: ResultStore<any>;
   state: LiveState<any>;
   stats: SubscriptionStats;
-  listener: Listener<any>;
+  listeners: Set<Listener<any>>;
+  /** The server subscription's id while subscribed (a new one each time). */
+  wireId: string | undefined;
   /** False while the cache is being read: the subscription isn't sent until then. */
   ready: boolean;
   /** Writes to the cache, one after another. */
@@ -182,13 +199,24 @@ interface SubRecord {
   saved: boolean;
   /** Waiting for the first diff after a resume (the catch-up). */
   awaitingCatchUp: boolean;
+  /** Without subscribers: when the server subscription ends, then when the rows go. */
+  keepAliveTimer: ReturnType<typeof setTimeout> | null;
+  gcTimer: ReturnType<typeof setTimeout> | null;
+  /** When the last subscriber left (for evicting the oldest first). */
+  idleSince: number;
 }
 
 const OPEN = 1;
+const DEFAULT_WARM_ROWS = 10_000;
 
 /**
  * One WebSocket shared by any number of live queries. Reconnects with exponential backoff and
  * resubscribes every active query from the cursor it has.
+ *
+ * Results are kept in memory per query and params, and shared: subscribing to a query the
+ * client already holds gets its rows at once (synchronously). After the last subscriber leaves,
+ * the server subscription stays for `keepAliveMs`, then the rows (and cursor) for `gcTimeMs`;
+ * coming back meanwhile shows them and resumes from the cursor.
  *
  * With a `cache`, a subscription first shows the cached result (`status: "cached"`) and asks
  * the server to resume from its cursor; the server sends only what changed since (or a full
@@ -197,12 +225,15 @@ const OPEN = 1;
 export class LiveClient {
   private readonly opts: Required<Omit<LiveClientOptions, "WebSocket" | "cache" | "parsers">> &
     Pick<LiveClientOptions, "WebSocket" | "parsers">;
-  /** Resolves to the cache once it's set up (`undefined` without one); loads wait for it. */
+  /** Resolves to the cache once it's set up and memory is warmed from it (`undefined` without
+   * one); reads wait for it. */
   private readonly cacheReady: Promise<ResultCache | undefined> | undefined;
   private cache: ResultCache | undefined;
   private removePageListeners: (() => void) | undefined;
   private ws: WebSocket | null = null;
-  private subs = new Map<string, SubRecord>();
+  private results = new Map<string, Result>();
+  /** Results by their server subscription's id. */
+  private byWire = new Map<string, Result>();
   private nextId = 1;
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -210,17 +241,28 @@ export class LiveClient {
 
   constructor(opts: LiveClientOptions) {
     const { cache = opfsAvailable(), ...rest } = opts;
-    this.opts = { minBackoffMs: 500, maxBackoffMs: 10_000, saveDelayMs: 1000, ...rest };
+    this.opts = {
+      minBackoffMs: 500,
+      maxBackoffMs: 10_000,
+      saveDelayMs: 1000,
+      keepAliveMs: 5000,
+      gcTimeMs: 300_000,
+      memoryRows: 100_000,
+      ...rest,
+    };
     this.backoff = this.opts.minBackoffMs;
     if (cache) {
+      const settings = cache === true || typeof (cache as ResultCache).load === "function" ? {} : (cache as CacheOptions);
+      const warmRows = settings.warmRows ?? DEFAULT_WARM_ROWS;
       this.cacheReady = openCache(cache)
         .catch((e) => {
           console.warn("chlive: the offline cache is unavailable:", e);
           return undefined;
         })
-        .then((c) => {
+        .then(async (c) => {
           if (c && this.closed) c.close?.();
           else this.cache = c;
+          if (this.cache && warmRows > 0) await this.warm(this.cache, warmRows);
           return this.cache;
         });
       this.removePageListeners = this.watchPage();
@@ -255,70 +297,66 @@ export class LiveClient {
     };
   }
 
+  /**
+   * Subscribe to a live query. The listener is called at once with what the client has (the
+   * rows, if it holds this query and params already), then on every change.
+   */
   subscribe<R extends Row = Row>(sql: string, listener: Listener<R>, opts: SubscribeOptions = {}): Subscription {
     if (this.closed) throw new Error("LiveClient is closed");
-    const id = `s${this.nextId++}`;
     const params = serializeParams(opts.params);
-    const rec: SubRecord = {
-      id,
-      sql,
-      params,
-      key: cacheKey(sql, params),
-      store: new ResultStore<R>({ parsers: this.opts.parsers }),
-      state: { status: "loading", rows: [], stats: newStats(id) },
-      stats: newStats(id),
-      listener,
-      ready: !this.cacheReady,
-      persist: Promise.resolve(),
-      saveTimer: null,
-      saved: false,
-      awaitingCatchUp: false,
-    };
-    this.subs.set(id, rec);
-    listener(rec.state);
-    this.ensureConnected();
-    if (this.cacheReady) {
-      const started = performance.now();
-      this.cacheReady
-        .then((cache) => cache?.load(rec.key))
-        .catch((e) => {
-          console.warn("chlive: reading the cache failed", e);
-          return undefined;
-        })
-        .then((cached) => {
-          if (this.subs.get(id) !== rec) return; // unsubscribed meanwhile
-          rec.stats = {
-            ...rec.stats,
-            at: cached?.at,
-            cache: {
-              hit: !!cached,
-              loadedRows: cached?.rows.length ?? 0,
-              loadMs: performance.now() - started,
-              savedAt: cached?.savedAt,
-              saves: 0,
-            },
-          };
-          if (cached) {
-            rec.store.applyCached(cached);
-            rec.saved = true;
-            this.emit(rec, { ...this.view(rec), status: "cached", cachedAt: cached.savedAt });
-          }
-          rec.ready = true;
-          this.sendSubscribe(rec);
-        });
-    } else {
-      this.sendSubscribe(rec);
+    const key = cacheKey(sql, params);
+    let r = this.results.get(key);
+    // a failed query is tried again once nobody is looking at the error
+    if (r && r.state.status === "error" && r.listeners.size === 0) {
+      this.drop(r);
+      r = undefined;
     }
+    r ??= this.create(sql, params, key);
+    const result = r;
+    // one entry per subscription, even if two pass the same function
+    const entry: Listener<any> = (s) => listener(s);
+    result.listeners.add(entry);
+    this.retain(result);
+    entry(result.state);
     let active = true;
     return {
       unsubscribe: () => {
         if (!active) return;
         active = false;
-        this.flushSave(rec);
-        this.subs.delete(id);
-        this.send({ type: "unsubscribe", id });
+        result.listeners.delete(entry);
+        if (result.listeners.size === 0) this.release(result);
       },
     };
+  }
+
+  /** The query's current state if the client holds it (synchronously), else `undefined`. The
+   * same object until it changes, so it can be a `useSyncExternalStore` snapshot. */
+  peek<R extends Row = Row>(sql: string, opts: SubscribeOptions = {}): LiveState<R> | undefined {
+    return this.results.get(cacheKey(sql, serializeParams(opts.params)))?.state;
+  }
+
+  /**
+   * Start a query ahead of the components that will show it (e.g. in a route loader): it's read
+   * from the cache and subscribed, then kept like a query whose last subscriber just left.
+   * Resolves once it has rows (cached or live) or failed.
+   */
+  preload(sql: string, opts: SubscribeOptions = {}): Promise<void> {
+    return new Promise((resolve) => {
+      let sub: Subscription | undefined;
+      let done = false;
+      sub = this.subscribe(
+        sql,
+        (s) => {
+          if (done || s.status === "loading") return;
+          done = true;
+          resolve();
+          // called during `subscribe` when the rows are already here
+          queueMicrotask(() => sub?.unsubscribe());
+        },
+        opts,
+      );
+      if (done) queueMicrotask(() => sub?.unsubscribe());
+    });
   }
 
   /** Forget every cached result (e.g. on logout). Results being shown stay. */
@@ -337,7 +375,7 @@ export class LiveClient {
 
   /** Write every pending result to the cache now. */
   private flush(): void {
-    for (const rec of this.subs.values()) this.flushSave(rec);
+    for (const r of this.results.values()) this.flushSave(r);
   }
 
   /** Close the socket and stop reconnecting; save pending results and close the cache. */
@@ -346,14 +384,177 @@ export class LiveClient {
     this.removePageListeners?.();
     const cache = this.cache;
     if (cache?.close) {
-      void Promise.all([...this.subs.values()].map((r) => r.persist)).then(() => cache.close!());
+      void Promise.all([...this.results.values()].map((r) => r.persist)).then(() => cache.close!());
     }
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.subs.clear();
+    for (const r of this.results.values()) this.clearTimers(r);
+    this.results.clear();
+    this.byWire.clear();
     this.ws?.close();
     this.ws = null;
   }
+
+  // --- results in memory ---------------------------------------------------------------------
+
+  /** A new result in memory; read from the cache unless `cached` gives it already. */
+  private create(sql: string, params: Params | undefined, key: string, cached?: CachedResult): Result {
+    const r: Result = {
+      sql,
+      params,
+      key,
+      store: new ResultStore({ parsers: this.opts.parsers }),
+      state: { status: "loading", rows: [], stats: newStats("") },
+      stats: newStats(""),
+      listeners: new Set(),
+      wireId: undefined,
+      ready: !this.cacheReady || cached !== undefined,
+      persist: Promise.resolve(),
+      saveTimer: null,
+      saved: false,
+      awaitingCatchUp: false,
+      keepAliveTimer: null,
+      gcTimer: null,
+      idleSince: 0,
+    };
+    this.results.set(key, r);
+    if (!r.ready) void this.read(r);
+    return r;
+  }
+
+  /** Show the cached result, if any, then let the subscription go out. */
+  private async read(r: Result): Promise<void> {
+    const started = performance.now();
+    const cached = await this.cacheReady!
+      .then((cache) => cache?.load(r.key))
+      .catch((e) => {
+        console.warn("chlive: reading the cache failed", e);
+        return undefined;
+      });
+    if (this.results.get(r.key) !== r) return; // dropped meanwhile
+    r.stats = {
+      ...r.stats,
+      at: cached?.at,
+      cache: {
+        hit: !!cached,
+        loadedRows: cached?.rows.length ?? 0,
+        loadMs: performance.now() - started,
+        savedAt: cached?.savedAt,
+        saves: 0,
+      },
+    };
+    // the server may have answered already (no cache wait without a subscription, but a
+    // snapshot could have come in through a previous server subscription)
+    if (cached && r.store.at === undefined) {
+      r.store.applyCached(cached);
+      r.saved = true;
+      this.emit(r, { ...this.view(r), status: "cached", cachedAt: cached.savedAt });
+    } else {
+      this.emit(r, r.state);
+    }
+    r.ready = true;
+    this.sendSubscribe(r);
+  }
+
+  /** Put the cache's most recently used results in memory (`cached`, not subscribed), so the
+   * first subscribers get them synchronously. */
+  private async warm(cache: ResultCache, maxRows: number): Promise<void> {
+    if (!cache.recent) return;
+    let recent: { key: string; result: CachedResult }[];
+    try {
+      recent = await cache.recent(maxRows);
+    } catch (e) {
+      console.warn("chlive: reading the cache failed", e);
+      return;
+    }
+    const now = Date.now();
+    recent.forEach(({ key, result }, i) => {
+      if (this.closed || this.results.has(key)) return;
+      const [sql, json] = splitKey(key);
+      const r = this.create(sql, json === undefined ? undefined : (JSON.parse(json) as Params), key, result);
+      r.store.applyCached(result);
+      r.saved = true;
+      r.stats = {
+        ...r.stats,
+        at: result.at,
+        cache: { hit: true, loadedRows: result.rows.length, loadMs: 0, savedAt: result.savedAt, saves: 0 },
+      };
+      r.state = { ...this.view(r), status: "cached", cachedAt: result.savedAt, stats: r.stats };
+      // the most recent is the newest idle one
+      r.idleSince = now - i;
+      r.gcTimer = setTimeout(() => this.drop(r), this.opts.gcTimeMs);
+    });
+    this.evict();
+  }
+
+  /** Someone subscribed: keep it, and make sure it's subscribed on the server. */
+  private retain(r: Result): void {
+    if (r.keepAliveTimer) clearTimeout(r.keepAliveTimer);
+    if (r.gcTimer) clearTimeout(r.gcTimer);
+    r.keepAliveTimer = r.gcTimer = null;
+    if (r.wireId) return;
+    r.wireId = `s${this.nextId++}`;
+    this.byWire.set(r.wireId, r);
+    r.stats = { ...r.stats, id: r.wireId };
+    this.ensureConnected();
+    this.sendSubscribe(r);
+  }
+
+  /** The last subscriber left: the server subscription goes after `keepAliveMs`, the rows
+   * after `gcTimeMs` more. */
+  private release(r: Result): void {
+    this.flushSave(r);
+    r.idleSince = Date.now();
+    r.keepAliveTimer = setTimeout(() => this.stop(r), this.opts.keepAliveMs);
+    this.evict();
+  }
+
+  /** End the server subscription, keeping the rows (and their cursor) for `gcTimeMs`. */
+  private stop(r: Result): void {
+    r.keepAliveTimer = null;
+    this.unsubscribeWire(r);
+    this.flushSave(r);
+    if (r.state.status === "live" || (r.state.status === "loading" && r.store.at !== undefined)) {
+      this.emit(r, { ...r.state, status: "cached", cachedAt: Date.now() });
+    }
+    r.gcTimer = setTimeout(() => this.drop(r), this.opts.gcTimeMs);
+  }
+
+  private unsubscribeWire(r: Result): void {
+    if (!r.wireId) return;
+    this.send({ type: "unsubscribe", id: r.wireId });
+    this.byWire.delete(r.wireId);
+    r.wireId = undefined;
+  }
+
+  /** Forget a result (its pending save still goes to the cache). */
+  private drop(r: Result): void {
+    this.clearTimers(r);
+    this.unsubscribeWire(r);
+    this.flushSave(r);
+    if (this.results.get(r.key) === r) this.results.delete(r.key);
+  }
+
+  private clearTimers(r: Result): void {
+    if (r.keepAliveTimer) clearTimeout(r.keepAliveTimer);
+    if (r.gcTimer) clearTimeout(r.gcTimer);
+    r.keepAliveTimer = r.gcTimer = null;
+  }
+
+  /** Results nobody subscribes to may hold `memoryRows` rows in all; the oldest go first. */
+  private evict(): void {
+    const idle = [...this.results.values()].filter((r) => r.listeners.size === 0);
+    let total = idle.reduce((n, r) => n + r.store.rows().length, 0);
+    if (total <= this.opts.memoryRows) return;
+    idle.sort((a, b) => a.idleSince - b.idleSince);
+    for (const r of idle) {
+      if (total <= this.opts.memoryRows) break;
+      total -= r.store.rows().length;
+      this.drop(r);
+    }
+  }
+
+  // --- the connection ------------------------------------------------------------------------
 
   /** Whether it was sent. While disconnected, subscriptions are (re)sent from `onopen`. */
   private send(msg: ClientMessage): boolean {
@@ -363,12 +564,12 @@ export class LiveClient {
   }
 
   /** Subscribe, resuming from the cursor of the rows we hold (cached, or before a reconnect). */
-  private sendSubscribe(rec: SubRecord): void {
-    if (!rec.ready) return;
-    const msg: ClientMessage = { type: "subscribe", id: rec.id, sql: rec.sql };
-    if (rec.store.at !== undefined) msg.since = rec.store.at;
-    if (rec.params) msg.params = rec.params;
-    if (this.send(msg)) rec.stats = { ...rec.stats, subscribes: rec.stats.subscribes + 1 };
+  private sendSubscribe(r: Result): void {
+    if (!r.ready || !r.wireId) return;
+    const msg: ClientMessage = { type: "subscribe", id: r.wireId, sql: r.sql };
+    if (r.store.at !== undefined) msg.since = r.store.at;
+    if (r.params) msg.params = r.params;
+    if (this.send(msg)) r.stats = { ...r.stats, subscribes: r.stats.subscribes + 1 };
   }
 
   private ensureConnected(): void {
@@ -378,7 +579,7 @@ export class LiveClient {
     this.ws = ws;
     ws.onopen = () => {
       this.backoff = this.opts.minBackoffMs;
-      for (const rec of this.subs.values()) this.sendSubscribe(rec);
+      for (const r of this.byWire.values()) this.sendSubscribe(r);
     };
     ws.onmessage = (ev: MessageEvent) => {
       const text = String(ev.data);
@@ -387,8 +588,8 @@ export class LiveClient {
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
-      for (const rec of this.subs.values()) {
-        if (rec.state.status === "live") this.emit(rec, { ...rec.state, status: "loading" });
+      for (const r of this.byWire.values()) {
+        if (r.state.status === "live") this.emit(r, { ...r.state, status: "loading" });
       }
       this.scheduleReconnect();
     };
@@ -403,12 +604,12 @@ export class LiveClient {
     this.backoff = Math.min(this.backoff * 2, this.opts.maxBackoffMs);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      if (this.subs.size > 0) this.ensureConnected();
+      if (this.byWire.size > 0) this.ensureConnected();
     }, delay);
   }
 
   private onMessage(msg: ServerMessage, bytes: number): void {
-    const rec = msg.id ? this.subs.get(msg.id) : undefined;
+    const rec = msg.id ? this.byWire.get(msg.id) : undefined;
     if (!rec) return;
     const started = performance.now();
     const stats: SubscriptionStats = {
@@ -467,7 +668,7 @@ export class LiveClient {
   // --- persistence ---------------------------------------------------------------------------
 
   /** Queue a cache write after the previous ones; failures are logged, never fatal. */
-  private queue(rec: SubRecord, write: (cache: ResultCache) => Promise<void>): void {
+  private queue(rec: Result, write: (cache: ResultCache) => Promise<void>): void {
     const cache = this.cache;
     if (!cache) return;
     rec.persist = rec.persist
@@ -481,12 +682,12 @@ export class LiveClient {
   }
 
   /** Save the whole result soon (the latest state then, not now). */
-  private scheduleSave(rec: SubRecord): void {
+  private scheduleSave(rec: Result): void {
     if (!this.cache || rec.saveTimer) return;
     rec.saveTimer = setTimeout(() => this.flushSave(rec), this.opts.saveDelayMs);
   }
 
-  private flushSave(rec: SubRecord): void {
+  private flushSave(rec: Result): void {
     if (!rec.saveTimer) return;
     clearTimeout(rec.saveTimer);
     rec.saveTimer = null;
@@ -506,7 +707,7 @@ export class LiveClient {
 
   /** Appends (their rows as they came over the wire) go straight to the cache; anything else
    * (indexes, deletes) means a full save. */
-  private persistDiff(rec: SubRecord, msg: DiffMessage): void {
+  private persistDiff(rec: Result, msg: DiffMessage): void {
     const appendOnly = msg.changes.every((c) => c.op === "insert" && c.index === undefined);
     if (appendOnly && rec.saved && !rec.saveTimer) {
       const rows = msg.changes.map((c) => (c as { row: Row }).row);
@@ -516,7 +717,7 @@ export class LiveClient {
     }
   }
 
-  private persistCursor(rec: SubRecord): void {
+  private persistCursor(rec: Result): void {
     const at = rec.store.at;
     if (at === undefined || !rec.saved || rec.saveTimer) return; // a pending save carries it
     this.queue(rec, (cache) => cache.setCursor(rec.key, at));
@@ -524,13 +725,13 @@ export class LiveClient {
 
   // -------------------------------------------------------------------------------------------
 
-  private view(rec: SubRecord): LiveState<any> {
+  private view(rec: Result): LiveState<any> {
     return { status: rec.state.status, rows: rec.store.rows(), stats: rec.stats };
   }
 
-  private emit(rec: SubRecord, state: LiveState<any>): void {
+  private emit(rec: Result, state: LiveState<any>): void {
     rec.state = { ...state, stats: rec.stats };
-    rec.listener(rec.state);
+    for (const listener of [...rec.listeners]) listener(rec.state);
   }
 }
 
@@ -574,6 +775,12 @@ export function stableJson(v: unknown): string {
 /** What a result is cached under: the query alone without params (as before params existed). */
 export function cacheKey(sql: string, params: Params | undefined): string {
   return params ? `${sql}\u0000${stableJson(params)}` : sql;
+}
+
+/** A `cacheKey`'s query and params (JSON), back. */
+function splitKey(key: string): [sql: string, params: string | undefined] {
+  const i = key.indexOf("\u0000");
+  return i < 0 ? [key, undefined] : [key.slice(0, i), key.slice(i + 1)];
 }
 
 function newStats(id: string): SubscriptionStats {

@@ -117,6 +117,7 @@ export function createOpfsCache(opts: OpfsCacheOptions = {}): OpfsCache {
     append: (key: string, rows: Row[], at: string) =>
       whenReady((call) => call<void>("append", key, rows, at), undefined),
     setCursor: (key, at) => whenReady((call) => call<void>("setCursor", key, at), undefined),
+    recent: (maxRows) => whenReady((call) => call<{ key: string; result: CachedResult }[]>("recent", maxRows), []),
     remove: (key) => whenReady((call) => call<void>("remove", key), undefined),
     clear: () => whenReady((call) => call<void>("clear"), undefined),
     info: async () => {

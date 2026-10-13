@@ -85,3 +85,22 @@ test("columns are saved with the rows", () => {
   s.save("old", result(1));
   assert.equal(s.load("old")!.columns, undefined);
 });
+
+test("recent: the most recently used results that fit, without marking them as used", async () => {
+  const s = new SqliteResultStore(db());
+  s.save("a", result(5));
+  await Bun.sleep(2);
+  s.save("b", result(3));
+  await Bun.sleep(2);
+  s.save("c", result(4));
+  await Bun.sleep(2);
+  s.load("a"); // a is now the most recently used
+  const keys = (n: number) => s.recent(n).map((r) => r.key);
+  assert.deepEqual(keys(100), ["a", "c", "b"]);
+  // c doesn't fit after a; b does
+  assert.deepEqual(keys(8), ["a", "b"]);
+  assert.deepEqual(keys(2), []);
+  assert.deepEqual(s.recent(5)[0].result.rows.length, 5);
+  // reading them didn't change the order
+  assert.deepEqual(keys(100), ["a", "c", "b"]);
+});

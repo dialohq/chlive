@@ -637,7 +637,7 @@ function Query() {
         </label>
         {paramsError && <span className="error"> {paramsError}</span>}
       </p>
-      {/* a new key per query: its result starts from a fresh snapshot; new params resubscribe */}
+      {/* a new key per query (and params): the client keeps results it saw recently, so coming back shows them at once */}
       <Result key={sql} sql={sql} params={params} enabled={enabled} />
     </section>
   );

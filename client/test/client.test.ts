@@ -1,7 +1,7 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 
-import { type CachedResult, LiveClient, type LiveState, opfsAvailable, type ResultCache } from "../src/index.ts";
+import { type CachedResult, cacheKey, LiveClient, type LiveState, opfsAvailable, type ResultCache } from "../src/index.ts";
 
 /** Minimal in-memory WebSocket double. */
 class FakeSocket {
@@ -40,7 +40,7 @@ const COLUMNS = [{ name: "user_id", type: "String" }];
 
 test("subscribes, applies messages, resubscribes after reconnect", async () => {
   FakeSocket.all = [];
-  const client = new LiveClient({ url: "ws://x/live", minBackoffMs: 5, WebSocket: FakeSocket as any });
+  const client = new LiveClient({ url: "ws://x/live", minBackoffMs: 5, keepAliveMs: 10, WebSocket: FakeSocket as any });
   const states: LiveState[] = [];
   const sub = client.subscribe(SQL, (s) => states.push(s));
   assert.equal(states.at(-1)!.status, "loading");
@@ -70,7 +70,10 @@ test("subscribes, applies messages, resubscribes after reconnect", async () => {
   ws2.deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "h1" }, { user_id: "e1" }, { user_id: "e2" }, { user_id: "e3" }] });
   assert.equal(states.at(-1)!.rows.length, 4);
 
+  // the server subscription outlives the last subscriber by keepAliveMs
   sub.unsubscribe();
+  assert.equal(ws2.sent.at(-1).type, "subscribe");
+  await tick(20);
   assert.deepEqual(ws2.sent.at(-1), { type: "unsubscribe", id: "s1" });
   client.close();
 });
@@ -403,4 +406,186 @@ test("the built-in cache is on by default only where OPFS and workers are", () =
     else delete nav.storage;
   }
   assert.equal(opfsAvailable(), false);
+});
+
+// --- results shared in memory ----------------------------------------------------------------
+
+const snapshot = (id: string, users: string[], at = "c1") => ({
+  type: "snapshot",
+  id,
+  columns: COLUMNS,
+  rows: users.map((user_id) => ({ user_id })),
+  at,
+});
+
+test("subscribers to the same query and params share one server subscription and its rows", () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any });
+  const a: LiveState[] = [];
+  client.subscribe(SQL, (s) => a.push(s));
+  const ws = FakeSocket.all[0];
+  ws.open();
+  ws.deliver(snapshot("s1", ["h1"]));
+
+  const b: LiveState[] = [];
+  client.subscribe(SQL, (s) => b.push(s));
+  assert.equal(b.length, 1, "called synchronously");
+  assert.equal(b[0].status, "live");
+  assert.equal(b[0].rows, a.at(-1)!.rows);
+  assert.equal(client.peek(SQL), a.at(-1));
+  assert.deepEqual(
+    ws.sent.map((m) => m.id),
+    ["s1"],
+    "one server subscription",
+  );
+
+  // other params: another result
+  const c: LiveState[] = [];
+  client.subscribe(SQL, (s) => c.push(s), { params: { n: 1 } });
+  assert.equal(c[0].status, "loading");
+  assert.deepEqual(ws.sent.at(-1), { type: "subscribe", id: "s2", sql: SQL, params: { n: 1 } });
+  assert.equal(client.peek(SQL, { params: { n: 1 } }), c[0]);
+  assert.equal(client.peek("select 1"), undefined);
+
+  // a diff reaches both
+  ws.deliver({ type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: "e1" } }], at: "c2" });
+  assert.equal(a.at(-1)!.rows.length, 2);
+  assert.equal(b.at(-1), a.at(-1));
+  client.close();
+});
+
+test("after the last subscriber: live for keepAliveMs, then rows for gcTimeMs, resuming on return", async () => {
+  FakeSocket.all = [];
+  const { cache, calls } = memoryCache();
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, keepAliveMs: 20, gcTimeMs: 60 });
+  const sub = client.subscribe(SQL, () => {});
+  const ws = FakeSocket.all[0];
+  ws.open();
+  await tick(1);
+  ws.deliver(snapshot("s1", ["h1"], "c1"));
+  sub.unsubscribe();
+
+  // within keepAliveMs: still live, a new subscriber sends nothing
+  const again = client.subscribe(SQL, () => {});
+  assert.equal(client.peek(SQL)!.status, "live");
+  again.unsubscribe();
+  await tick(5);
+  assert.deepEqual(ws.sent.map((m) => m.type), ["subscribe"]);
+
+  // then the server subscription ends; the rows stay, cached
+  await tick(30);
+  assert.deepEqual(ws.sent.at(-1), { type: "unsubscribe", id: "s1" });
+  assert.equal(client.peek(SQL)!.status, "cached");
+
+  // coming back: the rows at once, and a resume from their cursor (no cache read)
+  const loads = calls.filter((c) => c.startsWith("load")).length;
+  const states: LiveState[] = [];
+  const back = client.subscribe(SQL, (s) => states.push(s));
+  assert.equal(states[0].status, "cached");
+  assert.deepEqual(states[0].rows, [{ user_id: "h1" }]);
+  assert.deepEqual(ws.sent.at(-1), { type: "subscribe", id: "s2", sql: SQL, since: "c1" });
+  assert.equal(calls.filter((c) => c.startsWith("load")).length, loads);
+  ws.deliver({ type: "resume", id: "s2", columns: COLUMNS });
+  assert.equal(states.at(-1)!.status, "live");
+  back.unsubscribe();
+
+  // after keepAliveMs + gcTimeMs, gone
+  await tick(100);
+  assert.equal(client.peek(SQL), undefined);
+  client.close();
+});
+
+test("results nobody subscribes to are evicted beyond memoryRows, oldest first", async () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, memoryRows: 3 });
+  const subs = ["q1", "q2", "q3"].map((q) => client.subscribe(`select '${q}'`, () => {}));
+  const ws = FakeSocket.all[0];
+  ws.open();
+  ws.deliver(snapshot("s1", ["a", "b"]));
+  ws.deliver(snapshot("s2", ["c"]));
+  ws.deliver(snapshot("s3", ["d"]));
+  subs[0].unsubscribe();
+  await tick(2);
+  subs[1].unsubscribe();
+  // idle: q1 (2 rows) and q2 (1 row) fit; q3 is still subscribed
+  assert.ok(client.peek("select 'q1'") && client.peek("select 'q2'"));
+  subs[2].unsubscribe();
+  // 4 idle rows: the oldest, q1, goes
+  assert.equal(client.peek("select 'q1'"), undefined);
+  assert.ok(client.peek("select 'q2'") && client.peek("select 'q3'"));
+  client.close();
+});
+
+test("a failed query is tried again once nobody is looking at the error", () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any });
+  const first: LiveState[] = [];
+  const sub = client.subscribe(SQL, (s) => first.push(s));
+  const ws = FakeSocket.all[0];
+  ws.open();
+  ws.deliver({ type: "error", id: "s1", code: "STREAM_FAILED", message: "gone" });
+  // shared while someone sees it
+  const second: LiveState[] = [];
+  const other = client.subscribe(SQL, (s) => second.push(s));
+  assert.equal(second[0].status, "error");
+  sub.unsubscribe();
+  other.unsubscribe();
+  const third: LiveState[] = [];
+  client.subscribe(SQL, (s) => third.push(s));
+  assert.equal(third[0].status, "loading");
+  assert.deepEqual(ws.sent.at(-1), { type: "subscribe", id: "s2", sql: SQL });
+  client.close();
+});
+
+test("preload subscribes ahead of time; later subscribers get the rows synchronously", async () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, keepAliveMs: 50 });
+  let resolved = false;
+  const done = client.preload(SQL).then(() => (resolved = true));
+  const ws = FakeSocket.all[0];
+  ws.open();
+  assert.deepEqual(ws.sent, [{ type: "subscribe", id: "s1", sql: SQL }]);
+  await tick(1);
+  assert.equal(resolved, false);
+  ws.deliver(snapshot("s1", ["h1"]));
+  await done;
+  const states: LiveState[] = [];
+  client.subscribe(SQL, (s) => states.push(s));
+  assert.equal(states[0].status, "live");
+  assert.deepEqual(states[0].rows, [{ user_id: "h1" }]);
+  // preloading what's already there resolves at once
+  await client.preload(SQL);
+  assert.equal(ws.sent.length, 1);
+  client.close();
+});
+
+test("the cache's most recent results are warmed into memory; subscribing resumes without a read", async () => {
+  FakeSocket.all = [];
+  const KEY = cacheKey(SQL, { n: 1 });
+  const { cache, calls } = memoryCache();
+  let asked: number | undefined;
+  cache.recent = async (maxRows) => {
+    asked = maxRows;
+    return [
+      { key: KEY, result: { rows: [{ user_id: "w" }], at: "c9", savedAt: 7 } },
+      { key: "select 2", result: { rows: [], at: "c1", savedAt: 1 } },
+    ];
+  };
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache });
+  await tick(1);
+  assert.equal(asked, 10_000);
+  const warm = client.peek(SQL, { params: { n: 1 } })!;
+  assert.equal(warm.status, "cached");
+  assert.equal(warm.cachedAt, 7);
+  assert.deepEqual(warm.rows, [{ user_id: "w" }]);
+  assert.equal(FakeSocket.all.length, 0, "warming doesn't connect");
+
+  const states: LiveState[] = [];
+  client.subscribe(SQL, (s) => states.push(s), { params: { n: 1 } });
+  assert.equal(states[0], warm);
+  const ws = FakeSocket.all[0];
+  ws.open();
+  assert.deepEqual(ws.sent, [{ type: "subscribe", id: "s1", sql: SQL, since: "c9", params: { n: 1 } }]);
+  assert.deepEqual(calls.filter((c) => c.startsWith("load")), []);
+  client.close();
 });

@@ -68,9 +68,32 @@ export class SqliteResultStore {
 
   /** The cached result, marking it as just used. */
   load(key: string): CachedResult | undefined {
+    const result = this.read(key);
+    if (result) this.db.exec("UPDATE results SET used_at = ? WHERE key = ?", [Date.now(), key]);
+    return result;
+  }
+
+  /**
+   * The most recently used results that fit in `maxRows` rows together, most recent first (one
+   * that doesn't fit is skipped), for warming a client's memory. Doesn't mark them as used.
+   */
+  recent(maxRows: number): { key: string; result: CachedResult }[] {
+    const out: { key: string; result: CachedResult }[] = [];
+    let total = 0;
+    for (const r of this.db.all("SELECT key, rows FROM results ORDER BY used_at DESC, key")) {
+      const n = Number(r.rows);
+      if (total + n > maxRows) continue;
+      const result = this.read(r.key as string);
+      if (!result) continue;
+      total += n;
+      out.push({ key: r.key as string, result });
+    }
+    return out;
+  }
+
+  private read(key: string): CachedResult | undefined {
     const [r] = this.db.all("SELECT * FROM results WHERE key = ?", [key]);
     if (!r) return undefined;
-    this.db.exec("UPDATE results SET used_at = ? WHERE key = ?", [Date.now(), key]);
     const rows: Row[] = [];
     for (const c of this.db.all("SELECT data FROM chunks WHERE key = ? ORDER BY seq", [key])) {
       for (const row of JSON.parse(c.data as string) as Row[]) rows.push(row);

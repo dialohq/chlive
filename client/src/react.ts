@@ -1,4 +1,4 @@
-import { createContext, createElement, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, createElement, useCallback, useContext, useRef, useSyncExternalStore, type ReactNode } from "react";
 
 import { defaultUrl, LiveClient, type LiveError, type LiveState, type Status, stableJson } from "./index.ts";
 import type { Params, Row } from "./protocol.ts";
@@ -56,34 +56,52 @@ export function subscriptionKey(sql: string, params: Params | undefined, enabled
   return enabled ? `${sql}\u0000${stableJson(params ?? {})}` : "";
 }
 
+/** The hook's view of a state: the same object while its status, rows and error are, so
+ * changes to stats alone don't re-render. */
+export function project<R extends Row>(prev: LiveQuery<R>, s: { status: Status; rows: R[]; error?: LiveError }): LiveQuery<R> {
+  return prev.status === s.status && prev.rows === s.rows && prev.error === s.error
+    ? prev
+    : { status: s.status, rows: s.rows, error: s.error };
+}
+
 /**
- * Subscribe to a live query. Resubscribes when `sql` or the params' values change, and
- * unsubscribes on unmount or when `enabled` turns false.
+ * The client's state for a query, kept in sync with `useSyncExternalStore`: rows the client
+ * already holds (shared with other components, kept after unmounts, warmed from the cache) are
+ * there on the first render. `view` maps a state to what the hook returns, keeping it the same
+ * object while nothing it shows changed.
  */
-export function useLiveQuery<R extends Row = Row>(sql: string, opts: LiveQueryOptions = {}): LiveQuery<R> {
+function useClientState<V extends { status: Status }>(
+  sql: string,
+  opts: LiveQueryOptions,
+  initial: V,
+  view: (prev: V, s: LiveState<any>) => V,
+): V {
   const client = useClient(opts.client);
   const enabled = opts.enabled ?? true;
   const key = subscriptionKey(sql, opts.params, enabled);
-  const [result, setResult] = useState<LiveQuery<R>>(enabled ? EMPTY : idle(EMPTY));
-  useEffect(() => {
-    if (!enabled) {
-      setResult(idle);
-      return;
-    }
-    // re-render only when the status, rows or error change (not on every message)
-    const sub = client.subscribe<R>(
-      sql,
-      ({ status, rows, error }) =>
-        setResult((prev) =>
-          prev.status === status && prev.rows === rows && prev.error === error ? prev : { status, rows, error },
-        ),
-      { params: opts.params },
-    );
-    return () => sub.unsubscribe();
+  const params = opts.params;
+  const last = useRef<V>(initial);
+  const subscribe = useCallback(
+    (changed: () => void) => (enabled ? client.subscribe(sql, changed, { params }).unsubscribe : () => {}),
     // `key` stands for sql, the params' values and enabled
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, key]);
-  return result;
+    [client, key],
+  );
+  const snapshot = () => {
+    if (!enabled) return (last.current = idle(last.current));
+    const s = client.peek(sql, { params });
+    return (last.current = s ? view(last.current, s) : initial);
+  };
+  return useSyncExternalStore(subscribe, snapshot, () => initial);
+}
+
+/**
+ * Subscribe to a live query. Resubscribes when `sql` or the params' values change, and
+ * unsubscribes on unmount or when `enabled` turns false. When the client already holds the
+ * query, its rows are there on the first render.
+ */
+export function useLiveQuery<R extends Row = Row>(sql: string, opts: LiveQueryOptions = {}): LiveQuery<R> {
+  return useClientState<LiveQuery<R>>(sql, opts, EMPTY, project);
 }
 
 const LOADING: LiveState<never> = {
@@ -95,18 +113,5 @@ const LOADING: LiveState<never> = {
 /** `useLiveQuery` with everything the client knows (cache and message stats too), for dev
  * tools. Re-renders on every message. */
 export function useLiveQueryDebug<R extends Row = Row>(sql: string, opts: LiveQueryOptions = {}): LiveState<R> {
-  const client = useClient(opts.client);
-  const enabled = opts.enabled ?? true;
-  const key = subscriptionKey(sql, opts.params, enabled);
-  const [state, setState] = useState<LiveState<R>>(enabled ? LOADING : idle(LOADING));
-  useEffect(() => {
-    if (!enabled) {
-      setState(idle);
-      return;
-    }
-    const sub = client.subscribe<R>(sql, setState, { params: opts.params });
-    return () => sub.unsubscribe();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, key]);
-  return state;
+  return useClientState<LiveState<R>>(sql, opts, LOADING, (_, s) => s);
 }
