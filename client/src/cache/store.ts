@@ -1,4 +1,4 @@
-import type { Row } from "../protocol.ts";
+import type { Column, Row } from "../protocol.ts";
 import type { CachedResult } from "../state.ts";
 
 /** The little of SQLite the store needs; adapters exist for sqlite-wasm and `bun:sqlite`. */
@@ -25,7 +25,7 @@ export interface StoreStats {
 export const DEFAULT_BUDGET_BYTES = 2 * 1024 ** 3;
 
 /** The tables' layout; a database with another one is emptied. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /**
  * Cached results in SQLite: one `results` row per query (its metadata and cursor), and its rows
@@ -51,6 +51,7 @@ export class SqliteResultStore {
     db.exec(`CREATE TABLE IF NOT EXISTS results (
       key TEXT PRIMARY KEY,
       cursor TEXT NOT NULL,
+      columns TEXT,
       rows INTEGER NOT NULL,
       bytes INTEGER NOT NULL,
       saved_at INTEGER NOT NULL,
@@ -76,6 +77,7 @@ export class SqliteResultStore {
     }
     return {
       rows,
+      columns: r.columns ? (JSON.parse(r.columns as string) as Column[]) : undefined,
       at: r.cursor as string,
       savedAt: Number(r.saved_at),
     };
@@ -87,13 +89,15 @@ export class SqliteResultStore {
       this.db.exec("DELETE FROM chunks WHERE key = ?", [key]);
       const bytes = this.writeChunks(key, 0, result.rows);
       this.db.exec(
-        `INSERT INTO results (key, cursor, rows, bytes, saved_at, used_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (key) DO UPDATE SET cursor = excluded.cursor, rows = excluded.rows,
-           bytes = excluded.bytes, saved_at = excluded.saved_at, used_at = excluded.used_at`,
+        `INSERT INTO results (key, cursor, columns, rows, bytes, saved_at, used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (key) DO UPDATE SET cursor = excluded.cursor, columns = excluded.columns,
+           rows = excluded.rows, bytes = excluded.bytes, saved_at = excluded.saved_at,
+           used_at = excluded.used_at`,
         [
           key,
           result.at,
+          result.columns ? JSON.stringify(result.columns) : null,
           result.rows.length,
           bytes,
           result.savedAt,

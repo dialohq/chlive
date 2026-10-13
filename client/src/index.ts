@@ -1,8 +1,17 @@
+import type { ValueParsers } from "./parsers.ts";
 import type { ClientMessage, DiffMessage, Row, ServerMessage } from "./protocol.ts";
 import { type CachedResult, ResultStore } from "./state.ts";
 
 export type * from "./protocol.ts";
-export { ResultStore, type CachedResult } from "./state.ts";
+export { ResultStore, type CachedResult, type ResultStoreOptions } from "./state.ts";
+export {
+  defaultParsers,
+  parseClickHouseDate,
+  parseClickHouseType,
+  type ClickHouseType,
+  type ValueParser,
+  type ValueParsers,
+} from "./parsers.ts";
 
 /**
  * - `loading`: nothing to show yet;
@@ -131,6 +140,14 @@ export interface LiveClientOptions {
   cache?: boolean | CacheOptions | ResultCache;
   /** Full saves of a result are batched for this long after a change (default 1000 ms). */
   saveDelayMs?: number;
+  /**
+   * How column values become row values, by ClickHouse type (the base name: `DateTime64`,
+   * `UUID`, …), merged over `defaultParsers`, which make `Date`, `Date32`, `DateTime` and
+   * `DateTime64` columns JS `Date`s (read as UTC; DateTime64 to the millisecond). `null` turns
+   * a parser off; `false` keeps every value as it arrives. Cached results keep the values as
+   * they arrived, so they don't depend on the parsers.
+   */
+  parsers?: ValueParsers | false;
 }
 
 interface SubRecord {
@@ -163,8 +180,8 @@ const OPEN = 1;
  * snapshot if it can't resume). Results are saved back as they change.
  */
 export class LiveClient {
-  private readonly opts: Required<Omit<LiveClientOptions, "WebSocket" | "cache">> &
-    Pick<LiveClientOptions, "WebSocket">;
+  private readonly opts: Required<Omit<LiveClientOptions, "WebSocket" | "cache" | "parsers">> &
+    Pick<LiveClientOptions, "WebSocket" | "parsers">;
   /** Resolves to the cache once it's set up (`undefined` without one); loads wait for it. */
   private readonly cacheReady: Promise<ResultCache | undefined> | undefined;
   private cache: ResultCache | undefined;
@@ -229,7 +246,7 @@ export class LiveClient {
     const rec: SubRecord = {
       id,
       sql,
-      store: new ResultStore<R>(),
+      store: new ResultStore<R>({ parsers: this.opts.parsers }),
       state: { status: "loading", rows: [], stats: newStats(id) },
       stats: newStats(id),
       listener,
@@ -391,6 +408,7 @@ export class LiveClient {
           break;
         case "resume":
           // the rows we hold stay; the diffs that follow bring them up to date
+          rec.store.applyResume(msg.columns);
           if (stats.cache) stats.cache = { ...stats.cache, resumed: true };
           rec.awaitingCatchUp = true;
           break;
@@ -457,7 +475,8 @@ export class LiveClient {
     if (at === undefined) return;
     // the rows array is never mutated (a new one per diff), so this is a consistent state
     const result: CachedResult = {
-      rows: rec.store.rows(),
+      rows: rec.store.wireRows(),
+      columns: rec.store.columns(),
       at,
       savedAt: Date.now(),
       ids: rec.store.ids().some((id) => id !== undefined) ? rec.store.ids() : undefined,
@@ -466,7 +485,8 @@ export class LiveClient {
     this.queue(rec, (cache) => cache.save(rec.sql, result));
   }
 
-  /** Appends go straight to the cache; anything else (indexes, deletes) means a full save. */
+  /** Appends (their rows as they came over the wire) go straight to the cache; anything else
+   * (indexes, deletes) means a full save. */
   private persistDiff(rec: SubRecord, msg: DiffMessage): void {
     const appendOnly = msg.changes.every((c) => c.op === "insert" && c.index === undefined);
     if (appendOnly && rec.saved && !rec.saveTimer) {

@@ -274,3 +274,86 @@ test("the client saves results when the page is hidden, and manages the cache's 
   await tick(5);
   assert.deepEqual(calls.slice(4), ["close"]);
 });
+
+// --- value parsers ---------------------------------------------------------------------------
+
+const TS_SQL = "select user_id, ts from events order by ts desc";
+const TS_COLUMNS = [
+  { name: "user_id", type: "String" },
+  { name: "ts", type: "DateTime64(3)" },
+];
+
+test("date columns reach listeners as Dates; the message log keeps the wire strings", async () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any });
+  let last: LiveState | undefined;
+  client.subscribe(TS_SQL, (s) => (last = s));
+  FakeSocket.all[0].open();
+  FakeSocket.all[0].deliver({
+    type: "snapshot",
+    id: "s1",
+    columns: TS_COLUMNS,
+    rows: [{ user_id: "a", ts: "2026-10-01 12:00:00.250" }],
+    at: "c1",
+  });
+  assert.deepEqual(last!.rows, [{ user_id: "a", ts: new Date("2026-10-01T12:00:00.250Z") }]);
+  assert.deepEqual((last!.stats.lastMessage as any).rows, [{ user_id: "a", ts: "2026-10-01 12:00:00.250" }]);
+  client.close();
+});
+
+test("the cache gets wire rows and columns, and shows cached rows parsed", async () => {
+  FakeSocket.all = [];
+  const { cache, data } = memoryCache({
+    [TS_SQL]: { rows: [{ user_id: "a", ts: "2026-10-01 00:00:00.000" }], columns: TS_COLUMNS, at: "c1", savedAt: 1 },
+  });
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, saveDelayMs: 5 });
+  const states: LiveState[] = [];
+  client.subscribe(TS_SQL, (s) => states.push(s));
+  const ws = FakeSocket.all[0];
+  ws.open();
+  await tick(1);
+  assert.equal(states.at(-1)!.status, "cached");
+  assert.ok(states.at(-1)!.rows[0].ts instanceof Date);
+  ws.deliver({ type: "resume", id: "s1", columns: TS_COLUMNS });
+  // appended as they arrived
+  ws.deliver({ type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: "b", ts: "2026-10-02 00:00:00.000" } }], at: "c2" });
+  await tick(10);
+  assert.deepEqual(data.get(TS_SQL)!.rows[1], { user_id: "b", ts: "2026-10-02 00:00:00.000" });
+  // a full save too
+  ws.deliver({
+    type: "diff",
+    id: "s1",
+    changes: [{ op: "insert", row: { user_id: "c", ts: "2026-10-03 00:00:00.000" }, index: 0 }],
+    at: "c3",
+  });
+  await tick(20);
+  assert.deepEqual(data.get(TS_SQL)!.rows[0], { user_id: "c", ts: "2026-10-03 00:00:00.000" });
+  assert.deepEqual(data.get(TS_SQL)!.columns, TS_COLUMNS);
+  assert.ok(states.at(-1)!.rows.every((r) => r.ts instanceof Date));
+  client.close();
+});
+
+test("custom parsers apply, and one that throws fails the subscription", () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({
+    url: "ws://x/live",
+    WebSocket: FakeSocket as any,
+    parsers: {
+      DateTime64: (v) => {
+        if (v === "bad") throw new Error("cannot read bad");
+        return `parsed ${v}`;
+      },
+    },
+  });
+  let last: LiveState | undefined;
+  client.subscribe(TS_SQL, (s) => (last = s));
+  FakeSocket.all[0].open();
+  FakeSocket.all[0].deliver({ type: "snapshot", id: "s1", columns: TS_COLUMNS, rows: [{ user_id: "a", ts: "t" }], at: "c1" });
+  assert.equal(last!.rows[0].ts, "parsed t");
+  FakeSocket.all[0].deliver({ type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: "b", ts: "bad" } }], at: "c2" });
+  assert.equal(last!.status, "error");
+  assert.equal(last!.error!.code, "CLIENT_ERROR");
+  assert.match(last!.error!.message, /cannot read bad/);
+  assert.equal(last!.rows.length, 1);
+  client.close();
+});

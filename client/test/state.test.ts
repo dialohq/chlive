@@ -140,3 +140,109 @@ test("ordered aggregates: an update with an index moves the row", () => {
     /move to index 3 of a result with 3 rows/,
   );
 });
+
+// --- value parsers ---------------------------------------------------------------------------
+
+const TS = [
+  { name: "id", type: "String" },
+  { name: "ts", type: "Nullable(DateTime64(3))" },
+];
+const at = (s: string) => new Date(s.replace(" ", "T") + "Z");
+
+test("date columns are Dates; the wire rows keep the strings", () => {
+  const s = new ResultStore<{ id: string; ts: Date | null }>();
+  const wire = { id: "a", ts: "2026-10-01 12:00:00.500" };
+  s.applySnapshot({ type: "snapshot", id: "q", columns: TS, rows: [wire, { id: "n", ts: null }] });
+  assert.deepEqual(s.rows(), [{ id: "a", ts: at("2026-10-01 12:00:00.500") }, { id: "n", ts: null }]);
+  assert.deepEqual(s.wireRows(), [wire, { id: "n", ts: null }]);
+  assert.equal(wire.ts, "2026-10-01 12:00:00.500", "the message is not mutated");
+  s.applyDiff({ type: "diff", id: "q", changes: [{ op: "insert", row: { id: "b", ts: "2026-10-02 00:00:00.000" } }] });
+  assert.ok(s.rows()[2].ts instanceof Date);
+  assert.equal(s.wireRows()[2].ts, "2026-10-02 00:00:00.000");
+});
+
+test("parsed and wire rows stay aligned through inserts, deletes and moves", () => {
+  const cols = [
+    { name: "k", type: "String" },
+    { name: "last", type: "DateTime" },
+    { name: "n", type: "UInt64" },
+  ];
+  const s = new ResultStore<{ k: string; last: Date; n: number }>();
+  const row = (k: string, sec: number, n: number) => ({ k, last: `2026-10-01 00:00:${String(sec).padStart(2, "0")}`, n });
+  s.applySnapshot({ type: "snapshot", id: "q", columns: cols, rows: [row("a", 1, 1), row("b", 2, 1)], ids: ['["a"]', '["b"]'] });
+  s.applyDiff({
+    type: "diff",
+    id: "q",
+    changes: [
+      { op: "insert", row: row("c", 3, 1), id: '["c"]', index: 0 },
+      { op: "update", id: '["a"]', set: { last: "2026-10-01 00:00:09", n: 2 }, index: 0 },
+      { op: "delete", index: 2 },
+    ],
+  });
+  assert.deepEqual(s.wireRows(), [row("a", 9, 2), row("c", 3, 1)]);
+  assert.deepEqual(
+    s.rows(),
+    s.wireRows().map((r) => ({ ...r, last: at(r.last as string) })),
+  );
+  assert.deepEqual(s.ids(), ['["a"]', '["c"]']);
+});
+
+test("custom parsers replace or add to the defaults; null or false turns them off", () => {
+  const cols = [
+    { name: "ts", type: "DateTime64(3)" },
+    { name: "u", type: "UUID" },
+    { name: "d", type: "Date" },
+  ];
+  const rows = [{ ts: "2026-10-01 00:00:00.000", u: "abc", d: "2026-10-01" }];
+  const parse = (parsers: ConstructorParameters<typeof ResultStore>[0]) => {
+    const s = new ResultStore(parsers);
+    s.applySnapshot({ type: "snapshot", id: "q", columns: cols, rows });
+    return s.rows()[0];
+  };
+  assert.deepEqual(parse({ parsers: { DateTime64: (v, t) => `${t.args[0]}:${v}`, UUID: (v) => String(v).toUpperCase() } }), {
+    ts: "3:2026-10-01 00:00:00.000",
+    u: "ABC",
+    d: at("2026-10-01 00:00:00"),
+  });
+  assert.deepEqual(parse({ parsers: { Date: null } }), { ts: at("2026-10-01 00:00:00.000"), u: "abc", d: "2026-10-01" });
+  assert.deepEqual(parse({ parsers: false }), rows[0]);
+});
+
+test("without parsed columns, rows are the wire rows themselves", () => {
+  const s = new ResultStore<{ n: number }>();
+  s.applySnapshot({ type: "snapshot", id: "a", columns, rows: [{ n: 1 }] });
+  s.applyDiff({ type: "diff", id: "a", changes: [{ op: "insert", row: { n: 2 } }] });
+  assert.equal(s.rows(), s.wireRows());
+});
+
+test("a value a parser can't read fails the diff and leaves the rows untouched", () => {
+  const s = new ResultStore<{ id: string; ts: Date | null }>();
+  s.applySnapshot({ type: "snapshot", id: "q", columns: TS, rows: [{ id: "a", ts: "2026-10-01 00:00:00.000" }] });
+  assert.throws(
+    () =>
+      s.applyDiff({
+        type: "diff",
+        id: "q",
+        changes: [
+          { op: "insert", row: { id: "b", ts: "2026-10-02 00:00:00.000" } },
+          { op: "insert", row: { id: "c", ts: "soon" } },
+        ],
+      }),
+    /not a ClickHouse date or time: "soon"/,
+  );
+  assert.equal(s.size, 1);
+  assert.equal(s.wireRows().length, 1);
+});
+
+test("cached rows are parsed by their saved columns, and again by a resume's", () => {
+  const s = new ResultStore<{ id: string; ts: Date | null }>();
+  s.applyCached({ rows: [{ id: "a", ts: "2026-10-01 00:00:00.000" }], columns: TS, at: "c1", savedAt: 1 });
+  assert.ok(s.rows()[0].ts instanceof Date);
+  // a cache without columns: strings until the server says what they are
+  const t = new ResultStore<{ id: string; ts: Date | string | null }>();
+  t.applyCached({ rows: [{ id: "a", ts: "2026-10-01 00:00:00.000" }], at: "c1", savedAt: 1 });
+  assert.equal(t.rows()[0].ts, "2026-10-01 00:00:00.000");
+  t.applyResume(TS);
+  assert.ok(t.rows()[0].ts instanceof Date);
+  assert.deepEqual(t.columns(), TS);
+});

@@ -75,3 +75,13 @@ test("a database with an older layout starts empty", () => {
   // the same layout again: kept
   assert.equal(new SqliteResultStore(d).load("q")!.rows.length, 2);
 });
+
+test("columns are saved with the rows", () => {
+  const s = new SqliteResultStore(db());
+  const columns = [{ name: "ts", type: "DateTime64(3)" }];
+  s.save("q", { rows: [{ ts: "2026-10-01 00:00:00.000" }], columns, at: "c1", savedAt: 1 });
+  assert.deepEqual(s.load("q")!.columns, columns);
+  assert.deepEqual(s.load("q")!.rows, [{ ts: "2026-10-01 00:00:00.000" }]);
+  s.save("old", result(1));
+  assert.equal(s.load("old")!.columns, undefined);
+});

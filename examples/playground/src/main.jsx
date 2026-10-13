@@ -126,6 +126,8 @@ const WRITE_PRESETS = {
 };
 
 const pretty = (v) => JSON.stringify(v, null, 2);
+/** A cell: Dates (the client parses date columns) the way ClickHouse writes them, in UTC. */
+const cell = (v) => (v instanceof Date ? v.toISOString().replace("T", " ").replace("Z", "") : String(v ?? ""));
 
 /** One object, an array of objects, or one object per line (JSON lines). */
 function parseMessages(text) {
@@ -536,7 +538,7 @@ function Result({ sql }) {
           {shown.map((r, i) => (
             <tr key={i}>
               {columns.map((c) => (
-                <td key={c}>{String(r[c] ?? "")}</td>
+                <td key={c}>{cell(r[c])}</td>
               ))}
             </tr>
           ))}

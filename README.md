@@ -155,6 +155,29 @@ sub.unsubscribe();
 
 `status` is `loading` (nothing yet), `cached` (rows from the offline cache, being caught up), `live` or `error`. Rows are exactly the selected columns, in the query's order, so columns come from the rows themselves; the row type is the hook's type parameter. ORDER BY and LIMIT are already applied to `rows`. One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes from where it was.
 
+**Values are parsed by column type.** By default, `Date`, `Date32`, `DateTime` and `DateTime64` columns arrive as JS `Date`s. They're read as UTC, and DateTime64 is cut to the millisecond, since a `Date` holds no more. The `parsers` option sets how a ClickHouse type (its base name) becomes a row value, and is merged over the defaults:
+
+```ts
+import { LiveClient, parseClickHouseDate } from "@chlive/client";
+import spacetime from "spacetime";
+
+const live = new LiveClient({
+  url,
+  parsers: {
+    // (value as ClickHouse writes it in JSON, never null; the column's type, taken apart)
+    DateTime64: (v, type) => spacetime(parseClickHouseDate(v as string).getTime()),
+    UUID: (v) => (v as string).toUpperCase(),
+    Date: null, // keep Date columns as strings
+  },
+});
+```
+
+- `parsers: false` keeps every value as it arrives.
+- A parser that throws fails the subscription (`CLIENT_ERROR`).
+- The offline cache keeps values as they came over the wire, so cached results don't depend on the parsers.
+- Results with a parsed column hold their rows twice, once parsed and once as received.
+- Strings are read as UTC. That's correct for columns without a timezone of their own. For a `DateTime('Europe/Warsaw')` column, ClickHouse writes local times, while the engine still renders stream rows in UTC. A custom parser gets the timezone in `type.args`.
+
 For dev tools, `useLiveQueryDebug` (and `subscribe`'s listener) also give `stats`: per-subscription counters (snapshots, diffs, inserts, deletes, bytes, the last message and how long it took to apply, what the cache did).
 
 ### Rust client
