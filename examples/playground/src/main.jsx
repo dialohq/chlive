@@ -4,7 +4,7 @@ import { defaultUrl, LiveClient } from "@chlive/client";
 import { LiveClientProvider, useLiveQueryDebug } from "@chlive/client/react";
 
 // Results are cached (SQLite on OPFS): a reload shows them at once, then resumes from their cursor.
-const client = new LiveClient({ url: defaultUrl(), cache: true });
+const client = new LiveClient({ url: defaultUrl() });
 
 // Queries in the chlive dialect:
 // SELECT * | column [AS name], … FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]

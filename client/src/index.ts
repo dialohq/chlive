@@ -82,8 +82,8 @@ export interface CacheStats {
 }
 
 /**
- * Where results are kept between sessions. `cache: true` uses SQLite on OPFS
- * (`@chlive/client/cache`); this is for other storage, and for tests. Keyed by query. Every
+ * Where results are kept between sessions. The default cache uses SQLite on OPFS
+ * (`@chlive/client/cache`); this is for other storage, and for tests. Keyed by query and params. Every
  * write keeps the rows and their cursor together.
  */
 export interface ResultCache {
@@ -144,8 +144,9 @@ export interface LiveClientOptions {
   WebSocket?: new (url: string) => WebSocket;
   /**
    * Keep results between sessions: show them right away, then resume from their cursor.
-   * `true` (or settings) keeps them in SQLite on OPFS, in a worker; the client takes care of
-   * saving them when the page is hidden. Off by default.
+   * The built-in cache keeps them in SQLite on OPFS, in a worker; the client takes care of
+   * saving them when the page is hidden. On by default where it can run (a browser with OPFS
+   * and workers) and off elsewhere; `false` turns it off, settings tune it.
    */
   cache?: boolean | CacheOptions | ResultCache;
   /** Full saves of a result are batched for this long after a change (default 1000 ms). */
@@ -208,7 +209,7 @@ export class LiveClient {
   private closed = false;
 
   constructor(opts: LiveClientOptions) {
-    const { cache, ...rest } = opts;
+    const { cache = opfsAvailable(), ...rest } = opts;
     this.opts = { minBackoffMs: 500, maxBackoffMs: 10_000, saveDelayMs: 1000, ...rest };
     this.backoff = this.opts.minBackoffMs;
     if (cache) {
@@ -533,7 +534,13 @@ export class LiveClient {
   }
 }
 
-/** The cache for the `cache` option: the built-in one is loaded only when asked for. */
+/** Whether the built-in cache can run here: a browser (or worker) with OPFS and workers. */
+export function opfsAvailable(): boolean {
+  const g = globalThis as { Worker?: unknown; navigator?: { storage?: { getDirectory?: unknown } } };
+  return typeof g.Worker === "function" && typeof g.navigator?.storage?.getDirectory === "function";
+}
+
+/** The cache for the `cache` option: the built-in one is loaded only when used. */
 async function openCache(opt: true | CacheOptions | ResultCache): Promise<ResultCache> {
   if (opt !== true && typeof (opt as ResultCache).load === "function") return opt as ResultCache;
   const { createOpfsCache } = await import("./cache/index.ts");

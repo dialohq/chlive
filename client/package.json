@@ -24,20 +24,18 @@
     "typecheck": "bun --bun tsc -p tsconfig.json --noEmit",
     "test": "bun test"
   },
+  "dependencies": {
+    "@sqlite.org/sqlite-wasm": "^3.53.4-build2"
+  },
   "peerDependencies": {
-    "react": ">=18",
-    "@sqlite.org/sqlite-wasm": ">=3.50"
+    "react": ">=18"
   },
   "peerDependenciesMeta": {
     "react": {
       "optional": true
-    },
-    "@sqlite.org/sqlite-wasm": {
-      "optional": true
     }
   },
   "devDependencies": {
-    "@sqlite.org/sqlite-wasm": "^3.53.4-build2",
     "@types/react": "^19.0.0",
     "typescript": "^5.9.0"
   }

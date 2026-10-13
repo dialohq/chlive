@@ -1,5 +1,5 @@
 // The offline cache: live results kept between sessions, in SQLite on OPFS (in a worker).
-// `new LiveClient({ cache: true })` loads and manages it; nothing here is called directly.
+// `LiveClient` loads and manages it (by default, in browsers); nothing here is called directly.
 import type { CacheInfo, ResultCache } from "../index.ts";
 import type { Row } from "../protocol.ts";
 import type { CachedResult } from "../state.ts";

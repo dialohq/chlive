@@ -1,7 +1,7 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 
-import { type CachedResult, LiveClient, type LiveState, type ResultCache } from "../src/index.ts";
+import { type CachedResult, LiveClient, type LiveState, opfsAvailable, type ResultCache } from "../src/index.ts";
 
 /** Minimal in-memory WebSocket double. */
 class FakeSocket {
@@ -388,4 +388,19 @@ test("results are cached per params; without params, under the query alone", asy
   await tick(5);
   assert.deepEqual(calls, [`load ${sql}\u0000{"u":"a"}`, `load ${sql}\u0000{"u":"b"}`, `load ${SQL}`, `load ${sql}`]);
   client.close();
+});
+
+test("the built-in cache is on by default only where OPFS and workers are", () => {
+  // Bun, like Node and SSR, has no OPFS: the cache stays off without a word
+  assert.equal(opfsAvailable(), false);
+  const nav = globalThis.navigator as { storage?: unknown };
+  const had = Object.getOwnPropertyDescriptor(nav, "storage");
+  Object.defineProperty(nav, "storage", { value: { getDirectory: async () => ({}) }, configurable: true });
+  try {
+    assert.equal(opfsAvailable(), typeof Worker === "function");
+  } finally {
+    if (had) Object.defineProperty(nav, "storage", had);
+    else delete nav.storage;
+  }
+  assert.equal(opfsAvailable(), false);
 });

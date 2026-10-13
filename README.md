@@ -156,7 +156,7 @@ const q = useLiveQuery<Event>("select * from events where session_id = {s:UUID}"
 
 // without React
 import { LiveClient } from "@chlive/client";
-const live = new LiveClient({ url: "ws://localhost:8080/live", cache: true });
+const live = new LiveClient({ url: "ws://localhost:8080/live" }); // offline cache on by default
 const sub = live.subscribe(sql, (s) => render(s.status, s.rows, s.error), { params });
 sub.unsubscribe();
 ```
@@ -321,7 +321,7 @@ Known differences, where the engine skips an event that ClickHouse reads:
 
 ### Offline cache
 
-`new LiveClient({ url, cache: true })` keeps results between sessions in SQLite (sqlite-wasm) on OPFS, in a dedicated worker, using the `opfs-sahpool` VFS, so no COOP/COEP headers are needed. `cache: { budgetBytes }` sets its size (2 GB by default); `live.clearCache()` empties it (e.g. on logout). It's loaded only when enabled (`@sqlite.org/sqlite-wasm` is an optional peer dependency).
+`LiveClient` keeps results between sessions in SQLite (sqlite-wasm) on OPFS, in a dedicated worker, using the `opfs-sahpool` VFS, so no COOP/COEP headers are needed. It's on by default wherever it can run (a browser with OPFS and workers; `opfsAvailable()`) and off elsewhere (Bun, Node, SSR), with nothing to configure. `cache: false` turns it off, `cache: { budgetBytes }` sets its size (2 GB by default), and `live.clearCache()` empties it (e.g. on logout). sqlite-wasm is loaded (a separate chunk, from `@sqlite.org/sqlite-wasm`, a dependency) only when the cache is used.
 
 The client takes care of the page's lifecycle: it saves pending results when the tab goes to the background or the page is hidden, then closes the database so a reload can open it at once, and reopens it if the page comes back from the back/forward cache.
 
@@ -330,9 +330,9 @@ The client takes care of the page's lifecycle: it saves pending results when the
   - Unordered, unlimited: nothing to rebuild and no ClickHouse at all; the stream continues from `C`, replaying from Kafka what the client missed.
   - With ORDER BY (or LIMIT alone), the server rebuilds the client's state: the snapshot's sort keys (or row count), then the client's own events between `W` and `C`, re-read from Kafka and not sent again; then the stream continues from `C`. This needs `C ≥ W` in every partition; a client behind the snapshot gets a full snapshot instead (rare: snapshots are recent, and clients usually stream past them).
   - The cursor must fit the topic: past its end means the topic was recreated, and before the start of what the resume reads means retention deleted it. Either way the server sends a full snapshot instead.
-- **What's stored:** per query (the SQL text, for now), its rows as JSON chunks, the cursor and when it was last used. A database with an older layout is emptied (`PRAGMA user_version`). Each write is one transaction: snapshots and ordered diffs are saved in full (batched, about 1 s), append-only diffs are appended, and `progress` moves the cursor.
+- **What's stored:** per query and param values (the SQL text, plus the params as sent in stable JSON), its rows as JSON chunks, the cursor and when it was last used. A database with an older layout is emptied (`PRAGMA user_version`). Each write is one transaction: snapshots and ordered diffs are saved in full (batched, about 1 s), append-only diffs are appended, and `progress` moves the cursor.
 - **GC:** above the budget, the least recently used queries are evicted.
-- **MVP limits:** one tab holds the database at a time; other tabs run without a cache (the playground shows why). Keys are query strings, not shapes yet.
+- **MVP limits:** one tab holds the database at a time; other tabs run without a cache (the playground shows why). Keys are query texts with their param values, not shapes yet.
 
 The playground uses it: the "Client state" panel shows a hit or miss, whether the server resumed and how big the catch-up was, the cursor, and the store's size, with a "Clear cache" button.
 

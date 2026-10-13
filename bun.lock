@@ -8,17 +8,17 @@
     "client": {
       "name": "@chlive/client",
       "version": "0.1.0",
-      "devDependencies": {
+      "dependencies": {
         "@sqlite.org/sqlite-wasm": "^3.53.4-build2",
+      },
+      "devDependencies": {
         "@types/react": "^19.0.0",
         "typescript": "^5.9.0",
       },
       "peerDependencies": {
-        "@sqlite.org/sqlite-wasm": ">=3.50",
         "react": ">=18",
       },
       "optionalPeers": [
-        "@sqlite.org/sqlite-wasm",
         "react",
       ],
     },
