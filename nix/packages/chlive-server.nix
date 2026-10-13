@@ -27,6 +27,7 @@ rustPlatform.buildRustPackage {
       ../../client-rs
       ../../tests
       ../../examples/rust-alerts
+      ../../tui
     ];
   };
   cargoLock.lockFile = ../../Cargo.lock;

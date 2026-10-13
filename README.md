@@ -26,9 +26,9 @@ dnvr up          # starts everything in a tmux dashboard
 | `playground` → server, redpanda | the example query playground | `url` |
 | `rust-alerts` → server | the Rust client's example service | |
 
-Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `e2e` (the tests that need the stack), `bench` (the query benchmark), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
+Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `tui` (live queries as a table in the terminal), `e2e` (the tests that need the stack), `bench` (the query benchmark), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
 
-Every process picks free ports on each start (`dnvr-state pick-port`), so the stack runs next to anything else, and publishes its addresses; the processes get each other's through `dnvr://<process>/<key>` refs. From a terminal, read them with `dnvr-state get <process>.<key>` (e.g. `dnvr-state get playground.url`, `dnvr-state get server.url`), or list everything with `dnvr-state dump`. The `ch`, `produce`, `e2e` and `bench` scripts look them up the same way; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_CLICKHOUSE_NATIVE`, `CHLIVE_KAFKA` and `CHLIVE_PAUSE_SERVER` (and `PROXY_URL` for `produce`, `CHLIVE_URL`/`CH_URL`/`PROXY_URL` for `bench`) override them.
+Every process picks free ports on each start (`dnvr-state pick-port`), so the stack runs next to anything else, and publishes its addresses; the processes get each other's through `dnvr://<process>/<key>` refs. From a terminal, read them with `dnvr-state get <process>.<key>` (e.g. `dnvr-state get playground.url`, `dnvr-state get server.url`), or list everything with `dnvr-state dump`. The `ch`, `produce`, `tui`, `e2e` and `bench` scripts look them up the same way; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_CLICKHOUSE_NATIVE`, `CHLIVE_KAFKA` and `CHLIVE_PAUSE_SERVER` (and `PROXY_URL` for `produce`, `CHLIVE_URL`/`CH_URL`/`PROXY_URL` for `bench`) override them.
 
 State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 
@@ -84,6 +84,7 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
 | `client-rs/` | `chlive-client` (Rust): the client for services; `examples/watch.rs` prints any query's updates |
 | `examples/` | example apps: `playground`, the query playground (React); `rust-alerts`, an event-driven service on `chlive-client` |
+| `tui/` | `chlive-tui` (Rust): a terminal UI on `chlive-client`; type a query, watch its result as a table updated on every diff |
 | `tests/` | end-to-end tests (`chlive-e2e`): the server over the full stack, with a small Kafka producer |
 | `bench/` | `queries.ts`: a ladder of queries, simple to most complex, benchmarked through `@chlive/client` against the stack; results in `docs/bench/` |
 
@@ -222,6 +223,16 @@ while let Some(u) = sub.next().await {
 - **Rows** are deserialized into the type you subscribe with, once per row. `subscribe::<Row>` keeps them as JSON objects. A row that doesn't fit the type fails the subscription with `CLIENT_ERROR`, as an unknown change op or an index outside the result does, and the rows stay as they were before that diff.
 - **Backpressure.** Messages are applied when the stream is polled. A subscription that isn't read fills a small buffer, and then the connection waits for it. Nothing is dropped, and the server just falls behind on Kafka. Subscriptions sharing a client should all be read, e.g. with `tokio::select!` as in `examples/rust-alerts`. Use a client per subscription where one might lag.
 - **Cancelling:** dropping a subscription unsubscribes; `client.close().await` ends every stream.
+
+**Terminal UI.** `chlive-tui` (`tui/`) is a small user of the client: an input for the query and a table of its result (columns with their ClickHouse types), updated on every diff, with the rows a diff inserted or changed highlighted for a second. In the dev shell, `tui` connects it to the stack's server:
+
+```sh
+tui "select user_id, latency_ms from events order by latency_ms desc limit 10"
+tui --param s=0d1c2b3a-0000-4000-8000-00000000000a "select ts, path from events where session_id = {s:UUID}"
+chlive-tui --url ws://host:8080/live      # elsewhere (or CHLIVE_URL)
+```
+
+Enter runs the query in the input, replacing the last one. Tab moves the focus between the input and the table, ↑/↓/PgUp/PgDn scroll, Ctrl-U clears the input, and Esc or Ctrl-C quits. `--param name=value` (repeatable; JSON values as such, anything else a string) is sent with every query.
 
 ### Protocol
 

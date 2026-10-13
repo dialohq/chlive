@@ -1,0 +1,17 @@
+[package]
+name = "chlive-tui"
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+publish = false
+description = "A terminal table for live chlive queries, on chlive-client"
+
+[dependencies]
+chlive-client = { path = "../client-rs" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"

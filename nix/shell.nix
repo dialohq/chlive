@@ -466,6 +466,16 @@ in
       runtimeInputs = [ dnvrState ];
       text = ''exec ${chClient ''"$(dnvr-state get clickhouse.tcpPort)"''} "$@"'';
     };
+    tui = {
+      description = "A terminal table for live queries against the stack's server, e.g. `tui \"select * from events\"`";
+      runtimeInputs = [ dnvrState ];
+      text = ''
+        CHLIVE_URL="''${CHLIVE_URL:-$(dnvr-state get server.url)}"
+        export CHLIVE_URL
+        cd "$DNVR_ROOT"
+        exec cargo run -q -p chlive-tui -- "$@"
+      '';
+    };
     e2e = {
       description = "Run the tests that need the running stack: the engine's, then the server end to end";
       runtimeInputs = [ dnvrState ];
