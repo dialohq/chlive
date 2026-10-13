@@ -9,7 +9,7 @@ license = "MIT"
 path = "src/lib.rs"
 
 [[bin]]
-name = "chlive-server"
+name = "chlive"
 path = "src/main.rs"
 
 [dependencies]

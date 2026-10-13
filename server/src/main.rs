@@ -1,4 +1,4 @@
-//! `chlive-server`: serve live chlive-dialect queries over WebSocket (`/live`).
+//! `chlive`: serve live chlive-dialect queries over WebSocket (`/live`).
 //! A thin user of the `chlive-server` library.
 
 use anyhow::Result;

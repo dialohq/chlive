@@ -1,4 +1,5 @@
-# chlive-server: the WebSocket server over chlive-engine. Links rdkafka dynamically and libchdb
+# chlive: the server (`chlive`, WebSocket over chlive-engine) and the terminal client (`clc`,
+# chlive-tui). Links rdkafka dynamically and libchdb
 # (./libchdb.nix), whose store path build.rs embeds as an rpath.
 {
   lib,
@@ -12,7 +13,7 @@ let
   root = ../..;
 in
 rustPlatform.buildRustPackage {
-  pname = "chlive-server";
+  pname = "chlive";
   version = (lib.importTOML ../../server/Cargo.toml).package.version;
 
   # The whole workspace: cargo resolves every member, even when building one.
@@ -35,11 +36,15 @@ rustPlatform.buildRustPackage {
   cargoBuildFlags = [
     "-p"
     "chlive-server"
+    "-p"
+    "chlive-tui"
   ];
-  # The server's tests run over a fake history and in-memory events; the engine's need the stack.
+  # The server's tests run over a fake history and in-memory events (the engine's need the stack).
   cargoTestFlags = [
     "-p"
     "chlive-server"
+    "-p"
+    "chlive-tui"
   ];
 
   nativeBuildInputs = [
@@ -59,8 +64,8 @@ rustPlatform.buildRustPackage {
   };
 
   meta = {
-    description = "Live ClickHouse queries over WebSocket: history from ClickHouse, then Kafka events";
+    description = "Live ClickHouse queries over WebSocket (`chlive`), and a terminal client for them (`clc`)";
     license = lib.licenses.mit;
-    mainProgram = "chlive-server";
+    mainProgram = "chlive";
   };
 }

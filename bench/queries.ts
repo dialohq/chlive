@@ -114,7 +114,7 @@ function covers(at: string | undefined, want: Offsets): boolean {
 
 /** The chlive-server process's CPU seconds so far (user + system). */
 async function serverCpu(): Promise<number> {
-  const pid = (await Bun.$`pgrep -f target/release/chlive-server`.text()).trim().split("\n")[0];
+  const pid = (await Bun.$`pgrep -f "target/release/chlive( |$)"`.text()).trim().split("\n")[0];
   const t = (await Bun.$`ps -o time= -p ${pid}`.text()).trim(); // [[dd-]hh:]mm:ss.cc
   return t.split(":").reduce((acc, part) => acc * 60 + Number(part), 0);
 }

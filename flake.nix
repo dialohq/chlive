@@ -35,7 +35,8 @@
           # chDB (ClickHouse as a library), embedded in the engine to merge aggregate states;
           # built from the same ClickHouse version as ./clickhouse.nix.
           libchdb = pkgs.callPackage ./nix/packages/libchdb.nix { };
-          chlive-server = pkgs.callPackage ./nix/packages/chlive-server.nix { inherit libchdb; };
+          # the server (`chlive`) and the terminal client (`clc`)
+          chlive = pkgs.callPackage ./nix/packages/chlive.nix { inherit libchdb; };
         in
         {
           formatter = pkgs.nixfmt;
@@ -43,9 +44,9 @@
             inherit
               clickhouse
               libchdb
-              chlive-server
+              chlive
               ;
-            default = chlive-server;
+            default = chlive;
           };
 
           dnvr.shells.default = import ./nix/shell.nix {

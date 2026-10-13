@@ -6,6 +6,10 @@ license = "MIT"
 publish = false
 description = "A terminal table for live chlive queries, on chlive-client"
 
+[[bin]]
+name = "clc"
+path = "src/main.rs"
+
 [dependencies]
 chlive-client = { path = "../client-rs" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

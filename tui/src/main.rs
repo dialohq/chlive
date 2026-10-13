@@ -1,4 +1,4 @@
-//! `chlive-tui`: run live queries against a chlive-server and watch the result as a table,
+//! `clc` (chlive client, the `chlive-tui` crate): run live queries against a chlive-server and watch the result as a table,
 //! updated on every diff. A user of `chlive-client`.
 
 mod app;

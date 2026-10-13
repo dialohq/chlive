@@ -73,18 +73,18 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 
 | path | what |
 |---|---|
-| `flake.nix` | the flake: packages (`nix build` builds `chlive-server`) and the dnvr dev shell |
+| `flake.nix` | the flake: packages (`nix build` builds `chlive`: the server `chlive` and the terminal client `clc`) and the dnvr dev shell |
 | `nix/shell.nix` | the dnvr dev shell: toolchain, env, the local stack's processes (Redpanda in Docker, ClickHouse 26.7.2, Kafka Connect with the ClickHouse sink, the pause server, schema, seed, server, examples) and scripts |
 | `nix/settings.nix` | the local stack's ports, topics and seed size |
-| `nix/packages/` | custom derivations: `chlive-server.nix` (the server), `clickhouse.nix` (26.7.2), `libchdb.nix` (chDB, same version), `redpanda.nix` (the Docker-run Redpanda process) |
+| `nix/packages/` | custom derivations: `chlive.nix` (the server and `clc`), `clickhouse.nix` (26.7.2), `libchdb.nix` (chDB, same version), `redpanda.nix` (the Docker-run Redpanda process) |
 | `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
 | `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka |
 | `protocol/` | `chlive-protocol` (Rust): the WebSocket protocol's messages, shared by the server and the Rust client |
-| `server/` | `chlive-server` (Rust): the WebSocket protocol over the engine |
+| `server/` | `chlive-server` (Rust; binary `chlive`): the WebSocket protocol over the engine |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
 | `client-rs/` | `chlive-client` (Rust): the client for services; `examples/watch.rs` prints any query's updates |
 | `examples/` | example apps: `playground`, the query playground (React); `rust-alerts`, an event-driven service on `chlive-client` |
-| `tui/` | `chlive-tui` (Rust): a terminal UI on `chlive-client`; type a query, watch its result as a table updated on every diff |
+| `tui/` | `chlive-tui` (Rust; binary `clc`): a terminal UI on `chlive-client`; type a query, watch its result as a table updated on every diff |
 | `tests/` | end-to-end tests (`chlive-e2e`): the server over the full stack, with a small Kafka producer |
 | `bench/` | `queries.ts`: a ladder of queries, simple to most complex, benchmarked through `@chlive/client` against the stack; results in `docs/bench/` |
 
@@ -224,12 +224,12 @@ while let Some(u) = sub.next().await {
 - **Backpressure.** Messages are applied when the stream is polled. A subscription that isn't read fills a small buffer, and then the connection waits for it. Nothing is dropped, and the server just falls behind on Kafka. Subscriptions sharing a client should all be read, e.g. with `tokio::select!` as in `examples/rust-alerts`. Use a client per subscription where one might lag.
 - **Cancelling:** dropping a subscription unsubscribes; `client.close().await` ends every stream.
 
-**Terminal UI.** `chlive-tui` (`tui/`) is a small user of the client: an input for the query and a table of its result (columns with their ClickHouse types), updated on every diff, with the rows a diff inserted or changed highlighted for a second. In the dev shell, `tui` connects it to the stack's server:
+**Terminal UI.** `clc` (the `chlive-tui` crate, `tui/`) is a small user of the client: an input for the query and a table of its result (columns with their ClickHouse types), updated on every diff, with the rows a diff inserted or changed highlighted for a second. In the dev shell, `tui` connects it to the stack's server:
 
 ```sh
 tui "select user_id, latency_ms from events order by latency_ms desc limit 10"
 tui --param s=0d1c2b3a-0000-4000-8000-00000000000a "select ts, path from events where session_id = {s:UUID}"
-chlive-tui --url ws://host:8080/live      # elsewhere (or CHLIVE_URL)
+clc --url ws://host:8080/live             # elsewhere (or CHLIVE_URL); `nix build` has it in result/bin
 ```
 
 Enter runs the query in the input, replacing the last one. Tab moves the focus between the input and the table, ↑/↓/PgUp/PgDn scroll, Ctrl-U clears the input, and Esc or Ctrl-C quits. `--param name=value` (repeatable; JSON values as such, anything else a string) is sent with every query.
