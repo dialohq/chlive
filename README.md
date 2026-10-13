@@ -26,9 +26,9 @@ dnvr up          # starts everything in a tmux dashboard
 | `playground` → server, redpanda | the example query playground | `url` |
 | `rust-alerts` → server | the Rust client's example service | |
 
-Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `engine` (the engine CLI), `e2e` (the tests that need the stack), `bench` (the query benchmark), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
+Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `e2e` (the tests that need the stack), `bench` (the query benchmark), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
 
-Every process picks free ports on each start (`dnvr-state pick-port`), so the stack runs next to anything else, and publishes its addresses; the processes get each other's through `dnvr://<process>/<key>` refs. From a terminal, read them with `dnvr-state get <process>.<key>` (e.g. `dnvr-state get playground.url`, `dnvr-state get server.url`), or list everything with `dnvr-state dump`. The `ch`, `produce`, `engine`, `e2e` and `bench` scripts look them up the same way; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_CLICKHOUSE_NATIVE`, `CHLIVE_KAFKA` and `CHLIVE_PAUSE_SERVER` (and `PROXY_URL` for `produce`, `CHLIVE_URL`/`CH_URL`/`PROXY_URL` for `bench`) override them.
+Every process picks free ports on each start (`dnvr-state pick-port`), so the stack runs next to anything else, and publishes its addresses; the processes get each other's through `dnvr://<process>/<key>` refs. From a terminal, read them with `dnvr-state get <process>.<key>` (e.g. `dnvr-state get playground.url`, `dnvr-state get server.url`), or list everything with `dnvr-state dump`. The `ch`, `produce`, `e2e` and `bench` scripts look them up the same way; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_CLICKHOUSE_NATIVE`, `CHLIVE_KAFKA` and `CHLIVE_PAUSE_SERVER` (and `PROXY_URL` for `produce`, `CHLIVE_URL`/`CH_URL`/`PROXY_URL` for `bench`) override them.
 
 State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 
@@ -78,7 +78,7 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `nix/settings.nix` | the local stack's ports, topics and seed size |
 | `nix/packages/` | custom derivations: `chlive-server.nix` (the server), `clickhouse.nix` (26.7.2), `libchdb.nix` (chDB, same version), `redpanda.nix` (the Docker-run Redpanda process) |
 | `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
-| `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka; also a CLI that prints each iteration's diffs |
+| `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka |
 | `protocol/` | `chlive-protocol` (Rust): the WebSocket protocol's messages, shared by the server and the Rust client |
 | `server/` | `chlive-server` (Rust): the WebSocket protocol over the engine |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
@@ -89,13 +89,7 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 
 ## Engine (custom dialect)
 
-The engine is a library (used by the server) with a CLI that prints each iteration's diffs. With `dnvr up` running:
-
-```sh
-engine --explain "select * from events"     # plan: ClickHouse SQL, topics, keys, filter
-engine "select * from events where latency_ms > 500"   # history, then live events until Ctrl-C
-produce events '{"user_id": "u7", "latency_ms": 900}'  # one event per JSON argument
-```
+The engine is a library, used by the server.
 
 **History and stream meet at a snapshot's watermark.** At subscribe time the engine takes the table's current snapshot (see [How it works](#how-it-works)): a clone holding exactly the offsets below the pause server's `N[p]` per partition. History is the whole clone, and each Kafka partition is consumed from `N[p]`. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. A table must be ingested by exactly one sink connector, from the topic of the same name. The engine's ClickHouse node must be the one clones are made on (`clickhouse_url` and `clickhouse_native` point to one node); for replicated tables it runs `SYSTEM SYNC REPLICA` first.
 
@@ -106,7 +100,7 @@ The full grammar is under [Supported queries](#supported-queries). A condition c
 
 Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 
-**Parameters** work as in ClickHouse: `WHERE session_id = {s:UUID} AND latency_ms > {l:UInt32}`, with the values sent separately (`params` in the protocol and the clients, `--param s=…` for `engine`).
+**Parameters** work as in ClickHouse: `WHERE session_id = {s:UUID} AND latency_ms > {l:UInt32}`, with the values sent separately (`params` in the protocol and the clients).
 - They're allowed wherever a literal is in WHERE: comparisons, `IN (…)` items and `IS NULL`, in sub-queries too.
 - Each value is read by its declared type, with the rules event JSON is read by. `"ABCDEF00-…"` is a UUID, normalized; `100` or `"100"` is a UInt32; `null` is accepted only for a `Nullable(…)` type.
 - The declared type must be comparable with the column, as a literal must.

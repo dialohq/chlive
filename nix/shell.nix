@@ -466,15 +466,6 @@ in
       runtimeInputs = [ dnvrState ];
       text = ''exec ${chClient ''"$(dnvr-state get clickhouse.tcpPort)"''} "$@"'';
     };
-    engine = {
-      description = "Run the chlive-engine CLI against the stack, e.g. `engine --explain \"select * from events\"`";
-      runtimeInputs = [ dnvrState ];
-      text = ''
-        ${stackEnv}
-        cd "$DNVR_ROOT"
-        exec cargo run -q -p chlive-engine -- "$@"
-      '';
-    };
     e2e = {
       description = "Run the tests that need the running stack: the engine's, then the server end to end";
       runtimeInputs = [ dnvrState ];

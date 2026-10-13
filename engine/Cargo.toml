@@ -4,14 +4,6 @@ edition = "2021"
 version = "0.1.0"
 license = "MIT"
 
-# The library is the engine; the binary is a thin user of it (src/main.rs).
-[lib]
-path = "src/lib.rs"
-
-[[bin]]
-name = "chlive-engine"
-path = "src/main.rs"
-
 [dependencies]
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
@@ -23,10 +15,6 @@ futures = "0.3"
 async-trait = "0.1"
 chdb-rust = "2.0"
 rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dynamic-linking"] }
-# binary only
-anyhow = "1"
-clap = { version = "4", features = ["derive", "env"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
