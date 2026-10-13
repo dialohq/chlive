@@ -9,7 +9,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use chlive_client::{ClientOptions, LiveClient, Params, Row, Subscription, Update};
 use clap::Parser;
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    Event, EventStream, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use crossterm::execute;
+use crossterm::terminal::supports_keyboard_enhancement;
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use serde_json::Value;
@@ -42,9 +47,32 @@ fn parse_param(s: &str) -> Result<(String, Value), String> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut terminal = ratatui::init();
+    let enhanced = enhance_keyboard();
     let result = run(&mut terminal, cli).await;
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     ratatui::restore();
     result
+}
+
+/// Ask the terminal for the kitty keyboard protocol where it has it (kitty, Ghostty, WezTerm,
+/// iTerm2 with the option on, …), so modifiers like Cmd (Super) are reported. Undone on exit,
+/// panics included.
+fn enhance_keyboard() -> bool {
+    if !matches!(supports_keyboard_enhancement(), Ok(true)) {
+        return false;
+    }
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+    if execute!(std::io::stdout(), PushKeyboardEnhancementFlags(flags)).is_err() {
+        return false;
+    }
+    let restore = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        restore(info);
+    }));
+    true
 }
 
 async fn run(terminal: &mut DefaultTerminal, cli: Cli) -> Result<()> {

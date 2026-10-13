@@ -232,7 +232,18 @@ tui --param s=0d1c2b3a-0000-4000-8000-00000000000a "select ts, path from events 
 clc --url ws://host:8080/live             # elsewhere (or CHLIVE_URL); `nix build` has it in result/bin
 ```
 
-Enter runs the query in the input, replacing the last one. Tab moves the focus between the input and the table, ↑/↓/PgUp/PgDn scroll, Ctrl-U clears the input, and Esc or Ctrl-C quits. `--param name=value` (repeatable; JSON values as such, anything else a string) is sent with every query.
+Enter runs the query in the input, replacing the last one. Tab moves the focus between the input and the table, ↑/↓/PgUp/PgDn scroll, and Esc or Ctrl-C quits. The input has the usual readline and macOS shortcuts:
+
+| | back | forward |
+|---|---|---|
+| move a char | ←, Ctrl-B | →, Ctrl-F |
+| move a word | Option-← / Ctrl-←, Option-B | Option-→ / Ctrl-→, Option-F |
+| move to the line's start / end | Home, Ctrl-A, Cmd-← | End, Ctrl-E, Cmd-→ |
+| delete a char | Backspace, Ctrl-H | Delete, Ctrl-D |
+| delete a word | Option-Backspace, Ctrl-W (to whitespace) | Option-Delete, Option-D |
+| delete to the line's start / end | Cmd-Backspace, Ctrl-U | Cmd-Delete, Ctrl-K |
+
+Option shortcuts need the terminal to send Option as Meta/Alt (e.g. Terminal.app's "Use Option as Meta key", iTerm2's "Esc+"). Cmd shortcuts arrive where the terminal reports Cmd (the kitty keyboard protocol, which `clc` turns on when available) or sends Cmd-Backspace as Ctrl-U, as most macOS terminals do. `--param name=value` (repeatable; JSON values as such, anything else a string) is sent with every query.
 
 ### Protocol
 

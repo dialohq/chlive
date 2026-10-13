@@ -33,9 +33,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     draw_table(frame, app, table);
     frame.render_widget(
-        Paragraph::new(
-            " Enter run · Tab query/table · ↑↓ PgUp PgDn scroll · Ctrl-U clear · Esc quit".dim(),
-        ),
+        Paragraph::new(" Enter run · Tab query/table · ↑↓ PgUp PgDn scroll · Esc quit".dim()),
         keys,
     );
 }

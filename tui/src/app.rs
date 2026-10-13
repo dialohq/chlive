@@ -147,34 +147,105 @@ impl App {
                 KeyCode::End | KeyCode::Char('G') => self.scroll = usize::MAX,
                 _ => {}
             },
-            KeyCode::Char('u') if ctrl => {
-                self.input.clear();
-                self.cursor = 0;
-            }
-            KeyCode::Char('a') if ctrl => self.cursor = 0,
-            KeyCode::Char('e') if ctrl => self.cursor = self.input.chars().count(),
-            KeyCode::Char(c) if !ctrl => {
-                let at = self.byte(self.cursor);
-                self.input.insert(at, c);
-                self.cursor += 1;
-            }
-            KeyCode::Backspace if self.cursor > 0 => {
-                self.cursor -= 1;
-                let at = self.byte(self.cursor);
-                self.input.remove(at);
-            }
-            KeyCode::Delete if self.cursor < self.input.chars().count() => {
-                let at = self.byte(self.cursor);
-                self.input.remove(at);
-            }
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.chars().count()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.chars().count(),
-            _ => {}
+            _ => self.edit(key),
         }
         self.clamp_scroll();
         Action::None
+    }
+
+    /// Editing the query, with the usual shortcuts of readline and macOS text fields. Option
+    /// arrives as Alt (the terminal sends it as Meta), and Cmd as Super where the terminal reports
+    /// it (the kitty keyboard protocol); terminals that don't send Cmd+Delete as Ctrl-U.
+    fn edit(&mut self, key: KeyEvent) {
+        let m = key.modifiers;
+        let ctrl = m.contains(KeyModifiers::CONTROL);
+        let alt = m.intersects(KeyModifiers::ALT | KeyModifiers::META);
+        let cmd = m.contains(KeyModifiers::SUPER);
+        let len = self.input.chars().count();
+        let at = self.cursor;
+        match key.code {
+            // moving
+            KeyCode::Char('a') if ctrl => self.cursor = 0,
+            KeyCode::Char('e') if ctrl => self.cursor = len,
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = len,
+            KeyCode::Left if cmd => self.cursor = 0,
+            KeyCode::Right if cmd => self.cursor = len,
+            KeyCode::Char('b') if alt => self.cursor = self.word_start(),
+            KeyCode::Char('f') if alt => self.cursor = self.word_end(),
+            KeyCode::Left if alt || ctrl => self.cursor = self.word_start(),
+            KeyCode::Right if alt || ctrl => self.cursor = self.word_end(),
+            KeyCode::Char('b') if ctrl => self.cursor = at.saturating_sub(1),
+            KeyCode::Char('f') if ctrl => self.cursor = (at + 1).min(len),
+            KeyCode::Left => self.cursor = at.saturating_sub(1),
+            KeyCode::Right => self.cursor = (at + 1).min(len),
+            // deleting
+            KeyCode::Backspace if cmd => self.delete(0, at),
+            KeyCode::Char('u') if ctrl => self.delete(0, at),
+            KeyCode::Delete if cmd => self.delete(at, len),
+            KeyCode::Char('k') if ctrl => self.delete(at, len),
+            KeyCode::Backspace if alt || ctrl => self.delete(self.word_start(), at),
+            KeyCode::Char('w') if ctrl => self.delete(self.space_word_start(), at),
+            KeyCode::Delete if alt => self.delete(at, self.word_end()),
+            KeyCode::Char('d') if alt => self.delete(at, self.word_end()),
+            KeyCode::Backspace => self.delete(at.saturating_sub(1), at),
+            KeyCode::Char('h') if ctrl => self.delete(at.saturating_sub(1), at),
+            KeyCode::Delete => self.delete(at, (at + 1).min(len)),
+            KeyCode::Char('d') if ctrl => self.delete(at, (at + 1).min(len)),
+            // typing
+            KeyCode::Char(c) if !ctrl && !alt && !cmd => {
+                let b = self.byte(at);
+                self.input.insert(b, c);
+                self.cursor += 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// Delete the chars `from..to`, leaving the cursor at `from`.
+    fn delete(&mut self, from: usize, to: usize) {
+        let (a, b) = (self.byte(from), self.byte(to));
+        self.input.replace_range(a..b, "");
+        self.cursor = from;
+    }
+
+    /// Where the word before the cursor starts (words are letters, digits and `_`), as Option+←.
+    fn word_start(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && !is_word(chars[i - 1]) {
+            i -= 1;
+        }
+        while i > 0 && is_word(chars[i - 1]) {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Where the word after the cursor ends, as Option+→.
+    fn word_end(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor;
+        while i < chars.len() && !is_word(chars[i]) {
+            i += 1;
+        }
+        while i < chars.len() && is_word(chars[i]) {
+            i += 1;
+        }
+        i
+    }
+
+    /// Where the whitespace-separated word before the cursor starts, for Ctrl-W.
+    fn space_word_start(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i
     }
 
     fn byte(&self, char_index: usize) -> usize {
@@ -192,6 +263,10 @@ impl App {
     pub fn clamp_scroll(&mut self) {
         self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.page));
     }
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// A value as a table cell: strings as they are, NULL dimmed, anything else as JSON.
@@ -376,6 +451,7 @@ mod tests {
             app.on_key(key(KeyCode::Enter)),
             Action::Run("elect 1".into())
         );
+        app.on_key(key(KeyCode::End));
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(app.input, "");
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
@@ -384,6 +460,119 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Action::Quit
         );
+    }
+
+    #[test]
+    fn readline_and_macos_shortcuts() {
+        use KeyModifiers as M;
+        // the input, then keys, then the input with `|` at the cursor
+        type Case = (&'static str, &'static [(KeyCode, M)], &'static str);
+        let cases: &[Case] = &[
+            ("select 1", &[(KeyCode::Char('a'), M::CONTROL)], "|select 1"),
+            (
+                "select 1",
+                &[(KeyCode::Home, M::NONE), (KeyCode::Char('e'), M::CONTROL)],
+                "select 1|",
+            ),
+            ("select 1", &[(KeyCode::Char('b'), M::CONTROL)], "select |1"),
+            (
+                "select 1",
+                &[(KeyCode::Home, M::NONE), (KeyCode::Char('f'), M::CONTROL)],
+                "s|elect 1",
+            ),
+            (
+                "select a.b_c",
+                &[(KeyCode::Char('b'), M::ALT)],
+                "select a.|b_c",
+            ),
+            (
+                "select a.b_c",
+                &[(KeyCode::Left, M::ALT), (KeyCode::Left, M::ALT)],
+                "select |a.b_c",
+            ),
+            (
+                "select a.b_c",
+                &[(KeyCode::Home, M::NONE), (KeyCode::Char('f'), M::ALT)],
+                "select| a.b_c",
+            ),
+            (
+                "select a.b_c",
+                &[(KeyCode::Home, M::NONE), (KeyCode::Right, M::CONTROL)],
+                "select| a.b_c",
+            ),
+            ("select 1", &[(KeyCode::Left, M::SUPER)], "|select 1"),
+            (
+                "select 1",
+                &[(KeyCode::Home, M::NONE), (KeyCode::Right, M::SUPER)],
+                "select 1|",
+            ),
+            (
+                "select a.b_c",
+                &[(KeyCode::Backspace, M::ALT)],
+                "select a.|",
+            ),
+            (
+                "select a.b_c",
+                &[(KeyCode::Char('w'), M::CONTROL)],
+                "select |",
+            ),
+            (
+                "select a, b",
+                &[(KeyCode::Left, M::ALT), (KeyCode::Backspace, M::SUPER)],
+                "|b",
+            ),
+            (
+                "select a, b",
+                &[(KeyCode::Left, M::ALT), (KeyCode::Char('u'), M::CONTROL)],
+                "|b",
+            ),
+            (
+                "select a, b",
+                &[(KeyCode::Left, M::ALT), (KeyCode::Char('k'), M::CONTROL)],
+                "select a, |",
+            ),
+            (
+                "select a, b",
+                &[(KeyCode::Home, M::NONE), (KeyCode::Delete, M::SUPER)],
+                "|",
+            ),
+            (
+                "select a, b",
+                &[(KeyCode::Home, M::NONE), (KeyCode::Char('d'), M::ALT)],
+                "| a, b",
+            ),
+            (
+                "select a, b",
+                &[(KeyCode::Home, M::NONE), (KeyCode::Char('d'), M::CONTROL)],
+                "|elect a, b",
+            ),
+            (
+                "select a, b",
+                &[(KeyCode::Char('h'), M::CONTROL)],
+                "select a, |",
+            ),
+            (
+                "sélect",
+                &[
+                    (KeyCode::Left, M::ALT),
+                    (KeyCode::Right, M::NONE),
+                    (KeyCode::Delete, M::NONE),
+                ],
+                "s|lect",
+            ),
+            // Option+letter without Meta isn't typed as the letter
+            ("x", &[(KeyCode::Char('q'), M::ALT)], "x|"),
+            ("", &[(KeyCode::Char('X'), M::SHIFT)], "X|"),
+        ];
+        for (input, keys, want) in cases {
+            let mut app = App::new("ws://x/live", *input);
+            for &(code, m) in keys.iter() {
+                assert_eq!(app.on_key(KeyEvent::new(code, m)), Action::None);
+            }
+            let mut got = app.input.clone();
+            got.insert(app.byte(app.cursor), '|');
+            assert_eq!(&got, want, "{input:?} {keys:?}");
+        }
     }
 
     #[test]
