@@ -218,6 +218,7 @@ fn literal_sql(lit: &Literal) -> String {
         Literal::String(s) => quote_string(s),
         Literal::Bool(b) => b.to_string(),
         Literal::Null => "NULL".into(),
+        Literal::Param { .. } | Literal::Bound { .. } => unreachable!("no parameters here"),
     }
 }
 

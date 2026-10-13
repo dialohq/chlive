@@ -42,6 +42,6 @@ pub mod source;
 pub mod types;
 pub mod watermark;
 
-pub use binder::{BoundColumn, BoundExpr, BoundQuery};
+pub use binder::{BoundColumn, BoundExpr, BoundQuery, Params};
 pub use engine::{Config, Engine, EngineError, Iteration, Origin, Subscription};
 pub use plan::Plan;

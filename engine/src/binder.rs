@@ -2,6 +2,7 @@
 //! order: FROM, then WHERE, then SELECT, then ORDER BY, then LIMIT. Everything after binding works with resolved identifiers, never
 //! with the names as written.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::ast::{
@@ -19,7 +20,13 @@ pub struct Catalog<'a> {
     pub rules: &'a dyn NamingRules,
     pub history: &'a dyn HistorySource,
     pub source: &'a dyn EventSource,
+    /// The values of the query's parameters (`{name:Type}`), by name.
+    pub params: &'a Params,
 }
+
+/// Query parameter values by name, as JSON; each is read by its placeholder's declared type,
+/// with the rules event JSON is read by (`"42"` or `42` for a UInt32, …).
+pub type Params = BTreeMap<String, serde_json::Value>;
 
 /// Index of a column in [`BoundTable::columns`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -259,6 +266,8 @@ pub enum BindError {
     History(HistoryError),
     /// The event source could not be consulted (Kafka unreachable, …).
     Source(SourceError),
+    /// A problem with the query's parameters as a whole (one given that the query doesn't use).
+    Params(String),
 }
 
 impl BindError {
@@ -275,6 +284,7 @@ impl BindError {
             BindError::At { message, span } => render_at(src, *span, message),
             BindError::History(e) => e.to_string(),
             BindError::Source(e) => e.to_string(),
+            BindError::Params(message) => message.clone(),
         }
     }
 }
@@ -285,6 +295,7 @@ impl fmt::Display for BindError {
             BindError::At { message, span } => write!(f, "{message} at byte {}", span.start),
             BindError::History(e) => write!(f, "{e}"),
             BindError::Source(e) => write!(f, "{e}"),
+            BindError::Params(message) => write!(f, "{message}"),
         }
     }
 }
@@ -292,6 +303,119 @@ impl fmt::Display for BindError {
 impl std::error::Error for BindError {}
 
 pub async fn bind(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, BindError> {
+    let mut query = query.clone();
+    resolve_params(&mut query, catalog.params)?;
+    bind_resolved(&query, catalog).await
+}
+
+/// Replaces each parameter placeholder, in the query and its sub-queries, with its value read
+/// by the declared type; every given value must be used.
+fn resolve_params(query: &mut Query, params: &Params) -> Result<(), BindError> {
+    let mut declared: BTreeMap<String, (Type, Value)> = BTreeMap::new();
+    visit_query_literals(query, &mut |lit, span| {
+        let Literal::Param { name, ty } = lit else {
+            return Ok(());
+        };
+        let (t, value) = match declared.get(name.as_str()) {
+            Some((t, _)) if t.clickhouse != *ty => {
+                return Err(BindError::at(
+                    format!("parameter {name} is declared as both {t} and {ty}"),
+                    span,
+                ))
+            }
+            Some(resolved) => resolved.clone(),
+            None => {
+                let resolved = param_value(name, ty, params, span)?;
+                declared.insert(name.clone(), resolved.clone());
+                resolved
+            }
+        };
+        *lit = Literal::Bound {
+            name: std::mem::take(name),
+            ty: t,
+            value,
+        };
+        Ok(())
+    })?;
+    match params.keys().find(|k| !declared.contains_key(k.as_str())) {
+        Some(extra) => Err(BindError::Params(format!(
+            "unknown parameter {extra} (not in the query)"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// A parameter's declared type and its value.
+fn param_value(
+    name: &str,
+    ty: &str,
+    params: &Params,
+    span: Span,
+) -> Result<(Type, Value), BindError> {
+    let t = Type::parse(ty);
+    if !t.ops().filter {
+        return Err(BindError::at(
+            format!("parameter {name}: type {ty} is not supported"),
+            span,
+        ));
+    }
+    let Some(json) = params.get(name) else {
+        return Err(BindError::at(format!("missing parameter {name}"), span));
+    };
+    let value = if json.is_null() {
+        if !t.nullable {
+            return Err(BindError::at(
+                format!("parameter {name} is null, but {ty} isn't Nullable"),
+                span,
+            ));
+        }
+        Value::Null
+    } else {
+        t.kind.column_type().decode(json).ok_or_else(|| {
+            BindError::at(
+                format!("parameter {name}: cannot read {json} as {ty}"),
+                span,
+            )
+        })?
+    };
+    Ok((t, value))
+}
+
+fn visit_query_literals(
+    query: &mut Query,
+    f: &mut dyn FnMut(&mut Literal, Span) -> Result<(), BindError>,
+) -> Result<(), BindError> {
+    match &mut query.selection {
+        Some(expr) => visit_literals(expr, f),
+        None => Ok(()),
+    }
+}
+
+fn visit_literals(
+    expr: &mut Expr,
+    f: &mut dyn FnMut(&mut Literal, Span) -> Result<(), BindError>,
+) -> Result<(), BindError> {
+    match expr {
+        Expr::Column(_) => Ok(()),
+        Expr::Literal { value, span } => f(value, *span),
+        Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+            visit_literals(left, f)?;
+            visit_literals(right, f)
+        }
+        Expr::Not { expr, .. } | Expr::IsNull { expr, .. } => visit_literals(expr, f),
+        Expr::InList { expr, list, .. } => {
+            visit_literals(expr, f)?;
+            list.iter_mut().try_for_each(|(lit, span)| f(lit, *span))
+        }
+        Expr::Exists { query, .. } => visit_query_literals(query, f),
+        Expr::InSubquery { expr, query, .. } => {
+            visit_literals(expr, f)?;
+            visit_query_literals(query, f)
+        }
+    }
+}
+
+async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, BindError> {
     let table = bind_from(query, catalog).await?;
     let (selection, sub) = match &query.selection {
         Some(expr) => split_subquery(expr)?,
@@ -1171,6 +1295,14 @@ fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
             let values = list
                 .iter()
                 .map(|(lit, lspan)| match lit {
+                    Literal::Bound {
+                        name,
+                        value: Value::Null,
+                        ..
+                    } => Err(BindError::at(
+                        format!("parameter {name} is null, which never matches in IN; use IS NULL"),
+                        *lspan,
+                    )),
                     Literal::Null => Err(BindError::at(
                         "NULL in an IN list never matches; use IS NULL",
                         *lspan,
@@ -1254,7 +1386,13 @@ fn natural_type(lit: &Literal, span: Span) -> Result<Type, BindError> {
         Literal::String(_) => "String",
         Literal::Bool(_) => "Bool",
         Literal::Null => return Err(BindError::at("NULL has no type here", span)),
+        Literal::Bound { ty, .. } => return Ok(ty.clone()),
+        Literal::Param { name, .. } => return Err(unresolved(name, span)),
     }))
+}
+
+fn unresolved(name: &str, span: Span) -> BindError {
+    BindError::at(format!("parameter {name} has no value"), span)
 }
 
 /// A literal as a value of `ty`, or an error pointing at the literal.
@@ -1265,9 +1403,29 @@ fn coerce(lit: &Literal, span: Span, ty: &Type) -> Result<Value, BindError> {
             Literal::String(_) => "a string",
             Literal::Bool(_) => "a boolean",
             Literal::Null => "NULL",
+            Literal::Param { .. } | Literal::Bound { .. } => "a parameter",
         };
         BindError::at(format!("cannot compare {ty} with {what}"), span)
     };
+    match lit {
+        // typed as declared; compared with the column's values as two columns would be
+        Literal::Bound {
+            name,
+            ty: declared,
+            value,
+        } => {
+            return if declared.class().is_some() && declared.class() == ty.class() {
+                Ok(value.clone())
+            } else {
+                Err(BindError::at(
+                    format!("cannot compare {ty} with parameter {name} ({declared})"),
+                    span,
+                ))
+            }
+        }
+        Literal::Param { name, .. } => return Err(unresolved(name, span)),
+        _ => {}
+    }
     ty.literal(lit).map_err(|e| match e {
         LiteralError::Mismatch => mismatch(),
         LiteralError::Invalid(message) => BindError::at(message, span),
@@ -1404,11 +1562,17 @@ mod tests {
     }
 
     async fn bind_sql(sql: &str) -> Result<BoundQuery, String> {
+        bind_params(sql, serde_json::json!({})).await
+    }
+
+    async fn bind_params(sql: &str, params: serde_json::Value) -> Result<BoundQuery, String> {
+        let params: Params = serde_json::from_value(params).unwrap();
         let rules = HardcodedRules::default();
         let catalog = Catalog {
             rules: &rules,
             history: &FakeHistory,
             source: &topics(),
+            params: &params,
         };
         let q = parse(sql).map_err(|e| e.render(sql))?;
         bind(&q, &catalog).await.map_err(|e| e.render(sql))
@@ -1454,6 +1618,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names(&b), ["ts", "t", "latency_ms"]);
+    }
+
+    #[tokio::test]
+    async fn parameters_bind_as_typed_values() {
+        use serde_json::json;
+        let b = bind_params(
+            "select * from sessions where id = {id:UUID} and user_id in ({u:String}, 'x')",
+            json!({"id": "ABCDEF00-0000-0000-0000-000000000001", "u": "u1"}),
+        )
+        .await
+        .unwrap();
+        let uuid = Value::Uuid(crate::types::Uuid(0xabcdef00 << 96 | 1));
+        let Some(BoundExpr::And(l, r)) = b.filter else {
+            panic!("an AND: {:?}", b.filter)
+        };
+        assert!(
+            matches!(*l, BoundExpr::Compare { ref right, .. } if **right == BoundExpr::Literal(uuid.clone()))
+        );
+        assert!(matches!(*r, BoundExpr::InList { ref list, .. }
+            if list == &[Value::String("u1".into()), Value::String("x".into())]));
+        // values read by the declared type: a number as a string, a DateTime compared with a
+        // DateTime64 column, one placeholder used twice, and in a sub-query
+        for (sql, params) in [
+            ("select * from events where latency_ms > {l:UInt32}", json!({"l": "500"})),
+            ("select * from events where ts >= {t:DateTime}", json!({"t": "2026-10-01 00:00:00"})),
+            ("select * from events where latency_ms > {l:UInt32} or latency_ms = {l:UInt32}", json!({"l": 5})),
+            ("select * from sessions where parent in (select id from sessions where user_id = {u:String})", json!({"u": "u1"})),
+            ("select * from sessions where parent = {p:Nullable(UUID)}", json!({"p": null})),
+        ] {
+            assert!(bind_params(sql, params.clone()).await.is_ok(), "{sql} {params}: {:?}", bind_params(sql, params.clone()).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn parameters_render_into_history_and_the_cursor_fingerprint() {
+        use serde_json::json;
+        let sql = "select id from sessions where id = {id:UUID}";
+        let planned = |id: &'static str| async move {
+            crate::plan::plan(&bind_params(sql, json!({ "id": id })).await.unwrap())
+        };
+        let a = planned("ABCDEF00-0000-0000-0000-000000000001").await;
+        let b = planned("abcdef00-0000-0000-0000-000000000002").await;
+        assert_eq!(
+            a.history.sql("default.sessions"),
+            "SELECT id FROM default.sessions WHERE id = toUUID('abcdef00-0000-0000-0000-000000000001')"
+        );
+        assert_ne!(
+            crate::cursor::fingerprint(&a),
+            crate::cursor::fingerprint(&b)
+        );
+    }
+
+    #[tokio::test]
+    async fn parameter_errors() {
+        use serde_json::json;
+        let err = |sql: &'static str, params: serde_json::Value| async move {
+            bind_params(sql, params).await.unwrap_err()
+        };
+        assert_eq!(
+            err("select * from sessions where id = {id:UUID}", json!({})).await,
+            "missing parameter id at 1:35"
+        );
+        assert_eq!(
+            err(
+                "select * from sessions where id = {id:UUID}",
+                json!({"id": "nope"})
+            )
+            .await,
+            r#"parameter id: cannot read "nope" as UUID at 1:35"#
+        );
+        assert_eq!(
+            err(
+                "select * from sessions where id = {id:UUID}",
+                json!({"id": null})
+            )
+            .await,
+            "parameter id is null, but UUID isn't Nullable at 1:35"
+        );
+        assert_eq!(
+            err(
+                "select * from sessions where id = {id:UUID}",
+                json!({"id": "abcdef00000000000000000000000001", "x": 1})
+            )
+            .await,
+            "unknown parameter x (not in the query)"
+        );
+        assert_eq!(
+            err(
+                "select * from events where latency_ms = {x:String}",
+                json!({"x": "a"})
+            )
+            .await,
+            "cannot compare UInt32 with parameter x (String) at 1:41"
+        );
+        assert_eq!(
+            err(
+                "select * from events where user_id = {t:Array(String)}",
+                json!({"t": []})
+            )
+            .await,
+            "parameter t: type Array(String) is not supported at 1:38"
+        );
+        assert_eq!(
+            err(
+                "select * from events where latency_ms = {l:UInt32} or latency_ms = {l:UInt64}",
+                json!({"l": 1})
+            )
+            .await,
+            "parameter l is declared as both UInt32 and UInt64 at 1:68"
+        );
+        assert_eq!(
+            err(
+                "select * from sessions where parent in ({p:Nullable(UUID)})",
+                json!({"p": null})
+            )
+            .await,
+            "parameter p is null, which never matches in IN; use IS NULL at 1:41"
+        );
     }
 
     #[tokio::test]

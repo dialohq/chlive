@@ -20,6 +20,11 @@ pub enum TokenKind {
     Number(String),
     /// A single-quoted string literal, unescaped (`''` and `\'` are quotes).
     String(String),
+    /// A query parameter, `{name:Type}`.
+    Param {
+        name: String,
+        ty: String,
+    },
     Star,
     Plus,
     Minus,
@@ -46,6 +51,7 @@ impl TokenKind {
             TokenKind::Ident(i) => format!("identifier `{i}`"),
             TokenKind::Number(n) => format!("number `{n}`"),
             TokenKind::String(v) => format!("string '{v}'"),
+            TokenKind::Param { name, ty } => format!("parameter {{{name}:{ty}}}"),
             TokenKind::Star => "`*`".into(),
             TokenKind::Plus => "`+`".into(),
             TokenKind::Minus => "`-`".into(),
@@ -207,6 +213,14 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
                     span: Span::new(start, i),
                 });
             }
+            b'{' => {
+                let (kind, end) = param(src, start)?;
+                i = end;
+                tokens.push(Token {
+                    kind,
+                    span: Span::new(start, i),
+                });
+            }
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
@@ -236,6 +250,59 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
         span: Span::new(src.len(), src.len()),
     });
     Ok(tokens)
+}
+
+/// `{name:Type}` at `start` (the `{`): the token and the offset after its `}`. The type may hold
+/// parentheses and quoted strings, e.g. `{t:DateTime64(3, 'UTC')}`.
+fn param(src: &str, start: usize) -> Result<(TokenKind, usize), SyntaxError> {
+    let bytes = src.as_bytes();
+    let err = |msg: &str, end: usize| Err(SyntaxError::new(msg, Span::new(start, end)));
+    let mut i = start + 1;
+    let name_start = i;
+    if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+    }
+    let name = &src[name_start..i];
+    if name.is_empty() {
+        return err(
+            "expected a parameter name after `{` (as in {id:UUID})",
+            i.max(start + 1),
+        );
+    }
+    if bytes.get(i) != Some(&b':') {
+        return err(
+            "expected `:` and a type after the parameter name (as in {id:UUID})",
+            i,
+        );
+    }
+    i += 1;
+    let ty_start = i;
+    let (mut depth, mut quoted) = (0usize, false);
+    loop {
+        match bytes.get(i) {
+            None => return err("unterminated parameter; expected `}`", bytes.len()),
+            Some(b'\\') if quoted => i += 1,
+            Some(b'\'') => quoted = !quoted,
+            Some(b'(') if !quoted => depth += 1,
+            Some(b')') if !quoted => depth = depth.saturating_sub(1),
+            Some(b'}') if !quoted && depth == 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    let ty = src[ty_start..i].trim();
+    if ty.is_empty() {
+        return err("expected a type after `:` (as in {id:UUID})", i + 1);
+    }
+    Ok((
+        TokenKind::Param {
+            name: name.to_string(),
+            ty: ty.to_string(),
+        },
+        i + 1,
+    ))
 }
 
 #[cfg(test)]
@@ -329,5 +396,57 @@ mod tests {
         let e = tokenize("select # from x").unwrap_err();
         assert_eq!(e.span, Span::new(7, 8));
         assert!(tokenize("select * from \"oops").is_err());
+    }
+
+    #[test]
+    fn parameters() {
+        let kinds = |src: &str| -> Vec<TokenKind> {
+            tokenize(src).unwrap().into_iter().map(|t| t.kind).collect()
+        };
+        let param = |name: &str, ty: &str| TokenKind::Param {
+            name: name.into(),
+            ty: ty.into(),
+        };
+        assert_eq!(
+            kinds("id = {id:UUID}"),
+            [
+                TokenKind::Ident("id".into()),
+                TokenKind::Eq,
+                param("id", "UUID"),
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("{t: DateTime64(3, 'U}C') }")[0],
+            param("t", "DateTime64(3, 'U}C')")
+        );
+        let err = |src: &str| {
+            let e = tokenize(src).unwrap_err();
+            (e.message, e.span.start, e.span.end)
+        };
+        assert_eq!(
+            err("a = {:UUID}"),
+            (
+                "expected a parameter name after `{` (as in {id:UUID})".into(),
+                4,
+                5
+            )
+        );
+        assert_eq!(
+            err("a = {id UUID}"),
+            (
+                "expected `:` and a type after the parameter name (as in {id:UUID})".into(),
+                4,
+                7
+            )
+        );
+        assert_eq!(
+            err("a = {id:}"),
+            ("expected a type after `:` (as in {id:UUID})".into(), 4, 9)
+        );
+        assert_eq!(
+            err("a = {id:UUID"),
+            ("unterminated parameter; expected `}`".into(), 4, 12)
+        );
     }
 }

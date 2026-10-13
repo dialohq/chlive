@@ -14,7 +14,7 @@ use futures::stream::{self, BoxStream, Stream, StreamExt};
 
 use crate::aggregate::chdb_run::{AggregateRun, ChdbTable};
 use crate::aggregate::native_run::NativeRun;
-use crate::binder::{bind, BindError, Catalog};
+use crate::binder::{bind, BindError, Catalog, Params};
 use crate::chdb::{Chdb, ChdbError};
 use crate::cursor;
 use crate::diff::{Diff, Row};
@@ -189,11 +189,17 @@ impl Engine {
 
     /// Parse, bind and plan a query without running it.
     pub async fn explain(&self, sql: &str) -> Result<Plan, EngineError> {
+        self.explain_with(sql, &Params::new()).await
+    }
+
+    /// [`explain`](Self::explain) with the values of the query's parameters (`{name:Type}`).
+    pub async fn explain_with(&self, sql: &str, params: &Params) -> Result<Plan, EngineError> {
         let query = parse(sql).map_err(|e| EngineError::Syntax(e.render(sql)))?;
         let catalog = Catalog {
             rules: self.rules.as_ref(),
             history: self.history.as_ref(),
             source: self.source.as_ref(),
+            params,
         };
         let bound = bind(&query, &catalog).await.map_err(|e| match e {
             BindError::History(e) => EngineError::History(e),
@@ -210,7 +216,7 @@ impl Engine {
     /// every offset up to its [`Watermark`], and each partition is consumed from right after
     /// it. So every event is in exactly one of them, wherever ClickHouse's ingestion is at.
     pub async fn subscribe(&self, sql: &str) -> Result<Subscription, EngineError> {
-        self.subscribe_from(sql, None).await
+        self.subscribe_with(sql, &Params::new(), None).await
     }
 
     /// Like [`subscribe`](Self::subscribe), but for a client that already holds the result up to
@@ -231,7 +237,19 @@ impl Engine {
         sql: &str,
         since: Option<&str>,
     ) -> Result<Subscription, EngineError> {
-        let plan = self.explain(sql).await?;
+        self.subscribe_with(sql, &Params::new(), since).await
+    }
+
+    /// [`subscribe_from`](Self::subscribe_from) with the values of the query's parameters
+    /// (`{name:Type}`). They're bound as literals, so a cursor taken with other values doesn't
+    /// resume (its plan differs).
+    pub async fn subscribe_with(
+        &self,
+        sql: &str,
+        params: &Params,
+        since: Option<&str>,
+    ) -> Result<Subscription, EngineError> {
+        let plan = self.explain_with(sql, params).await?;
         if plan.semi.is_some() {
             // a semi-join always starts from history (no resume yet)
             return self.subscribe_semi(plan).await;

@@ -139,6 +139,17 @@ pub enum Literal {
     String(String),
     Bool(bool),
     Null,
+    /// A query parameter, `{name:Type}`: its value comes with the query, typed as declared.
+    Param {
+        name: String,
+        ty: String,
+    },
+    /// A parameter with its value, as the binder resolves `Param`s before binding.
+    Bound {
+        name: String,
+        ty: crate::types::Type,
+        value: crate::types::Value,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

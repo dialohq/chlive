@@ -156,6 +156,12 @@ impl Parser {
         let t = self.peek().clone();
         Ok(
             match (&t.kind, &self.tokens.get(self.pos + 1).map(|t| &t.kind)) {
+                (TokenKind::Param { .. }, _) => {
+                    return Err(SyntaxError::new(
+                        "parameters can only be used in WHERE",
+                        t.span,
+                    ))
+                }
                 (
                     TokenKind::Number(_)
                     | TokenKind::String(_)
@@ -511,6 +517,7 @@ impl Parser {
             TokenKind::Keyword("TRUE") => Literal::Bool(true),
             TokenKind::Keyword("FALSE") => Literal::Bool(false),
             TokenKind::Keyword("NULL") => Literal::Null,
+            TokenKind::Param { name, ty } => Literal::Param { name, ty },
             TokenKind::Minus => {
                 self.next();
                 let n = self.peek().clone();
@@ -550,6 +557,7 @@ impl Parser {
             }
             TokenKind::Number(_)
             | TokenKind::String(_)
+            | TokenKind::Param { .. }
             | TokenKind::Minus
             | TokenKind::Keyword("TRUE" | "FALSE" | "NULL") => {
                 let (value, span) = self.literal()?;
@@ -1034,6 +1042,23 @@ mod tests {
         assert_eq!(
             error("select * from t where a is 1"),
             "expected NULL, found number `1` at 1:28"
+        );
+    }
+
+    #[test]
+    fn parameters_are_literals_in_where() {
+        let q = parse("select * from t where id = {id:UUID} and n in (1, {n:UInt8})").unwrap();
+        let Some(Expr::And(l, r)) = q.selection else {
+            panic!("an AND")
+        };
+        assert!(matches!(*l, Expr::Compare { ref right, .. }
+            if matches!(**right, Expr::Literal { value: Literal::Param { ref name, ref ty }, .. }
+                if name == "id" && ty == "UUID")));
+        assert!(matches!(*r, Expr::InList { ref list, .. }
+            if matches!(list[1].0, Literal::Param { ref name, .. } if name == "n")));
+        assert_eq!(
+            error("select {x:UInt8} from t"),
+            "parameters can only be used in WHERE at 1:8"
         );
     }
 

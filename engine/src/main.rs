@@ -5,7 +5,7 @@ use anyhow::Result;
 use std::time::Duration;
 
 use chlive_engine::snapshot::SnapshotConfig;
-use chlive_engine::{Config, Engine};
+use chlive_engine::{Config, Engine, Params};
 use clap::Parser;
 use futures::StreamExt;
 
@@ -62,6 +62,18 @@ struct Cli {
     /// Print the plan instead of running it
     #[arg(long)]
     explain: bool,
+    /// A query parameter's value, for `{name:Type}`: `--param id=abcdef00-…`. A value that
+    /// reads as JSON is taken as such (`5`, `true`, `null`), anything else as a string.
+    #[arg(long = "param", value_name = "NAME=VALUE", value_parser = parse_param)]
+    params: Vec<(String, serde_json::Value)>,
+}
+
+fn parse_param(s: &str) -> Result<(String, serde_json::Value), String> {
+    let (name, value) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=VALUE, got {s:?}"))?;
+    let value = serde_json::from_str(value).unwrap_or_else(|_| value.into());
+    Ok((name.to_string(), value))
 }
 
 #[tokio::main]
@@ -74,6 +86,7 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let (query, explain) = (cli.query.clone(), cli.explain);
+    let params: Params = cli.params.iter().cloned().collect();
     let engine = Engine::connect(Config {
         clickhouse_url: cli.clickhouse_url,
         user: cli.user,
@@ -91,19 +104,19 @@ async fn main() -> Result<()> {
         },
     });
 
-    let result = run(&engine, &query, explain).await;
+    let result = run(&engine, &query, &params, explain).await;
     engine.shutdown().await;
     // with chDB open (aggregates), the process must close it before exiting
     chlive_engine::chdb::shutdown();
     result
 }
 
-async fn run(engine: &Engine, query: &str, explain: bool) -> Result<()> {
+async fn run(engine: &Engine, query: &str, params: &Params, explain: bool) -> Result<()> {
     if explain {
-        println!("{}", engine.explain(query).await?);
+        println!("{}", engine.explain_with(query, params).await?);
         return Ok(());
     }
-    let mut subscription = engine.subscribe(query).await?;
+    let mut subscription = engine.subscribe_with(query, params, None).await?;
     loop {
         tokio::select! {
             next = subscription.next() => match next {
