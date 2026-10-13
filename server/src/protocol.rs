@@ -96,6 +96,7 @@ mod tests {
                 id: "s1".into(),
                 sql: "select * from events".into(),
                 since: None,
+                params: Default::default(),
             }
         );
         let m: ClientMsg = serde_json::from_value(
@@ -106,9 +107,9 @@ mod tests {
         let m: ClientMsg =
             serde_json::from_value(json!({"type": "unsubscribe", "id": "s1"})).unwrap();
         assert_eq!(m, ClientMsg::Unsubscribe { id: "s1".into() });
-        // v0 fields (params) are rejected rather than silently ignored
+        // unknown fields are rejected rather than silently ignored
         assert!(serde_json::from_value::<ClientMsg>(
-            json!({"type": "subscribe", "id": "s1", "sql": "x", "params": {}})
+            json!({"type": "subscribe", "id": "s1", "sql": "x", "nope": {}})
         )
         .is_err());
         assert!(serde_json::from_value::<ClientMsg>(json!({"type": "nope"})).is_err());

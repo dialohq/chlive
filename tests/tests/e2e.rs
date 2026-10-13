@@ -733,3 +733,59 @@ async fn rust_client_matches_direct_queries() -> Result<()> {
 .boxed())
 .await
 }
+
+#[tokio::test]
+async fn parameters_match_the_same_query_with_literals() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let sql = "select ts, user_id, session_id from events \
+               where session_id = {s:UUID} and latency_ms > {l:UInt32}";
+    let (a, b) = (producer::SESSIONS[0], producer::SESSIONS[2]);
+    with_server(config(), |server| {
+        async move {
+            let producer = producer()?;
+            let conn = LiveConn::connect(server).await?;
+            // read by their declared types: an upper-case UUID, a number as a string
+            conn.subscribe_with(
+                "a",
+                sql,
+                serde_json::json!({"s": a.to_uppercase(), "l": "50"}),
+            );
+            conn.subscribe_with("b", sql, serde_json::json!({"s": b, "l": 50}));
+            conn.wait_ready(&["a", "b"], Duration::from_secs(60))
+                .await?;
+            let produced = producer.produce(2000, Some(2000.0)).await?;
+            settle(&conn, &produced).await?;
+            let mut results = Vec::new();
+            for (id, session) in [("a", a), ("b", b)] {
+                let live = conn.result(id).unwrap();
+                assert!(live.error.is_none(), "{id}: {:?}", live.error);
+                assert!(
+                    live.protocol_violations.is_empty(),
+                    "{id}: {:?}",
+                    live.protocol_violations
+                );
+                assert!(live.inserted > 0, "{id}: no live inserts");
+                let direct = direct(&format!(
+                    "select ts, user_id, session_id from events \
+                     where session_id = '{session}' and latency_ms > 50"
+                ))
+                .await?;
+                eprintln!(
+                    "{id}: {} rows ({} inserted live)",
+                    live.rows.len(),
+                    live.inserted
+                );
+                assert_eq!(multiset(&live.rows), multiset(&direct), "{id}");
+                results.push(multiset(&live.rows));
+            }
+            assert_ne!(results[0], results[1], "other values, other rows");
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}

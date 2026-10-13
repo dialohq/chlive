@@ -47,7 +47,7 @@ use futures::Stream;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
-pub use chlive_protocol::{Column, Row, ServerMsg, CLIENT_ERROR};
+pub use chlive_protocol::{Column, Params, Row, ServerMsg, CLIENT_ERROR};
 pub use store::Rows;
 
 use conn::{Cmd, Event};
@@ -94,6 +94,17 @@ impl LiveClient {
     /// Subscribe to a query in the chlive dialect. Rows are deserialized into `R`
     /// (`subscribe::<Row>` keeps them as JSON). Dropping the subscription unsubscribes.
     pub fn subscribe<R: DeserializeOwned>(&self, sql: impl Into<String>) -> Subscription<R> {
+        self.subscribe_with(sql, Params::new())
+    }
+
+    /// [`subscribe`](Self::subscribe) with values for the query's parameters (`{name:Type}`),
+    /// e.g. `Params::from([("id".into(), json!(session))])`. They're sent again on every
+    /// reconnect.
+    pub fn subscribe_with<R: DeserializeOwned>(
+        &self,
+        sql: impl Into<String>,
+        params: Params,
+    ) -> Subscription<R> {
         let n = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -104,6 +115,7 @@ impl LiveClient {
             .send(Cmd::Subscribe {
                 id: id.clone(),
                 sql: sql.into(),
+                params,
                 events: tx,
             })
             .is_ok();

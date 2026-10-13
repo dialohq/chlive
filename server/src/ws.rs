@@ -66,6 +66,7 @@ struct Registry(Mutex<BTreeMap<(u64, String), Arc<Entry>>>);
 #[serde(rename_all = "camelCase")]
 struct Entry {
     sql: String,
+    params: chlive_protocol::Params,
     /// Set once subscribed: where history ends and the stream begins.
     watermark: Mutex<Option<String>>,
     /// Whether it resumed from the client's cursor rather than starting with a snapshot.
@@ -79,6 +80,8 @@ struct DebugEntry {
     conn: u64,
     id: String,
     sql: String,
+    #[serde(skip_serializing_if = "chlive_protocol::Params::is_empty")]
+    params: chlive_protocol::Params,
     watermark: Option<String>,
     resumed: bool,
     rows_sent: u64,
@@ -106,6 +109,7 @@ impl Registry {
                 conn: *conn,
                 id: id.clone(),
                 sql: e.sql.clone(),
+                params: e.params.clone(),
                 watermark: e.watermark.lock().unwrap().clone(),
                 resumed: e.resumed.load(Ordering::Relaxed),
                 rows_sent: e.rows_sent.load(Ordering::Relaxed),
@@ -157,7 +161,12 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64) {
             }
         };
         match msg {
-            ClientMsg::Subscribe { id, sql, since } => {
+            ClientMsg::Subscribe {
+                id,
+                sql,
+                since,
+                params,
+            } => {
                 if subscriptions.get(&id).is_some_and(|t| !t.is_finished()) {
                     let _ = tx
                         .send(ServerMsg::error(
@@ -171,6 +180,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64) {
                 debug!(conn, id, sql, "subscribe");
                 let entry = Arc::new(Entry {
                     sql: sql.clone(),
+                    params: params.clone(),
                     watermark: Mutex::new(None),
                     resumed: AtomicBool::new(false),
                     rows_sent: AtomicU64::new(0),
@@ -184,6 +194,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64) {
                         id: id.clone(),
                         sql,
                         since,
+                        params,
                     },
                     entry,
                     tx.clone(),
@@ -216,6 +227,7 @@ struct Request {
     id: String,
     sql: String,
     since: Option<String>,
+    params: chlive_protocol::Params,
 }
 
 async fn run(
@@ -226,11 +238,12 @@ async fn run(
         id,
         sql,
         since,
+        params,
     }: Request,
     entry: Arc<Entry>,
     tx: mpsc::Sender<ServerMsg>,
 ) {
-    let subscription = match engine.subscribe_from(&sql, since.as_deref()).await {
+    let subscription = match engine.subscribe_with(&sql, &params, since.as_deref()).await {
         Ok(s) => s,
         Err(e) => {
             debug!(conn, id, error = %e, "subscribe failed");

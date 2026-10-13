@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use chlive_protocol::{ClientMsg, ServerMsg};
+use chlive_protocol::{ClientMsg, Params, ServerMsg};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
@@ -19,6 +19,7 @@ pub(crate) enum Cmd {
     Subscribe {
         id: String,
         sql: String,
+        params: Params,
         events: mpsc::Sender<Event>,
     },
     Unsubscribe(String),
@@ -43,6 +44,7 @@ pub(crate) enum Event {
 
 struct Sub {
     sql: String,
+    params: Params,
     events: mpsc::Sender<Event>,
 }
 
@@ -62,8 +64,20 @@ enum Flow {
 fn offline(cmd: Option<Cmd>, subs: &mut BTreeMap<String, Sub>) -> Flow {
     match cmd {
         None => Flow::Stop,
-        Some(Cmd::Subscribe { id, sql, events }) => {
-            subs.insert(id, Sub { sql, events });
+        Some(Cmd::Subscribe {
+            id,
+            sql,
+            params,
+            events,
+        }) => {
+            subs.insert(
+                id,
+                Sub {
+                    sql,
+                    params,
+                    events,
+                },
+            );
             Flow::Go
         }
         Some(Cmd::Unsubscribe(id)) => {
@@ -81,11 +95,12 @@ fn text(msg: &ClientMsg) -> Message {
     Message::text(serde_json::to_string(msg).expect("client messages serialize"))
 }
 
-fn subscribe(id: &str, sql: &str) -> Message {
+fn subscribe(id: &str, sql: &str, params: &Params) -> Message {
     text(&ClientMsg::Subscribe {
         id: id.to_string(),
         sql: sql.to_string(),
         since: None,
+        params: params.clone(),
     })
 }
 
@@ -147,7 +162,11 @@ async fn connected(
 ) -> Flow {
     let (mut sink, mut stream) = ws.split();
     for (id, sub) in subs.iter() {
-        if sink.send(subscribe(id, &sub.sql)).await.is_err() {
+        if sink
+            .send(subscribe(id, &sub.sql, &sub.params))
+            .await
+            .is_err()
+        {
             return Flow::Go;
         }
         let _ = sub.events.send(Event::Subscribed).await;
@@ -165,12 +184,24 @@ async fn connected(
                     let _ = done.send(());
                     return Flow::Stop;
                 }
-                Some(Cmd::Subscribe { id, sql, events }) => {
-                    let sent = sink.send(subscribe(&id, &sql)).await.is_ok();
+                Some(Cmd::Subscribe {
+                    id,
+                    sql,
+                    params,
+                    events,
+                }) => {
+                    let sent = sink.send(subscribe(&id, &sql, &params)).await.is_ok();
                     if sent {
                         let _ = events.send(Event::Subscribed).await;
                     }
-                    subs.insert(id, Sub { sql, events });
+                    subs.insert(
+                        id,
+                        Sub {
+                            sql,
+                            params,
+                            events,
+                        },
+                    );
                     if !sent {
                         return Flow::Go;
                     }

@@ -285,6 +285,12 @@ impl LiveConn {
         self.tx.send(msg.to_string()).expect("socket open");
     }
 
+    /// Subscribe with values for the query's parameters (`{name:Type}`).
+    pub fn subscribe_with(&self, id: &str, sql: &str, params: serde_json::Value) {
+        let msg = json!({"type": "subscribe", "id": id, "sql": sql, "params": params});
+        self.tx.send(msg.to_string()).expect("socket open");
+    }
+
     /// Resume a result we hold (`rows`, complete up to the cursor `since`).
     pub fn resume(&self, id: &str, sql: &str, since: &str, rows: Vec<Row>) {
         self.results.lock().unwrap().insert(

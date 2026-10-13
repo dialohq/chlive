@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use chlive_client::{Change, ClientOptions, Kind, LiveClient, Row, Status, Subscription, Update};
+use chlive_client::{
+    Change, ClientOptions, Kind, LiveClient, Params, Row, Status, Subscription, Update,
+};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
@@ -147,6 +149,25 @@ async fn subscribes_applies_messages_and_resubscribes_after_reconnect() {
     assert_eq!(users(&u), ["h1", "e1"]);
     assert_eq!(u.stats.subscribes, 2);
     assert_eq!(u.stats.snapshots, 2);
+}
+
+#[tokio::test]
+async fn parameters_are_sent_and_sent_again_after_a_reconnect() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let sql = "select user_id from events where session_id = {s:UUID}";
+    let params = Params::from([(
+        "s".to_string(),
+        json!("ABCDEF00-0000-0000-0000-000000000001"),
+    )]);
+    let _sub = client.subscribe_with::<Row>(sql, params);
+    let expected = json!({"type": "subscribe", "id": "s1", "sql": sql,
+                          "params": {"s": "ABCDEF00-0000-0000-0000-000000000001"}});
+    let mut conn = server.next().await;
+    assert_eq!(conn.recv().await, expected);
+    conn.close().await;
+    let mut again = server.next().await;
+    assert_eq!(again.recv().await, expected);
 }
 
 #[tokio::test]

@@ -33,6 +33,10 @@ use serde::{Deserialize, Serialize};
 /// column order.
 pub type Row = serde_json::Map<String, serde_json::Value>;
 
+/// Query parameter values by name, for the query's `{name:Type}` placeholders; each is read by
+/// its declared type (`"42"` or `42` for a UInt32, a UUID in either case, …).
+pub type Params = std::collections::BTreeMap<String, serde_json::Value>;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ClientMsg {
@@ -42,6 +46,9 @@ pub enum ClientMsg {
         /// The `at` of a result the client already holds, to resume from it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since: Option<String>,
+        /// Values for the query's parameters (`{name:Type}`).
+        #[serde(default, skip_serializing_if = "Params::is_empty")]
+        params: Params,
     },
     Unsubscribe {
         id: String,
@@ -217,8 +224,21 @@ mod tests {
             round_trip(json!({"type": "subscribe", "id": "s1", "sql": "x", "since": "c"}));
         assert!(matches!(m, ClientMsg::Subscribe { since: Some(c), .. } if c == "c"));
         round_trip::<ClientMsg>(json!({"type": "unsubscribe", "id": "s1"}));
+        let m: ClientMsg = round_trip(json!({
+            "type": "subscribe", "id": "s1", "sql": "x", "params": {"id": "u1", "n": 5}
+        }));
+        assert!(matches!(m, ClientMsg::Subscribe { params, .. } if params["n"] == 5));
+        // no params: none sent
+        let m: ClientMsg = serde_json::from_value(
+            json!({"type": "subscribe", "id": "s1", "sql": "x", "params": {}}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            json!({"type": "subscribe", "id": "s1", "sql": "x"})
+        );
         assert!(serde_json::from_value::<ClientMsg>(
-            json!({"type": "subscribe", "id": "s1", "sql": "x", "params": {}})
+            json!({"type": "subscribe", "id": "s1", "sql": "x", "nope": 1})
         )
         .is_err());
     }

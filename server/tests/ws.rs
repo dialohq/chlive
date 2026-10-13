@@ -210,6 +210,35 @@ async fn snapshot_then_inserts_of_matching_events() {
 }
 
 #[tokio::test]
+async fn parameters_are_bound_by_their_declared_types() {
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+    // `l` comes as a string and is read as the UInt32 it's declared as; only "slower" (700) is
+    // above it
+    c.send(json!({"type": "subscribe", "id": "s1",
+                  "sql": "select user_id, latency_ms from requests where latency_ms > {l:UInt32}",
+                  "params": {"l": "600"}}))
+        .await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    assert_eq!(
+        c.inserts("s1", 1).await,
+        [json!({"user_id": "slower", "latency_ms": 700})]
+    );
+    c.subscribe("s2", "select * from requests where latency_ms > {l:UInt32}")
+        .await;
+    assert_eq!(
+        c.expect().await,
+        json!({"type": "error", "id": "s2", "code": "INVALID_QUERY",
+               "message": "missing parameter l at 1:43"})
+    );
+    let listed: Value = serde_json::from_str(
+        &http_get(&format!("http://{}/debug/subscriptions", server.addr)).await,
+    )
+    .unwrap();
+    assert_eq!(listed[0]["params"], json!({"l": "600"}));
+}
+
+#[tokio::test]
 async fn subscriptions_on_one_connection_are_independent() {
     let server = server().await;
     let mut c = Client::connect(&server).await;
@@ -280,7 +309,7 @@ async fn errors() {
     let m = c.expect().await;
     assert_eq!(m["code"], "BAD_MESSAGE");
     assert!(m.get("id").is_none());
-    c.send(json!({"type": "subscribe", "id": "p", "sql": "select * from requests", "params": {}}))
+    c.send(json!({"type": "subscribe", "id": "p", "sql": "select * from requests", "nope": {}}))
         .await;
     assert_eq!(c.expect().await["code"], "BAD_MESSAGE");
 
