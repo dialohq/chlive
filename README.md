@@ -102,9 +102,17 @@ produce events '{"user_id": "u7", "latency_ms": 900}'  # one event per JSON argu
 The full grammar is under [Supported queries](#supported-queries). A condition can use:
 - comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), with `AND`, `OR`, `NOT` and parentheses;
 - `IS [NOT] NULL` and `[NOT] IN (…)`;
-- operands that are columns or literals: numbers, strings, `TRUE`/`FALSE`.
+- operands that are columns or literals: numbers, strings, `TRUE`/`FALSE`, or parameters.
 
 Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
+
+**Parameters** work as in ClickHouse: `WHERE session_id = {s:UUID} AND latency_ms > {l:UInt32}`, with the values sent separately (`params` in the protocol and the clients, `--param s=…` for `engine`).
+- They're allowed wherever a literal is in WHERE: comparisons, `IN (…)` items and `IS NULL`, in sub-queries too.
+- Each value is read by its declared type, with the rules event JSON is read by. `"ABCDEF00-…"` is a UUID, normalized; `100` or `"100"` is a UInt32; `null` is accepted only for a `Nullable(…)` type.
+- The declared type must be comparable with the column, as a literal must.
+- Errors point at the placeholder: a missing value, one that doesn't fit its type, an unsupported type, or one name declared with two types. A value the query doesn't use is an error too, to catch typos.
+- **Bound as literals.** Values become typed literals at bind time. The history query has them inlined, escaped by their type (`toUUID('…')`), and nothing is sent to ClickHouse as a parameter. A cursor taken with other values doesn't resume.
+- **Not yet:** arrays (`IN {ids:Array(UUID)}`), parameters in LIMIT/OFFSET, and `Identifier`.
 
 **ORDER BY** takes columns (selected or not), each with `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST`, or `ALL`, which sorts by the SELECT list in SELECT order, as in ClickHouse. Positions, expressions, `COLLATE` and `WITH FILL` aren't supported yet. The order is **managed**:
 - **Semantics match ClickHouse.** NULLs default to last in both directions; NaN sits between the values and the NULLs; strings compare by bytes; `-0` ties with `0`. The history query always spells out each key's direction and NULL placement.
@@ -145,15 +153,23 @@ Each iteration prints its diff: first the history (`+ {row}` per ClickHouse row,
 // React
 import { useLiveQuery } from "@chlive/client/react";
 const { status, rows, error } = useLiveQuery<Event>(sql); // error: { code, message }
+// with parameters, and only once there's a session to watch
+const q = useLiveQuery<Event>("select * from events where session_id = {s:UUID}", {
+  params: { s: sessionId },
+  enabled: sessionId !== undefined,
+});
 
 // without React
 import { LiveClient } from "@chlive/client";
 const live = new LiveClient({ url: "ws://localhost:8080/live", cache: true });
-const sub = live.subscribe(sql, (s) => render(s.status, s.rows, s.error));
+const sub = live.subscribe(sql, (s) => render(s.status, s.rows, s.error), { params });
 sub.unsubscribe();
 ```
 
-`status` is `loading` (nothing yet), `cached` (rows from the offline cache, being caught up), `live` or `error`. Rows are exactly the selected columns, in the query's order, so columns come from the rows themselves; the row type is the hook's type parameter. ORDER BY and LIMIT are already applied to `rows`. One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes from where it was.
+`status` is `loading` (nothing yet), `cached` (rows from the offline cache, being caught up), `live`, `error`, or, from the hooks, `idle`.
+- **`enabled: false`** makes a hook subscribe to nothing, the way TanStack Query's `enabled` holds off a fetch: hooks can't be called conditionally. Its status is then `idle`: with no rows if it never ran, or with its last rows (frozen) if it was turned off.
+- **`params`** resubscribe only when their values change; a new object with the same values doesn't. A `Date` is sent in ClickHouse's form (UTC), a `bigint` as its digits.
+- **The offline cache** keeps results per query and parameter values. Rows are exactly the selected columns, in the query's order, so columns come from the rows themselves; the row type is the hook's type parameter. ORDER BY and LIMIT are already applied to `rows`. One socket carries all of a client's subscriptions; it reconnects with backoff and resubscribes from where it was.
 
 **Values are parsed by column type.** By default, `Date`, `Date32`, `DateTime` and `DateTime64` columns arrive as JS `Date`s. They're read as UTC, and DateTime64 is cut to the millisecond, since a `Date` holds no more. The `parsers` option sets how a ClickHouse type (its base name) becomes a row value, and is merged over the defaults:
 
@@ -193,6 +209,7 @@ struct Slow { user_id: String, latency_ms: u32 }
 
 let client = LiveClient::new(ClientOptions::new("ws://127.0.0.1:8080/live"));
 let mut sub = client.subscribe::<Slow>("select user_id, latency_ms from events order by latency_ms desc limit 5");
+// with parameters: client.subscribe_with::<Row>(sql, Params::from([("s".into(), json!(session))]))
 while let Some(u) = sub.next().await {
     if let Status::Error(e) = &u.status { eprintln!("{e}"); break; }
     for change in &u.changes {
@@ -219,6 +236,7 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 ```jsonc
 // client → server
 {"type": "subscribe", "id": "s1", "sql": "select user_id, latency_ms from events where latency_ms > 100"}
+{"type": "subscribe", "id": "s2", "sql": "select * from events where session_id = {s:UUID}", "params": {"s": "abcdef00-…"}}
 {"type": "unsubscribe", "id": "s1"}
 // server → client
 {"type": "snapshot", "id": "s1", "columns": [{"name": "user_id", "type": "String"}, …], "rows": [{"user_id": "u1", "latency_ms": 340}, …]}

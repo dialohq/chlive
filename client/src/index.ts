@@ -1,5 +1,5 @@
 import type { ValueParsers } from "./parsers.ts";
-import type { ClientMessage, DiffMessage, Row, ServerMessage } from "./protocol.ts";
+import type { ClientMessage, DiffMessage, Params, Row, ServerMessage } from "./protocol.ts";
 import { type CachedResult, ResultStore } from "./state.ts";
 
 export type * from "./protocol.ts";
@@ -17,9 +17,11 @@ export {
  * - `loading`: nothing to show yet;
  * - `cached`: rows from the cache, while the server catches them up;
  * - `live`: up to date, and following changes;
- * - `error`: see `error`.
+ * - `error`: see `error`;
+ * - `idle` (the React hooks with `enabled: false`): not subscribed; the rows, if any, are the
+ *   last ones it had, no longer updated.
  */
-export type Status = "loading" | "cached" | "live" | "error";
+export type Status = "loading" | "cached" | "live" | "error" | "idle";
 
 /** Why a subscription failed; after an error it gets no more updates. */
 export interface LiveError {
@@ -124,6 +126,14 @@ export interface Subscription {
   unsubscribe(): void;
 }
 
+export interface SubscribeOptions {
+  /**
+   * Values for the query's parameters (`{name:Type}`), read by their declared types. A `Date`
+   * is sent as ClickHouse's `YYYY-MM-DD hh:mm:ss.fff` (UTC), a `bigint` as its digits.
+   */
+  params?: Params;
+}
+
 export interface LiveClientOptions {
   /** e.g. `ws://localhost:8080/live` */
   url: string;
@@ -153,6 +163,10 @@ export interface LiveClientOptions {
 interface SubRecord {
   id: string;
   sql: string;
+  /** As sent (serialized); undefined without any. */
+  params: Params | undefined;
+  /** What the cache keeps the result under: the query, with its params if any. */
+  key: string;
   store: ResultStore<any>;
   state: LiveState<any>;
   stats: SubscriptionStats;
@@ -240,12 +254,15 @@ export class LiveClient {
     };
   }
 
-  subscribe<R extends Row = Row>(sql: string, listener: Listener<R>): Subscription {
+  subscribe<R extends Row = Row>(sql: string, listener: Listener<R>, opts: SubscribeOptions = {}): Subscription {
     if (this.closed) throw new Error("LiveClient is closed");
     const id = `s${this.nextId++}`;
+    const params = serializeParams(opts.params);
     const rec: SubRecord = {
       id,
       sql,
+      params,
+      key: cacheKey(sql, params),
       store: new ResultStore<R>({ parsers: this.opts.parsers }),
       state: { status: "loading", rows: [], stats: newStats(id) },
       stats: newStats(id),
@@ -262,7 +279,7 @@ export class LiveClient {
     if (this.cacheReady) {
       const started = performance.now();
       this.cacheReady
-        .then((cache) => cache?.load(sql))
+        .then((cache) => cache?.load(rec.key))
         .catch((e) => {
           console.warn("chlive: reading the cache failed", e);
           return undefined;
@@ -349,6 +366,7 @@ export class LiveClient {
     if (!rec.ready) return;
     const msg: ClientMessage = { type: "subscribe", id: rec.id, sql: rec.sql };
     if (rec.store.at !== undefined) msg.since = rec.store.at;
+    if (rec.params) msg.params = rec.params;
     if (this.send(msg)) rec.stats = { ...rec.stats, subscribes: rec.stats.subscribes + 1 };
   }
 
@@ -482,7 +500,7 @@ export class LiveClient {
       ids: rec.store.ids().some((id) => id !== undefined) ? rec.store.ids() : undefined,
     };
     rec.saved = true;
-    this.queue(rec, (cache) => cache.save(rec.sql, result));
+    this.queue(rec, (cache) => cache.save(rec.key, result));
   }
 
   /** Appends (their rows as they came over the wire) go straight to the cache; anything else
@@ -491,7 +509,7 @@ export class LiveClient {
     const appendOnly = msg.changes.every((c) => c.op === "insert" && c.index === undefined);
     if (appendOnly && rec.saved && !rec.saveTimer) {
       const rows = msg.changes.map((c) => (c as { row: Row }).row);
-      this.queue(rec, (cache) => cache.append(rec.sql, rows, msg.at));
+      this.queue(rec, (cache) => cache.append(rec.key, rows, msg.at));
     } else {
       this.scheduleSave(rec);
     }
@@ -500,7 +518,7 @@ export class LiveClient {
   private persistCursor(rec: SubRecord): void {
     const at = rec.store.at;
     if (at === undefined || !rec.saved || rec.saveTimer) return; // a pending save carries it
-    this.queue(rec, (cache) => cache.setCursor(rec.sql, at));
+    this.queue(rec, (cache) => cache.setCursor(rec.key, at));
   }
 
   // -------------------------------------------------------------------------------------------
@@ -520,6 +538,35 @@ async function openCache(opt: true | CacheOptions | ResultCache): Promise<Result
   if (opt !== true && typeof (opt as ResultCache).load === "function") return opt as ResultCache;
   const { createOpfsCache } = await import("./cache/index.ts");
   return createOpfsCache(opt === true ? {} : (opt as CacheOptions));
+}
+
+/** Params as sent: `Date`s in ClickHouse's form (UTC), `bigint`s as digits; `undefined` if none. */
+export function serializeParams(params: Params | undefined): Params | undefined {
+  if (!params || Object.keys(params).length === 0) return undefined;
+  const out: Params = {};
+  for (const [k, v] of Object.entries(params)) {
+    out[k] =
+      v instanceof Date
+        ? v.toISOString().replace("T", " ").replace("Z", "")
+        : typeof v === "bigint"
+          ? v.toString()
+          : v;
+  }
+  return out;
+}
+
+/** JSON with object keys sorted, so the same params always give the same text. */
+export function stableJson(v: unknown): string {
+  return JSON.stringify(v, (_, x) =>
+    x && typeof x === "object" && !Array.isArray(x)
+      ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : x,
+  );
+}
+
+/** What a result is cached under: the query alone without params (as before params existed). */
+export function cacheKey(sql: string, params: Params | undefined): string {
+  return params ? `${sql}\u0000${stableJson(params)}` : sql;
 }
 
 function newStats(id: string): SubscriptionStats {

@@ -357,3 +357,35 @@ test("custom parsers apply, and one that throws fails the subscription", () => {
   assert.equal(last!.rows.length, 1);
   client.close();
 });
+
+// --- query parameters -------------------------------------------------------------------------
+
+test("params are sent with every (re)subscribe, Dates and bigints serialized", async () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", minBackoffMs: 5, WebSocket: FakeSocket as any });
+  const sql = "select * from events where ts > {t:DateTime64(3)} and n = {n:UInt64} and s = {s:String}";
+  client.subscribe(sql, () => {}, { params: { t: new Date("2026-10-01T12:00:00.250Z"), n: 2n ** 63n, s: "x" } });
+  const params = { t: "2026-10-01 12:00:00.250", n: "9223372036854775808", s: "x" };
+  FakeSocket.all[0].open();
+  assert.deepEqual(FakeSocket.all[0].sent, [{ type: "subscribe", id: "s1", sql, params }]);
+  FakeSocket.all[0].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [], at: "c1" });
+  FakeSocket.all[0].close();
+  await tick(20);
+  FakeSocket.all[1].open();
+  assert.deepEqual(FakeSocket.all[1].sent, [{ type: "subscribe", id: "s1", sql, params, since: "c1" }]);
+  client.close();
+});
+
+test("results are cached per params; without params, under the query alone", async () => {
+  FakeSocket.all = [];
+  const { cache, calls } = memoryCache();
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, saveDelayMs: 1 });
+  const sql = "select user_id from events where user_id = {u:String}";
+  client.subscribe(sql, () => {}, { params: { u: "a" } });
+  client.subscribe(sql, () => {}, { params: { u: "b" } });
+  client.subscribe(SQL, () => {});
+  client.subscribe(sql, () => {}, { params: {} });
+  await tick(5);
+  assert.deepEqual(calls, [`load ${sql}\u0000{"u":"a"}`, `load ${sql}\u0000{"u":"b"}`, `load ${SQL}`, `load ${sql}`]);
+  client.close();
+});

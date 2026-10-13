@@ -30,6 +30,11 @@ const QUERY_PRESETS = [
   "select * from events where country = 'PL'",
   "select session_id, count() as n, max(latency_ms) from events group by session_id order by n desc limit 10",
   "select ts, user_id, session_id, path from events where session_id = '0d1c2b3a-0000-4000-8000-00000000000a' order by ts desc",
+  // with parameters: values come separately, typed as declared
+  {
+    sql: "select ts, user_id, session_id, latency_ms from events where session_id = {s:UUID} and latency_ms > {l:UInt32} order by ts desc",
+    params: { s: "0D1C2B3A-0000-4000-8000-00000000000A", l: 100 },
+  },
   "select ts, user_id, path, amount from events where amount > 0 and country in ('DE', 'FR')",
   "select ts, order_id, customer_id, amount from orders where amount > 100",
   "select * from customers",
@@ -338,11 +343,31 @@ function summarize(msg) {
 const LOG = 30;
 const RATE_WINDOW_MS = 5000;
 
+// Whether "Client state" is expanded: changed only by clicking it, and kept across queries (each
+// result remounts the panel) and reloads.
+const DEBUG_OPEN_KEY = "chlive.playground.debugOpen";
+let debugOpen = (() => {
+  try {
+    return localStorage.getItem(DEBUG_OPEN_KEY) !== "false";
+  } catch {
+    return true;
+  }
+})();
+const rememberDebugOpen = (open) => {
+  debugOpen = open;
+  try {
+    localStorage.setItem(DEBUG_OPEN_KEY, String(open));
+  } catch {
+    // storage unavailable: remembered for this page only
+  }
+};
+
 /** What the client holds for this subscription, and what arrived lately. */
 function Debug({ state, sql, shown }) {
   const { stats, rows, status } = state;
   const [log, setLog] = useState([]); // newest first
   const [open, setOpen] = useState(null); // index into log
+  const [expanded, setExpanded] = useState(debugOpen);
   const [now, setNow] = useState(Date.now());
   const samples = useRef([]); // [time, inserts total]
 
@@ -365,7 +390,14 @@ function Debug({ state, sql, shown }) {
   const opened = open !== null ? log[open] : null;
 
   return (
-    <details className="debug" open>
+    <details
+      className="debug"
+      open={expanded}
+      onToggle={(e) => {
+        rememberDebugOpen(e.currentTarget.open);
+        setExpanded(e.currentTarget.open);
+      }}
+    >
       <summary>Client state</summary>
       <table className="kv">
         <tbody>
@@ -504,10 +536,10 @@ const truncate = (s, n) => (s.length > n ? s.slice(0, n) + `\n… ${s.length - n
 // columns from the rows themselves: each row has exactly the selected columns, in order
 const columnsOf = (rows) => Object.keys(rows[0] ?? {});
 
-function Result({ sql }) {
-  // an app would use `useLiveQuery(sql)`: just `{ status, rows, error }`; this one also shows the
-  // client's internals
-  const state = useLiveQueryDebug(sql);
+function Result({ sql, params, enabled }) {
+  // an app would use `useLiveQuery(sql, { params, enabled })`: just `{ status, rows, error }`;
+  // this one also shows the client's internals
+  const state = useLiveQueryDebug(sql, { params, enabled });
   const { rows, status, error } = state;
   const columns = columnsOf(rows);
   // ordered or limited results as they are (a LIMIT window has its newest row last); unordered
@@ -548,35 +580,65 @@ function Result({ sql }) {
   );
 }
 
+const presetSql = (p) => (typeof p === "string" ? p : p.sql);
+
 function Query() {
   const [draft, setDraft] = useState(QUERY_PRESETS[0]);
+  const [paramsDraft, setParamsDraft] = useState("");
   const [sql, setSql] = useState(QUERY_PRESETS[0]);
-  const run = (q) => {
+  const [params, setParams] = useState(undefined);
+  const [paramsError, setParamsError] = useState(null);
+  const [enabled, setEnabled] = useState(true);
+  const run = (q, paramsText) => {
+    let parsed;
+    try {
+      parsed = paramsText.trim() ? JSON.parse(paramsText) : undefined;
+    } catch (e) {
+      setParamsError(`params: ${e.message}`);
+      return;
+    }
+    setParamsError(null);
     setDraft(q);
+    setParamsDraft(paramsText);
     setSql(q);
+    setParams(parsed);
   };
+  const runPreset = (p) => run(presetSql(p), typeof p === "string" ? "" : JSON.stringify(p.params));
   return (
     <section className="query">
       <h2>Live query</h2>
       <p>
         {QUERY_PRESETS.map((q) => (
-          <button key={q} className="preset" onClick={() => run(q)}>
-            {q}
+          <button key={presetSql(q)} className="preset" onClick={() => runPreset(q)}>
+            {presetSql(q)}
+            {typeof q === "string" ? "" : ` · ${JSON.stringify(q.params)}`}
           </button>
         ))}
       </p>
       <textarea
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => (e.metaKey || e.ctrlKey) && e.key === "Enter" && run(draft)}
+        onKeyDown={(e) => (e.metaKey || e.ctrlKey) && e.key === "Enter" && run(draft, paramsDraft)}
         rows={3}
         spellCheck={false}
       />
+      <input
+        className="params"
+        placeholder='params, as JSON: {"s": "…", "l": 100}'
+        value={paramsDraft}
+        onChange={(e) => setParamsDraft(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && run(draft, paramsDraft)}
+        spellCheck={false}
+      />
       <p>
-        <button onClick={() => run(draft)}>Run</button> <small>(⌘/Ctrl+Enter)</small>
+        <button onClick={() => run(draft, paramsDraft)}>Run</button> <small>(⌘/Ctrl+Enter)</small>{" "}
+        <label>
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> enabled
+        </label>
+        {paramsError && <span className="error"> {paramsError}</span>}
       </p>
-      {/* a new key per query: its result starts from a fresh snapshot */}
-      <Result key={sql} sql={sql} />
+      {/* a new key per query: its result starts from a fresh snapshot; new params resubscribe */}
+      <Result key={sql} sql={sql} params={params} enabled={enabled} />
     </section>
   );
 }

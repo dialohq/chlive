@@ -15,9 +15,14 @@ export interface Column {
   type: string;
 }
 
+/** Values for a query's parameters (`{name:Type}`), by name; each is read by its declared type
+ * (`"42"` or `42` for a UInt32, a UUID in either case, …). */
+export type Params = Record<string, unknown>;
+
 export type ClientMessage =
-  /** `since`: the `at` of a result the client already holds (e.g. cached), to resume from it. */
-  | { type: "subscribe"; id: string; sql: string; since?: string }
+  /** `since`: the `at` of a result the client already holds (e.g. cached), to resume from it.
+   * `params`: values for the query's parameters. */
+  | { type: "subscribe"; id: string; sql: string; since?: string; params?: Params }
   | { type: "unsubscribe"; id: string };
 
 /**
