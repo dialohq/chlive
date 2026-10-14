@@ -8,11 +8,12 @@ use super::SnapshotError;
 
 #[async_trait]
 pub trait Cloner: Send + Sync {
-    /// Clone `database.source` as `database.clone`, with all its data.
+    /// Clone `database.source` as `clone_database.clone`, with all its data.
     async fn clone_table(
         &self,
         database: &str,
         source: &str,
+        clone_database: &str,
         clone: &str,
     ) -> Result<(), SnapshotError>;
     /// Drop `database.name`, if it exists.
@@ -78,10 +79,11 @@ impl Cloner for ClickHouseCloner {
         &self,
         database: &str,
         source: &str,
+        clone_database: &str,
         clone: &str,
     ) -> Result<(), SnapshotError> {
         let src = format!("{}.{}", ident(database), ident(source));
-        let dst = format!("{}.{}", ident(database), ident(clone));
+        let dst = format!("{}.{}", ident(clone_database), ident(clone));
         // a replica must have every part the connector inserted before its offsets were read
         let engine = self
             .query(&format!(

@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chlive_engine::diff::Row;
 use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
-use chlive_engine::rules::HardcodedRules;
+use chlive_engine::rules::ConfiguredRules;
 use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Snapshots};
 use chlive_engine::source::MemorySource;
 use chlive_engine::watermark::Watermark;
@@ -125,7 +125,7 @@ const SQL: &str =
 
 async fn run(fake: &Fake, refresh: Duration) -> Vec<String> {
     let engine = Engine::new(
-        HardcodedRules::default(),
+        ConfiguredRules::default(),
         fake.clone(),
         source(),
         fake.clone(),
@@ -208,7 +208,7 @@ async fn not_while_the_newer_snapshot_is_ahead_of_the_stream() {
 async fn exists_plans_like_in() {
     let fake = Fake::default();
     let engine = Engine::new(
-        HardcodedRules::default(),
+        ConfiguredRules::default(),
         fake.clone(),
         source(),
         fake.clone(),
@@ -236,7 +236,7 @@ async fn uncorrelated_exists_lets_everything_in_once_the_sub_query_has_a_row() {
     let mut with_xx = source();
     with_xx.push("users", 0, r#"{"id": "u9", "country": "XX"}"#);
     let engine = Engine::new(
-        HardcodedRules::default(),
+        ConfiguredRules::default(),
         fake.clone(),
         with_xx,
         fake.clone(),
@@ -268,7 +268,7 @@ async fn uncorrelated_exists_lets_everything_in_once_the_sub_query_has_a_row() {
     // already true at subscribe time: the history has everything, nothing is kept back
     let fake = Fake::default();
     let engine = Engine::new(
-        HardcodedRules::default(),
+        ConfiguredRules::default(),
         fake.clone(),
         source(),
         fake.clone(),

@@ -3,6 +3,7 @@
 //! A subscription yields the history from ClickHouse first, then one [`Iteration`] per event of
 //! the topics the query needs, each carrying the diffs it produced.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -22,7 +23,7 @@ use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
 use crate::order::{HeldWindow, OffsetState, OrderedState, SortKey, WindowState};
 use crate::parser::parse;
 use crate::plan::{plan, AggregatePlan, Plan, StreamPlan};
-use crate::rules::{HardcodedRules, NamingRules, TopicId};
+use crate::rules::{ConfigError, ConfiguredRules, NamingRules, TablesConfig, TopicId};
 use crate::snapshot::{
     ClickHouseCloner, Lease, PauseServer, SnapshotConfig, SnapshotError, SnapshotManager, Snapshots,
 };
@@ -60,10 +61,14 @@ pub struct Config {
     /// Reads history (needs SELECT on the tables and their snapshots).
     pub user: String,
     pub password: String,
-    /// ClickHouse database that dialect tables map to.
-    pub database: String,
+    /// Which tables queries can use, and where they live (ClickHouse, topics, columns).
+    pub tables: TablesConfig,
     /// Kafka bootstrap servers, e.g. `127.0.0.1:9092`.
     pub kafka_brokers: String,
+    /// librdkafka properties for every Kafka client (TLS, SASL, …).
+    pub kafka_properties: BTreeMap<String, String>,
+    /// How often topics' partitions are reloaded.
+    pub metadata_refresh: Duration,
     /// ClickHouse's native protocol address, for chDB's `remote()` (aggregates).
     pub clickhouse_native: String,
     /// The pause server (continuous-backup's), e.g. `http://127.0.0.1:18091`.
@@ -78,12 +83,14 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            clickhouse_url: "http://127.0.0.1:18123".into(),
+            clickhouse_url: "http://127.0.0.1:8123".into(),
             user: "default".into(),
             password: String::new(),
-            database: "default".into(),
+            tables: TablesConfig::default(),
             kafka_brokers: "127.0.0.1:9092".into(),
-            clickhouse_native: "127.0.0.1:19000".into(),
+            kafka_properties: BTreeMap::new(),
+            metadata_refresh: crate::source::METADATA_REFRESH,
+            clickhouse_native: "127.0.0.1:9000".into(),
             pause_server_url: "http://127.0.0.1:18091".into(),
             snapshot_user: "default".into(),
             snapshot_password: String::new(),
@@ -111,9 +118,11 @@ struct Native {
 }
 
 impl Engine {
-    /// The standard setup from a [`Config`]. Starts the snapshot task, so it must run inside a
-    /// tokio runtime.
-    pub fn connect(config: Config) -> Self {
+    /// The standard setup from a [`Config`]; fails on an invalid table mapping. Starts the
+    /// snapshot task, so it must run inside a tokio runtime.
+    pub fn connect(config: Config) -> Result<Self, ConfigError> {
+        let rules = ConfiguredRules::new(config.tables)?;
+        let semi_refresh = config.snapshots.refresh;
         let snapshots = SnapshotManager::start(
             Arc::new(PauseServer::new(&config.pause_server_url)),
             Arc::new(ClickHouseCloner::new(
@@ -123,20 +132,22 @@ impl Engine {
             )),
             config.snapshots,
         );
-        Self::new(
-            HardcodedRules {
-                database: config.database,
-            },
+        Ok(Self::new(
+            rules,
             ClickHouseHttp::new(&config.clickhouse_url, &config.user, &config.password),
-            KafkaSource::new(&config.kafka_brokers),
+            KafkaSource::with_options(
+                &config.kafka_brokers,
+                config.kafka_properties,
+                config.metadata_refresh,
+            ),
             snapshots,
         )
-        .with_semi_refresh(config.snapshots.refresh)
-        .with_clickhouse_native(&config.clickhouse_native, &config.user, &config.password)
+        .with_semi_refresh(semi_refresh)
+        .with_clickhouse_native(&config.clickhouse_native, &config.user, &config.password))
     }
 
     /// Where chDB reads aggregate states from main ClickHouse (`remote()`, native protocol);
-    /// default `127.0.0.1:19000` as `default` without a password.
+    /// default `127.0.0.1:9000` as `default` without a password.
     pub fn with_clickhouse_native(mut self, address: &str, user: &str, password: &str) -> Self {
         self.native = Native {
             address: address.into(),
@@ -166,7 +177,7 @@ impl Engine {
             source: Arc::new(source),
             snapshots: Arc::new(snapshots),
             native: Native {
-                address: "127.0.0.1:19000".into(),
+                address: "127.0.0.1:9000".into(),
                 user: "default".into(),
                 password: String::new(),
             },

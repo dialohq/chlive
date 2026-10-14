@@ -97,7 +97,8 @@ export interface DiffMessage {
 /**
  * `SYNTAX_ERROR` and `INVALID_QUERY` are problems with the query (the message ends with
  * `at line:column`); `HISTORY_FAILED` / `STREAM_FAILED` are ClickHouse / Kafka problems;
- * `BAD_MESSAGE` (no id) and `DUPLICATE_ID` are protocol misuse.
+ * `BAD_MESSAGE` (no id) and `DUPLICATE_ID` are protocol misuse; `TOO_MANY_SUBSCRIPTIONS`: the
+ * connection is at the server's `max_subscriptions_per_connection`.
  */
 export interface ErrorMessage {
   type: "error";

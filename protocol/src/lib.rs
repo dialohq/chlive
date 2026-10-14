@@ -167,6 +167,8 @@ pub enum Change {
 pub const BAD_MESSAGE: &str = "BAD_MESSAGE";
 /// A `subscribe` with an id already in use on the connection.
 pub const DUPLICATE_ID: &str = "DUPLICATE_ID";
+/// A `subscribe` beyond the server's `max_subscriptions_per_connection`.
+pub const TOO_MANY_SUBSCRIPTIONS: &str = "TOO_MANY_SUBSCRIPTIONS";
 /// The query's syntax (the message ends with `at line:column`).
 pub const SYNTAX_ERROR: &str = "SYNTAX_ERROR";
 /// The query doesn't fit the tables (the message ends with `at line:column`).

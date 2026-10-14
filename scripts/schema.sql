@@ -48,3 +48,9 @@ CREATE USER IF NOT EXISTS chlive_snap IDENTIFIED WITH plaintext_password BY 'chl
 GRANT SELECT, INSERT, CREATE TABLE, DROP TABLE, ALTER ON default.* TO chlive_snap;
 GRANT SYSTEM SYNC REPLICA ON default.* TO chlive_snap;
 GRANT SELECT ON system.tables TO chlive_snap;
+
+-- Where the dev server makes its snapshots (`clickhouse.snapshot_database` in
+-- nix/chlive.dev.toml): clones are created and dropped there, and history is read from them.
+CREATE DATABASE IF NOT EXISTS chlive_snapshots;
+GRANT SELECT, INSERT, CREATE TABLE, DROP TABLE, ALTER ON chlive_snapshots.* TO chlive_snap;
+GRANT SELECT ON chlive_snapshots.* TO chlive_ro;

@@ -120,6 +120,7 @@ impl TopicCache {
 /// fetched at start and refreshed in the background.
 struct Metadata {
     brokers: String,
+    properties: BTreeMap<String, String>,
     /// Created on first use. An admin client polls itself (a consumer would have to be polled).
     client: Mutex<Option<Arc<AdminClient<DefaultClientContext>>>>,
     cache: RwLock<TopicCache>,
@@ -136,8 +137,7 @@ impl Metadata {
         if let Some(c) = client.as_ref() {
             return Ok(c.clone());
         }
-        let c: AdminClient<DefaultClientContext> = ClientConfig::new()
-            .set("bootstrap.servers", &self.brokers)
+        let c: AdminClient<DefaultClientContext> = admin_config(&self.brokers, &self.properties)
             .create()
             .map_err(|e| SourceError(format!("creating the metadata client: {e}")))?;
         let c = Arc::new(c);
@@ -218,6 +218,9 @@ async fn refresh(metadata: Weak<Metadata>, every: Duration) {
 /// [`METADATA_REFRESH`], so subscribing doesn't ask Kafka.
 pub struct KafkaSource {
     brokers: String,
+    /// librdkafka properties for every client (TLS, SASL, …).
+    properties: BTreeMap<String, String>,
+    metadata_refresh: Duration,
     metadata: Arc<Metadata>,
 }
 
@@ -230,8 +233,20 @@ impl KafkaSource {
     /// inside a tokio runtime; otherwise (and if it falls behind) a lookup on a cache older
     /// than three intervals fetches anew.
     pub fn with_metadata_refresh(brokers: &str, every: Duration) -> Self {
+        Self::with_options(brokers, BTreeMap::new(), every)
+    }
+
+    /// With librdkafka `properties` for every client it creates (they override chlive's own
+    /// settings, except the ones its consumers rely on: see [`consumer_config`]).
+    pub fn with_options(
+        brokers: &str,
+        properties: BTreeMap<String, String>,
+        metadata_refresh: Duration,
+    ) -> Self {
+        let every = metadata_refresh;
         let metadata = Arc::new(Metadata {
             brokers: brokers.to_string(),
+            properties: properties.clone(),
             client: Mutex::new(None),
             cache: RwLock::new(TopicCache::default()),
             fetching: tokio::sync::Mutex::new(()),
@@ -243,8 +258,15 @@ impl KafkaSource {
         }
         Self {
             brokers: brokers.to_string(),
+            properties,
+            metadata_refresh,
             metadata,
         }
+    }
+
+    /// How often the topics' partitions are reloaded.
+    pub fn metadata_refresh(&self) -> Duration {
+        self.metadata_refresh
     }
 
     /// How many metadata fetches this source has made (for tests).
@@ -254,16 +276,35 @@ impl KafkaSource {
     }
 
     fn config(&self) -> ClientConfig {
-        let mut c = ClientConfig::new();
-        c.set("bootstrap.servers", &self.brokers)
-            // required by librdkafka even with manual assignment; nothing is committed
-            .set("group.id", format!("chlive-engine-{}", std::process::id()))
-            .set("enable.auto.commit", "false")
-            .set("enable.auto.offset.store", "false")
-            .set("allow.auto.create.topics", "false")
-            .set("fetch.wait.max.ms", "10");
-        c
+        consumer_config(&self.brokers, &self.properties)
     }
+}
+
+/// The metadata client's settings: the brokers, then `properties`.
+pub fn admin_config(brokers: &str, properties: &BTreeMap<String, String>) -> ClientConfig {
+    let mut c = ClientConfig::new();
+    c.set("bootstrap.servers", brokers);
+    for (k, v) in properties {
+        c.set(k, v);
+    }
+    c
+}
+
+/// A subscription's consumer: chlive's settings, then `properties` over them, then the ones
+/// it relies on again (nothing is ever committed; offsets are assigned).
+pub fn consumer_config(brokers: &str, properties: &BTreeMap<String, String>) -> ClientConfig {
+    let mut c = ClientConfig::new();
+    c.set("bootstrap.servers", brokers)
+        // required by librdkafka even with manual assignment; nothing is committed
+        .set("group.id", format!("chlive-engine-{}", std::process::id()))
+        .set("allow.auto.create.topics", "false")
+        .set("fetch.wait.max.ms", "10");
+    for (k, v) in properties {
+        c.set(k, v);
+    }
+    c.set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false");
+    c
 }
 
 #[async_trait]
@@ -481,6 +522,48 @@ impl<'de> Visitor<'de> for Pruned<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kafka_properties_apply_over_chlives_but_not_over_what_consumers_rely_on() {
+        let props: BTreeMap<String, String> = [
+            ("security.protocol", "SASL_SSL"),
+            ("fetch.wait.max.ms", "50"),
+            ("enable.auto.commit", "true"),
+            ("enable.auto.offset.store", "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        let c = consumer_config("b:9092", &props);
+        assert_eq!(c.get("bootstrap.servers"), Some("b:9092"));
+        assert_eq!(c.get("security.protocol"), Some("SASL_SSL"));
+        assert_eq!(c.get("fetch.wait.max.ms"), Some("50"), "overrides chlive's");
+        assert_eq!(
+            c.get("enable.auto.commit"),
+            Some("false"),
+            "never committed"
+        );
+        assert_eq!(c.get("enable.auto.offset.store"), Some("false"));
+        assert_eq!(c.get("allow.auto.create.topics"), Some("false"));
+        // without properties: chlive's settings
+        let plain = consumer_config("b:9092", &BTreeMap::new());
+        assert_eq!(plain.get("fetch.wait.max.ms"), Some("10"));
+        assert_eq!(plain.get("security.protocol"), None);
+        let admin = admin_config("b:9092", &props);
+        assert_eq!(admin.get("bootstrap.servers"), Some("b:9092"));
+        assert_eq!(admin.get("security.protocol"), Some("SASL_SSL"));
+    }
+
+    #[tokio::test]
+    async fn metadata_refresh_defaults_and_can_be_set() {
+        assert_eq!(
+            KafkaSource::new("b:9092").metadata_refresh(),
+            METADATA_REFRESH
+        );
+        assert_eq!(METADATA_REFRESH, Duration::from_secs(30));
+        let s = KafkaSource::with_options("b:9092", BTreeMap::new(), Duration::from_secs(5));
+        assert_eq!(s.metadata_refresh(), Duration::from_secs(5));
+    }
 
     fn keys(k: &[&str]) -> HashSet<String> {
         k.iter().map(|s| s.to_string()).collect()

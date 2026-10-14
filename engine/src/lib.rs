@@ -2,11 +2,15 @@
 //! of events from Kafka.
 //!
 //! ```no_run
+//! use chlive_engine::rules::TablesConfig;
 //! use chlive_engine::{Config, Engine};
 //! use futures::StreamExt;
 //!
-//! # async fn demo() -> Result<(), chlive_engine::EngineError> {
-//! let engine = Engine::connect(Config::default());
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! let engine = Engine::connect(Config {
+//!     tables: TablesConfig::listed(["events"]),
+//!     ..Config::default()
+//! })?;
 //! println!("{}", engine.explain("select * from events").await?);
 //! let mut subscription = engine.subscribe("select * from events").await?;
 //! while let Some(iteration) = subscription.next().await {

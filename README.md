@@ -22,7 +22,7 @@ dnvr up          # starts everything in a tmux dashboard
 | `connectors` → connect, schema, clickhouse | one sink connector per topic (`chlive-sink-<topic>`, exactly once), into the table of the same name; waits until they run | |
 | `pause-server` → connectors | continuous-backup's pause server: pauses a table's connector and reports its exact offsets, for snapshots | `url` |
 | `seed` → connectors, clickhouse, redpanda | if ClickHouse has fewer than `$SEED_COUNT` events: `scripts/seed.sql` generates backdated events, produced to Kafka and ingested by the sink | |
-| `server` → pause-server, clickhouse, redpanda | chlive-server: WebSocket over chlive-engine, as `chlive_ro` (snapshots as `chlive_snap`) | `url` (the WebSocket, `/live`), `httpUrl` (`/debug/subscriptions`, `/healthz`) |
+| `server` → pause-server, clickhouse, redpanda | chlive-server on `nix/chlive.dev.toml` (the three tables, snapshots in `chlive_snapshots`): WebSocket over chlive-engine, as `chlive_ro` (snapshots as `chlive_snap`) | `url` (the WebSocket, `/live`), `httpUrl` (`/debug/subscriptions`, `/healthz`) |
 | `playground` → server, redpanda | the example query playground | `url` |
 | `rust-alerts` → server | the Rust client's example service | |
 
@@ -75,12 +75,12 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 |---|---|
 | `flake.nix` | the flake: packages (`nix build` builds `chlive`: the server `chlive` and the terminal client `clc`) and the dnvr dev shell |
 | `nix/shell.nix` | the dnvr dev shell: toolchain, env, the local stack's processes (Redpanda in Docker, ClickHouse 26.7.2, Kafka Connect with the ClickHouse sink, the pause server, schema, seed, server, examples) and scripts |
-| `nix/settings.nix` | the local stack's ports, topics and seed size |
+| `nix/chlive.dev.toml` | the dev server's config (the stack's addresses come as flags) |
 | `nix/packages/` | custom derivations: `chlive.nix` (the server and `clc`), `clickhouse.nix` (26.7.2), `libchdb.nix` (chDB, same version), `redpanda.nix` (the Docker-run Redpanda process) |
 | `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
 | `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka |
 | `protocol/` | `chlive-protocol` (Rust): the WebSocket protocol's messages, shared by the server and the Rust client |
-| `server/` | `chlive-server` (Rust; binary `chlive`): the WebSocket protocol over the engine |
+| `server/` | `chlive-server` (Rust; binary `chlive`): the WebSocket protocol over the engine, and its config (`chlive.example.toml`: every key and default) |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
 | `client-rs/` | `chlive-client` (Rust): the client for services; `examples/watch.rs` prints any query's updates |
 | `examples/` | example apps: `playground`, the query playground (React); `rust-alerts`, an event-driven service on `chlive-client` |
@@ -88,11 +88,66 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `tests/` | end-to-end tests (`chlive-e2e`): the server over the full stack, with a small Kafka producer |
 | `bench/` | `queries.ts`: a ladder of queries, simple to most complex, benchmarked through `@chlive/client` against the stack; results in `docs/bench/` |
 
+## Server configuration
+
+`chlive` reads its settings from built-in defaults, then a TOML file (`--config chlive.toml`, or `CHLIVE_CONFIG`), then environment variables, then flags; each layer overrides the one before. [`server/chlive.example.toml`](server/chlive.example.toml) lists every key with its default (a test keeps it exact), and `nix/chlive.dev.toml` is the dev stack's.
+
+```toml
+[server]
+listen = "0.0.0.0:8080"
+allowed_origins = ["https://app.example.com"]   # browsers; clients without an Origin always connect
+
+[clickhouse]
+url = "http://clickhouse:8123"
+native = "clickhouse:9000"                      # the same node, for aggregates
+password_env = "CHLIVE_RO_PASSWORD"             # or password, or password_file
+snapshot_password_file = "/run/secrets/chlive_snap"
+snapshot_database = "chlive_snapshots"          # clones go there instead of next to each table
+
+[kafka]
+brokers = "kafka-1:9092,kafka-2:9092"
+[kafka.properties]                              # librdkafka's, for every client
+"security.protocol" = "SASL_SSL"
+
+[pause_server]
+url = "http://pause-server:18091"
+
+[tables]                                        # only listed tables can be queried (expose = "listed")
+[tables.events]                                 # default.events, topic events, columns as they are
+[tables.orders]
+clickhouse = "shop.orders_v2"
+topic = "prod.orders"
+hidden_columns = ["internal_*"]                 # besides the global ["_*"]
+[tables.orders.columns]
+customer = { clickhouse = "customer_id", json = "customerId" }
+```
+
+- **Sections:**
+  - `[server]`: `listen`, `path` (`/live`), `allowed_origins`, `max_connections` (10 000; more get 503), `max_subscriptions_per_connection` (100; more get `TOO_MANY_SUBSCRIPTIONS`) and `progress_interval` (1 s);
+  - `[clickhouse]`: `url`, `native`, `user` (`chlive_ro`) and `snapshot_user` (`chlive_snap`) with their passwords, and `snapshot_database`;
+  - `[kafka]`: `brokers`, `metadata_refresh` (30 s) and `properties`;
+  - `[pause_server]`: `url`;
+  - `[snapshots]`: `refresh` (10 s) and `idle` (1 h);
+  - `[log]`: `level` (an `EnvFilter` directive; `RUST_LOG` wins when set) and `format` (`text` or `json`);
+  - `[tables]`: see below.
+- **Durations** are written `"250ms"`, `"10s"`, `"5m"` or `"1h"`. Unknown keys are errors, so a typo stops the server at start, with the key named.
+- **Env vars** are `CHLIVE_<SECTION>__<KEY>`, with `__` for each level, e.g. `CHLIVE_KAFKA__BROKERS`, `CHLIVE_SERVER__MAX_CONNECTIONS=500` or `CHLIVE_TABLES__EVENTS__TOPIC=prod.events`. Values are read as TOML when they can be (`500`, `["a", "b"]`). Only names whose first part is a section count: `CHLIVE_URL`, `CHLIVE_E2E` and the test scripts' `CHLIVE_CLICKHOUSE_URL` aren't config.
+- **Flags:** `--set key.path=value` (repeatable; the value as TOML, or a string), and the shortcuts `--listen`, `--clickhouse-url`, `--clickhouse-native`, `--kafka` and `--pause-server`.
+- **Passwords** come as is (`password`), from an env var (`password_env`) or from a file (`password_file`, as Docker and Kubernetes mount secrets; a trailing newline is trimmed). Each user takes at most one of the three; none means an empty password.
+- **`chlive config show`** prints the effective config, each value with where it came from (`default`, `file`, `env CHLIVE_…` or `flag`), passwords hidden. `chlive config check [FILE]` checks a file.
+- **Tables.** `expose = "listed"` (the default) allows only the tables listed as `[tables.<name>]`, so a new ClickHouse table is never queryable by accident; `"all"` allows every table in `database` too. Each listed table can override:
+  - `clickhouse`: `database.table`, or `table` in `database` (default: its name in `database`);
+  - `topic` (default: the `topic` template, `{table}`, where `{table}` and `{database}` are replaced);
+  - `hidden_columns`: globs, added to the global ones (`["_*"]`);
+  - `columns`: renames, by the name queries use; `clickhouse` defaults to that name, and `json` (the key in the topic's events) to the ClickHouse name.
+- **`snapshot_database`** must exist, with the same storage policy as the tables, since ATTACH PARTITION links their parts. The snapshot user needs CREATE TABLE, ALTER, INSERT, SELECT and DROP TABLE there, and the history user SELECT. A separate, non-Replicated database also keeps the clones' DDL off a Replicated database's log.
+- **Kafka properties** are librdkafka's (TLS, SASL, …). They override chlive's own consumer settings, except `enable.auto.commit` and `enable.auto.offset.store`, which stay off since chlive never commits.
+
 ## Engine (custom dialect)
 
 The engine is a library, used by the server.
 
-**History and stream meet at a snapshot's watermark.** At subscribe time the engine takes the table's current snapshot (see [How it works](#how-it-works)): a clone holding exactly the offsets below the pause server's `N[p]` per partition. History is the whole clone, and each Kafka partition is consumed from `N[p]`. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. A table must be ingested by exactly one sink connector, from the topic of the same name. The engine's ClickHouse node must be the one clones are made on (`clickhouse_url` and `clickhouse_native` point to one node); for replicated tables it runs `SYSTEM SYNC REPLICA` first.
+**History and stream meet at a snapshot's watermark.** At subscribe time the engine takes the table's current snapshot (see [How it works](#how-it-works)): a clone holding exactly the offsets below the pause server's `N[p]` per partition. History is the whole clone, and each Kafka partition is consumed from `N[p]`. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. A table must be ingested by exactly one sink connector, from its topic (by default the one of the same name; see [Server configuration](#server-configuration)). The engine's ClickHouse node must be the one clones are made on (`clickhouse_url` and `clickhouse_native` point to one node); for replicated tables it runs `SYSTEM SYNC REPLICA` first.
 
 The full grammar is under [Supported queries](#supported-queries). A condition can use:
 - comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), with `AND`, `OR`, `NOT` and parentheses;
@@ -270,7 +325,7 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 - `{"op": "delete", "index": k}` removes the row at `k`; the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes. With OFFSET (`"offset": m` in the snapshot, informational), the diffs already account for the rows above the result: a row sliding in from above is an ordinary insert.
 - A `diff` is atomic: its changes apply in sequence, each index into the list as the previous change left it, and only the state after all of them is meaningful (in between, an insert and its delete can briefly make one row more than the LIMIT). The client applies a whole diff to one copy of the rows before its listeners see it.
 - **Resuming.** `snapshot`, `diff` and `{"type": "progress", "id", "at"}` carry `at`, an opaque cursor: how far the result is complete, per Kafka partition, counting events that didn't match. A client that kept a result subscribes with `"since": <at>`; the server answers `{"type": "resume", "id", "columns", "order"?, "limit"?}` instead of a snapshot (the client's rows are still valid), then diffs with only what was missed. If it can't resume (another query or schema, a topic recreated since, …), it sends a normal `snapshot`.
-- Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`. After an error, that subscription is over.
+- Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`, `TOO_MANY_SUBSCRIPTIONS` (over `server.max_subscriptions_per_connection`). After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
 
 ### GROUP BY and aggregates

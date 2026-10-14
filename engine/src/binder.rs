@@ -1137,6 +1137,12 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
             from.span,
         ));
     }
+    if !catalog.rules.exposes(&from.name) {
+        return Err(BindError::at(
+            format!("unknown table {} (not in the server's config)", from.name),
+            from.span,
+        ));
+    }
     let (database, clickhouse_name) = catalog.rules.clickhouse_location(&from.name);
     let clickhouse_table = catalog.rules.clickhouse_table(&from.name);
     let described = match catalog.history.describe(&clickhouse_table).await {
@@ -1165,12 +1171,12 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
             from.span,
         ));
     }
-    let columns = described
+    let columns: Vec<BoundColumn> = described
         .into_iter()
-        .filter(|c| !catalog.rules.is_hidden(&c.name))
+        .filter(|c| !catalog.rules.is_hidden(&from.name, &c.name))
         .enumerate()
         .map(|(i, c)| {
-            let m = catalog.rules.column(&c.name);
+            let m = catalog.rules.column(&from.name, &c.name);
             BoundColumn {
                 id: ColumnId(i),
                 name: m.name,
@@ -1180,6 +1186,17 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
             }
         })
         .collect();
+    // a rename can land on another column's name
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(dup) = columns.iter().find(|c| !names.insert(c.name.as_str())) {
+        return Err(BindError::at(
+            format!(
+                "table {} has two columns named {} (check its column mapping)",
+                from.name, dup.name
+            ),
+            from.span,
+        ));
+    }
     Ok(BoundTable {
         name: from.name.clone(),
         alias: from.alias.clone(),
@@ -1511,7 +1528,7 @@ mod tests {
     use crate::diff::Row;
     use crate::history::DescribedColumn;
     use crate::parser::parse;
-    use crate::rules::HardcodedRules;
+    use crate::rules::ConfiguredRules;
     use crate::source::MemorySource;
     use crate::types::{parse_datetime, DateTime};
     use async_trait::async_trait;
@@ -1566,8 +1583,15 @@ mod tests {
     }
 
     async fn bind_params(sql: &str, params: serde_json::Value) -> Result<BoundQuery, String> {
+        bind_with(ConfiguredRules::default(), sql, params).await
+    }
+
+    async fn bind_with(
+        rules: ConfiguredRules,
+        sql: &str,
+        params: serde_json::Value,
+    ) -> Result<BoundQuery, String> {
         let params: Params = serde_json::from_value(params).unwrap();
-        let rules = HardcodedRules::default();
         let catalog = Catalog {
             rules: &rules,
             history: &FakeHistory,
@@ -1576,6 +1600,93 @@ mod tests {
         };
         let q = parse(sql).map_err(|e| e.render(sql))?;
         bind(&q, &catalog).await.map_err(|e| e.render(sql))
+    }
+
+    fn configured(tables: serde_json::Value) -> ConfiguredRules {
+        ConfiguredRules::new(serde_json::from_value(tables).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_exposed_tables_can_be_queried() {
+        let rules = || configured(serde_json::json!({ "events": {} }));
+        assert!(
+            bind_with(rules(), "select ts from events", serde_json::json!({}))
+                .await
+                .is_ok()
+        );
+        let e = bind_with(rules(), "select id from plain", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("unknown table plain (not in the server's config)"),
+            "{e}"
+        );
+        assert!(e.contains("1:16"), "at the table: {e}");
+        // and in sub-queries too
+        let e = bind_with(
+            rules(),
+            "select ts from events where user_id in (select id from plain)",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("unknown table plain"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn renamed_and_hidden_columns_follow_the_mapping() {
+        let rules = configured(serde_json::json!({
+            "events": {
+                "hidden_columns": ["coupon"],
+                "columns": {
+                    "who": { "clickhouse": "user_id", "json": "uid" },
+                    "latency": { "clickhouse": "latency_ms" },
+                },
+            },
+        }));
+        let b = bind_with(
+            rules,
+            "select who, latency from events where who = 'u1' and latency > 5",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let out: Vec<_> = b
+            .output()
+            .map(|c| (c.name, c.clickhouse, c.json_key))
+            .collect();
+        assert_eq!(
+            out,
+            [
+                ("who".into(), "user_id".into(), "uid".into()),
+                ("latency".into(), "latency_ms".into(), "latency_ms".into()),
+            ]
+        );
+        let all: Vec<_> = b.table.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            all,
+            ["ts", "who", "latency", "paid", "tags"],
+            "coupon and _* hidden"
+        );
+        // the old names are gone
+        let rules = configured(serde_json::json!({
+            "events": { "columns": { "who": { "clickhouse": "user_id" } } },
+        }));
+        let e = bind_with(rules, "select user_id from events", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("user_id"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_rename_onto_another_column_is_an_error() {
+        let rules = configured(serde_json::json!({
+            "events": { "columns": { "ts": { "clickhouse": "user_id" } } },
+        }));
+        let e = bind_with(rules, "select ts from events", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("two columns named ts"), "{e}");
     }
 
     fn names(b: &BoundQuery) -> Vec<String> {

@@ -159,8 +159,9 @@ pub enum Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveError {
     /// `SYNTAX_ERROR`, `INVALID_QUERY` (both with a line:column in the message),
-    /// `HISTORY_FAILED`, `STREAM_FAILED`, `AGGREGATE_FAILED`, `SNAPSHOT_FAILED`, or
-    /// `CLIENT_ERROR` (a message the client couldn't apply).
+    /// `HISTORY_FAILED`, `STREAM_FAILED`, `AGGREGATE_FAILED`, `SNAPSHOT_FAILED`,
+    /// `TOO_MANY_SUBSCRIPTIONS` (the server's limit per connection), or `CLIENT_ERROR` (a
+    /// message the client couldn't apply).
     pub code: String,
     pub message: String,
 }

@@ -1,0 +1,88 @@
+## chlive server configuration: every key, with its default.
+##
+## Settings come from the defaults, then this file (`chlive --config chlive.toml`), then
+## environment variables, then flags; each overrides the one before.
+##   env:   CHLIVE_<SECTION>__<KEY>, e.g. CHLIVE_KAFKA__BROKERS=broker:9092,
+##          CHLIVE_TABLES__EVENTS__TOPIC=prod.events (values are read as TOML when they can be)
+##   flags: --set server.max_connections=500, and --listen, --clickhouse-url,
+##          --clickhouse-native, --kafka, --pause-server
+## `chlive config show` prints the result with where each value came from; `chlive config
+## check FILE` checks a file. Unknown keys are errors. Durations: "250ms", "10s", "5m", "1h".
+
+[server]
+# listen = "0.0.0.0:8080"
+## Where the WebSocket is (/debug/subscriptions and /healthz stay where they are).
+# path = "/live"
+## Browsers' Origins allowed to connect; empty (or "*") allows any. Clients that send no
+## Origin (services) are always allowed.
+# allowed_origins = []
+## More connections are refused (503).
+# max_connections = 10000
+## More subscriptions on one connection get a TOO_MANY_SUBSCRIPTIONS error.
+# max_subscriptions_per_connection = 100
+## At most this often, a client hears how far its result is complete when only events that
+## didn't match it arrived.
+# progress_interval = "1s"
+
+[clickhouse]
+## HTTP (history, snapshots) and the native protocol (aggregates), on the same node.
+# url = "http://127.0.0.1:8123"
+# native = "127.0.0.1:9000"
+## Reads history: SELECT on the tables and on their snapshots.
+# user = "chlive_ro"
+## A password is given as is (password), from an env var (password_env) or from a file
+## (password_file, trailing newline trimmed); one of them at most, none means empty.
+##   password_env = "CHLIVE_CLICKHOUSE_PASSWORD"
+## Creates and drops snapshots (CREATE TABLE, ALTER, INSERT, DROP TABLE where they're made,
+## SYSTEM SYNC REPLICA for replicated tables); snapshot_password, _env and _file likewise.
+# snapshot_user = "chlive_snap"
+## Where snapshots (clones of the tables) are made; unset: next to each table. It must exist
+## and use the tables' storage policy (ATTACH PARTITION links their parts).
+##   snapshot_database = "chlive_snapshots"
+
+[kafka]
+# brokers = "127.0.0.1:9092"
+## How often the topics' partitions are reloaded.
+# metadata_refresh = "30s"
+
+[kafka.properties]
+## librdkafka properties for every client (TLS, SASL, …); they override chlive's own settings,
+## except the ones its consumers rely on (enable.auto.commit, enable.auto.offset.store).
+##   "security.protocol" = "SASL_SSL"
+
+[pause_server]
+## Pauses a table's ingestion while it's snapshotted.
+# url = "http://127.0.0.1:18091"
+
+[snapshots]
+## How often a table in use gets a new snapshot.
+# refresh = "10s"
+## After this long without subscriptions, a table's snapshots stop.
+# idle = "1h"
+
+[log]
+## An EnvFilter directive, e.g. "warn,chlive_server=debug"; RUST_LOG wins when set.
+# level = "info"
+## "text" or "json" (one object per line).
+# format = "text"
+
+[tables]
+## Which tables queries can use: "listed" (only [tables.<name>] below) or "all" (every table
+## in `database`, the listed ones mapped as they say).
+# expose = "listed"
+## Where a table lives unless it says otherwise.
+# database = "default"
+## A table's topic unless it says otherwise; {table} and {database} are replaced.
+# topic = "{table}"
+## ClickHouse columns hidden from every table (globs: * and ?).
+# hidden_columns = ["_*"]
+
+## One section per table, by the name queries use; all keys optional:
+##   [tables.events]
+##   [tables.orders]
+##   clickhouse = "shop.orders_v2"          # "database.table", or "table" in `database`
+##   topic = "prod.orders"
+##   hidden_columns = ["internal_*"]        # added to the ones above
+##   [tables.orders.columns]                # renamed columns, by the name queries use
+##   customer = { clickhouse = "customer_id", json = "customerId" }
+##                                          # clickhouse: default the name; json: default clickhouse

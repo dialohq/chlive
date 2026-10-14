@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use chlive_engine::diff::{Diff, Row};
 use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
-use chlive_engine::rules::{HardcodedRules, TopicId};
+use chlive_engine::rules::{ConfiguredRules, TopicId};
 use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Snapshots};
 use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
 use chlive_engine::watermark::Watermark;
@@ -128,7 +128,7 @@ fn events_topic() -> MemorySource {
 
 fn engine(source: MemorySource) -> Engine {
     Engine::new(
-        HardcodedRules::default(),
+        ConfiguredRules::default(),
         FakeHistory,
         source,
         FakeSnapshots,
@@ -778,7 +778,7 @@ async fn a_partition_missing_from_the_cached_list_is_read_anew() {
             refreshes: count.clone(),
         };
         let engine = Engine::new(
-            HardcodedRules::default(),
+            ConfiguredRules::default(),
             FakeHistory,
             source,
             FakeSnapshots,

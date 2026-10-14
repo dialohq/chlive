@@ -58,7 +58,7 @@ impl SnapshotTable {
 /// A clone of a table and the offsets it holds.
 #[derive(Debug)]
 pub struct Snapshot {
-    /// The clone's database (its source's).
+    /// The clone's database (its source's, or the configured snapshot database).
     pub database: String,
     /// The clone's name.
     pub name: String,
@@ -115,7 +115,7 @@ pub trait Snapshots: Send + Sync {
     async fn shutdown(&self) {}
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotConfig {
     /// How often a table in use gets a new snapshot.
     pub refresh: Duration,
@@ -124,6 +124,9 @@ pub struct SnapshotConfig {
     /// On start, drop every clone (`__chlive_snap_*`) left by an earlier run. Only for the one
     /// process that owns them (the server), not for tools running next to it.
     pub sweep: bool,
+    /// Where clones are created; `None`: next to their table. Must exist, on the same storage
+    /// policy as the tables (ATTACH PARTITION links their parts).
+    pub database: Option<String>,
 }
 
 impl Default for SnapshotConfig {
@@ -132,6 +135,7 @@ impl Default for SnapshotConfig {
             refresh: Duration::from_secs(10),
             idle: Duration::from_secs(3600),
             sweep: false,
+            database: None,
         }
     }
 }
@@ -327,8 +331,9 @@ impl Task {
             state.taking = true;
         }
         let (pauser, cloner) = (self.pauser.clone(), self.cloner.clone());
+        let into = self.config.database.clone();
         tokio::spawn(async move {
-            let result = take(pauser.as_ref(), cloner.as_ref(), &table)
+            let result = take(pauser.as_ref(), cloner.as_ref(), &table, into.as_deref())
                 .await
                 .map(|mut s| {
                     s.on_drop = Some(tx.clone());
@@ -339,14 +344,16 @@ impl Task {
     }
 }
 
-/// Pause the table's ingestion, clone it, resume. Resuming always happens; a failed clone is
-/// dropped.
+/// Pause the table's ingestion, clone it (into `database`, or next to it), resume. Resuming
+/// always happens; a failed clone is dropped.
 pub async fn take(
     pauser: &dyn Pauser,
     cloner: &dyn Cloner,
     table: &SnapshotTable,
+    database: Option<&str>,
 ) -> Result<Snapshot, SnapshotError> {
     let clone = format!("{CLONE_PREFIX}{}_{}", table.table, unique_suffix());
+    let clone_db = database.unwrap_or(&table.database);
     let started = std::time::Instant::now();
     let paused = pauser.pause(table).await?;
     let taken_at = SystemTime::now();
@@ -363,7 +370,7 @@ pub async fn take(
         }
     };
     let cloned = tokio::select! {
-        r = cloner.clone_table(&table.database, &table.table, &clone) => r,
+        r = cloner.clone_table(&table.database, &table.table, clone_db, &clone) => r,
         _ = renew => unreachable!("renewing never ends"),
     };
     let resumed = pauser.resume(&paused.token).await;
@@ -378,7 +385,7 @@ pub async fn take(
                 ms = started.elapsed().as_millis() as u64, "snapshot taken"
             );
             Ok(Snapshot {
-                database: table.database.clone(),
+                database: clone_db.to_string(),
                 name: clone,
                 watermark: paused.watermark,
                 taken_at,
@@ -386,7 +393,7 @@ pub async fn take(
             })
         }
         Err(e) => {
-            let _ = cloner.drop_table(&table.database, &clone).await;
+            let _ = cloner.drop_table(clone_db, &clone).await;
             Err(e)
         }
     }
@@ -459,10 +466,16 @@ mod tests {
 
     #[async_trait]
     impl Cloner for Fake {
-        async fn clone_table(&self, _: &str, _: &str, clone: &str) -> Result<(), SnapshotError> {
+        async fn clone_table(
+            &self,
+            db: &str,
+            source: &str,
+            into: &str,
+            clone: &str,
+        ) -> Result<(), SnapshotError> {
             let delay = *self.clone_delay.lock().unwrap();
             tokio::time::sleep(delay).await;
-            self.push(format!("clone {clone}"));
+            self.push(format!("clone {db}.{source} {into}.{clone}"));
             if self.fail_clone.load(Ordering::SeqCst) {
                 return Err(SnapshotError("no space".into()));
             }
@@ -489,6 +502,7 @@ mod tests {
                 refresh: Duration::from_secs(10),
                 idle: Duration::from_secs(3600),
                 sweep: true,
+                database: None,
             },
         )
     }
@@ -498,6 +512,65 @@ mod tests {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clones_go_next_to_their_table_or_into_the_snapshot_database() {
+        let fake = Fake::default();
+        let s = take(&fake, &fake, &events(), None).await.unwrap();
+        assert_eq!(s.database, "default");
+        assert_eq!(s.sql_table(), format!("default.{}", s.name));
+        assert!(fake
+            .log()
+            .contains(&format!("clone default.events default.{}", s.name)));
+
+        let fake = Fake::default();
+        let s = take(&fake, &fake, &events(), Some("snaps")).await.unwrap();
+        assert_eq!(s.database, "snaps", "history reads the clone there");
+        assert_eq!(s.sql_table(), format!("snaps.{}", s.name));
+        assert!(fake
+            .log()
+            .contains(&format!("clone default.events snaps.{}", s.name)));
+
+        // a failed clone is dropped where it was made
+        let fake = Fake::default();
+        fake.fail_clone.store(true, Ordering::SeqCst);
+        assert!(take(&fake, &fake, &events(), Some("snaps")).await.is_err());
+        assert!(fake
+            .log()
+            .iter()
+            .any(|l| l.starts_with("drop snaps.__chlive_snap_events_")));
+
+        // the manager uses its config's database, and drops replaced clones there
+        let fake = Arc::new(Fake::default());
+        let m = SnapshotManager::start(
+            fake.clone(),
+            fake.clone(),
+            SnapshotConfig {
+                database: Some("snaps".into()),
+                ..SnapshotConfig::default()
+            },
+        );
+        let a = m.acquire(&events()).await.unwrap();
+        assert_eq!(a.database, "snaps");
+        let name = a.name.clone();
+        drop(a);
+        m.shutdown().await;
+        settle().await;
+        assert!(
+            fake.log().contains(&format!("drop snaps.{name}")),
+            "{:?}",
+            fake.log()
+        );
+    }
+
+    #[test]
+    fn snapshot_config_defaults() {
+        let d = SnapshotConfig::default();
+        assert_eq!(d.refresh, Duration::from_secs(10));
+        assert_eq!(d.idle, Duration::from_secs(3600));
+        assert!(!d.sweep);
+        assert_eq!(d.database, None);
     }
 
     #[tokio::test(start_paused = true)]

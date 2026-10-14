@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chlive_engine::diff::Diff;
 use chlive_engine::history::ClickHouseHttp;
-use chlive_engine::rules::HardcodedRules;
+use chlive_engine::rules::ConfiguredRules;
 use chlive_engine::snapshot::{
     ClickHouseCloner, Paused, Pauser, SnapshotConfig, SnapshotError, SnapshotManager, SnapshotTable,
 };
@@ -60,6 +60,23 @@ fn engine_with(
     watermark: Watermark,
     tables: std::collections::HashMap<String, Watermark>,
 ) -> Engine {
+    engine_custom(
+        ConfiguredRules::expose_all(&database),
+        None,
+        source,
+        watermark,
+        tables,
+    )
+}
+
+/// Any table mapping, and snapshots in `snapshot_database` (or next to their tables).
+fn engine_custom(
+    rules: ConfiguredRules,
+    snapshot_database: Option<&str>,
+    source: MemorySource,
+    watermark: Watermark,
+    tables: std::collections::HashMap<String, Watermark>,
+) -> Engine {
     let snapshots = SnapshotManager::start(
         Arc::new(FixedPause(watermark, tables)),
         Arc::new(ClickHouseCloner::new(&url(), "default", "")),
@@ -67,10 +84,11 @@ fn engine_with(
             refresh: Duration::from_secs(3600),
             idle: Duration::from_secs(3600),
             sweep: false,
+            database: snapshot_database.map(String::from),
         },
     );
     Engine::new(
-        HardcodedRules { database },
+        rules,
         ClickHouseHttp::new(&url(), "default", ""),
         source,
         snapshots,
@@ -207,6 +225,100 @@ async fn select_star_from_events_against_clickhouse() {
     assert_eq!(query(clones).await.trim(), "0");
 
     exec("DROP DATABASE chlive_engine_test").await;
+}
+
+/// Snapshots in their own database, and a table mapped under other names (ClickHouse table,
+/// topic, columns, JSON keys): history reads the clone there by the ClickHouse names, the
+/// stream decodes by the JSON keys, and both come out under the dialect names.
+#[tokio::test]
+async fn snapshot_database_and_table_mapping_against_clickhouse() {
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    // fresh, whatever an earlier run left
+    for db in ["chlive_engine_map_test", "chlive_engine_snaps_test"] {
+        exec(&format!("DROP DATABASE IF EXISTS {db} SYNC")).await;
+        exec(&format!("CREATE DATABASE {db}")).await;
+    }
+    exec("CREATE TABLE chlive_engine_map_test.events_v2 (ts DateTime64(3), user_id String, latency_ms UInt32, note String) ENGINE = MergeTree ORDER BY ts").await;
+    exec("INSERT INTO chlive_engine_map_test.events_v2 VALUES ('2026-10-01 12:00:00.000', 'u1', 10, 'x'), ('2026-10-01 12:00:01.000', 'u2', 20, 'y')").await;
+
+    let mut source = MemorySource::new();
+    source
+        .push(
+            "prod.events",
+            0,
+            r#"{"ts": "2026-10-01 12:00:00.000", "uid": "u1", "latency_ms": 10, "note": "x"}"#,
+        )
+        .push(
+            "prod.events",
+            0,
+            r#"{"ts": "2026-10-01 12:00:01.000", "uid": "u2", "latency_ms": 20, "note": "y"}"#,
+        )
+        .push(
+            "prod.events",
+            0,
+            r#"{"ts": "2026-10-01 12:00:02.000", "uid": "u3", "latency_ms": 30, "note": "z"}"#,
+        );
+    let rules = ConfiguredRules::new(
+        serde_json::from_value(json!({
+            "events": {
+                "clickhouse": "chlive_engine_map_test.events_v2",
+                "topic": "prod.events",
+                "hidden_columns": ["note"],
+                "columns": { "who": { "clickhouse": "user_id", "json": "uid" } },
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let engine = engine_custom(
+        rules,
+        Some("chlive_engine_snaps_test"),
+        source,
+        Watermark([(0, 1)].into()),
+        Default::default(),
+    );
+    let subscription = engine
+        .subscribe("select who, latency_ms from events where latency_ms >= 20")
+        .await
+        .unwrap();
+    assert!(
+        subscription.history_sql.starts_with(
+            "SELECT user_id AS who, latency_ms FROM chlive_engine_snaps_test.__chlive_snap_events_v2_"
+        ),
+        "{}",
+        subscription.history_sql
+    );
+    let clones = |db: &str| {
+        format!(
+            "SELECT count() FROM system.tables WHERE database = '{db}' \
+             AND startsWith(name, '__chlive_snap_')"
+        )
+    };
+    assert_eq!(query(&clones("chlive_engine_snaps_test")).await.trim(), "1");
+    assert_eq!(query(&clones("chlive_engine_map_test")).await.trim(), "0");
+
+    let lines: Vec<String> = subscription.map(|i| i.unwrap().to_string()).collect().await;
+    assert_eq!(
+        lines,
+        [
+            "+ {\"who\":\"u2\",\"latency_ms\":20}\nhistory: 1 rows",
+            r#"prod.events/0:2 + {"who":"u3","latency_ms":30}"#,
+        ]
+    );
+    // unlisted tables are unknown
+    let err = engine.subscribe("select * from other").await.err().unwrap();
+    assert!(
+        err.to_string().contains("not in the server's config"),
+        "{err}"
+    );
+
+    engine.shutdown().await;
+    assert_eq!(query(&clones("chlive_engine_snaps_test")).await.trim(), "0");
+    exec("DROP DATABASE chlive_engine_map_test").await;
+    exec("DROP DATABASE chlive_engine_snaps_test").await;
 }
 
 /// The same events go into ClickHouse (which fills omitted keys with its defaults / NULL) and

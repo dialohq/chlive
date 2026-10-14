@@ -6,11 +6,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chlive_engine::diff::Row;
 use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
-use chlive_engine::rules::{HardcodedRules, TopicId};
+use chlive_engine::rules::{ConfiguredRules, TopicId};
 use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Snapshots};
 use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
 use chlive_engine::watermark::Watermark;
 use chlive_engine::Engine;
+use chlive_server::ServerSettings;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::SinkExt;
 use serde_json::{json, Value};
@@ -102,6 +103,10 @@ fn obj(v: Value) -> Row {
 }
 
 async fn server() -> chlive_server::Server {
+    server_with(ServerSettings::default()).await
+}
+
+async fn server_with(settings: ServerSettings) -> chlive_server::Server {
     let mut events = MemorySource::new();
     events
         .push("requests", 0, r#"{"user_id": "h1", "latency_ms": 900}"#) // offset 0: history
@@ -113,12 +118,14 @@ async fn server() -> chlive_server::Server {
             r#"{"user_id": "slower", "latency_ms": "700"}"#,
         );
     let engine = Engine::new(
-        HardcodedRules::default(),
+        ConfiguredRules::default(),
         FakeHistory,
         Endless(events),
         FakeSnapshots,
     );
-    chlive_server::start("127.0.0.1:0", engine).await.unwrap()
+    chlive_server::start_with("127.0.0.1:0", settings, engine)
+        .await
+        .unwrap()
 }
 
 struct Client(WebSocketStream<MaybeTlsStream<TcpStream>>);
@@ -637,4 +644,216 @@ async fn ordered_aggregates_report_their_order_and_place_new_groups() {
         ]
     );
     assert_eq!(c.next().await, None);
+}
+
+// --- [server] settings ----------------------------------------------------------------------
+
+/// Open a WebSocket at `path`, with an `Origin` header if given; the HTTP status if refused.
+async fn open(
+    server: &chlive_server::Server,
+    path: &str,
+    origin: Option<&str>,
+) -> Result<Client, u16> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Error;
+    let mut req = format!("ws://{}{path}", server.addr)
+        .into_client_request()
+        .unwrap();
+    if let Some(o) = origin {
+        req.headers_mut().insert("origin", o.parse().unwrap());
+    }
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, _)) => Ok(Client(ws)),
+        Err(Error::Http(resp)) => Err(resp.status().as_u16()),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[tokio::test]
+async fn settings_defaults() {
+    let d = ServerSettings::default();
+    assert_eq!(d.path, "/live");
+    assert!(d.allowed_origins.is_empty());
+    assert_eq!(d.max_connections, 10_000);
+    assert_eq!(d.max_subscriptions_per_connection, 100);
+    assert_eq!(d.progress_interval, Duration::from_secs(1));
+    // any origin, by default
+    let server = server().await;
+    assert!(open(&server, "/live", Some("https://anywhere.example"))
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn the_websocket_path_is_configurable() {
+    let server = server_with(ServerSettings {
+        path: "/ws".into(),
+        ..Default::default()
+    })
+    .await;
+    let mut c = open(&server, "/ws", None).await.unwrap();
+    c.subscribe("s1", "select user_id from requests").await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    assert_eq!(open(&server, "/live", None).await.err(), Some(404));
+}
+
+#[tokio::test]
+async fn only_allowed_origins_connect() {
+    let server = server_with(ServerSettings {
+        allowed_origins: vec!["https://app.example".into()],
+        ..Default::default()
+    })
+    .await;
+    assert!(open(&server, "/live", Some("https://app.example"))
+        .await
+        .is_ok());
+    assert_eq!(
+        open(&server, "/live", Some("https://evil.example"))
+            .await
+            .err(),
+        Some(403)
+    );
+    // services send no Origin
+    assert!(open(&server, "/live", None).await.is_ok());
+
+    let any = server_with(ServerSettings {
+        allowed_origins: vec!["*".into()],
+        ..Default::default()
+    })
+    .await;
+    assert!(open(&any, "/live", Some("https://evil.example"))
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn connections_beyond_the_limit_are_refused_until_one_closes() {
+    let server = server_with(ServerSettings {
+        max_connections: 2,
+        ..Default::default()
+    })
+    .await;
+    let a = open(&server, "/live", None).await.unwrap();
+    let mut b = open(&server, "/live", None).await.unwrap();
+    assert_eq!(open(&server, "/live", None).await.err(), Some(503));
+    // the others still work
+    b.subscribe("s1", "select user_id from requests").await;
+    assert_eq!(b.expect().await["type"], "snapshot");
+    drop(a);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match open(&server, "/live", None).await {
+            Ok(_) => break,
+            Err(503) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            Err(s) => panic!("{s}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_beyond_the_limit_get_an_error() {
+    let server = server_with(ServerSettings {
+        max_subscriptions_per_connection: 2,
+        ..Default::default()
+    })
+    .await;
+    let mut c = open(&server, "/live", None).await.unwrap();
+    let sql = "select user_id from requests where latency_ms > 100";
+    c.subscribe("a", sql).await;
+    c.subscribe("b", sql).await;
+    c.subscribe("c", sql).await;
+    let mut errors = Vec::new();
+    while let Some(m) = c.next().await {
+        if m["type"] == "error" {
+            errors.push(m);
+        }
+    }
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        (errors[0]["id"].as_str(), errors[0]["code"].as_str()),
+        (Some("c"), Some("TOO_MANY_SUBSCRIPTIONS"))
+    );
+    // unsubscribing makes room; a failed subscription doesn't hold a place
+    c.send(json!({"type": "unsubscribe", "id": "a"})).await;
+    c.subscribe("bad", "select nope from requests").await;
+    assert_eq!(c.expect().await["code"], "INVALID_QUERY");
+    c.subscribe("d", sql).await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    // and another connection has its own limit
+    let mut other = open(&server, "/live", None).await.unwrap();
+    other.subscribe("a", sql).await;
+    assert_eq!(other.expect().await["type"], "snapshot");
+}
+
+/// Events that never match, one every 10 ms: only `progress` messages, as often as allowed.
+struct Trickle;
+
+#[async_trait]
+impl EventSource for Trickle {
+    async fn partitions(&self, _: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
+        Ok(Some(vec![0]))
+    }
+
+    async fn subscribe(
+        &self,
+        starts: &[TopicStart],
+        keys: &[String],
+    ) -> Result<BoxStream<'static, Event>, SourceError> {
+        let mut events = MemorySource::new();
+        events.push("requests", 0, r#"{"user_id": "h1", "latency_ms": 900}"#);
+        for _ in 0..60 {
+            events.push("requests", 0, r#"{"user_id": "fast", "latency_ms": 5}"#);
+        }
+        Ok(events
+            .subscribe(starts, keys)
+            .await?
+            .then(|e| async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                e
+            })
+            .chain(stream::pending())
+            .boxed())
+    }
+}
+
+#[tokio::test]
+async fn progress_comes_at_most_every_progress_interval() {
+    async fn progresses(interval: Duration) -> usize {
+        let engine = Engine::new(
+            ConfiguredRules::default(),
+            FakeHistory,
+            Trickle,
+            FakeSnapshots,
+        );
+        let server = chlive_server::start_with(
+            "127.0.0.1:0",
+            ServerSettings {
+                progress_interval: interval,
+                ..Default::default()
+            },
+            engine,
+        )
+        .await
+        .unwrap();
+        let mut c = open(&server, "/live", None).await.unwrap();
+        c.subscribe("s1", "select user_id from requests where latency_ms > 100")
+            .await;
+        assert_eq!(c.expect().await["type"], "snapshot");
+        let mut n = 0;
+        while let Some(m) = c.next().await {
+            assert_eq!(m["type"], "progress", "{m}");
+            n += 1;
+        }
+        n
+    }
+    // 60 events over ~600 ms
+    let often = progresses(Duration::from_millis(100)).await;
+    assert!((4..=8).contains(&often), "every 100 ms: {often}");
+    assert_eq!(
+        progresses(Duration::from_secs(10)).await,
+        1,
+        "the first goes at once"
+    );
 }

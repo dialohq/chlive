@@ -7,13 +7,14 @@
 //! with it its Kafka consumer. A slow client fills the channel, which pauses its subscriptions.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chlive_engine::cursor;
@@ -27,32 +28,62 @@ use tracing::{debug, info, warn};
 
 use crate::protocol::{
     change, engine_error, order_terms, Change, ClientMsg, Column, ServerMsg, BAD_MESSAGE,
-    DUPLICATE_ID,
+    DUPLICATE_ID, TOO_MANY_SUBSCRIPTIONS,
 };
 
 /// Iterations already waiting are sent together, in one `diff`, up to this many.
 const MAX_ITERATIONS_PER_MESSAGE: usize = 256;
 /// Messages buffered per connection before its subscriptions pause.
 const OUTBOX: usize = 256;
-/// At most this often, a `progress` tells a client how far its result is complete when only
-/// events that didn't match arrived.
-const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+/// The server's own settings (the `[server]` config section, besides `listen`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerSettings {
+    /// Where the WebSocket is served.
+    pub path: String,
+    /// Browsers' `Origin`s allowed to connect: empty allows any, `"*"` too. Clients that send
+    /// no `Origin` (services, not browsers) are always allowed.
+    pub allowed_origins: Vec<String>,
+    /// Open WebSockets at most; more are refused with 503.
+    pub max_connections: usize,
+    /// Subscriptions running on one connection at most; more get `TOO_MANY_SUBSCRIPTIONS`.
+    pub max_subscriptions_per_connection: usize,
+    /// At most this often, a `progress` tells a client how far its result is complete when only
+    /// events that didn't match arrived.
+    pub progress_interval: Duration,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            path: "/live".into(),
+            allowed_origins: Vec::new(),
+            max_connections: 10_000,
+            max_subscriptions_per_connection: 100,
+            progress_interval: Duration::from_secs(1),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
     engine: Arc<Engine>,
+    settings: Arc<ServerSettings>,
     registry: Arc<Registry>,
     next_conn: Arc<AtomicU64>,
+    connections: Arc<AtomicUsize>,
 }
 
-pub fn router(engine: Arc<Engine>) -> Router {
+pub fn router(engine: Arc<Engine>, settings: ServerSettings) -> Router {
+    let path = settings.path.clone();
     let state = AppState {
         engine,
+        settings: Arc::new(settings),
         registry: Arc::default(),
         next_conn: Arc::new(AtomicU64::new(1)),
+        connections: Arc::default(),
     };
     Router::new()
-        .route("/live", get(live))
+        .route(&path, get(live))
         .route("/debug/subscriptions", get(debug_subscriptions))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
@@ -122,9 +153,40 @@ async fn debug_subscriptions(State(s): State<AppState>) -> impl IntoResponse {
     Json(s.registry.list())
 }
 
-async fn live(ws: WebSocketUpgrade, State(s): State<AppState>) -> impl IntoResponse {
+/// One open WebSocket, counted against `max_connections` until dropped.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn origin_allowed(allowed: &[String], origin: Option<&str>) -> bool {
+    match origin {
+        None => true,
+        Some(o) => allowed.is_empty() || allowed.iter().any(|a| a == "*" || a == o),
+    }
+}
+
+async fn live(ws: WebSocketUpgrade, headers: HeaderMap, State(s): State<AppState>) -> Response {
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    if !origin_allowed(&s.settings.allowed_origins, origin) {
+        debug!(origin, "origin not allowed");
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+    if s.connections.fetch_add(1, Ordering::Relaxed) >= s.settings.max_connections {
+        s.connections.fetch_sub(1, Ordering::Relaxed);
+        warn!(max = s.settings.max_connections, "too many connections");
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many connections").into_response();
+    }
+    // freed when the connection ends, or if the upgrade fails (the callback is dropped)
+    let slot = Slot(s.connections.clone());
     let conn = s.next_conn.fetch_add(1, Ordering::Relaxed);
-    ws.on_upgrade(move |socket| connection(socket, s, conn))
+    ws.on_upgrade(move |socket| async move {
+        connection(socket, s, conn).await;
+        drop(slot);
+    })
 }
 
 async fn connection(socket: WebSocket, s: AppState, conn: u64) {
@@ -177,6 +239,20 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64) {
                         .await;
                     continue;
                 }
+                subscriptions.retain(|_, t| !t.is_finished());
+                if subscriptions.len() >= s.settings.max_subscriptions_per_connection {
+                    let _ = tx
+                        .send(ServerMsg::error(
+                            Some(&id),
+                            TOO_MANY_SUBSCRIPTIONS,
+                            format!(
+                                "at most {} subscriptions per connection",
+                                s.settings.max_subscriptions_per_connection
+                            ),
+                        ))
+                        .await;
+                    continue;
+                }
                 debug!(conn, id, sql, "subscribe");
                 let entry = Arc::new(Entry {
                     sql: sql.clone(),
@@ -195,6 +271,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64) {
                         sql,
                         since,
                         params,
+                        progress_interval: s.settings.progress_interval,
                     },
                     entry,
                     tx.clone(),
@@ -228,6 +305,7 @@ struct Request {
     sql: String,
     since: Option<String>,
     params: chlive_protocol::Params,
+    progress_interval: Duration,
 }
 
 async fn run(
@@ -239,6 +317,7 @@ async fn run(
         sql,
         since,
         params,
+        progress_interval,
     }: Request,
     entry: Arc<Entry>,
     tx: mpsc::Sender<ServerMsg>,
@@ -297,7 +376,7 @@ async fn run(
 
     // The cursor last sent, and when a `progress` last went out.
     let mut sent_at: Option<Watermark> = None;
-    let mut last_progress = Instant::now() - PROGRESS_EVERY;
+    let mut last_progress = Instant::now() - progress_interval;
     let mut batches = subscription.ready_chunks(MAX_ITERATIONS_PER_MESSAGE);
     while let Some(batch) = batches.next().await {
         let mut changes: Vec<Change> = Vec::new();
@@ -365,7 +444,7 @@ async fn run(
                 });
                 sent_at = Some(a);
             } else if sent_at.as_ref() != Some(&a)
-                && (catch_up || last_progress.elapsed() >= PROGRESS_EVERY)
+                && (catch_up || last_progress.elapsed() >= progress_interval)
             {
                 // only non-matching events: tell the client how far it is anyway, now and then
                 out.push(ServerMsg::Progress {

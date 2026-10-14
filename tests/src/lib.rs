@@ -55,13 +55,19 @@ pub fn config() -> Config {
         pause_server_url: env("CHLIVE_PAUSE_SERVER", "http://127.0.0.1:18091"),
         snapshot_user: "chlive_snap".into(),
         snapshot_password: "chlive_snap".into(),
-        snapshots: Default::default(),
+        // as the dev shell's server: snapshots in their own database
+        snapshots: chlive_engine::snapshot::SnapshotConfig {
+            database: Some("chlive_snapshots".into()),
+            ..Default::default()
+        },
         clickhouse_url: std::env::var("CHLIVE_CLICKHOUSE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18123".into()),
         user: "chlive_ro".into(),
         password: "chlive_ro".into(),
-        database: "default".into(),
+        tables: chlive_engine::rules::TablesConfig::listed(["events", "orders", "customers"]),
         kafka_brokers: std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:9092".into()),
+        kafka_properties: Default::default(),
+        metadata_refresh: chlive_engine::source::METADATA_REFRESH,
         clickhouse_native: std::env::var("CHLIVE_CLICKHOUSE_NATIVE")
             .unwrap_or_else(|_| "127.0.0.1:19000".into()),
     }
@@ -73,7 +79,7 @@ pub async fn with_server<F>(config: Config, test: F) -> Result<()>
 where
     F: for<'a> FnOnce(&'a Server) -> futures::future::BoxFuture<'a, Result<()>>,
 {
-    let server = chlive_server::start("127.0.0.1:0", Engine::connect(config)).await?;
+    let server = chlive_server::start("127.0.0.1:0", Engine::connect(config)?).await?;
     let result = std::panic::AssertUnwindSafe(test(&server))
         .catch_unwind()
         .await;
@@ -407,7 +413,7 @@ pub async fn wait_ingested(produced: &BTreeMap<i32, i64>) -> Result<()> {
 
 /// The query run directly on ClickHouse, unbounded: the SQL the engine plans for its history.
 pub async fn direct(sql: &str) -> Result<Vec<Row>> {
-    let plan = Engine::connect(config())
+    let plan = Engine::connect(config())?
         .explain(sql)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;

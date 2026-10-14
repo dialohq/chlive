@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chlive_engine::rules::TablesConfig;
 use chlive_engine::{Config, Engine, Origin};
 use futures::StreamExt;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -89,8 +90,10 @@ async fn every_event_exactly_once_across_the_watermark() {
         clickhouse_url: clickhouse_url(),
         kafka_brokers: brokers(),
         pause_server_url: pause_server_url(),
+        tables: TablesConfig::listed(["events"]),
         ..Config::default()
-    });
+    })
+    .unwrap();
     let mut subscription = engine
         .subscribe(&format!("select user_id from events where path = '{path}'"))
         .await

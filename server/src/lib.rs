@@ -2,6 +2,8 @@
 //! each query (ClickHouse history, then Kafka events); the server only speaks the
 //! [`protocol`] with clients.
 
+pub mod config;
+pub mod log;
 pub mod protocol;
 pub mod ws;
 
@@ -12,7 +14,7 @@ use chlive_engine::Engine;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-pub use ws::router;
+pub use ws::{router, ServerSettings};
 
 /// A running server (see [`start`]).
 pub struct Server {
@@ -38,12 +40,22 @@ impl Server {
     }
 }
 
-/// Listen on `addr` (port 0 picks a free one) and serve `engine` in the background.
+/// Listen on `addr` (port 0 picks a free one) and serve `engine` in the background, with the
+/// default [`ServerSettings`].
 pub async fn start(addr: &str, engine: impl Into<Arc<Engine>>) -> std::io::Result<Server> {
+    start_with(addr, ServerSettings::default(), engine).await
+}
+
+/// [`start`] with these settings.
+pub async fn start_with(
+    addr: &str,
+    settings: ServerSettings,
+    engine: impl Into<Arc<Engine>>,
+) -> std::io::Result<Server> {
     let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
     let engine = engine.into();
-    let router = router(engine.clone());
+    let router = router(engine.clone(), settings);
     let task = tokio::spawn(async move { axum::serve(listener, router).await });
     Ok(Server { addr, task, engine })
 }

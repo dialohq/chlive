@@ -21,11 +21,16 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
-# binary only
 anyhow = "1"
+# the config (src/config.rs): defaults, a TOML file, env vars and flags, in layers
+figment = { version = "0.10", features = ["toml", "env"] }
+toml = "1"
+humantime-serde = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# binary only
 clap = { version = "4", features = ["derive", "env"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+figment = { version = "0.10", features = ["toml", "env", "test"] }
 async-trait = "0.1"
 tokio-tungstenite = "0.30"

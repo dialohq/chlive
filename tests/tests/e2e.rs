@@ -155,7 +155,7 @@ async fn rejections_over_websocket() -> Result<()> {
                     "table",
                     "select * from nope",
                     "INVALID_QUERY",
-                    "unknown table nope in ClickHouse (default.nope) at 1:15",
+                    "unknown table nope (not in the server's config) at 1:15",
                 ),
                 (
                     "column",
@@ -458,7 +458,8 @@ async fn live_aggregates_match_direct_queries() -> Result<()> {
 async fn orders_clones() -> Result<Vec<String>> {
     let rows = clickhouse()
         .fetch(
-            "SELECT name FROM system.tables WHERE database = 'default' \
+            // `config()` makes them there, as the dev server does
+            "SELECT name FROM system.tables WHERE database = 'chlive_snapshots' \
              AND startsWith(name, '__chlive_snap_orders_') ORDER BY name",
         )
         .await?;

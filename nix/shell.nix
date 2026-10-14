@@ -415,21 +415,24 @@ in
     # As chlive_ro (snapshots as chlive_snap), against this stack. Publishes `url` (the
     # WebSocket) and `httpUrl` (/healthz, /debug/subscriptions) as soon as its port is picked:
     # a cold `cargo build` can outlast the consumers' wait for them, and both reconnect.
+    # The rest of its config: nix/chlive.dev.toml.
     server = {
       env = {
-        CHLIVE_PAUSE_SERVER = "dnvr://pause-server/url";
-        CHLIVE_CLICKHOUSE_URL = "dnvr://clickhouse/httpUrl";
-        CHLIVE_KAFKA = "dnvr://redpanda/bootstrap";
+        PAUSE_SERVER_URL = "dnvr://pause-server/url";
+        CH_HTTP_URL = "dnvr://clickhouse/httpUrl";
+        KAFKA_BROKERS = "dnvr://redpanda/bootstrap";
         CH_HOST = "dnvr://clickhouse/host";
         CH_TCP_PORT = "dnvr://clickhouse/tcpPort";
       };
       command = ''
         cd "$DNVR_ROOT"
         port=$(dnvr-state pick-port)
-        export CHLIVE_LISTEN="127.0.0.1:$port" CHLIVE_CLICKHOUSE_NATIVE="$CH_HOST:$CH_TCP_PORT"
         dnvr-state set url "ws://127.0.0.1:$port/live"
         dnvr-state set httpUrl "http://127.0.0.1:$port"
-        exec cargo run --release -p chlive-server
+        exec cargo run --release -p chlive-server -- --config nix/chlive.dev.toml \
+          --listen "127.0.0.1:$port" --clickhouse-url "$CH_HTTP_URL" \
+          --clickhouse-native "$CH_HOST:$CH_TCP_PORT" --kafka "$KAFKA_BROKERS" \
+          --pause-server "$PAUSE_SERVER_URL"
       '';
     };
 

@@ -1,0 +1,15 @@
+# The dev shell's server (`dnvr up`); addresses come from flags, since every process picks its
+# ports on start. Keys and defaults: server/chlive.example.toml.
+
+[clickhouse]
+password = "chlive_ro"
+snapshot_password = "chlive_snap"
+# made by scripts/schema.sql
+snapshot_database = "chlive_snapshots"
+
+[log]
+level = "info,chlive_server=info"
+
+[tables.events]
+[tables.orders]
+[tables.customers]
