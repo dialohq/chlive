@@ -51,11 +51,11 @@ pub enum EngineError {
     Snapshot(#[from] SnapshotError),
 }
 
-/// Everything [`Engine::connect`] needs for the standard setup: ClickHouse over HTTP, Kafka,
-/// snapshots through the pause server, and the hard-coded naming rules.
+/// Everything [`Engine::connect`] needs for the standard setup: ClickHouse over HTTP (history,
+/// snapshots, and the states chDB merges aggregates from), Kafka, snapshots through the pause
+/// server, and the table mapping.
 ///
-/// `clickhouse_url` and `clickhouse_native` must be the same ClickHouse node: snapshots are
-/// created there, and exist only there.
+/// `clickhouse_url` must reach the node snapshots are made on: they exist only there.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub clickhouse_url: String,
@@ -70,8 +70,6 @@ pub struct Config {
     pub kafka_properties: BTreeMap<String, String>,
     /// How often topics' partitions are reloaded.
     pub metadata_refresh: Duration,
-    /// ClickHouse's native protocol address, for chDB's `remote()` (aggregates).
-    pub clickhouse_native: String,
     /// The pause server (continuous-backup's), e.g. `http://127.0.0.1:18091`.
     pub pause_server_url: String,
     /// Creates and drops snapshots: CREATE TABLE, ALTER (ATTACH PARTITION) and DROP TABLE in
@@ -91,7 +89,6 @@ impl Default for Config {
             kafka_brokers: "127.0.0.1:9092".into(),
             kafka_properties: BTreeMap::new(),
             metadata_refresh: crate::source::METADATA_REFRESH,
-            clickhouse_native: "127.0.0.1:9000".into(),
             pause_server_url: "http://127.0.0.1:18091".into(),
             snapshot_user: "default".into(),
             snapshot_password: String::new(),
@@ -105,15 +102,16 @@ pub struct Engine {
     history: Arc<dyn HistorySource>,
     source: Arc<dyn EventSource>,
     snapshots: Arc<dyn Snapshots>,
-    native: Native,
+    /// Where chDB reads aggregate states from (main ClickHouse, over HTTP).
+    states_from: HttpSource,
     max_batch: usize,
     /// How often a semi-join looks for a newer snapshot of its outer table.
     semi_refresh: Duration,
 }
 
 #[derive(Debug, Clone)]
-struct Native {
-    address: String,
+struct HttpSource {
+    url: String,
     user: String,
     password: String,
 }
@@ -144,14 +142,14 @@ impl Engine {
             snapshots,
         )
         .with_semi_refresh(semi_refresh)
-        .with_clickhouse_native(&config.clickhouse_native, &config.user, &config.password))
+        .with_clickhouse(&config.clickhouse_url, &config.user, &config.password))
     }
 
-    /// Where chDB reads aggregate states from main ClickHouse (`remote()`, native protocol);
-    /// default `127.0.0.1:9000` as `default` without a password.
-    pub fn with_clickhouse_native(mut self, address: &str, user: &str, password: &str) -> Self {
-        self.native = Native {
-            address: address.into(),
+    /// Main ClickHouse over HTTP, which chDB reads aggregate states from (the history's
+    /// node); default `http://127.0.0.1:8123` as `default` without a password.
+    pub fn with_clickhouse(mut self, url: &str, user: &str, password: &str) -> Self {
+        self.states_from = HttpSource {
+            url: url.into(),
             user: user.into(),
             password: password.into(),
         };
@@ -177,8 +175,8 @@ impl Engine {
             history: Arc::new(history),
             source: Arc::new(source),
             snapshots: Arc::new(snapshots),
-            native: Native {
-                address: "127.0.0.1:9000".into(),
+            states_from: HttpSource {
+                url: "http://127.0.0.1:8123".into(),
                 user: "default".into(),
                 password: String::new(),
             },
@@ -541,14 +539,20 @@ impl Engine {
                     std::process::id(),
                     NEXT.fetch_add(1, AtomicOrdering::Relaxed)
                 );
-                let remote = AggregatePlan::remote(
-                    &from,
-                    &self.native.address,
-                    &self.native.user,
-                    &self.native.password,
+                // what ClickHouse runs on the snapshot; chDB reads its result over HTTP
+                let states = aggregate.states_sql(&from);
+                let source = AggregatePlan::http_source(
+                    &self.states_from.url,
+                    &states,
+                    &self.states_from.user,
+                    &self.states_from.password,
                 );
-                let create = aggregate.create_sql(&table, &remote);
-                tracing::info!(table, create = %create.replace(&self.native.password, "***"), "subscribed (aggregate, chDB)");
+                let create = aggregate.create_sql(&table, &source);
+                let logged = match self.states_from.password.as_str() {
+                    "" => create.clone(),
+                    p => create.replace(p, "***"),
+                };
+                tracing::info!(table, create = %logged, "subscribed (aggregate, chDB)");
                 let result = aggregate.result();
                 let run = AggregateRun {
                     table: Arc::new(ChdbTable {
@@ -571,7 +575,7 @@ impl Engine {
                     Some((next, run))
                 })
                 .boxed();
-                (create, iterations)
+                (states, iterations)
             }
         };
         Ok(Subscription {

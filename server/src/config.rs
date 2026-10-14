@@ -69,10 +69,9 @@ impl Default for Server {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClickHouse {
-    /// HTTP, for history and snapshots.
+    /// HTTP: history, snapshots, and the states aggregates start from (the node snapshots are
+    /// made on).
     pub url: String,
-    /// The native protocol on the same node, for aggregates.
-    pub native: String,
     /// Reads history (SELECT on the tables and their snapshots).
     pub user: String,
     /// The user's password: as is, from an env var, or from a file (one at most; none: empty).
@@ -99,7 +98,6 @@ impl Default for ClickHouse {
     fn default() -> Self {
         Self {
             url: "http://127.0.0.1:8123".into(),
-            native: "127.0.0.1:9000".into(),
             user: "chlive_ro".into(),
             password: None,
             password_env: None,
@@ -350,7 +348,6 @@ impl Config {
             kafka_brokers: self.kafka.brokers.clone(),
             kafka_properties: self.kafka.properties.clone(),
             metadata_refresh: self.kafka.metadata_refresh,
-            clickhouse_native: self.clickhouse.native.clone(),
             pause_server_url: self.pause_server.url.clone(),
             snapshot_user: self.clickhouse.snapshot_user.clone(),
             snapshot_password: self.clickhouse.snapshot_password()?,
@@ -496,7 +493,6 @@ mod tests {
             d.clickhouse,
             ClickHouse {
                 url: "http://127.0.0.1:8123".into(),
-                native: "127.0.0.1:9000".into(),
                 user: "chlive_ro".into(),
                 password: None,
                 password_env: None,
@@ -551,7 +547,6 @@ mod tests {
             (e.snapshot_user.as_str(), e.snapshot_password.as_str()),
             ("chlive_snap", "")
         );
-        assert_eq!(e.clickhouse_native, "127.0.0.1:9000");
         assert_eq!(e.kafka_brokers, "127.0.0.1:9092");
         assert!(e.kafka_properties.is_empty());
         assert_eq!(e.metadata_refresh, Duration::from_secs(30));
@@ -609,7 +604,6 @@ mod tests {
 
                 [clickhouse]
                 url = "http://ch:8123"
-                native = "ch:9000"
                 user = "reader"
                 password_env = "CH_PASS"
                 snapshot_user = "snapper"
@@ -662,7 +656,6 @@ mod tests {
                 }
             );
             assert_eq!(c.clickhouse.url, "http://ch:8123");
-            assert_eq!(c.clickhouse.native, "ch:9000");
             assert_eq!(c.clickhouse.user, "reader");
             assert_eq!(c.clickhouse.snapshot_user, "snapper");
             assert_eq!(c.clickhouse.snapshot_database.as_deref(), Some("snaps"));
@@ -779,6 +772,9 @@ mod tests {
     #[test]
     fn errors_name_the_key() {
         Jail::expect_with(|jail| {
+            // the native address is gone: everything is HTTP
+            let e = err(jail, "[clickhouse]\nnative = \"ch:9000\"");
+            assert!(e.contains("native"), "{e}");
             let e = err(jail, "[server]\nlisten_on = \"x\"");
             assert!(e.contains("listen_on"), "{e}");
             let e = err(jail, "[nope]\nx = 1");

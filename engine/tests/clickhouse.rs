@@ -1,4 +1,4 @@
-//! Against a real ClickHouse (CHLIVE_CLICKHOUSE_URL and CHLIVE_CLICKHOUSE_NATIVE, which the `e2e`
+//! Against a real ClickHouse (CHLIVE_CLICKHOUSE_URL, which the `e2e`
 //! script sets); runs only with CHLIVE_E2E=1. Uses its own small table instead of the seeded
 //! `default.events`.
 
@@ -20,11 +20,6 @@ use serde_json::json;
 
 fn url() -> String {
     std::env::var("CHLIVE_CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:18123".into())
-}
-
-/// Where chDB reads aggregate states from (`remote()`, the native protocol).
-fn native() -> String {
-    std::env::var("CHLIVE_CLICKHOUSE_NATIVE").unwrap_or_else(|_| "127.0.0.1:19000".into())
 }
 
 /// Stands in for the pause server: ingestion is "paused" with the offsets the test put in
@@ -93,7 +88,7 @@ fn engine_custom(
         source,
         snapshots,
     )
-    .with_clickhouse_native(&native(), "default", "")
+    .with_clickhouse(&url(), "default", "")
 }
 
 /// ClickHouse holds partition 0's first `n` events.

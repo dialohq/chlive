@@ -41,7 +41,8 @@ impl Drop for ChdbTable {
 pub(crate) struct AggregateRun {
     pub(crate) chdb: Chdb,
     pub(crate) table: Arc<ChdbTable>,
-    /// The history's `CREATE TABLE … AS SELECT … FROM remote(…)`, until it has run.
+    /// The history's `CREATE TABLE … AS SELECT * FROM url(…)` (main ClickHouse's states, over
+    /// HTTP), until it has run.
     pub(crate) create: Option<String>,
     /// The snapshot `create` reads, until it has run.
     pub(crate) snapshot: Option<crate::snapshot::Lease>,

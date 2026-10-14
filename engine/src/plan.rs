@@ -186,9 +186,20 @@ impl AggregatePlan {
         ))
     }
 
-    /// Create the chDB table with the history's states, computed by main ClickHouse (`remote`:
-    /// the `remote(…)` table function reading a snapshot of the table).
-    pub fn create_sql(&self, table: &str, remote: &str) -> String {
+    /// The history's per-group states, as main ClickHouse computes them from `from` (a
+    /// snapshot of the table): what chDB's table starts with.
+    pub fn states_sql(&self, from: &str) -> String {
+        format!(
+            "SELECT {} FROM {from}{}{}",
+            self.state_select,
+            self.where_clause(),
+            self.group_by_clause()
+        )
+    }
+
+    /// Create the chDB table with the history's states, read from `source` (see
+    /// [`AggregatePlan::http_source`]).
+    pub fn create_sql(&self, table: &str, source: &str) -> String {
         let order = if self.keys == 0 {
             "tuple()".to_string()
         } else {
@@ -196,18 +207,23 @@ impl AggregatePlan {
         };
         format!(
             "CREATE TABLE {table} ENGINE = AggregatingMergeTree ORDER BY {order} \
-             SETTINGS allow_nullable_key = 1 AS SELECT {} FROM {remote}{}{}",
-            self.state_select,
-            self.where_clause(),
-            self.group_by_clause()
+             SETTINGS allow_nullable_key = 1 AS SELECT * FROM {source}"
         )
     }
 
-    /// The `remote()` reading `table` (`db.name`) from main ClickHouse.
-    pub fn remote(table: &str, address: &str, user: &str, password: &str) -> String {
+    /// chDB's `url()` running `sql` on main ClickHouse over HTTP. The result comes as
+    /// RowBinaryWithNamesAndTypes, which carries aggregate states as they are and, unlike Native,
+    /// names its columns and types even when there are no rows (no history), so chDB always
+    /// knows the table's structure. The credentials go in headers (so they're in no URL or query
+    /// log).
+    pub fn http_source(http_url: &str, sql: &str, user: &str, password: &str) -> String {
+        let mut url = reqwest::Url::parse(http_url)
+            .unwrap_or_else(|_| reqwest::Url::parse("http://invalid/").expect("a URL"));
+        url.query_pairs_mut()
+            .append_pair("query", &format!("{sql} FORMAT RowBinaryWithNamesAndTypes"));
         format!(
-            "remote({}, {table}, {}, {})",
-            quote_string(address),
+            "url({}, 'RowBinaryWithNamesAndTypes', headers('X-ClickHouse-User' = {}, 'X-ClickHouse-Key' = {}))",
+            quote_string(url.as_str()),
             quote_string(user),
             quote_string(password)
         )
@@ -787,11 +803,8 @@ impl std::fmt::Display for Plan {
             writeln!(f, "output:  {}", names.join(", "))?;
             writeln!(
                 f,
-                "history: {}",
-                a.create_sql(
-                    "<chdb table>",
-                    &AggregatePlan::remote("<snapshot>", "<main>", "<user>", "<password>")
-                )
+                "history: {} (in ClickHouse; chDB reads the states over HTTP)",
+                a.states_sql("<snapshot>")
             )?;
             writeln!(f, "merge:   {}", a.snapshot_sql("<chdb table>"))?;
             match a.native_history_sql("<snapshot>") {
@@ -1158,6 +1171,36 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
 mod tests {
     use super::*;
     use crate::binder::Projected;
+
+    #[test]
+    fn chdb_reads_states_over_http() {
+        let sql = "SELECT country AS __k0, uniqExactState(user_id) AS __a0_0 \
+                   FROM db.`__chlive_snap_events_1` WHERE path = 'a&b' GROUP BY __k0";
+        let src = AggregatePlan::http_source("http://ch:8123", sql, "ro", "it's secret");
+        // the query (with its FORMAT) is in the URL, encoded; the credentials are headers
+        assert_eq!(
+            src,
+            "url('http://ch:8123/?query=SELECT+country+AS+__k0%2C+uniqExactState%28user_id%29+AS+__a0_0+\
+             FROM+db.%60__chlive_snap_events_1%60+WHERE+path+%3D+%27a%26b%27+GROUP+BY+__k0+FORMAT+RowBinaryWithNamesAndTypes', \
+             'RowBinaryWithNamesAndTypes', headers('X-ClickHouse-User' = 'ro', 'X-ClickHouse-Key' = 'it\\'s secret'))"
+        );
+        assert!(
+            !src.contains("secret") || !src.split("headers").next().unwrap().contains("secret")
+        );
+        // HTTPS, a path, and parameters already in the URL are kept
+        let src = AggregatePlan::http_source(
+            "https://ch.example:8443/proxy?database=x",
+            "SELECT 1",
+            "u",
+            "",
+        );
+        assert!(
+            src.starts_with(
+                "url('https://ch.example:8443/proxy?database=x&query=SELECT+1+FORMAT+RowBinaryWithNamesAndTypes'"
+            ),
+            "{src}"
+        );
+    }
     use crate::watermark::Watermark;
     use serde_json::json;
 

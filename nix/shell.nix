@@ -180,7 +180,6 @@ let
   # chlive-engine, the tests and the bench read; a value already set wins.
   stackEnv = ''
     export CHLIVE_CLICKHOUSE_URL="''${CHLIVE_CLICKHOUSE_URL:-$(dnvr-state get clickhouse.httpUrl)}"
-    export CHLIVE_CLICKHOUSE_NATIVE="''${CHLIVE_CLICKHOUSE_NATIVE:-$(dnvr-state get clickhouse.host):$(dnvr-state get clickhouse.tcpPort)}"
     export CHLIVE_KAFKA="''${CHLIVE_KAFKA:-$(dnvr-state get redpanda.bootstrap)}"
     export CHLIVE_PAUSE_SERVER="''${CHLIVE_PAUSE_SERVER:-$(dnvr-state get pause-server.url)}"
   '';
@@ -427,8 +426,6 @@ in
         PAUSE_SERVER_URL = "dnvr://pause-server/url";
         CH_HTTP_URL = "dnvr://clickhouse/httpUrl";
         KAFKA_BROKERS = "dnvr://redpanda/bootstrap";
-        CH_HOST = "dnvr://clickhouse/host";
-        CH_TCP_PORT = "dnvr://clickhouse/tcpPort";
       };
       command = ''
         cd "$DNVR_ROOT"
@@ -437,8 +434,7 @@ in
         dnvr-state set httpUrl "http://127.0.0.1:$port"
         exec cargo run --release -p chlive-server -- --config nix/chlive.dev.toml \
           --listen "127.0.0.1:$port" --clickhouse-url "$CH_HTTP_URL" \
-          --clickhouse-native "$CH_HOST:$CH_TCP_PORT" --kafka "$KAFKA_BROKERS" \
-          --pause-server "$PAUSE_SERVER_URL"
+          --kafka "$KAFKA_BROKERS" --pause-server "$PAUSE_SERVER_URL"
       '';
     };
 

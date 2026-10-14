@@ -68,8 +68,6 @@ pub fn config() -> Config {
         kafka_brokers: std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:9092".into()),
         kafka_properties: Default::default(),
         metadata_refresh: chlive_engine::source::METADATA_REFRESH,
-        clickhouse_native: std::env::var("CHLIVE_CLICKHOUSE_NATIVE")
-            .unwrap_or_else(|_| "127.0.0.1:19000".into()),
     }
 }
 
@@ -250,7 +248,11 @@ pub struct LiveConn {
 impl LiveConn {
     pub async fn connect(server: &Server) -> Result<Self> {
         let url = format!("ws://{}/live", server.addr);
-        let (ws, _) = tokio_tungstenite::connect_async(&url)
+        // like the clients: no limit on message size (a snapshot is one message)
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(None)
+            .max_frame_size(None);
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(&url, Some(config), false)
             .await
             .context("connecting websocket")?;
         let (mut sink, mut stream) = ws.split();
@@ -273,7 +275,12 @@ impl LiveConn {
                             *last.lock().unwrap() = Some(Instant::now());
                         }
                         Some(Ok(_)) => {}
-                        _ => return,
+                        Some(Err(e)) => {
+                            // the tests then wait in vain: say why
+                            eprintln!("live connection failed: {e}");
+                            return;
+                        }
+                        None => return,
                     }
                 }
             }

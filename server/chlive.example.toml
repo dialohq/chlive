@@ -4,8 +4,8 @@
 ## environment variables, then flags; each overrides the one before.
 ##   env:   CHLIVE_<SECTION>__<KEY>, e.g. CHLIVE_KAFKA__BROKERS=broker:9092,
 ##          CHLIVE_TABLES__EVENTS__TOPIC=prod.events (values are read as TOML when they can be)
-##   flags: --set server.max_connections=500, and --listen, --clickhouse-url,
-##          --clickhouse-native, --kafka, --pause-server
+##   flags: --set server.max_connections=500, and --listen, --clickhouse-url, --kafka,
+##          --pause-server
 ## `chlive config show` prints the result with where each value came from; `chlive config
 ## check FILE` checks a file. Unknown keys are errors. Durations: "250ms", "10s", "5m", "1h".
 
@@ -25,9 +25,9 @@
 # progress_interval = "1s"
 
 [clickhouse]
-## HTTP (history, snapshots) and the native protocol (aggregates), on the same node.
+## Everything goes over HTTP(S): history, snapshots (made on this node) and the aggregate
+## states chDB merges from.
 # url = "http://127.0.0.1:8123"
-# native = "127.0.0.1:9000"
 ## Reads history: SELECT on the tables and on their snapshots.
 # user = "chlive_ro"
 ## A password is given as is (password), from an env var (password_env) or from a file

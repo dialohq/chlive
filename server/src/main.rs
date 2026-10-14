@@ -28,9 +28,6 @@ struct Cli {
     /// = --set clickhouse.url=…
     #[arg(long, global = true)]
     clickhouse_url: Option<String>,
-    /// = --set clickhouse.native=…
-    #[arg(long, global = true)]
-    clickhouse_native: Option<String>,
     /// = --set kafka.brokers=…
     #[arg(long, global = true)]
     kafka: Option<String>,
@@ -68,7 +65,6 @@ impl Cli {
         let shortcuts = [
             ("server.listen", &self.listen),
             ("clickhouse.url", &self.clickhouse_url),
-            ("clickhouse.native", &self.clickhouse_native),
             ("kafka.brokers", &self.kafka),
             ("pause_server.url", &self.pause_server),
         ];

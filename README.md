@@ -28,7 +28,7 @@ dnvr up          # starts everything in a tmux dashboard
 
 Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `tui` (live queries as a table in the terminal), `e2e` (the tests that need the stack), `bench` (the query benchmark), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
 
-Every process picks free ports on each start (`dnvr-state pick-port`), so the stack runs next to anything else, and publishes its addresses; the processes get each other's through `dnvr://<process>/<key>` refs. From a terminal, read them with `dnvr-state get <process>.<key>` (e.g. `dnvr-state get playground.url`, `dnvr-state get server.url`), or list everything with `dnvr-state dump`. The `ch`, `produce`, `tui`, `e2e` and `bench` scripts look them up the same way; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_CLICKHOUSE_NATIVE`, `CHLIVE_KAFKA` and `CHLIVE_PAUSE_SERVER` (and `PROXY_URL` for `produce`, `CHLIVE_URL`/`CH_URL`/`PROXY_URL` for `bench`) override them.
+Every process picks free ports on each start (`dnvr-state pick-port`), so the stack runs next to anything else, and publishes its addresses; the processes get each other's through `dnvr://<process>/<key>` refs. From a terminal, read them with `dnvr-state get <process>.<key>` (e.g. `dnvr-state get playground.url`, `dnvr-state get server.url`), or list everything with `dnvr-state dump`. The `ch`, `produce`, `tui`, `e2e` and `bench` scripts look them up the same way; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_KAFKA` and `CHLIVE_PAUSE_SERVER` (and `PROXY_URL` for `produce`, `CHLIVE_URL`/`CH_URL`/`PROXY_URL` for `bench`) override them.
 
 State lives in `.dnvr/` (gitignored) and in the `chlive-redpanda` Docker volume.
 
@@ -98,8 +98,7 @@ listen = "0.0.0.0:8080"
 allowed_origins = ["https://app.example.com"]   # browsers; clients without an Origin always connect
 
 [clickhouse]
-url = "http://clickhouse:8123"
-native = "clickhouse:9000"                      # the same node, for aggregates
+url = "http://clickhouse:8123"                  # everything goes over HTTP(S)
 password_env = "CHLIVE_RO_PASSWORD"             # or password, or password_file
 snapshot_password_file = "/run/secrets/chlive_snap"
 snapshot_database = "chlive_snapshots"          # clones go there instead of next to each table
@@ -124,7 +123,7 @@ customer = { clickhouse = "customer_id", json = "customerId" }
 
 - **Sections:**
   - `[server]`: `listen`, `path` (`/live`), `allowed_origins`, `max_connections` (10 000; more get 503), `max_subscriptions_per_connection` (100; more get `TOO_MANY_SUBSCRIPTIONS`) and `progress_interval` (1 s);
-  - `[clickhouse]`: `url`, `native`, `user` (`chlive_ro`) and `snapshot_user` (`chlive_snap`) with their passwords, and `snapshot_database`;
+  - `[clickhouse]`: `url` (HTTP or HTTPS; the only way the server talks to ClickHouse), `user` (`chlive_ro`) and `snapshot_user` (`chlive_snap`) with their passwords, and `snapshot_database`;
   - `[kafka]`: `brokers`, `metadata_refresh` (30 s) and `properties`;
   - `[pause_server]`: `url`;
   - `[snapshots]`: `refresh` (10 s) and `idle` (1 h);
@@ -132,7 +131,7 @@ customer = { clickhouse = "customer_id", json = "customerId" }
   - `[tables]`: see below.
 - **Durations** are written `"250ms"`, `"10s"`, `"5m"` or `"1h"`. Unknown keys are errors, so a typo stops the server at start, with the key named.
 - **Env vars** are `CHLIVE_<SECTION>__<KEY>`, with `__` for each level, e.g. `CHLIVE_KAFKA__BROKERS`, `CHLIVE_SERVER__MAX_CONNECTIONS=500` or `CHLIVE_TABLES__EVENTS__TOPIC=prod.events`. Values are read as TOML when they can be (`500`, `["a", "b"]`). Only names whose first part is a section count: `CHLIVE_URL`, `CHLIVE_E2E` and the test scripts' `CHLIVE_CLICKHOUSE_URL` aren't config.
-- **Flags:** `--set key.path=value` (repeatable; the value as TOML, or a string), and the shortcuts `--listen`, `--clickhouse-url`, `--clickhouse-native`, `--kafka` and `--pause-server`.
+- **Flags:** `--set key.path=value` (repeatable; the value as TOML, or a string), and the shortcuts `--listen`, `--clickhouse-url`, `--kafka` and `--pause-server`.
 - **Passwords** come as is (`password`), from an env var (`password_env`) or from a file (`password_file`, as Docker and Kubernetes mount secrets; a trailing newline is trimmed). Each user takes at most one of the three; none means an empty password.
 - **`chlive config show`** prints the effective config, each value with where it came from (`default`, `file`, `env CHLIVE_…` or `flag`), passwords hidden. `chlive config check [FILE]` checks a file.
 - **Tables.** `expose = "listed"` (the default) allows only the tables listed as `[tables.<name>]`, so a new ClickHouse table is never queryable by accident; `"all"` allows every table in `database` too. Each listed table can override:
@@ -147,7 +146,7 @@ customer = { clickhouse = "customer_id", json = "customerId" }
 
 The engine is a library, used by the server.
 
-**History and stream meet at a snapshot's watermark.** At subscribe time the engine takes the table's current snapshot (see [How it works](#how-it-works)): a clone holding exactly the offsets below the pause server's `N[p]` per partition. History is the whole clone, and each Kafka partition is consumed from `N[p]`. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. A table must be ingested by exactly one sink connector, from its topic (by default the one of the same name; see [Server configuration](#server-configuration)). The engine's ClickHouse node must be the one clones are made on (`clickhouse_url` and `clickhouse_native` point to one node); for replicated tables it runs `SYSTEM SYNC REPLICA` first.
+**History and stream meet at a snapshot's watermark.** At subscribe time the engine takes the table's current snapshot (see [How it works](#how-it-works)): a clone holding exactly the offsets below the pause server's `N[p]` per partition. History is the whole clone, and each Kafka partition is consumed from `N[p]`. So every event is in exactly one of the two, wherever ClickHouse's ingestion is at. The engine assigns partitions directly and never commits offsets, so subscriptions don't affect each other. A table must be ingested by exactly one sink connector, from its topic (by default the one of the same name; see [Server configuration](#server-configuration)). The engine talks to ClickHouse only over HTTP(S), and `clickhouse.url` must reach the node clones are made on; for replicated tables it runs `SYSTEM SYNC REPLICA` first.
 
 The full grammar is under [Supported queries](#supported-queries). A condition can use:
 - comparisons (`=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`), with `AND`, `OR`, `NOT` and parentheses;
@@ -333,7 +332,7 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 `SELECT keys, agg(c) [AS name], … FROM t [WHERE …] [GROUP BY keys] [ORDER BY …] [LIMIT n] [OFFSET m]`, with ClickHouse's result types and output names (see [Supported queries](#supported-queries)). Functions: `count()`, `count(c)`, `sum`, `avg`, `min`, `max` (native), and `uniq`, `uniqExact`, `median`, `any`, `anyLast` (chDB). Not yet: HAVING, expressions as arguments, and resuming aggregates (they start from a snapshot).
 
 - **Native** when every aggregate in the query has a native implementation (`engine/src/aggregate/`: the `AggregateFunction` and `AggregateState` traits). ClickHouse computes the parts of each group's state over HTTP (`avg(x)` → `sum(x)`, `count(x)`), and the engine keeps the states in memory and updates them per event. `--explain` says which way a query runs.
-- **chDB** (ClickHouse as a library, inside the engine) otherwise. Main ClickHouse computes the history's aggregate states (`uniqExactState(x)`, …) with `remote()` into a chDB table per subscription; each batch of events (up to 1000 that arrived together) adds its states, and the groups it touched are read back finalized with `…Merge`.
+- **chDB** (ClickHouse as a library, inside the engine) otherwise. Main ClickHouse computes the history's aggregate states (`uniqExactState(x)`, …) from the snapshot, and a chDB table per subscription loads them over HTTP (`url()`, as RowBinaryWithNamesAndTypes, which carries states as they are); each batch of events (up to 1000 that arrived together) adds its states, and the groups it touched are read back finalized with `…Merge`.
 - Either way, the groups touched by a batch are compared with what was sent.
 - **Rows have ids**, their group's key as JSON (`["PL"]`, `[]` for a global aggregate). The snapshot carries `ids`; new groups are `insert`s with an `id`; changed ones `{"op": "update", "id", "set": {…}}` with only the changed columns, and, when an ordered result moves the row, `"index"`: where it is after the move.
 - **Cost:** see [docs/bench/group-by.md](docs/bench/group-by.md). Natively ~1 M events/s per subscription one at a time, up to several M/s batched. chDB costs ~2–5 ms per batch, so ~500 events/s one at a time and ~150–500 k/s in batches of 1000.
