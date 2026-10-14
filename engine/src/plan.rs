@@ -1575,13 +1575,30 @@ mod tests {
         assert_eq!(cursor::decode(&other, &token), None);
         assert_eq!(cursor::decode(&p, "garbage"), None);
         assert_eq!(
-            cursor::decode(&p, &token.replace("\"v\":1", "\"v\":2")),
+            cursor::decode(&p, &token.replace("\"v\":2", "\"v\":1")),
             None
         );
         // stable across runs: a hash of the plan, not of memory addresses
         assert_eq!(
             cursor::fingerprint(&p),
             cursor::fingerprint(&plan(&bound(&[1], None)))
+        );
+        assert_eq!(cursor::fingerprint(&p), cursor::hash(&cursor::identity(&p)));
+        // with a lineage (a shared result's): both come back
+        let token = cursor::encode_with(&p, Some("lin-1"), &at);
+        assert_eq!(
+            cursor::decode_cursor(&p, &token),
+            Some(cursor::Cursor {
+                at: at.clone(),
+                lineage: Some("lin-1".into())
+            })
+        );
+        assert_eq!(cursor::decode(&p, &token), Some(at.clone()));
+        assert_eq!(
+            cursor::decode_cursor(&p, &cursor::encode(&p, &at))
+                .unwrap()
+                .lineage,
+            None
         );
     }
 }

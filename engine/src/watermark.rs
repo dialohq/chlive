@@ -29,6 +29,15 @@ impl Watermark {
         Watermark(out)
     }
 
+    /// Whether this is at or past `other` in every partition (a missing partition is `-1`): a
+    /// result complete up to `self` has everything one complete up to `other` has.
+    pub fn covers(&self, other: &Watermark) -> bool {
+        let partitions = self.0.keys().chain(other.0.keys());
+        partitions
+            .into_iter()
+            .all(|p| self.get(*p) >= other.get(*p))
+    }
+
     /// For logs and explain: `{0: 120, 1: 98}`.
     pub fn describe(&self) -> String {
         let parts: Vec<String> = self.0.iter().map(|(p, o)| format!("{p}: {o}")).collect();
@@ -39,6 +48,19 @@ impl Watermark {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn covers() {
+        let w = |pairs: &[(i32, i64)]| Watermark(pairs.iter().copied().collect());
+        assert!(w(&[(0, 5), (1, 3)]).covers(&w(&[(0, 5), (1, 3)])));
+        assert!(w(&[(0, 6), (1, 3)]).covers(&w(&[(0, 5), (1, 3)])));
+        assert!(!w(&[(0, 6), (1, 2)]).covers(&w(&[(0, 5), (1, 3)])));
+        // a partition missing on one side is -1 there
+        assert!(w(&[(0, 5), (1, 0)]).covers(&w(&[(0, 5)])));
+        assert!(!w(&[(0, 5)]).covers(&w(&[(0, 5), (1, 0)])));
+        assert!(w(&[]).covers(&w(&[])));
+        assert!(w(&[(0, -1)]).covers(&w(&[])));
+    }
 
     #[test]
     fn starts() {

@@ -1786,6 +1786,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_plan_identity_tells_queries_apart() {
+        let id = |sql: &'static str| async move {
+            crate::cursor::identity(&crate::plan::plan(&bind_sql(sql).await.unwrap()))
+        };
+        // aggregates over the same table and filter: their plain history is the same, their
+        // identities aren't
+        let by_user = id("select user_id, count() from events group by user_id").await;
+        let global = id("select count(), sum(latency_ms) from events").await;
+        let top =
+            id("select user_id, count() as n from events group by user_id order by n desc limit 3")
+                .await;
+        assert_ne!(by_user, global);
+        assert_ne!(by_user, top);
+        assert_ne!(global, id("select count() from events").await);
+        // the same query, written differently (keywords, spacing): the same identity
+        assert_eq!(
+            by_user,
+            id("SELECT user_id,   count()  FROM events  GROUP BY user_id").await
+        );
+        assert_eq!(
+            id("select ts from events where latency_ms > 5").await,
+            id("select ts from events where latency_ms>5").await
+        );
+        // output names are part of it: `COUNT()` is another column than `count()`
+        assert_ne!(
+            by_user,
+            id("select user_id, COUNT() from events group by user_id").await
+        );
+    }
+
+    #[tokio::test]
     async fn parameter_errors() {
         use serde_json::json;
         let err = |sql: &'static str, params: serde_json::Value| async move {
