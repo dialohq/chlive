@@ -401,7 +401,7 @@ The playground uses it: the "Client state" panel shows a hit or miss, whether th
 cargo test --workspace     # engine (lexer, parser, binder, planner, types, watermark), server protocol over a real WebSocket,
                            # the protocol's messages, the Rust client's result store and connection (against a fake server)
 bun run test               # client state, reconnect/resume, the cache store on bun:sqlite (bun test)
-e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chlive-e2e, against `dnvr up`
+e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chlive-e2e, against `dnvr up`; output kept in .dnvr/e2e.log
 ```
 
 `e2e` runs the engine's ClickHouse and Kafka tests, then the server end to end. The latter subscribe over WebSocket while producing events, and check that each live result (snapshot plus inserts) equals the same query run directly on ClickHouse once everything is ingested; one does so through the Rust client. They count rows across the whole `events` table, so don't produce other events (e.g. with the playground's buttons) while they run.

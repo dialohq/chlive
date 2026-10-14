@@ -485,7 +485,14 @@ in
       text = ''
         ${stackEnv}
         cd "$DNVR_ROOT"
-        CHLIVE_E2E=1 exec cargo test -p chlive-engine -p chlive-e2e "$@"
+        # the whole output is kept (the stack's tests can be timing-sensitive: a failure's
+        # details shouldn't depend on what the terminal kept)
+        mkdir -p .dnvr
+        set -o pipefail
+        status=0
+        CHLIVE_E2E=1 cargo test -p chlive-engine -p chlive-e2e "$@" 2>&1 | tee .dnvr/e2e.log || status=$?
+        echo "(full output: .dnvr/e2e.log)" >&2
+        exit "$status"
       '';
     };
     bench = {
