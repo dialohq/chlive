@@ -57,11 +57,13 @@ pub fn lookup(name: &str) -> Option<AggFunc> {
         "median" => AggFunc::Median,
         "any" => AggFunc::Any,
         "anylast" => AggFunc::AnyLast,
+        "grouparray" | "array_agg" => AggFunc::GroupArray,
         _ => return None,
     })
 }
 
-pub const SUPPORTED: &str = "count, sum, avg, min, max, uniq, uniqExact, median, any, anyLast";
+pub const SUPPORTED: &str =
+    "count, sum, avg, min, max, uniq, uniqExact, median, any, anyLast, groupArray (array_agg)";
 
 /// The native implementation, if there is one.
 pub fn native(func: AggFunc) -> Option<&'static dyn AggregateFunction> {
@@ -116,6 +118,8 @@ pub fn result_type(func: AggFunc, arg: Option<&Type>) -> Result<Type, String> {
             _ => "Float64",
         })),
         AggFunc::Avg | AggFunc::Median => Ok(nullable("Float64")),
+        // NULLs are skipped, so the elements aren't Nullable; nor LowCardinality
+        AggFunc::GroupArray => Ok(Type::parse(&format!("Array({})", bare(ty)))),
         AggFunc::Min | AggFunc::Max | AggFunc::Any | AggFunc::AnyLast => {
             if !ty.ops().min_max {
                 Err(format!("{}() of this type is not supported", func.name()))

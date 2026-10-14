@@ -173,6 +173,8 @@ pub enum AggFunc {
     Median,
     Any,
     AnyLast,
+    /// `groupArray` (also `array_agg`): every value, NULLs skipped.
+    GroupArray,
 }
 
 impl AggFunc {
@@ -189,6 +191,7 @@ impl AggFunc {
             AggFunc::Median => "median",
             AggFunc::Any => "any",
             AggFunc::AnyLast => "anyLast",
+            AggFunc::GroupArray => "groupArray",
         }
     }
 }
@@ -919,9 +922,10 @@ fn bind_call(
         }
     };
     let ty = result_type(func, arg.as_ref().map(|(id, c)| (table.column(*id), *c)))?;
+    // as ClickHouse names it: the function as written (`COUNT()`, `array_agg(x)`)
     let default_name = match &arg {
-        None => format!("{}()", func.name()),
-        Some((id, _)) => format!("{}({})", func.name(), table.column(*id).name),
+        None => format!("{name}()"),
+        Some((id, _)) => format!("{name}({})", table.column(*id).name),
     };
     let expr = AggExpr::Call {
         func,
@@ -2125,6 +2129,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_array_and_names_as_written() {
+        let b = bind_sql(
+            "select user_id, groupArray(latency_ms), array_agg(coupon), ARRAY_AGG(ts), COUNT(*), Sum(latency_ms) \
+             from events group by user_id",
+        )
+        .await
+        .unwrap();
+        let items: Vec<(String, String)> = b
+            .aggregation
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| (i.name.clone(), i.ty.clickhouse.clone()))
+            .collect();
+        let want = [
+            ("user_id", "String"),
+            ("groupArray(latency_ms)", "Array(UInt32)"),
+            // NULLs are skipped: the elements aren't Nullable
+            ("array_agg(coupon)", "Array(String)"),
+            ("ARRAY_AGG(ts)", "Array(DateTime64(3))"),
+            // ClickHouse's names keep the function as written
+            ("COUNT()", "UInt64"),
+            ("Sum(latency_ms)", "UInt64"),
+        ];
+        assert_eq!(items, want.map(|(n, t)| (n.to_string(), t.to_string())));
+        // arrays have no order to sort groups by
+        let e =
+            bind_sql("select user_id, groupArray(ts) as g from events group by user_id order by g")
+                .await
+                .unwrap_err();
+        assert!(e.contains("g"), "{e}");
+        // and it's chDB's: there's no native implementation
+        assert!(crate::aggregate::native(AggFunc::GroupArray).is_none());
+    }
+
+    #[tokio::test]
     async fn aggregation_errors() {
         let e = |sql: &'static str| async move { bind_sql(sql).await.unwrap_err() };
         assert_eq!(
@@ -2141,7 +2181,7 @@ mod tests {
         );
         assert_eq!(
             e("select stddev(ts) from events").await,
-            "unknown function stddev (supported: count, sum, avg, min, max, uniq, uniqExact, median, any, anyLast) at 1:8"
+            "unknown function stddev (supported: count, sum, avg, min, max, uniq, uniqExact, median, any, anyLast, groupArray (array_agg)) at 1:8"
         );
         assert_eq!(
             e("select sum(user_id) from events").await,

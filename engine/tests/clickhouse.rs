@@ -1067,6 +1067,9 @@ async fn aggregates_match_clickhouse() {
         "select country, uniqExact(name), uniq(n), median(amount) from events group by country",
         "select country, any(country), anyLast(country), uniqExact(score) from events group by country",
         "select median(score), uniqExact(flag) from events",
+        // groupArray (array_agg): every value (NULLs skipped), in no defined order
+        "select country, groupArray(name), array_agg(score) from events group by country",
+        "select groupArray(flag), ARRAY_AGG(ts), count() from events where n > 0",
         // ordered and limited: checked in order, tie groups compared as sets, and with LIMIT
         // the last tie group by key and size only (which of its rows make it is arbitrary)
         "select country, count() as n from events group by country order by n desc, country",
@@ -1119,31 +1122,29 @@ async fn aggregates_match_clickhouse() {
     }
     let direct = ClickHouseHttp::new(&url(), "default", "");
     // rows as comparable text: floats to 9 significant digits (ClickHouse adds in parallel)
-    let canon = |rows: &[chlive_engine::diff::Row]| -> Vec<String> {
-        let mut v: Vec<String> = rows
-            .iter()
-            .map(|r| {
-                r.iter()
-                    .map(|(k, v)| match v.as_f64() {
-                        Some(f) if !v.is_i64() && !v.is_u64() => format!("{k}={f:.9e}"),
-                        _ => format!("{k}={v}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-            .collect();
-        v.sort();
-        v
-    };
-    // a row as comparable text: floats to 9 significant digits (ClickHouse adds in parallel)
+    // a value as comparable text: floats to 9 significant digits (ClickHouse adds in
+    // parallel), arrays (groupArray) as sorted lists (their order isn't defined)
+    fn canon_value(v: &serde_json::Value) -> String {
+        match (v, v.as_f64()) {
+            (serde_json::Value::Array(items), _) => {
+                let mut items: Vec<String> = items.iter().map(canon_value).collect();
+                items.sort();
+                format!("[{}]", items.join(","))
+            }
+            (_, Some(f)) if !v.is_i64() && !v.is_u64() => format!("{f:.9e}"),
+            _ => v.to_string(),
+        }
+    }
     let canon_row = |r: &chlive_engine::diff::Row| -> String {
         r.iter()
-            .map(|(k, v)| match v.as_f64() {
-                Some(f) if !v.is_i64() && !v.is_u64() => format!("{k}={f:.9e}"),
-                _ => format!("{k}={v}"),
-            })
+            .map(|(k, v)| format!("{k}={}", canon_value(v)))
             .collect::<Vec<_>>()
             .join(",")
+    };
+    let canon = |rows: &[chlive_engine::diff::Row]| -> Vec<String> {
+        let mut v: Vec<String> = rows.iter().map(canon_row).collect();
+        v.sort();
+        v
     };
     // the output columns an ordered case is ordered by (none: hidden, or unordered)
     let order_columns = |sql: &str| -> Vec<String> {
