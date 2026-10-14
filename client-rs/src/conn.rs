@@ -114,7 +114,11 @@ async fn run(opts: ClientOptions, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                 return;
             }
         }
-        let connecting = tokio_tungstenite::connect_async(opts.url.as_str());
+        let connecting = tokio_tungstenite::connect_async_with_config(
+            opts.url.as_str(),
+            Some(ws_config()),
+            false,
+        );
         tokio::pin!(connecting);
         let ws = loop {
             tokio::select! {
@@ -251,4 +255,13 @@ async fn dispatch(subs: &BTreeMap<String, Sub>, text: &str) {
         },
     };
     let _ = sub.events.send(event).await;
+}
+
+/// No size limit on messages: a snapshot is the whole result in one message, so a big result
+/// is a big message (tungstenite's default, 16 MiB, would drop the connection on it). Browsers
+/// don't limit them either.
+fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(None)
+        .max_frame_size(None)
 }

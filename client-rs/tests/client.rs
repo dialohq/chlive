@@ -314,3 +314,25 @@ async fn typed_rows_of_an_aggregated_result() {
         matches!(&u.changes[0], Change::Update { id, row, index: Some(0) } if id == "[\"DE\"]" && **row == want)
     );
 }
+
+#[tokio::test]
+async fn a_snapshot_bigger_than_16_mib_arrives() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let mut sub = client.subscribe::<Row>(SQL);
+    assert_eq!(next(&mut sub).await.kind, Kind::Subscribed);
+    let mut conn = server.next().await;
+    conn.recv().await;
+    // ~20 MB in one message
+    let rows: Vec<Value> = (0..100_000)
+        .map(|i| json!({"user_id": format!("{i:0>200}")}))
+        .collect();
+    conn.send(
+        json!({"type": "snapshot", "id": "s1", "columns": [{"name": "user_id", "type": "String"}],
+                     "rows": rows, "at": "c1"}),
+    )
+    .await;
+    let u = next(&mut sub).await;
+    assert_eq!(u.kind, Kind::Snapshot);
+    assert_eq!(u.rows.len(), 100_000);
+}
