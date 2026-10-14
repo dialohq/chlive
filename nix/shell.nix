@@ -339,6 +339,12 @@ in
             | ${pkgs.curl}/bin/curl -sS --fail-with-body -X PUT \
               -H 'Content-Type: application/json' --data-binary @- \
               "$CONNECT_URL/connectors/${(sinkConnector topic).name}/config" >/dev/null
+          # a stop during a snapshot leaves the sink paused (the pause server's pause outlives
+          # it), and a task that failed on old settings stays failed: start clean
+          ${pkgs.curl}/bin/curl -sS --fail-with-body -X PUT \
+            "$CONNECT_URL/connectors/${(sinkConnector topic).name}/resume" >/dev/null
+          ${pkgs.curl}/bin/curl -sS --fail-with-body -X POST \
+            "$CONNECT_URL/connectors/${(sinkConnector topic).name}/restart?includeTasks=true&onlyFailed=true" >/dev/null
           until ${pkgs.curl}/bin/curl -fs "$CONNECT_URL/connectors/${(sinkConnector topic).name}/status" \
             | ${pkgs.jq}/bin/jq -e '.connector.state == "RUNNING" and (.tasks | length > 0) and all(.tasks[]; .state == "RUNNING")' >/dev/null; do
             sleep 0.5
