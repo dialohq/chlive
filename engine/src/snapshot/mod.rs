@@ -110,6 +110,11 @@ pub type Lease = Arc<Snapshot>;
 #[async_trait]
 pub trait Snapshots: Send + Sync {
     async fn acquire(&self, table: &SnapshotTable) -> Result<Lease, SnapshotError>;
+    /// The table is in use while the guard lives (a running subscription): its snapshots keep
+    /// being refreshed, and it's idle only from when the last guard goes.
+    fn in_use(&self, _table: &SnapshotTable) -> InUse {
+        InUse(None)
+    }
     /// Stop: drop the current clones (leases still held keep reading theirs; their tables are
     /// left for the next start's sweep).
     async fn shutdown(&self) {}
@@ -140,8 +145,21 @@ impl Default for SnapshotConfig {
     }
 }
 
+/// Keeps a table in use until dropped (see [`Snapshots::in_use`]).
+pub struct InUse(Option<(mpsc::UnboundedSender<Cmd>, SnapshotTable)>);
+
+impl Drop for InUse {
+    fn drop(&mut self) {
+        if let Some((tx, table)) = self.0.take() {
+            let _ = tx.send(Cmd::Unuse(table));
+        }
+    }
+}
+
 enum Cmd {
     Acquire(SnapshotTable, oneshot::Sender<Result<Lease, SnapshotError>>),
+    Use(SnapshotTable),
+    Unuse(SnapshotTable),
     Taken(SnapshotTable, Result<Snapshot, SnapshotError>),
     DropClone(String, String),
     Shutdown(oneshot::Sender<()>),
@@ -181,6 +199,13 @@ impl Snapshots for SnapshotManager {
             .map_err(|_| SnapshotError("the snapshot task stopped".into()))?
     }
 
+    fn in_use(&self, table: &SnapshotTable) -> InUse {
+        match self.tx.send(Cmd::Use(table.clone())) {
+            Ok(()) => InUse(Some((self.tx.clone(), table.clone()))),
+            Err(_) => InUse(None),
+        }
+    }
+
     async fn shutdown(&self) {
         let (done, rx) = oneshot::channel();
         if self.tx.send(Cmd::Shutdown(done)).is_ok() {
@@ -191,7 +216,10 @@ impl Snapshots for SnapshotManager {
 
 struct TableState {
     current: Option<Lease>,
+    /// The last acquire, or when the last user went.
     last_used: Instant,
+    /// Running subscriptions on the table ([`InUse`] guards).
+    users: usize,
     taking: bool,
     waiting: Vec<oneshot::Sender<Result<Lease, SnapshotError>>>,
 }
@@ -249,13 +277,20 @@ impl Task {
 
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
+            Cmd::Use(table) => {
+                let state = self.state(&table);
+                state.users += 1;
+                state.last_used = Instant::now();
+            }
+            Cmd::Unuse(table) => {
+                if let Some(state) = self.tables.get_mut(&table) {
+                    state.users = state.users.saturating_sub(1);
+                    // idle from now
+                    state.last_used = Instant::now();
+                }
+            }
             Cmd::Acquire(table, reply) => {
-                let state = self.tables.entry(table.clone()).or_insert(TableState {
-                    current: None,
-                    last_used: Instant::now(),
-                    taking: false,
-                    waiting: Vec::new(),
-                });
+                let state = self.state(&table);
                 state.last_used = Instant::now();
                 match &state.current {
                     Some(lease) => {
@@ -304,11 +339,22 @@ impl Task {
         }
     }
 
-    /// Every `refresh`: a new snapshot of each table in use; tables idle for `idle` are let go.
+    fn state(&mut self, table: &SnapshotTable) -> &mut TableState {
+        self.tables.entry(table.clone()).or_insert(TableState {
+            current: None,
+            last_used: Instant::now(),
+            users: 0,
+            taking: false,
+            waiting: Vec::new(),
+        })
+    }
+
+    /// Every `refresh`: a new snapshot of each table in use; tables idle for `idle` (no
+    /// subscription running, none acquired) are let go.
     fn refresh(&mut self) {
         let idle = self.config.idle;
         self.tables.retain(|table, state| {
-            let keep = state.last_used.elapsed() < idle || state.taking;
+            let keep = state.users > 0 || state.last_used.elapsed() < idle || state.taking;
             if !keep {
                 tracing::info!(table = %table.table, "no subscriptions lately: snapshots stop");
             }
@@ -640,6 +686,52 @@ mod tests {
         // a new subscription takes a fresh one
         m.acquire(&events()).await.unwrap();
         assert_eq!(fake.pauses.load(Ordering::SeqCst), pauses + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_running_subscription_keeps_its_table_in_use_past_idle() {
+        let fake = Arc::new(Fake::default());
+        let m = manager(&fake); // refresh 10 s, idle 1 h
+        let guard = m.in_use(&events());
+        drop(m.acquire(&events()).await.unwrap());
+        // two hours with no acquire, but in use: still refreshed
+        tokio::time::sleep(Duration::from_secs(7200)).await;
+        settle().await;
+        let pauses = fake.pauses.load(Ordering::SeqCst);
+        assert!(
+            (720..=722).contains(&pauses),
+            "{pauses} pauses in two hours"
+        );
+        // the subscription ends: idle counts from now
+        drop(guard);
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(1800)).await;
+        settle().await;
+        let half = fake.pauses.load(Ordering::SeqCst);
+        assert!(half > pauses + 170, "still refreshed 30 min after: {half}");
+        tokio::time::sleep(Duration::from_secs(1800 + 60)).await;
+        settle().await;
+        let after = fake.pauses.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        settle().await;
+        assert_eq!(
+            fake.pauses.load(Ordering::SeqCst),
+            after,
+            "idle an hour after it ended"
+        );
+        // guards from a stopped manager (or the default) do nothing
+        let none = FakeSnapshotsOnly.in_use(&events());
+        drop(none);
+    }
+
+    /// Only `acquire`: `in_use` is the trait's no-op default.
+    struct FakeSnapshotsOnly;
+
+    #[async_trait]
+    impl Snapshots for FakeSnapshotsOnly {
+        async fn acquire(&self, _: &SnapshotTable) -> Result<Lease, SnapshotError> {
+            Err(SnapshotError("none".into()))
+        }
     }
 
     #[tokio::test(start_paused = true)]

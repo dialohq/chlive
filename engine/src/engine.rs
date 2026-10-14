@@ -25,7 +25,8 @@ use crate::parser::parse;
 use crate::plan::{plan, AggregatePlan, Plan, StreamPlan};
 use crate::rules::{ConfigError, ConfiguredRules, NamingRules, TablesConfig, TopicId};
 use crate::snapshot::{
-    ClickHouseCloner, Lease, PauseServer, SnapshotConfig, SnapshotError, SnapshotManager, Snapshots,
+    ClickHouseCloner, InUse, Lease, PauseServer, SnapshotConfig, SnapshotError, SnapshotManager,
+    Snapshots,
 };
 use crate::source::{Event, EventSource, KafkaSource, SourceError, TopicStart};
 use crate::watermark::Watermark;
@@ -261,6 +262,21 @@ impl Engine {
         since: Option<&str>,
     ) -> Result<Subscription, EngineError> {
         let plan = self.explain_with(sql, params).await?;
+        // its tables are in use, their snapshots kept fresh, while it runs
+        let mut in_use = vec![self.snapshots.in_use(&plan.source)];
+        if let Some(semi) = &plan.semi {
+            in_use.push(self.snapshots.in_use(&semi.inner));
+        }
+        let mut subscription = self.subscribe_plan(plan, since).await?;
+        subscription.in_use = in_use;
+        Ok(subscription)
+    }
+
+    async fn subscribe_plan(
+        &self,
+        plan: Plan,
+        since: Option<&str>,
+    ) -> Result<Subscription, EngineError> {
         if plan.semi.is_some() {
             // a semi-join always starts from history (no resume yet)
             return self.subscribe_semi(plan).await;
@@ -406,6 +422,7 @@ impl Engine {
             history_sql,
             resumed: false,
             iterations,
+            in_use: Vec::new(),
         })
     }
 
@@ -468,6 +485,7 @@ impl Engine {
             history_sql,
             resumed,
             iterations,
+            in_use: Vec::new(),
         })
     }
 
@@ -562,6 +580,7 @@ impl Engine {
             history_sql,
             resumed: false,
             iterations,
+            in_use: Vec::new(),
         })
     }
 
@@ -936,6 +955,8 @@ pub struct Subscription {
     /// Whether this resumed from a client's cursor (the first iteration is then a catch-up).
     pub resumed: bool,
     iterations: BoxStream<'static, Result<Iteration, EngineError>>,
+    /// Its tables' [`InUse`] guards.
+    in_use: Vec<InUse>,
 }
 
 impl Stream for Subscription {
