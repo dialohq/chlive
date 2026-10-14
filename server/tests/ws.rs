@@ -11,7 +11,7 @@ use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Sna
 use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
 use chlive_engine::watermark::Watermark;
 use chlive_engine::Engine;
-use chlive_server::ServerSettings;
+use chlive_server::{CacheSettings, ServerSettings};
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::SinkExt;
 use serde_json::{json, Value};
@@ -36,6 +36,9 @@ impl HistorySource for FakeHistory {
     }
 
     async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError> {
+        if sql.contains("latency_ms = 13") {
+            return Err(HistoryError::ClickHouse("boom".into()));
+        }
         if sql.contains(" GROUP BY ") {
             // the native aggregate test's history: its one group, as states
             assert_eq!(
@@ -336,33 +339,60 @@ async fn errors() {
 }
 
 #[tokio::test]
-async fn unsubscribe_stops_the_subscription() {
-    let server = server().await;
-    let debug = || async {
-        let resp = http_get(&format!("http://{}/debug/subscriptions", server.addr)).await;
-        serde_json::from_str::<Value>(&resp).unwrap()
-    };
+async fn unsubscribe_leaves_the_shared_entry() {
+    let server = server_with(ServerSettings {
+        cache: CacheSettings {
+            keep_alive: Duration::from_millis(400),
+            keep_warm: Duration::ZERO,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let debug = || debug(&server);
     let mut c = Client::connect(&server).await;
     c.subscribe("s1", "select user_id from requests").await;
     assert_eq!(c.expect().await["type"], "snapshot");
     assert_eq!(c.inserts("s1", 3).await.len(), 3);
     let listed = debug().await;
-    assert_eq!(listed[0]["id"], "s1");
-    assert_eq!(listed[0]["watermark"], "{0: 0}");
-    assert_eq!(listed[0]["rowsSent"], 4);
+    let e = &listed[0];
+    assert_eq!(e["sql"], "select user_id from requests");
+    assert_eq!(e["stage"], "live");
+    assert_eq!(
+        e["subscribers"],
+        json!([{"conn": 1, "id": "s1", "lagging": false}])
+    );
+    assert_eq!(e["rows"], 4);
+    assert_eq!(e["at"], "{0: 3}");
+    assert_eq!(e["logStart"], "{0: 0}");
+    assert_eq!(e["joinsSnapshot"], 0);
+    assert_eq!(e["joinsWait"], 1);
+    assert!(e["lineage"].as_str().is_some_and(|l| !l.is_empty()));
+    assert_eq!(e["key"].as_str().unwrap().len(), 16);
 
     c.send(json!({"type": "unsubscribe", "id": "s1"})).await;
-    assert_eq!(c.next().await, None);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // kept alive a moment, then (no warm) gone
+    let listed = debug().await;
+    assert_eq!(listed[0]["stage"], "keep_alive");
+    assert_eq!(listed[0]["subscribers"], json!([]));
+    assert_eq!(c.next().await, None, "nothing more for it");
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(debug().await, json!([]));
 
-    // disconnecting releases everything too
+    // disconnecting leaves too
     let mut c = Client::connect(&server).await;
     c.subscribe("s1", "select user_id from requests").await;
     assert_eq!(c.expect().await["type"], "snapshot");
     assert_eq!(debug().await.as_array().unwrap().len(), 1);
     drop(c);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(debug().await, json!([]));
+}
+
+async fn debug(server: &chlive_server::Server) -> Value {
+    let resp = http_get(&format!("http://{}/debug/subscriptions", server.addr)).await;
+    serde_json::from_str::<Value>(&resp).unwrap()
 }
 
 #[tokio::test]
@@ -524,25 +554,25 @@ async fn resume_from_a_cursor_sends_only_what_is_missing() {
     assert_eq!(users, ["fast", "slow", "slower"]);
     drop(c);
 
-    // a client that is up to date: resume, then just a progress with its cursor
+    // a client that is up to date: a resume, and nothing more (it has everything)
     let mut c = Client::connect(&server).await;
     c.send(json!({"type": "subscribe", "id": "r2", "sql": sql, "since": last_at}))
         .await;
     assert_eq!(c.expect().await["type"], "resume");
-    let m = c.expect().await;
-    assert_eq!(
-        (m["type"].as_str(), m["at"].as_str()),
-        (Some("progress"), Some(last_at.as_str()))
-    );
     assert_eq!(c.next().await, None);
 
-    // a cursor for another query, or garbage: a normal snapshot
-    for since in [last_at.as_str(), "garbage"] {
-        c.send(json!({"type": "subscribe", "id": since, "sql": "select user_id, latency_ms from requests", "since": since}))
-            .await;
-        assert_eq!(c.expect().await["type"], "snapshot");
-        let _ = c.inserts(since, 3).await;
-    }
+    // a cursor for another query: a snapshot (a new entry: the history, then the events)
+    let other = "select user_id, latency_ms from requests";
+    c.send(json!({"type": "subscribe", "id": "o1", "sql": other, "since": last_at}))
+        .await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    let _ = c.inserts("o1", 3).await;
+    // garbage: a snapshot of that (now shared) entry as it is, events included
+    c.send(json!({"type": "subscribe", "id": "o2", "sql": other, "since": "garbage"}))
+        .await;
+    let m = c.expect().await;
+    assert_eq!(m["type"], "snapshot");
+    assert_eq!(m["rows"].as_array().unwrap().len(), 4);
 }
 
 /// A plain HTTP GET (no client library needed for one endpoint).
@@ -856,4 +886,460 @@ async fn progress_comes_at_most_every_progress_interval() {
         1,
         "the first goes at once"
     );
+}
+
+// --- shared entries, the change log, warm results ----------------------------------------------
+
+/// `requests`, partition 0: offset 0 is the history's `h1` (see [`FakeSnapshots`]); events pushed
+/// later go to every engine subscription reading it. Counts the engine's subscriptions.
+#[derive(Clone)]
+struct Live(std::sync::Arc<LiveInner>);
+
+struct LiveInner {
+    messages: std::sync::Mutex<Vec<String>>,
+    pushed: tokio::sync::broadcast::Sender<(i64, String)>,
+    subscribes: std::sync::atomic::AtomicUsize,
+}
+
+impl Live {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(LiveInner {
+            messages: std::sync::Mutex::new(vec![
+                r#"{"user_id": "h1", "latency_ms": 900}"#.to_string()
+            ]),
+            pushed: tokio::sync::broadcast::channel(100_000).0,
+            subscribes: Default::default(),
+        }))
+    }
+
+    fn push(&self, user: &str, latency: u32) {
+        self.push_raw(json!({"user_id": user, "latency_ms": latency}).to_string());
+    }
+
+    fn push_raw(&self, message: String) {
+        let mut messages = self.0.messages.lock().unwrap();
+        messages.push(message.clone());
+        let _ = self.0.pushed.send(((messages.len() - 1) as i64, message));
+    }
+
+    fn subscribes(&self) -> usize {
+        self.0.subscribes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl EventSource for Live {
+    async fn partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
+        Ok((topic.0 == "requests").then(|| vec![0]))
+    }
+
+    async fn subscribe(
+        &self,
+        starts: &[TopicStart],
+        keys: &[String],
+    ) -> Result<BoxStream<'static, Event>, SourceError> {
+        self.0
+            .subscribes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let keys: std::collections::HashSet<String> = keys.iter().cloned().collect();
+        let from = starts
+            .iter()
+            .flat_map(|s| s.partitions.iter())
+            .map(|(_, o)| *o)
+            .next()
+            .unwrap_or(0);
+        // what's there, and what's pushed after, with nothing lost in between
+        let (existing, rx) = {
+            let messages = self.0.messages.lock().unwrap();
+            (messages.clone(), self.0.pushed.subscribe())
+        };
+        let event =
+            move |offset: i64, text: &str, keys: &std::collections::HashSet<String>| Event {
+                topic: TopicId("requests".into()),
+                partition: 0,
+                offset,
+                value: chlive_engine::source::decode_pruned(text.as_bytes(), keys).unwrap(),
+            };
+        let first: Vec<Event> = existing
+            .iter()
+            .enumerate()
+            .skip(from.max(0) as usize)
+            .map(|(o, t)| event(o as i64, t, &keys))
+            .collect();
+        let later = stream::unfold((rx, keys), move |(mut rx, keys)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok((offset, text)) if offset >= from => {
+                        let e = event(offset, &text, &keys);
+                        return Some((e, (rx, keys)));
+                    }
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+        });
+        Ok(stream::iter(first).chain(later).boxed())
+    }
+}
+
+async fn live_server(live: &Live, settings: ServerSettings) -> chlive_server::Server {
+    let engine = Engine::new(
+        ConfiguredRules::default(),
+        FakeHistory,
+        live.clone(),
+        FakeSnapshots,
+    );
+    chlive_server::start_with("127.0.0.1:0", settings, engine)
+        .await
+        .unwrap()
+}
+
+fn cache(cache: CacheSettings) -> ServerSettings {
+    ServerSettings {
+        cache,
+        ..Default::default()
+    }
+}
+
+/// Every `diff`'s inserted users, until `n` have come; and the last cursor.
+async fn users(c: &mut Client, id: &str, n: usize) -> (Vec<String>, String) {
+    let (mut out, mut at) = (Vec::new(), String::new());
+    while out.len() < n {
+        let m = c.expect().await;
+        assert_eq!(
+            (m["type"].as_str(), m["id"].as_str()),
+            (Some("diff"), Some(id)),
+            "{m}"
+        );
+        at = m["at"].as_str().unwrap().to_string();
+        for ch in m["changes"].as_array().unwrap() {
+            out.push(ch["row"]["user_id"].as_str().unwrap().to_string());
+        }
+    }
+    (out, at)
+}
+
+#[tokio::test]
+async fn subscribers_to_one_query_share_one_entry() {
+    let live = Live::new();
+    let server = live_server(&live, ServerSettings::default()).await;
+    let sql = "select user_id from requests where latency_ms > {l:UInt32}";
+    let mut a = Client::connect(&server).await;
+    a.send(json!({"type": "subscribe", "id": "a", "sql": sql, "params": {"l": 100}}))
+        .await;
+    assert_eq!(a.expect().await["rows"], json!([{"user_id": "h1"}]));
+    live.push("u1", 500);
+    let (got, a_at) = users(&mut a, "a", 1).await;
+    assert_eq!(got, ["u1"]);
+
+    // another connection, the same query and value (spelled "100"): the same entry, which it
+    // gets as a snapshot of the rows as they are now, at the same cursor
+    let mut b = Client::connect(&server).await;
+    b.send(json!({"type": "subscribe", "id": "b", "sql": sql, "params": {"l": "100"}}))
+        .await;
+    let snap = b.expect().await;
+    assert_eq!(snap["type"], "snapshot");
+    assert_eq!(snap["rows"], json!([{"user_id": "h1"}, {"user_id": "u1"}]));
+    assert_eq!(snap["at"].as_str().unwrap(), a_at);
+    assert_eq!(live.subscribes(), 1, "one engine subscription");
+    // both get what comes next
+    live.push("u2", 600);
+    assert_eq!(users(&mut a, "a", 1).await.0, ["u2"]);
+    assert_eq!(users(&mut b, "b", 1).await.0, ["u2"]);
+    // another value: another entry
+    // (a new entry: the history, then the events after it)
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "c", "sql": sql, "params": {"l": 550}}))
+        .await;
+    assert_eq!(c.expect().await["rows"], json!([{"user_id": "h1"}]));
+    assert_eq!(users(&mut c, "c", 1).await.0, ["u2"]);
+    assert_eq!(live.subscribes(), 2);
+    assert_eq!(debug(&server).await.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_returning_client_gets_what_it_missed_from_the_log() {
+    let live = Live::new();
+    let server = live_server(&live, ServerSettings::default()).await;
+    let sql = "select user_id from requests";
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", sql).await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    live.push("u1", 1);
+    let (_, at) = users(&mut c, "s", 1).await;
+    drop(c);
+
+    // while away (kept alive)
+    live.push("u2", 1);
+    live.push("u3", 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "s", "sql": sql, "since": at}))
+        .await;
+    assert_eq!(c.expect().await["type"], "resume");
+    assert_eq!(users(&mut c, "s", 2).await.0, ["u2", "u3"]);
+    assert_eq!(c.next().await, None, "nothing more");
+    let e = &debug(&server).await[0];
+    assert_eq!(
+        (e["joinsResume"].as_u64(), e["joinsWait"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(live.subscribes(), 1);
+}
+
+#[tokio::test]
+async fn warm_entries_follow_kafka_with_nobody_connected() {
+    let live = Live::new();
+    let server = live_server(
+        &live,
+        cache(CacheSettings {
+            keep_alive: Duration::from_millis(50),
+            keep_warm: Duration::from_millis(600),
+            ..Default::default()
+        }),
+    )
+    .await;
+    let sql = "select user_id from requests";
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", sql).await;
+    let at = c.expect().await["at"].as_str().unwrap().to_string();
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(debug(&server).await[0]["stage"], "warm");
+    // events while warm are applied
+    live.push("w1", 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(debug(&server).await[0]["rows"], 2);
+    // back while warm: a resume with them, and the entry is live again
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "s", "sql": sql, "since": at}))
+        .await;
+    assert_eq!(c.expect().await["type"], "resume");
+    assert_eq!(users(&mut c, "s", 1).await.0, ["w1"]);
+    assert_eq!(debug(&server).await[0]["stage"], "live");
+    let (_, at) = (live.push("w2", 1), users(&mut c, "s", 1).await.1);
+    drop(c);
+
+    // warm expires: the entry goes; the next subscriber starts a new one (another lineage), so
+    // an old cursor gets a snapshot
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(debug(&server).await, json!([]));
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "s", "sql": sql, "since": at}))
+        .await;
+    let snap = c.expect().await;
+    assert_eq!(snap["type"], "snapshot");
+    assert_eq!(
+        snap["rows"].as_array().unwrap().len(),
+        1,
+        "a fresh snapshot: the history"
+    );
+    assert_eq!(live.subscribes(), 2);
+}
+
+#[tokio::test]
+async fn which_entries_are_kept_warm() {
+    let settings = |c: CacheSettings| {
+        cache(CacheSettings {
+            keep_alive: Duration::from_millis(30),
+            keep_warm: Duration::from_secs(60),
+            ..c
+        })
+    };
+    let stages = |v: Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["sql"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // keep_warm = 0: gone after the keep-alive
+    let live = Live::new();
+    let server = live_server(
+        &live,
+        cache(CacheSettings {
+            keep_alive: Duration::from_millis(30),
+            keep_warm: Duration::ZERO,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", "select user_id from requests").await;
+    c.expect().await;
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(debug(&server).await, json!([]));
+
+    // bigger than max_shared_rows: not kept warm
+    let server = live_server(
+        &live,
+        settings(CacheSettings {
+            max_shared_rows: 0,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", "select user_id from requests").await;
+    c.expect().await;
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(debug(&server).await, json!([]));
+
+    // max_warm = 1: the one warm the longest goes
+    let server = live_server(
+        &live,
+        settings(CacheSettings {
+            max_warm: 1,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe("a", "select user_id from requests").await;
+    c.expect().await;
+    c.send(json!({"type": "unsubscribe", "id": "a"})).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    c.subscribe("b", "select latency_ms from requests").await;
+    c.expect().await;
+    c.send(json!({"type": "unsubscribe", "id": "b"})).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        stages(debug(&server).await),
+        ["select latency_ms from requests"]
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_the_log_no_longer_covers_gets_a_snapshot() {
+    let live = Live::new();
+    let server = live_server(
+        &live,
+        cache(CacheSettings {
+            log_length: 1,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let sql = "select user_id from requests";
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", sql).await;
+    let at = c.expect().await["at"].as_str().unwrap().to_string();
+    drop(c);
+    // two messages while away; the log keeps one
+    live.push("u1", 1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    live.push("u2", 1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "s", "sql": sql, "since": at.clone()}))
+        .await;
+    let snap = c.expect().await;
+    assert_eq!(snap["type"], "snapshot", "{snap}");
+    assert_eq!(snap["rows"].as_array().unwrap().len(), 3);
+    // garbage, an old (v1) cursor: snapshots too
+    let v1 = at.replace("\"v\":2", "\"v\":1");
+    for (id, since) in [("g", "garbage".to_string()), ("v1", v1)] {
+        c.send(json!({"type": "subscribe", "id": id, "sql": sql, "since": since}))
+            .await;
+        assert_eq!(c.expect().await["type"], "snapshot");
+    }
+}
+
+#[tokio::test]
+async fn a_slow_subscriber_catches_up_without_holding_others_up() {
+    let live = Live::new();
+    let server = live_server(&live, ServerSettings::default()).await;
+    let sql = "select user_id from requests";
+    // a client that doesn't read for a while, and one that does
+    let mut slow = Client::connect(&server).await;
+    slow.subscribe("s", sql).await;
+    let mut fast = Client::connect(&server).await;
+    fast.subscribe("f", sql).await;
+    assert_eq!(fast.expect().await["type"], "snapshot");
+    // many messages, big enough to fill the socket and the slow one's queue
+    let big = "x".repeat(20_000);
+    let mut fast_got = 0;
+    for i in 0..600 {
+        live.push(&format!("{big}{i}"), 1);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        while let Ok(Some(Ok(_))) =
+            tokio::time::timeout(Duration::from_millis(0), fast.0.next()).await
+        {
+            fast_got += 1;
+        }
+    }
+    // the fast one got everything meanwhile
+    let (rest, _) = {
+        let mut n = 0;
+        while let Some(m) = fast.next().await {
+            n += m["changes"].as_array().map_or(0, |c| c.len());
+        }
+        (n, ())
+    };
+    assert!(fast_got > 0 && rest < 600, "the fast client kept up");
+    let e = &debug(&server).await[0];
+    assert!(
+        e["subscribers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["lagging"] == true)
+            || e["resyncs"].as_u64().unwrap() > 0,
+        "the slow one fell behind: {e}"
+    );
+    // the slow one reads now: it ends up with the whole result (a snapshot replaces its rows,
+    // or the log brings them up to date)
+    let mut rows: Vec<String> = Vec::new();
+    while let Some(m) = slow.next().await {
+        match m["type"].as_str() {
+            Some("snapshot") => {
+                rows = m["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["user_id"].as_str().unwrap().to_string())
+                    .collect()
+            }
+            Some("diff") => rows.extend(
+                m["changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["row"]["user_id"].as_str().unwrap().to_string()),
+            ),
+            _ => {}
+        }
+    }
+    assert_eq!(rows.len(), 601, "h1 and the 600 events, each once");
+    let mut sorted = rows.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 601);
+}
+
+#[tokio::test]
+async fn an_entry_that_fails_tells_every_subscriber_and_goes() {
+    let live = Live::new();
+    let server = live_server(&live, ServerSettings::default()).await;
+    let sql = "select user_id from requests where latency_ms = 13";
+    let mut a = Client::connect(&server).await;
+    a.subscribe("a", sql).await;
+    let mut b = Client::connect(&server).await;
+    b.subscribe("b", sql).await;
+    for (c, id) in [(&mut a, "a"), (&mut b, "b")] {
+        let m = c.expect().await;
+        assert_eq!(
+            (m["type"].as_str(), m["id"].as_str(), m["code"].as_str()),
+            (Some("error"), Some(id), Some("HISTORY_FAILED")),
+            "{m}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(debug(&server).await, json!([]));
+    // the same id can subscribe again: a new attempt
+    a.subscribe("a", sql).await;
+    assert_eq!(a.expect().await["code"], "HISTORY_FAILED");
 }

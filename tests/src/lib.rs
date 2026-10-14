@@ -77,7 +77,20 @@ pub async fn with_server<F>(config: Config, test: F) -> Result<()>
 where
     F: for<'a> FnOnce(&'a Server) -> futures::future::BoxFuture<'a, Result<()>>,
 {
-    let server = chlive_server::start("127.0.0.1:0", Engine::connect(config)?).await?;
+    with_server_settings(config, chlive_server::ServerSettings::default(), test).await
+}
+
+/// [`with_server`] with these server settings (e.g. how long shared results are kept).
+pub async fn with_server_settings<F>(
+    config: Config,
+    settings: chlive_server::ServerSettings,
+    test: F,
+) -> Result<()>
+where
+    F: for<'a> FnOnce(&'a Server) -> futures::future::BoxFuture<'a, Result<()>>,
+{
+    let server =
+        chlive_server::start_with("127.0.0.1:0", settings, Engine::connect(config)?).await?;
     let result = std::panic::AssertUnwindSafe(test(&server))
         .catch_unwind()
         .await;
@@ -468,4 +481,10 @@ pub fn tie_groups(rows: &[Row], keys: &[&str]) -> Vec<(String, Vec<String>)> {
         rows.sort();
     }
     out
+}
+
+/// `/debug/subscriptions`: the server's shared entries.
+pub async fn entries(server: &Server) -> Result<Vec<serde_json::Value>> {
+    let url = format!("http://{}/debug/subscriptions", server.addr);
+    Ok(reqwest::get(url).await?.json().await?)
 }

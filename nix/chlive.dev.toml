@@ -8,7 +8,8 @@ snapshot_password = "chlive_snap"
 snapshot_database = "chlive_snapshots"
 
 [log]
-level = "info,chlive_server=info"
+# the shared results' lives in detail (joins, resumes, warm, lagging clients)
+level = "info,chlive_server::hub=debug"
 
 [tables.events]
 [tables.orders]

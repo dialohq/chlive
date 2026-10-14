@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
         warn!("no tables listed in [tables]: nothing can be queried");
     }
     let engine = std::sync::Arc::new(Engine::connect(config.engine()?)?);
-    let server = chlive_server::start_with(
+    let mut server = chlive_server::start_with(
         &config.server.listen,
         config.server_settings(),
         engine.clone(),
@@ -122,10 +122,11 @@ async fn main() -> Result<()> {
     .await?;
     info!(addr = %server.addr, path = %config.server.path, "listening");
     tokio::select! {
-        r = async { server.wait().await } => r?,
+        r = server.wait() => r?,
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
     }
-    engine.shutdown().await;
+    // the shared results, then the engine
+    server.shutdown().await;
     // with chDB open (aggregates), the process must close it before exiting
     chlive_engine::chdb::shutdown();
     Ok(())

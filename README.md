@@ -122,6 +122,7 @@ customer = { clickhouse = "customer_id", json = "customerId" }
 ```
 
 - **Sections:**
+  - `[cache]`: shared results, see [Shared results](#shared-results);
   - `[server]`: `listen`, `path` (`/live`), `allowed_origins`, `max_connections` (10 000; more get 503), `max_subscriptions_per_connection` (100; more get `TOO_MANY_SUBSCRIPTIONS`) and `progress_interval` (1 s);
   - `[clickhouse]`: `url` (HTTP or HTTPS; the only way the server talks to ClickHouse), `user` (`chlive_ro`) and `snapshot_user` (`chlive_snap`) with their passwords, and `snapshot_database`;
   - `[kafka]`: `brokers`, `metadata_refresh` (30 s) and `properties`;
@@ -141,6 +142,27 @@ customer = { clickhouse = "customer_id", json = "customerId" }
   - `columns`: renames, by the name queries use; `clickhouse` defaults to that name, and `json` (the key in the topic's events) to the ClickHouse name.
 - **`snapshot_database`** must exist, with the same storage policy as the tables, since ATTACH PARTITION links their parts. The snapshot user needs CREATE TABLE, ALTER, INSERT, SELECT and DROP TABLE there, and the history user SELECT. A separate, non-Replicated database also keeps the clones' DDL off a Replicated database's log.
 - **Kafka properties** are librdkafka's (TLS, SASL, …). They override chlive's own consumer settings, except `enable.auto.commit` and `enable.auto.offset.store`, which stay off since chlive never commits.
+
+### Shared results
+
+Every subscription to the same query, with the same parameter values (any spelling, any order), shares one **entry** on the server (`server/src/hub.rs`):
+
+- **One engine subscription per entry:** one ClickHouse snapshot and history query, and one Kafka consumer, however many clients watch it.
+- **The result is kept** (its rows, and the cursor they're complete to), so a new subscriber gets it at once as a `snapshot`, without ClickHouse. Before the history is in, joiners wait for it.
+- **A change log:** the entry keeps its last `cache.log_length` `diff` messages. A client returning with a cursor from this entry gets `resume` and just what it missed. A cursor from another entry of the same query (another *lineage*: entries started at different times can hold the same rows in a different order, or a different subset of tied rows), one older than the log, garbage or an old format gets a `snapshot` instead.
+- **Warm:** after the last subscriber leaves, the entry stays fully live for `cache.keep_alive` (30 s; reloads and route changes reuse it), then **warm** for `cache.keep_warm` (15 min): still following Kafka with nobody connected, so the next visitor subscribes to an up-to-date result and a returning client resumes from the log. Then it's dropped. At most `cache.max_warm` (100) entries are warm; the one warm the longest goes first. Results over `cache.max_shared_rows` (100 000 rows) are shared while subscribed but not kept warm.
+- **Slow clients** don't hold anyone up: a subscriber whose connection's queue is full falls behind (nothing more is queued for it) and catches up once it has room, from the log, or with a snapshot if the log no longer reaches back.
+- **When an entry fails** (ClickHouse, Kafka, …), every subscriber gets the error and the entry goes; subscribing again starts a new one.
+- **Debugging:** `/debug/subscriptions` lists the entries: query, lineage, stage (`starting`, `live`, `keep_alive`, `warm`) and how long it has left, subscribers (and whether they're lagging), rows, cursor, log length and start, how long the history took, and the joins by outcome (snapshot, resume, wait) and catch-ups. `RUST_LOG=info,chlive_server::hub=debug` logs every entry's life by its `key` (a fingerprint of the query) and `lineage`: created, history loaded, each join with its decision and reason, leaves, stage changes, lagging and catching up, and why it was dropped; `trace` adds every diff applied.
+
+```toml
+[cache]
+keep_alive = "30s"
+keep_warm = "15m"        # "0s": not kept warm
+max_warm = 100
+log_length = 1000        # diff messages per entry
+max_shared_rows = 100000
+```
 
 ## Engine (custom dialect)
 
@@ -323,7 +345,7 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 - With an `index`, the row is inserted there: the row at that index and every row after it move one down. Without one, it's appended.
 - `{"op": "delete", "index": k}` removes the row at `k`; the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes. With OFFSET (`"offset": m` in the snapshot, informational), the diffs already account for the rows above the result: a row sliding in from above is an ordinary insert.
 - A `diff` is atomic: its changes apply in sequence, each index into the list as the previous change left it, and only the state after all of them is meaningful (in between, an insert and its delete can briefly make one row more than the LIMIT). The client applies a whole diff to one copy of the rows before its listeners see it.
-- **Resuming.** `snapshot`, `diff` and `{"type": "progress", "id", "at"}` carry `at`, an opaque cursor: how far the result is complete, per Kafka partition, counting events that didn't match. A client that kept a result subscribes with `"since": <at>`; the server answers `{"type": "resume", "id", "columns", "order"?, "limit"?}` instead of a snapshot (the client's rows are still valid), then diffs with only what was missed. If it can't resume (another query or schema, a topic recreated since, …), it sends a normal `snapshot`.
+- **Resuming.** `snapshot`, `diff` and `{"type": "progress", "id", "at"}` carry `at`, an opaque cursor: how far the result is complete, per Kafka partition, counting events that didn't match. A client that kept a result subscribes with `"since": <at>`; the server answers `{"type": "resume", "id", "columns", "order"?, "limit"?}` instead of a snapshot (the client's rows are still valid), then diffs with only what was missed. If it can't resume (another query or schema, a cursor from an earlier server result for the query, one older than the result's change log, …), it sends a normal `snapshot`.
 - Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`, `TOO_MANY_SUBSCRIPTIONS` (over `server.max_subscriptions_per_connection`). After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
 
@@ -384,10 +406,7 @@ Known differences, where the engine skips an event that ClickHouse reads:
 The client takes care of the page's lifecycle: it saves pending results when the tab goes to the background or the page is hidden, then closes the database so a reload can open it at once, and reopens it if the page comes back from the back/forward cache.
 
 - **On subscribe**, the cached result (if any) is shown at once (`status: "cached"`, with `cachedAt`), and the subscription is sent with `since` = its cursor. The server resumes and sends only what was missed; reconnects resume the same way.
-- **On the server** (`Engine::subscribe_from`), resuming from cursor `C`; the table's current snapshot holds offsets up to `W`:
-  - Unordered, unlimited: nothing to rebuild and no ClickHouse at all; the stream continues from `C`, replaying from Kafka what the client missed.
-  - With ORDER BY (or LIMIT alone), the server rebuilds the client's state: the snapshot's sort keys (or row count), then the client's own events between `W` and `C`, re-read from Kafka and not sent again; then the stream continues from `C`. This needs `C ≥ W` in every partition; a client behind the snapshot gets a full snapshot instead (rare: snapshots are recent, and clients usually stream past them).
-  - The cursor must fit the topic: past its end means the topic was recreated, and before the start of what the resume reads means retention deleted it. Either way the server sends a full snapshot instead.
+- **On the server**, the cursor resumes against the query's shared result (see [Shared results](#shared-results)): if it comes from that result (the same lineage) and its change log still reaches back to it, the client gets `resume` and just the diffs it missed; otherwise a snapshot of the result as it is, with no ClickHouse query while the result is live or warm.
 - **What's stored:** per query and param values (the SQL text, plus the params as sent in stable JSON), its rows as JSON chunks, the cursor and when it was last used. A database with an older layout is emptied (`PRAGMA user_version`). Each write is one transaction: snapshots and ordered diffs are saved in full (batched, about 1 s), append-only diffs are appended, and `progress` moves the cursor.
 - **GC:** above the budget, the least recently used queries are evicted.
 - **MVP limits:** one tab holds the database at a time; other tabs run without a cache (the playground shows why). Keys are query texts with their param values, not shapes yet.

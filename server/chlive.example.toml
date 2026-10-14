@@ -24,6 +24,21 @@
 ## didn't match it arrived.
 # progress_interval = "1s"
 
+[cache]
+## Results are shared: every subscription to the same query (and parameter values) shares one
+## live result, which new subscribers get at once (no ClickHouse query), and which keeps a log of
+## its recent changes, so a returning client gets just what it missed.
+## After the last subscriber leaves, the result stays fully live this long ...
+# keep_alive = "30s"
+## ... then keeps following Kafka with nobody connected this long ("0s": not at all) ...
+# keep_warm = "15m"
+## ... for at most this many results at once (the one warm the longest goes first).
+# max_warm = 100
+## Changes ("diff" messages) kept per result for resuming clients.
+# log_length = 1000
+## Larger results are shared while subscribed, but not kept warm.
+# max_shared_rows = 100000
+
 [clickhouse]
 ## Everything goes over HTTP(S): history, snapshots (made on this node) and the aggregate
 ## states chDB merges from.

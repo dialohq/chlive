@@ -497,7 +497,16 @@ async fn snapshots_are_refreshed_while_used_and_dropped_when_idle() -> Result<()
     config.snapshots.idle = Duration::from_secs(3);
     // like the server: start by dropping clones left behind (e.g. by an earlier failed run)
     config.snapshots.sweep = true;
-    with_server(config, |server| {
+    // the shared result is what keeps the table in use: let it go right after the client
+    let settings = chlive_server::ServerSettings {
+        cache: chlive_server::CacheSettings {
+            keep_alive: Duration::from_millis(100),
+            keep_warm: Duration::ZERO,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    with_server_settings(config, settings, |server| {
         async move {
             let conn = LiveConn::connect(server).await?;
             conn.subscribe("o", "select order_id, amount from orders");
@@ -784,6 +793,138 @@ async fn parameters_match_the_same_query_with_literals() -> Result<()> {
                 results.push(multiset(&live.rows));
             }
             assert_ne!(results[0], results[1], "other values, other rows");
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// Many connections, overlapping queries: one shared entry per distinct query (and parameter
+/// values), each joiner getting it as it is; every result still matches ClickHouse.
+#[tokio::test]
+async fn connections_share_one_entry_per_query() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    with_server(config(), |server| {
+        async move {
+            let producer = producer()?;
+            const QUERIES: &[&str] = &[
+                "select ts, user_id, latency_ms from events where country = 'PL'",
+                "select ts, user_id, latency_ms from events order by latency_ms desc limit 20",
+            ];
+            let conns = [
+                LiveConn::connect(server).await?,
+                LiveConn::connect(server).await?,
+                LiveConn::connect(server).await?,
+            ];
+            // the first connection subscribes before the events, the others while they come
+            for (i, sql) in QUERIES.iter().enumerate() {
+                conns[0].subscribe(&format!("q{i}"), sql);
+            }
+            conns[0]
+                .wait_ready(&["q0", "q1"], Duration::from_secs(60))
+                .await?;
+            let producing = tokio::spawn(async move { producer.produce(1000, Some(2000.0)).await });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            for conn in &conns[1..] {
+                for (i, sql) in QUERIES.iter().enumerate() {
+                    conn.subscribe(&format!("q{i}"), sql);
+                }
+            }
+            let produced = producing.await??;
+            for conn in &conns {
+                conn.wait_ready(&["q0", "q1"], Duration::from_secs(60))
+                    .await?;
+                settle(conn, &produced).await?;
+            }
+            let listed = entries(server).await?;
+            assert_eq!(
+                listed.len(),
+                QUERIES.len(),
+                "one entry per query: {listed:?}"
+            );
+            for e in &listed {
+                assert_eq!(e["subscribers"].as_array().unwrap().len(), 3, "{e}");
+            }
+            for (i, sql) in QUERIES.iter().enumerate() {
+                let direct = direct(sql).await?;
+                for (n, conn) in conns.iter().enumerate() {
+                    let live = conn.result(&format!("q{i}")).unwrap();
+                    assert!(live.error.is_none(), "conn {n} q{i}: {:?}", live.error);
+                    assert!(
+                        live.protocol_violations.is_empty(),
+                        "conn {n} q{i}: {:?}",
+                        live.protocol_violations
+                    );
+                    if sql.contains(" limit ") {
+                        let keys = |rows: &[Row]| -> Vec<String> {
+                            rows.iter().map(|r| r["latency_ms"].to_string()).collect()
+                        };
+                        assert_eq!(
+                            keys(&live.rows),
+                            keys(&direct),
+                            "conn {n} q{i}: the top 20's latencies"
+                        );
+                    } else {
+                        assert_eq!(multiset(&live.rows), multiset(&direct), "conn {n} q{i}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// With no warm results, a client returning after its entry is gone gets a snapshot (a new
+/// entry, another lineage), which matches ClickHouse.
+#[tokio::test]
+async fn returning_after_the_entry_is_gone_gets_a_snapshot() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let settings = chlive_server::ServerSettings {
+        cache: chlive_server::CacheSettings {
+            keep_alive: Duration::from_millis(200),
+            keep_warm: Duration::ZERO,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    with_server_settings(config(), settings, |server| {
+        async move {
+            let producer = producer()?;
+            let sql = "select ts, user_id, latency_ms from events where country = 'PL'";
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("pl", sql);
+            conn.wait_ready(&["pl"], Duration::from_secs(60)).await?;
+            let kept = conn.result("pl").unwrap();
+            drop(conn);
+            // away until the entry is gone; events meanwhile
+            let produced = producer.produce(300, None).await?;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert!(entries(server).await?.is_empty(), "the entry is gone");
+
+            let conn = LiveConn::connect(server).await?;
+            conn.resume(
+                "pl",
+                sql,
+                kept.at.as_deref().expect("a cursor"),
+                kept.rows.clone(),
+            );
+            conn.wait_ready(&["pl"], Duration::from_secs(60)).await?;
+            settle(&conn, &produced).await?;
+            let live = conn.result("pl").unwrap();
+            assert!(!live.resumed, "a snapshot, not a resume");
+            assert!(live.snapshot);
+            assert_eq!(multiset(&live.rows), multiset(&direct(sql).await?));
             Ok(())
         }
         .boxed()

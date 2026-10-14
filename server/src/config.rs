@@ -18,8 +18,9 @@ use crate::ServerSettings;
 
 /// The sections, in order; env vars are read only for these (`CHLIVE_URL` and the like aren't
 /// config).
-pub const SECTIONS: [&str; 7] = [
+pub const SECTIONS: [&str; 8] = [
     "server",
+    "cache",
     "clickhouse",
     "kafka",
     "pause_server",
@@ -32,6 +33,7 @@ pub const SECTIONS: [&str; 7] = [
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub server: Server,
+    pub cache: Cache,
     pub clickhouse: ClickHouse,
     pub kafka: Kafka,
     pub pause_server: PauseServer,
@@ -62,6 +64,38 @@ impl Default for Server {
             max_connections: s.max_connections,
             max_subscriptions_per_connection: s.max_subscriptions_per_connection,
             progress_interval: s.progress_interval,
+        }
+    }
+}
+
+/// Shared results (see `crate::hub`): how long they're kept after the last subscriber, and
+/// their change logs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Cache {
+    /// After the last subscriber leaves, still fully live.
+    #[serde(with = "humantime_serde")]
+    pub keep_alive: Duration,
+    /// Then still following Kafka with nobody connected (0: not at all).
+    #[serde(with = "humantime_serde")]
+    pub keep_warm: Duration,
+    /// Results kept warm at most; the one warm the longest goes first.
+    pub max_warm: usize,
+    /// `diff` messages kept per result, for resuming clients.
+    pub log_length: usize,
+    /// Larger results are shared while subscribed, but not kept warm.
+    pub max_shared_rows: usize,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        let d = crate::CacheSettings::default();
+        Self {
+            keep_alive: d.keep_alive,
+            keep_warm: d.keep_warm,
+            max_warm: d.max_warm,
+            log_length: d.log_length,
+            max_shared_rows: d.max_shared_rows,
         }
     }
 }
@@ -322,6 +356,9 @@ impl Config {
         if self.server.max_connections == 0 || self.server.max_subscriptions_per_connection == 0 {
             bail!("server.max_connections and server.max_subscriptions_per_connection: must be more than 0");
         }
+        if self.cache.log_length == 0 {
+            bail!("cache.log_length: must be more than 0");
+        }
         if self.server.listen.is_empty() {
             bail!("server.listen: empty");
         }
@@ -368,6 +405,13 @@ impl Config {
             max_connections: self.server.max_connections,
             max_subscriptions_per_connection: self.server.max_subscriptions_per_connection,
             progress_interval: self.server.progress_interval,
+            cache: crate::CacheSettings {
+                keep_alive: self.cache.keep_alive,
+                keep_warm: self.cache.keep_warm,
+                max_warm: self.cache.max_warm,
+                log_length: self.cache.log_length,
+                max_shared_rows: self.cache.max_shared_rows,
+            },
         }
     }
 }
@@ -490,6 +534,16 @@ mod tests {
             }
         );
         assert_eq!(
+            d.cache,
+            Cache {
+                keep_alive: Duration::from_secs(30),
+                keep_warm: Duration::from_secs(15 * 60),
+                max_warm: 100,
+                log_length: 1000,
+                max_shared_rows: 100_000,
+            }
+        );
+        assert_eq!(
             d.clickhouse,
             ClickHouse {
                 url: "http://127.0.0.1:8123".into(),
@@ -562,6 +616,7 @@ mod tests {
         );
         assert_eq!(e.tables, TablesConfig::default());
         assert_eq!(d.server_settings(), ServerSettings::default());
+        assert_eq!(d.server_settings().cache, crate::CacheSettings::default());
     }
 
     /// The example file lists every key with its default.
@@ -601,6 +656,13 @@ mod tests {
                 max_connections = 7
                 max_subscriptions_per_connection = 3
                 progress_interval = "250ms"
+
+                [cache]
+                keep_alive = "5s"
+                keep_warm = "1h"
+                max_warm = 7
+                log_length = 50
+                max_shared_rows = 1234
 
                 [clickhouse]
                 url = "http://ch:8123"
@@ -699,6 +761,26 @@ mod tests {
             assert_eq!(e.kafka_properties.len(), 2);
             assert_eq!(e.metadata_refresh, Duration::from_secs(5));
             assert_eq!(e.tables, c.tables);
+            assert_eq!(
+                c.cache,
+                Cache {
+                    keep_alive: Duration::from_secs(5),
+                    keep_warm: Duration::from_secs(3600),
+                    max_warm: 7,
+                    log_length: 50,
+                    max_shared_rows: 1234,
+                }
+            );
+            assert_eq!(
+                c.server_settings().cache,
+                crate::CacheSettings {
+                    keep_alive: Duration::from_secs(5),
+                    keep_warm: Duration::from_secs(3600),
+                    max_warm: 7,
+                    log_length: 50,
+                    max_shared_rows: 1234,
+                }
+            );
             let s = c.server_settings();
             assert_eq!(s.path, "/ws");
             assert_eq!(s.allowed_origins.len(), 2);
@@ -730,6 +812,7 @@ mod tests {
             jail.set_env("CHLIVE_KAFKA__BROKERS", "env:9092");
             jail.set_env("CHLIVE_SERVER__MAX_CONNECTIONS", "6");
             jail.set_env("CHLIVE_TABLES__EVENTS__TOPIC", "env.events");
+            jail.set_env("CHLIVE_CACHE__KEEP_WARM", "0s");
             jail.set_env("CHLIVE_SERVER__ALLOWED_ORIGINS", "[\"https://x\"]");
             // not config: the clients', the tests', the old flags'
             jail.set_env("CHLIVE_URL", "ws://x");
@@ -748,6 +831,7 @@ mod tests {
                 Some("env.events")
             );
             assert_eq!(c.server.allowed_origins, ["https://x"]);
+            assert_eq!(c.cache.keep_warm, Duration::ZERO, "warm off by env");
             assert_eq!(c.clickhouse.url, "http://127.0.0.1:8123");
 
             o.set("kafka.brokers=flag:9092").unwrap();
@@ -808,6 +892,18 @@ mod tests {
             assert!(e.contains("max_connections"), "{e}");
             let e = err(jail, "[server]\nprogress_interval = \"0s\"");
             assert!(e.contains("progress_interval"), "{e}");
+            let e = err(jail, "[cache]\nlog_length = 0");
+            assert!(e.contains("cache.log_length"), "{e}");
+            let e = err(jail, "[cache]\nkeep_warm = \"later\"");
+            assert!(e.contains("keep_warm"), "{e}");
+            let e = err(jail, "[cache]\nwarm = true");
+            assert!(e.contains("warm"), "{e}");
+            // zero keep-alive and warm are allowed: dropped as soon as nobody's subscribed
+            assert!(load(
+                jail,
+                "[cache]\nkeep_alive = \"0s\"\nkeep_warm = \"0s\"\nmax_warm = 0"
+            )
+            .is_ok());
             let e = err(jail, "[kafka]\nmetadata_refresh = \"0s\"");
             assert!(e.contains("metadata_refresh"), "{e}");
             // a missing file is an error, not the defaults
