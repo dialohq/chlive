@@ -7,6 +7,7 @@ use anyhow::Result;
 use chlive_e2e::*;
 use chlive_engine::history::HistorySource;
 use futures::FutureExt;
+use serde_json::json;
 
 /// Dialect queries over `events`, covering numbers, strings, IN, NOT and AND/OR.
 /// (id, query, its ORDER BY columns): numbers, strings, IN, NOT, AND/OR, and ORDER BY.
@@ -925,6 +926,156 @@ async fn returning_after_the_entry_is_gone_gets_a_snapshot() -> Result<()> {
             assert!(!live.resumed, "a snapshot, not a resume");
             assert!(live.snapshot);
             assert_eq!(multiset(&live.rows), multiset(&direct(sql).await?));
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// A directory for a disk store, removed when dropped.
+struct CacheDir(std::path::PathBuf);
+
+impl CacheDir {
+    fn new(name: &str) -> Self {
+        let d = std::env::temp_dir().join(format!("chlive-e2e-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        Self(d)
+    }
+}
+
+impl Drop for CacheDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A warm entry follows Kafka with nobody connected, its rows on disk; a returning client
+/// resumes from it, and the result matches ClickHouse.
+#[tokio::test]
+async fn a_warm_entry_follows_kafka_on_disk_and_serves_the_next_client() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let dir = CacheDir::new("warm");
+    let settings = chlive_server::ServerSettings {
+        cache: chlive_server::CacheSettings {
+            dir: Some(dir.0.clone()),
+            keep_alive: Duration::from_millis(200),
+            keep_warm: Duration::from_secs(60),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    with_server_settings(config(), settings, |server| {
+        async move {
+            let producer = producer()?;
+            let sql = "select ts, user_id, latency_ms from events where country = 'PL'";
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("pl", sql);
+            conn.wait_ready(&["pl"], Duration::from_secs(60)).await?;
+            let kept = conn.result("pl").unwrap();
+            drop(conn);
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let e = &entries(server).await?[0];
+            assert_eq!(
+                (&e["stage"], &e["inMemory"]),
+                (&json!("warm"), &json!(false)),
+                "{e}"
+            );
+            let produced = producer.produce(300, None).await?;
+            wait_ingested(&produced).await?;
+
+            let conn = LiveConn::connect(server).await?;
+            conn.resume(
+                "pl",
+                sql,
+                kept.at.as_deref().expect("a cursor"),
+                kept.rows.clone(),
+            );
+            conn.wait_ready(&["pl"], Duration::from_secs(60)).await?;
+            settle(&conn, &produced).await?;
+            let live = conn.result("pl").unwrap();
+            assert!(live.resumed, "a resume from the disk log");
+            assert_eq!(multiset(&live.rows), multiset(&direct(sql).await?));
+            let e = &entries(server).await?[0];
+            assert_eq!(
+                (&e["stage"], &e["inMemory"]),
+                (&json!("live"), &json!(true)),
+                "{e}"
+            );
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// After a restart, a result is restored from disk (no ClickHouse), caught up from Kafka, and
+/// a client from before the restart resumes through the fork; it matches ClickHouse.
+#[tokio::test]
+async fn a_restarted_server_restores_results_from_disk() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let dir = CacheDir::new("restart");
+    let settings = chlive_server::ServerSettings {
+        cache: chlive_server::CacheSettings {
+            dir: Some(dir.0.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let sql = "select user_id, latency_ms from events where country = 'DE' order by latency_ms desc, user_id limit 20";
+    let kept = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let k = kept.clone();
+    with_server_settings(config(), settings.clone(), move |server| {
+        async move {
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("de", sql);
+            conn.wait_ready(&["de"], Duration::from_secs(60)).await?;
+            *k.lock().unwrap() = conn.result("de");
+            Ok(())
+        }
+        .boxed()
+    })
+    .await?;
+    // while the server is down
+    let produced = producer()?.produce(300, None).await?;
+    wait_ingested(&produced).await?;
+    let kept = kept.lock().unwrap().clone().unwrap();
+    with_server_settings(config(), settings, move |server| {
+        async move {
+            let e = &entries(server).await?;
+            assert_eq!(e.len(), 1, "{e:?}");
+            assert_eq!(e[0]["stage"], "cold");
+            let conn = LiveConn::connect(server).await?;
+            conn.resume(
+                "de",
+                sql,
+                kept.at.as_deref().expect("a cursor"),
+                kept.rows.clone(),
+            );
+            conn.wait_ready(&["de"], Duration::from_secs(60)).await?;
+            settle(&conn, &produced).await?;
+            let live = conn.result("de").unwrap();
+            assert!(live.resumed, "resumed through the fork");
+            assert!(
+                live.protocol_violations.is_empty(),
+                "{:?}",
+                live.protocol_violations
+            );
+            let latencies = |rows: &[Row]| -> Vec<String> {
+                rows.iter().map(|r| r["latency_ms"].to_string()).collect()
+            };
+            assert_eq!(latencies(&live.rows), latencies(&direct(sql).await?));
+            let e = &entries(server).await?[0];
+            assert_eq!(e["restored"], true, "no ClickHouse: {e}");
+            assert!(e.get("historyMs").is_some());
             Ok(())
         }
         .boxed()

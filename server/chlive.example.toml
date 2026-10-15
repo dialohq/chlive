@@ -26,18 +26,34 @@
 
 [cache]
 ## Results are shared: every subscription to the same query (and parameter values) shares one
-## live result, which new subscribers get at once (no ClickHouse query), and which keeps a log of
-## its recent changes, so a returning client gets just what it missed.
-## After the last subscriber leaves, the result stays fully live this long ...
+## result, which new subscribers get at once (no ClickHouse query), with a log of its changes, so
+## a returning client gets just what it missed. Plain queries and native aggregates are also kept
+## on disk, through these stages:
+##   live: subscribed (then keep_alive): rows in memory, mirrored to disk
+##   warm (keep_warm): still following Kafka, rows on disk only
+##   cold: stopped; its rows and engine state on disk, restored (no ClickHouse) when subscribed
+##   gone: evicted, least recently used first, beyond disk_budget
+## Other queries (chDB aggregates, semi-joins) are live, then dropped.
+## The disk store; "" turns it off (live, then dropped). Kept across restarts.
+# dir = "./chlive-cache"
+## After the last subscriber leaves, the result stays live this long ...
 # keep_alive = "30s"
-## ... then keeps following Kafka with nobody connected this long ("0s": not at all) ...
-# keep_warm = "15m"
-## ... for at most this many results at once (the one warm the longest goes first).
+## ... then warm this long, then cold ...
+# keep_warm = "1h"
+## ... for at most this many warm results at once (the one warm the longest goes cold first).
 # max_warm = 100
-## Changes ("diff" messages) kept per result for resuming clients.
+## Changes ("diff" messages) kept in memory per live result for resuming clients.
 # log_length = 1000
-## Larger results are shared while subscribed, but not kept warm.
-# max_shared_rows = 100000
+## Cold results are evicted, least recently used first, beyond this on disk.
+# disk_budget = "10GiB"
+## A stored result whose snapshot is older than this is rebuilt from ClickHouse.
+# max_age = "24h"
+## A stored result more events than this behind Kafka is rebuilt from ClickHouse.
+# max_catch_up = 1000000
+## How often running results save their engine state.
+# checkpoint_interval = "60s"
+## A result's change log on disk past this is folded into its rows.
+# log_bytes = "16MiB"
 
 [clickhouse]
 ## Everything goes over HTTP(S): history, snapshots (made on this node) and the aggregate

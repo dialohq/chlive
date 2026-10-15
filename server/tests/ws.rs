@@ -59,7 +59,10 @@ impl HistorySource for FakeHistory {
             .ok_or_else(|| HistoryError::ClickHouse(format!("unexpected query {sql}")))?;
         Ok(vec![columns
             .split(", ")
-            .map(|c| (c.to_string(), history[c].clone()))
+            .map(|c| match c.split_once(" AS ") {
+                Some((col, alias)) => (alias.to_string(), history[col].clone()),
+                None => (c.to_string(), history[c].clone()),
+            })
             .collect()])
     }
 }
@@ -899,6 +902,8 @@ struct LiveInner {
     messages: std::sync::Mutex<Vec<String>>,
     pushed: tokio::sync::broadcast::Sender<(i64, String)>,
     subscribes: std::sync::atomic::AtomicUsize,
+    /// The first offset still in the topic (retention).
+    low: std::sync::atomic::AtomicI64,
 }
 
 impl Live {
@@ -909,6 +914,7 @@ impl Live {
             ]),
             pushed: tokio::sync::broadcast::channel(100_000).0,
             subscribes: Default::default(),
+            low: Default::default(),
         }))
     }
 
@@ -931,6 +937,15 @@ impl Live {
 impl EventSource for Live {
     async fn partitions(&self, topic: &TopicId) -> Result<Option<Vec<i32>>, SourceError> {
         Ok((topic.0 == "requests").then(|| vec![0]))
+    }
+
+    async fn offset_bounds(
+        &self,
+        topic: &TopicId,
+    ) -> Result<Option<std::collections::BTreeMap<i32, (i64, i64)>>, SourceError> {
+        let high = self.0.messages.lock().unwrap().len() as i64;
+        let low = self.0.low.load(std::sync::atomic::Ordering::SeqCst);
+        Ok((topic.0 == "requests").then(|| [(0, (low, high))].into()))
     }
 
     async fn subscribe(
@@ -1088,14 +1103,60 @@ async fn a_returning_client_gets_what_it_missed_from_the_log() {
     assert_eq!(live.subscribes(), 1);
 }
 
+/// A new directory for a disk store, removed when dropped.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "chlive-ws-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        Self(d)
+    }
+
+    fn cache(&self, c: CacheSettings) -> ServerSettings {
+        cache(CacheSettings {
+            dir: Some(self.0.clone()),
+            ..c
+        })
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The debug listing's (sql, stage) pairs.
+async fn stages(server: &chlive_server::Server) -> Vec<(String, String)> {
+    debug(server)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["sql"].as_str().unwrap().to_string(),
+                e["stage"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn warm_entries_follow_kafka_with_nobody_connected() {
+async fn warm_entries_follow_kafka_with_their_rows_on_disk() {
     let live = Live::new();
+    let dir = TempDir::new();
     let server = live_server(
         &live,
-        cache(CacheSettings {
+        dir.cache(CacheSettings {
             keep_alive: Duration::from_millis(50),
-            keep_warm: Duration::from_millis(600),
+            keep_warm: Duration::from_secs(60),
             ..Default::default()
         }),
     )
@@ -1105,78 +1166,207 @@ async fn warm_entries_follow_kafka_with_nobody_connected() {
     c.subscribe("s", sql).await;
     let at = c.expect().await["at"].as_str().unwrap().to_string();
     drop(c);
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(debug(&server).await[0]["stage"], "warm");
-    // events while warm are applied
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let e = &debug(&server).await[0];
+    assert_eq!(
+        (&e["stage"], &e["inMemory"], &e["persisted"]),
+        (&json!("warm"), &json!(false), &json!(true)),
+        "{e}"
+    );
+    // events while warm go to disk
     live.push("w1", 1);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(debug(&server).await[0]["rows"], 2);
-    // back while warm: a resume with them, and the entry is live again
+    // back while warm: the rows and the log from disk; a resume with what it missed
     let mut c = Client::connect(&server).await;
     c.send(json!({"type": "subscribe", "id": "s", "sql": sql, "since": at}))
         .await;
     assert_eq!(c.expect().await["type"], "resume");
     assert_eq!(users(&mut c, "s", 1).await.0, ["w1"]);
-    assert_eq!(debug(&server).await[0]["stage"], "live");
-    let (_, at) = (live.push("w2", 1), users(&mut c, "s", 1).await.1);
-    drop(c);
-
-    // warm expires: the entry goes; the next subscriber starts a new one (another lineage), so
-    // an old cursor gets a snapshot
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    assert_eq!(debug(&server).await, json!([]));
-    let mut c = Client::connect(&server).await;
-    c.send(json!({"type": "subscribe", "id": "s", "sql": sql, "since": at}))
-        .await;
-    let snap = c.expect().await;
-    assert_eq!(snap["type"], "snapshot");
+    let mut d = Client::connect(&server).await;
+    d.subscribe("d", sql).await;
+    let snap = d.expect().await;
+    assert_eq!(snap["rows"], json!([{"user_id": "h1"}, {"user_id": "w1"}]));
+    let e = &debug(&server).await[0];
     assert_eq!(
-        snap["rows"].as_array().unwrap().len(),
-        1,
-        "a fresh snapshot: the history"
+        (&e["stage"], &e["inMemory"]),
+        (&json!("live"), &json!(true)),
+        "{e}"
     );
-    assert_eq!(live.subscribes(), 2);
+    assert_eq!(live.subscribes(), 1, "it never stopped following Kafka");
 }
 
 #[tokio::test]
-async fn which_entries_are_kept_warm() {
-    let settings = |c: CacheSettings| {
-        cache(CacheSettings {
-            keep_alive: Duration::from_millis(30),
-            keep_warm: Duration::from_secs(60),
-            ..c
-        })
-    };
-    let stages = |v: Value| -> Vec<String> {
-        v.as_array()
-            .unwrap()
-            .iter()
-            .map(|e| e["sql"].as_str().unwrap().to_string())
-            .collect()
-    };
-    // keep_warm = 0: gone after the keep-alive
+async fn cold_entries_are_restored_from_disk_and_resume_through_the_fork() {
     let live = Live::new();
+    let dir = TempDir::new();
     let server = live_server(
         &live,
-        cache(CacheSettings {
+        dir.cache(CacheSettings {
             keep_alive: Duration::from_millis(30),
             keep_warm: Duration::ZERO,
             ..Default::default()
         }),
     )
     .await;
+    let sql = "select user_id from requests";
     let mut c = Client::connect(&server).await;
-    c.subscribe("s", "select user_id from requests").await;
-    c.expect().await;
+    c.subscribe("s", sql).await;
+    let first = c.expect().await["at"].as_str().unwrap().to_string();
+    live.push("u1", 1);
+    let (_, at) = users(&mut c, "s", 1).await;
     drop(c);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(debug(&server).await, json!([]));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let listed = debug(&server).await;
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["stage"], "cold");
+    assert!(listed[0]["bytes"].as_i64().unwrap() > 0);
+    // while cold, nothing follows Kafka
+    live.push("u2", 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(live.subscribes(), 1);
 
-    // bigger than max_shared_rows: not kept warm
+    // back: restored from its checkpoint (no snapshot, no history), caught up from Kafka;
+    // its cursor, from the old lineage, resumes
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "s", "sql": sql, "since": at}))
+        .await;
+    assert_eq!(c.expect().await["type"], "resume");
+    assert_eq!(users(&mut c, "s", 1).await.0, ["u2"]);
+    // and an older one, from the log on disk
+    c.send(json!({"type": "subscribe", "id": "t", "sql": sql, "since": first}))
+        .await;
+    assert_eq!(c.expect().await["type"], "resume");
+    assert_eq!(users(&mut c, "t", 2).await.0, ["u1", "u2"]);
+    let e = &debug(&server).await[0];
+    assert_eq!(
+        (&e["restored"], &e["stage"]),
+        (&json!(true), &json!("live"))
+    );
+    assert_eq!(e["forks"].as_array().unwrap().len(), 1, "{e}");
+    assert_ne!(e["lineage"], e["forks"][0], "a new lineage");
+    assert_eq!(live.subscribes(), 2);
+    let mut d = Client::connect(&server).await;
+    d.subscribe("d", sql).await;
+    assert_eq!(
+        d.expect().await["rows"],
+        json!([{"user_id": "h1"}, {"user_id": "u1"}, {"user_id": "u2"}])
+    );
+}
+
+#[tokio::test]
+async fn a_restarted_server_restores_from_disk_when_subscribed() {
+    let live = Live::new();
+    let dir = TempDir::new();
+    let settings = dir.cache(CacheSettings::default());
+    let sql = "select user_id from requests order by latency_ms desc limit 2";
+    let server = live_server(&live, settings.clone()).await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", sql).await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    live.push("u1", 1000);
+    let m = c.expect().await;
+    let at = m["at"].as_str().unwrap().to_string();
+    drop(c);
+    server.shutdown().await;
+    drop(server);
+
+    live.push("u2", 950);
+    let server = live_server(&live, settings).await;
+    assert_eq!(
+        stages(&server).await,
+        [(sql.to_string(), "cold".to_string())]
+    );
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "s", "sql": sql, "since": at}))
+        .await;
+    assert_eq!(c.expect().await["type"], "resume");
+    let m = c.expect().await;
+    assert_eq!(m["type"], "diff", "{m}");
+    // u2 in, h1 (900) out of the top two
+    let ops: Vec<&str> = m["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["op"].as_str().unwrap())
+        .collect();
+    assert_eq!(ops, ["insert", "delete"], "{m}");
+    assert_eq!(debug(&server).await[0]["restored"], true);
+    let mut d = Client::connect(&server).await;
+    d.subscribe("d", sql).await;
+    assert_eq!(
+        d.expect().await["rows"],
+        json!([{"user_id": "u1"}, {"user_id": "u2"}])
+    );
+}
+
+#[tokio::test]
+async fn stored_results_that_cant_continue_start_from_clickhouse() {
+    let sql = "select user_id from requests";
+    // each case: a stored result (left by a server that stopped), then a server with `c`
+    async fn case(name: &str, c: CacheSettings, before: impl FnOnce(&Live)) {
+        let live = Live::new();
+        let dir = TempDir::new();
+        let server = live_server(&live, dir.cache(CacheSettings::default())).await;
+        let mut cl = Client::connect(&server).await;
+        cl.subscribe("s", "select user_id from requests").await;
+        cl.expect().await;
+        live.push("u1", 1);
+        users(&mut cl, "s", 1).await;
+        drop(cl);
+        server.shutdown().await;
+        drop(server);
+        before(&live);
+        let server = live_server(&live, dir.cache(c)).await;
+        let mut cl = Client::connect(&server).await;
+        cl.subscribe("s", "select user_id from requests").await;
+        let snap = cl.expect().await;
+        assert_eq!(snap["type"], "snapshot", "{name}");
+        // the history (the fake's one row), then the events after the snapshot
+        assert_eq!(snap["rows"], json!([{"user_id": "h1"}]), "{name}");
+        let e = &debug(&server).await[0];
+        assert_eq!(e["restored"], false, "{name}: {e}");
+        assert_eq!(live.subscribes(), 2, "{name}");
+    }
+    let _ = sql;
+    case(
+        "max_age",
+        CacheSettings {
+            max_age: Duration::from_millis(1),
+            ..Default::default()
+        },
+        |_| std::thread::sleep(Duration::from_millis(20)),
+    )
+    .await;
+    case(
+        "max_catch_up",
+        CacheSettings {
+            max_catch_up: 2,
+            ..Default::default()
+        },
+        |live| {
+            for i in 0..3 {
+                live.push(&format!("x{i}"), 1);
+            }
+        },
+    )
+    .await;
+    case("retention", CacheSettings::default(), |live| {
+        live.push("x", 1);
+        live.push("y", 1);
+        live.0.low.store(3, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn which_entries_are_kept() {
+    let live = Live::new();
+    // no disk store: gone after the keep-alive
     let server = live_server(
         &live,
-        settings(CacheSettings {
-            max_shared_rows: 0,
+        cache(CacheSettings {
+            keep_alive: Duration::from_millis(30),
             ..Default::default()
         }),
     )
@@ -1184,14 +1374,18 @@ async fn which_entries_are_kept_warm() {
     let mut c = Client::connect(&server).await;
     c.subscribe("s", "select user_id from requests").await;
     c.expect().await;
+    let e = &debug(&server).await[0];
+    assert_eq!(e["persisted"], false);
     drop(c);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(debug(&server).await, json!([]));
 
-    // max_warm = 1: the one warm the longest goes
+    // max_warm = 1: the one warm the longest goes cold
+    let dir = TempDir::new();
     let server = live_server(
         &live,
-        settings(CacheSettings {
+        dir.cache(CacheSettings {
+            keep_alive: Duration::from_millis(30),
             max_warm: 1,
             ..Default::default()
         }),
@@ -1205,11 +1399,25 @@ async fn which_entries_are_kept_warm() {
     c.subscribe("b", "select latency_ms from requests").await;
     c.expect().await;
     c.send(json!({"type": "unsubscribe", "id": "b"})).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        stages(debug(&server).await),
-        ["select latency_ms from requests"]
-    );
+    let want = [
+        (
+            "select latency_ms from requests".to_string(),
+            "warm".to_string(),
+        ),
+        (
+            "select user_id from requests".to_string(),
+            "cold".to_string(),
+        ),
+    ];
+    let started = std::time::Instant::now();
+    loop {
+        let got = stages(&server).await;
+        if got == want {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "{got:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]

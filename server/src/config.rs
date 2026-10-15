@@ -73,29 +73,112 @@ impl Default for Server {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Cache {
-    /// After the last subscriber leaves, still fully live.
+    /// The disk store of results (warm and cold stages); "" turns it off.
+    pub dir: String,
+    /// After the last subscriber leaves, still live (in memory).
     #[serde(with = "humantime_serde")]
     pub keep_alive: Duration,
-    /// Then still following Kafka with nobody connected (0: not at all).
+    /// Then warm (following Kafka, rows on disk), then cold.
     #[serde(with = "humantime_serde")]
     pub keep_warm: Duration,
-    /// Results kept warm at most; the one warm the longest goes first.
+    /// Results warm at most; the one warm the longest goes cold first.
     pub max_warm: usize,
-    /// `diff` messages kept per result, for resuming clients.
+    /// `diff` messages kept in memory per live result, for resuming clients.
     pub log_length: usize,
-    /// Larger results are shared while subscribed, but not kept warm.
-    pub max_shared_rows: usize,
+    /// Cold results are evicted, least recently used first, beyond this on disk.
+    #[serde(with = "size")]
+    pub disk_budget: u64,
+    /// A stored result whose snapshot is older is rebuilt from ClickHouse.
+    #[serde(with = "humantime_serde")]
+    pub max_age: Duration,
+    /// A stored result more events behind Kafka is rebuilt from ClickHouse.
+    pub max_catch_up: u64,
+    /// How often running results save their engine state.
+    #[serde(with = "humantime_serde")]
+    pub checkpoint_interval: Duration,
+    /// A result's log on disk past this is folded into its rows.
+    #[serde(with = "size")]
+    pub log_bytes: u64,
 }
 
 impl Default for Cache {
     fn default() -> Self {
         let d = crate::CacheSettings::default();
         Self {
+            dir: "./chlive-cache".into(),
             keep_alive: d.keep_alive,
             keep_warm: d.keep_warm,
             max_warm: d.max_warm,
             log_length: d.log_length,
-            max_shared_rows: d.max_shared_rows,
+            disk_budget: d.disk_budget,
+            max_age: d.max_age,
+            max_catch_up: d.max_catch_up,
+            checkpoint_interval: d.checkpoint_interval,
+            log_bytes: d.log_bytes,
+        }
+    }
+}
+
+/// Sizes: "10GiB", "16MiB", "512KiB", "100B", "1GB", or a number of bytes.
+pub mod size {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+
+    pub fn parse(text: &str) -> Result<u64, String> {
+        let t = text.trim();
+        let split = t
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(t.len());
+        let (n, unit) = (t[..split].trim(), t[split..].trim());
+        let n: f64 = n
+            .parse()
+            .map_err(|_| format!("{text:?}: not a size (e.g. \"10GiB\", \"16MiB\")"))?;
+        let mult: u64 = match unit.to_ascii_lowercase().as_str() {
+            "" | "b" => 1,
+            "kib" => 1 << 10,
+            "mib" => 1 << 20,
+            "gib" => 1 << 30,
+            "tib" => 1 << 40,
+            "kb" => 1_000,
+            "mb" => 1_000_000,
+            "gb" => 1_000_000_000,
+            "tb" => 1_000_000_000_000,
+            _ => {
+                return Err(format!(
+                    "{text:?}: unknown unit {unit:?} (B, KiB, MiB, GiB, TiB, KB, MB, GB, TB)"
+                ))
+            }
+        };
+        Ok((n * mult as f64) as u64)
+    }
+
+    pub fn format(bytes: u64) -> String {
+        for (unit, m) in [
+            ("TiB", 1u64 << 40),
+            ("GiB", 1 << 30),
+            ("MiB", 1 << 20),
+            ("KiB", 1 << 10),
+        ] {
+            if bytes >= m && bytes.is_multiple_of(m) {
+                return format!("{}{unit}", bytes / m);
+            }
+        }
+        format!("{bytes}B")
+    }
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format(*v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            N(u64),
+            S(String),
+        }
+        match Either::deserialize(d)? {
+            Either::N(n) => Ok(n),
+            Either::S(s) => parse(&s).map_err(de::Error::custom),
         }
     }
 }
@@ -359,6 +442,10 @@ impl Config {
         if self.cache.log_length == 0 {
             bail!("cache.log_length: must be more than 0");
         }
+        positive("cache.checkpoint_interval", self.cache.checkpoint_interval)?;
+        if self.cache.disk_budget == 0 || self.cache.log_bytes == 0 {
+            bail!("cache.disk_budget and cache.log_bytes: must be more than 0");
+        }
         if self.server.listen.is_empty() {
             bail!("server.listen: empty");
         }
@@ -406,11 +493,16 @@ impl Config {
             max_subscriptions_per_connection: self.server.max_subscriptions_per_connection,
             progress_interval: self.server.progress_interval,
             cache: crate::CacheSettings {
+                dir: (!self.cache.dir.is_empty()).then(|| self.cache.dir.clone().into()),
                 keep_alive: self.cache.keep_alive,
                 keep_warm: self.cache.keep_warm,
                 max_warm: self.cache.max_warm,
                 log_length: self.cache.log_length,
-                max_shared_rows: self.cache.max_shared_rows,
+                disk_budget: self.cache.disk_budget,
+                max_age: self.cache.max_age,
+                max_catch_up: self.cache.max_catch_up,
+                checkpoint_interval: self.cache.checkpoint_interval,
+                log_bytes: self.cache.log_bytes,
             },
         }
     }
@@ -536,11 +628,16 @@ mod tests {
         assert_eq!(
             d.cache,
             Cache {
+                dir: "./chlive-cache".into(),
                 keep_alive: Duration::from_secs(30),
-                keep_warm: Duration::from_secs(15 * 60),
+                keep_warm: Duration::from_secs(3600),
                 max_warm: 100,
                 log_length: 1000,
-                max_shared_rows: 100_000,
+                disk_budget: 10 << 30,
+                max_age: Duration::from_secs(24 * 3600),
+                max_catch_up: 1_000_000,
+                checkpoint_interval: Duration::from_secs(60),
+                log_bytes: 16 << 20,
             }
         );
         assert_eq!(
@@ -615,8 +712,21 @@ mod tests {
             }
         );
         assert_eq!(e.tables, TablesConfig::default());
-        assert_eq!(d.server_settings(), ServerSettings::default());
-        assert_eq!(d.server_settings().cache, crate::CacheSettings::default());
+        assert_eq!(
+            d.server_settings(),
+            ServerSettings {
+                cache: d.server_settings().cache,
+                ..Default::default()
+            }
+        );
+        // the server's default store; the library's is none (embedders choose)
+        assert_eq!(
+            d.server_settings().cache,
+            crate::CacheSettings {
+                dir: Some("./chlive-cache".into()),
+                ..Default::default()
+            }
+        );
     }
 
     /// The example file lists every key with its default.
@@ -662,7 +772,12 @@ mod tests {
                 keep_warm = "1h"
                 max_warm = 7
                 log_length = 50
-                max_shared_rows = 1234
+                dir = "/var/cache/chlive"
+                disk_budget = "2GiB"
+                max_age = "6h"
+                max_catch_up = 5000
+                checkpoint_interval = "10s"
+                log_bytes = 1048576
 
                 [clickhouse]
                 url = "http://ch:8123"
@@ -764,21 +879,31 @@ mod tests {
             assert_eq!(
                 c.cache,
                 Cache {
+                    dir: "/var/cache/chlive".into(),
                     keep_alive: Duration::from_secs(5),
                     keep_warm: Duration::from_secs(3600),
                     max_warm: 7,
                     log_length: 50,
-                    max_shared_rows: 1234,
+                    disk_budget: 2 << 30,
+                    max_age: Duration::from_secs(6 * 3600),
+                    max_catch_up: 5000,
+                    checkpoint_interval: Duration::from_secs(10),
+                    log_bytes: 1 << 20,
                 }
             );
             assert_eq!(
                 c.server_settings().cache,
                 crate::CacheSettings {
+                    dir: Some("/var/cache/chlive".into()),
                     keep_alive: Duration::from_secs(5),
                     keep_warm: Duration::from_secs(3600),
                     max_warm: 7,
                     log_length: 50,
-                    max_shared_rows: 1234,
+                    disk_budget: 2 << 30,
+                    max_age: Duration::from_secs(6 * 3600),
+                    max_catch_up: 5000,
+                    checkpoint_interval: Duration::from_secs(10),
+                    log_bytes: 1 << 20,
                 }
             );
             let s = c.server_settings();
@@ -854,6 +979,27 @@ mod tests {
     }
 
     #[test]
+    fn sizes() {
+        for (t, n) in [
+            ("10GiB", 10u64 << 30),
+            ("16MiB", 16 << 20),
+            ("512 KiB", 512 << 10),
+            ("1.5GiB", 3 << 29),
+            ("100", 100),
+            ("100B", 100),
+            ("2GB", 2_000_000_000),
+            ("3kb", 3000),
+        ] {
+            assert_eq!(size::parse(t), Ok(n), "{t}");
+        }
+        assert!(size::parse("lots").is_err());
+        assert!(size::parse("5 parsecs").is_err());
+        assert_eq!(size::format(10 << 30), "10GiB");
+        assert_eq!(size::format(16 << 20), "16MiB");
+        assert_eq!(size::format(1000), "1000B");
+    }
+
+    #[test]
     fn errors_name_the_key() {
         Jail::expect_with(|jail| {
             // the native address is gone: everything is HTTP
@@ -896,6 +1042,17 @@ mod tests {
             assert!(e.contains("cache.log_length"), "{e}");
             let e = err(jail, "[cache]\nkeep_warm = \"later\"");
             assert!(e.contains("keep_warm"), "{e}");
+            let e = err(jail, "[cache]\ndisk_budget = \"lots\"");
+            assert!(e.contains("disk_budget"), "{e}");
+            let e = err(jail, "[cache]\nlog_bytes = \"5 parsecs\"");
+            assert!(e.contains("log_bytes"), "{e}");
+            let e = err(jail, "[cache]\ncheckpoint_interval = \"0s\"");
+            assert!(e.contains("checkpoint_interval"), "{e}");
+            let e = err(jail, "[cache]\nmax_shared_rows = 5");
+            assert!(e.contains("max_shared_rows"), "removed: {e}");
+            // "" turns the store off
+            let c = load(jail, "[cache]\ndir = \"\"").unwrap();
+            assert_eq!(c.server_settings().cache.dir, None);
             let e = err(jail, "[cache]\nwarm = true");
             assert!(e.contains("warm"), "{e}");
             // zero keep-alive and warm are allowed: dropped as soon as nobody's subscribed

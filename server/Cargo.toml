@@ -26,6 +26,8 @@ anyhow = "1"
 figment = { version = "0.10", features = ["toml", "env"] }
 toml = "1"
 humantime-serde = "1"
+# the shared results' disk store (src/store.rs)
+rusqlite = { version = "0.40", features = ["bundled"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # binary only
 clap = { version = "4", features = ["derive", "env"] }

@@ -510,14 +510,15 @@ in
       '';
     };
     reset-data = {
-      description = "Delete local Redpanda and ClickHouse data (run while `dnvr up` is stopped)";
+      description = "Delete local Redpanda, ClickHouse and chlive cache data (run while `dnvr up` is stopped)";
       text = ''
         # Kafka (with Connect's own topics) and ClickHouse (with the sink's KeeperMap
-        # offsets) must be reset together.
+        # offsets) must be reset together; chlive's stored results hold cursors into them.
         docker rm -f chlive-redpanda >/dev/null 2>&1 || true
         docker volume rm chlive-redpanda >/dev/null 2>&1 || true
         rm -rf "''${DNVR_ROOT:?}/${config.processes.clickhouse.dataDir}"
-        echo "removed Redpanda and ClickHouse data; next \`dnvr up\` starts empty and re-seeds"
+        rm -rf "''${DNVR_ROOT:?}/.dnvr/chlive-cache"
+        echo "removed Redpanda, ClickHouse and chlive cache data; next \`dnvr up\` starts empty and re-seeds"
       '';
     };
   };

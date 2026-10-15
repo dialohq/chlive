@@ -6,6 +6,7 @@ pub mod config;
 pub mod hub;
 pub mod log;
 pub mod protocol;
+pub mod store;
 pub mod ws;
 
 use std::net::SocketAddr;

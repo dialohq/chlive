@@ -150,18 +150,33 @@ Every subscription to the same query, with the same parameter values (any spelli
 - **One engine subscription per entry:** one ClickHouse snapshot and history query, and one Kafka consumer, however many clients watch it.
 - **The result is kept** (its rows, and the cursor they're complete to), so a new subscriber gets it at once as a `snapshot`, without ClickHouse. Before the history is in, joiners wait for it.
 - **A change log:** the entry keeps its last `cache.log_length` `diff` messages. A client returning with a cursor from this entry gets `resume` and just what it missed. A cursor from another entry of the same query (another *lineage*: entries started at different times can hold the same rows in a different order, or a different subset of tied rows), one older than the log, garbage or an old format gets a `snapshot` instead.
-- **Warm:** after the last subscriber leaves, the entry stays fully live for `cache.keep_alive` (30 s; reloads and route changes reuse it), then **warm** for `cache.keep_warm` (15 min): still following Kafka with nobody connected, so the next visitor subscribes to an up-to-date result and a returning client resumes from the log. Then it's dropped. At most `cache.max_warm` (100) entries are warm; the one warm the longest goes first. Results over `cache.max_shared_rows` (100 000 rows) are shared while subscribed but not kept warm.
+- **Stages:** plain queries and native aggregates are also kept on disk, in a SQLite store at `cache.dir` (`./chlive-cache`; `""` turns it off, kept across restarts): their rows as of some cursor (the *base*), every `diff` message after it (the *log*), and the engine's state (a *checkpoint*, every `cache.checkpoint_interval`, 60 s). So an entry goes through:
+
+  | stage | follows Kafka | rows and log | engine state |
+  |---|---|---|---|
+  | **live** (subscribed, then `cache.keep_alive`, 30 s) | yes | memory, mirrored to disk | memory |
+  | **warm** (`cache.keep_warm`, 1 h) | yes | disk only | memory |
+  | **cold** | no | disk | disk |
+  | **gone** | — | — | — |
+
+  A subscriber brings a warm entry back to live, its rows loaded from disk, and a cold one, restored from its checkpoint and caught up from Kafka (no ClickHouse). Cold entries go, least recently used first, beyond `cache.disk_budget` (10 GiB). At most `cache.max_warm` (100) entries are warm (each has a Kafka consumer); the one warm the longest goes cold first. A stored result is rebuilt from ClickHouse instead when its snapshot is older than `cache.max_age` (24 h), its cursor is no longer in Kafka, it's more than `cache.max_catch_up` (1M) events behind, or the query plans differently now. After a restart every entry is cold. A log past `cache.log_bytes` (16 MiB) is folded into the base. Other queries (chDB aggregates, semi-joins) are live, then dropped.
+- **Restores fork the lineage:** a restored entry is a new lineage that continues from the old one's checkpoint, so a cursor of the old lineage up to there still resumes; one past it (an unclean stop that lost messages after the last checkpoint) gets a snapshot.
 - **Slow clients** don't hold anyone up: a subscriber whose connection's queue is full falls behind (nothing more is queued for it) and catches up once it has room, from the log, or with a snapshot if the log no longer reaches back.
 - **When an entry fails** (ClickHouse, Kafka, …), every subscriber gets the error and the entry goes; subscribing again starts a new one.
-- **Debugging:** `/debug/subscriptions` lists the entries: query, lineage, stage (`starting`, `live`, `keep_alive`, `warm`) and how long it has left, subscribers (and whether they're lagging), rows, cursor, log length and start, how long the history took, and the joins by outcome (snapshot, resume, wait) and catch-ups. `RUST_LOG=info,chlive_server::hub=debug` logs every entry's life by its `key` (a fingerprint of the query) and `lineage`: created, history loaded, each join with its decision and reason, leaves, stage changes, lagging and catching up, and why it was dropped; `trace` adds every diff applied.
+- **Debugging:** `/debug/subscriptions` lists the entries: query, lineage, stage (`starting`, `live`, `keep_alive`, `warm`) and how long it has left, subscribers (and whether they're lagging), rows (and whether they're in memory), whether it's on disk or was restored, its forks, cursor, log length and start, how long the history took, and the joins by outcome (snapshot, resume, wait) and catch-ups. `RUST_LOG=info,chlive_server::hub=debug` logs every entry's life by its `key` (a fingerprint of the query) and `lineage`: created, history loaded, each join with its decision and reason, leaves, stage changes, lagging and catching up, and why it was dropped; `chlive_server::store=debug` adds the disk store: checkpoints, compactions, write batches, restores and why a stored result couldn't be used, evictions. Cold entries are listed from the store (stage `cold`, bytes, last used); `sqlite3 chlive-cache/cache.sqlite3` shows the tables (`entries`, `base`, `log`). `trace` adds every diff applied.
 
 ```toml
 [cache]
+dir = "./chlive-cache"    # "": no disk stages (live, then dropped)
 keep_alive = "30s"
-keep_warm = "15m"        # "0s": not kept warm
+keep_warm = "1h"          # "0s": cold right after the keep-alive
 max_warm = 100
-log_length = 1000        # diff messages per entry
-max_shared_rows = 100000
+log_length = 1000         # diff messages in memory per live entry
+disk_budget = "10GiB"
+max_age = "24h"
+max_catch_up = 1000000
+checkpoint_interval = "60s"
+log_bytes = "16MiB"
 ```
 
 ## Engine (custom dialect)
@@ -406,7 +421,7 @@ Known differences, where the engine skips an event that ClickHouse reads:
 The client takes care of the page's lifecycle: it saves pending results when the tab goes to the background or the page is hidden, then closes the database so a reload can open it at once, and reopens it if the page comes back from the back/forward cache.
 
 - **On subscribe**, the cached result (if any) is shown at once (`status: "cached"`, with `cachedAt`), and the subscription is sent with `since` = its cursor. The server resumes and sends only what was missed; reconnects resume the same way.
-- **On the server**, the cursor resumes against the query's shared result (see [Shared results](#shared-results)): if it comes from that result (the same lineage) and its change log still reaches back to it, the client gets `resume` and just the diffs it missed; otherwise a snapshot of the result as it is, with no ClickHouse query while the result is live or warm.
+- **On the server**, the cursor resumes against the query's shared result (see [Shared results](#shared-results)): if it comes from that result (the same lineage) and its change log still reaches back to it, the client gets `resume` and just the diffs it missed; otherwise a snapshot of the result as it is, with no ClickHouse query while the result is live, warm or cold.
 - **What's stored:** per query and param values (the SQL text, plus the params as sent in stable JSON), its rows as JSON chunks, the cursor and when it was last used. A database with an older layout is emptied (`PRAGMA user_version`). Each write is one transaction: snapshots and ordered diffs are saved in full (batched, about 1 s), append-only diffs are appended, and `progress` moves the cursor.
 - **GC:** above the budget, the least recently used queries are evicted.
 - **MVP limits:** one tab holds the database at a time; other tabs run without a cache (the playground shows why). Keys are query texts with their param values, not shapes yet.

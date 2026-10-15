@@ -93,7 +93,7 @@ pub fn router_with(hub: Arc<Hub>, settings: ServerSettings) -> Router {
 
 /// The shared entries, with their subscribers.
 async fn debug_subscriptions(State(s): State<AppState>) -> impl IntoResponse {
-    Json(s.hub.list())
+    Json(s.hub.list().await)
 }
 
 /// One open WebSocket, counted against `max_connections` until dropped.

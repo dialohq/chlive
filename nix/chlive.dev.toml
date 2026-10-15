@@ -7,9 +7,13 @@ snapshot_password = "chlive_snap"
 # made by scripts/schema.sql
 snapshot_database = "chlive_snapshots"
 
+[cache]
+# stored results (warm and cold); `reset-data` deletes them with the data they point into
+dir = ".dnvr/chlive-cache"
+
 [log]
-# the shared results' lives in detail (joins, resumes, warm, lagging clients)
-level = "info,chlive_server::hub=debug"
+# the shared results' lives in detail (joins, resumes, warm, cold, restores, the disk store)
+level = "info,chlive_server::hub=debug,chlive_server::store=debug"
 
 [tables.events]
 [tables.orders]
