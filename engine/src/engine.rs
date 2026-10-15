@@ -201,6 +201,11 @@ impl Engine {
         self.snapshots.shutdown().await;
     }
 
+    /// The snapshots' state, per table (for the debug page).
+    pub async fn snapshot_status(&self) -> Vec<crate::snapshot::SnapshotStatus> {
+        self.snapshots.status().await
+    }
+
     /// Parse, bind and plan a query without running it.
     pub async fn explain(&self, sql: &str) -> Result<Plan, EngineError> {
         self.explain_with(sql, &Params::new()).await

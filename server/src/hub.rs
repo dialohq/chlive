@@ -340,6 +340,56 @@ impl Hub {
     /// For `/debug/subscriptions`: the running entries, then the cold ones in the store (as
     /// of every write sent so far).
     pub async fn list(&self) -> Vec<Json> {
+        self.entries_and_index().await.0
+    }
+
+    /// For `/debug/state`: the entries (as [`Hub::list`]), the store and the cache settings.
+    pub async fn state(&self) -> Json {
+        let (entries, index) = self.entries_and_index().await;
+        let store = self.store.as_ref().map(|store| {
+            let running: HashMap<String, &str> = entries
+                .iter()
+                .filter_map(|e| Some((e["key"].as_str()?.to_string(), e["stage"].as_str()?)))
+                .collect();
+            let mut by_stage: HashMap<&str, u64> = HashMap::new();
+            let mut bytes = 0;
+            for e in &index {
+                bytes += e.bytes.max(0) as u64;
+                // as listed: a running entry's stage as it is now (the store's lags a batch)
+                let stage = match running.get(&store::short(&e.key)).copied() {
+                    Some(s @ ("warm" | "cold")) => s,
+                    Some(_) => "live",
+                    None => e.stage.as_str(),
+                };
+                *by_stage.entry(stage).or_default() += 1;
+            }
+            let mut stats = serde_json::to_value(store.stats()).expect("stats serialize");
+            stats["bytes"] = bytes.into();
+            stats["budget"] = self.cache.disk_budget.into();
+            stats["byStage"] = serde_json::to_value(by_stage).expect("counts serialize");
+            stats
+        });
+        let c = &self.cache;
+        serde_json::json!({
+            "cache": {
+                "dir": c.dir.as_ref().map(|d| d.display().to_string()),
+                "keepAlive": c.keep_alive.as_secs_f64(),
+                "keepWarm": c.keep_warm.as_secs_f64(),
+                "maxWarm": c.max_warm,
+                "logLength": c.log_length,
+                "diskBudget": c.disk_budget,
+                "maxAge": c.max_age.as_secs_f64(),
+                "maxCatchUp": c.max_catch_up,
+                "checkpointInterval": c.checkpoint_interval.as_secs_f64(),
+                "logBytes": c.log_bytes,
+            },
+            "entries": entries,
+            "store": store,
+        })
+    }
+
+    /// The running entries, then the cold ones in the store; and the store's index.
+    async fn entries_and_index(&self) -> (Vec<Json>, Vec<store::IndexEntry>) {
         if let Some(store) = &self.store {
             store.flush().await;
         }
@@ -354,34 +404,40 @@ impl Hub {
             )
         };
         running.sort_by_key(|i| i.created);
+        let now = store::now_ms() as u64;
         let mut out: Vec<Json> = running
-            .iter()
-            .map(|i| serde_json::to_value(i).expect("info serializes"))
+            .iter_mut()
+            .map(|i| {
+                i.stage_ends_in = i
+                    .stage_ends_at
+                    .map(|at| at.saturating_sub(now) as f64 / 1000.0);
+                serde_json::to_value(&*i).expect("info serializes")
+            })
             .collect();
+        let mut index = Vec::new();
         if let Some(store) = self.store.clone() {
             match tokio::task::spawn_blocking(move || store.index())
                 .await
                 .expect("the index read")
             {
-                Ok(index) => out.extend(index.into_iter().filter(|e| !keys.contains(&e.key)).map(
-                    |e| {
-                        serde_json::json!({
-                            "key": store::short(&e.key),
-                            "sql": e.sql,
-                            "lineage": e.lineage,
-                            "stage": e.stage,
-                            "at": e.state_at,
-                            "bytes": e.bytes,
-                            "logRows": e.log_rows,
-                            "usedAt": e.used_at,
-                            "bornAt": e.born_at,
-                        })
-                    },
-                )),
+                Ok(i) => index = i,
                 Err(e) => warn!(error = %e, "reading the cache store's index failed"),
             }
         }
-        out
+        out.extend(index.iter().filter(|e| !keys.contains(&e.key)).map(|e| {
+            serde_json::json!({
+                "key": store::short(&e.key),
+                "sql": e.sql,
+                "lineage": e.lineage,
+                "stage": e.stage,
+                "at": e.state_at,
+                "bytes": e.bytes,
+                "logRows": e.log_rows,
+                "usedAt": e.used_at,
+                "bornAt": e.born_at,
+            })
+        }));
+        (out, index)
     }
 
     /// Stop every entry: those with a store are checkpointed and go cold.
@@ -431,6 +487,7 @@ impl Hub {
         let mut entries = self.entries.lock().unwrap();
         if let Some(h) = entries.get_mut(key).filter(|h| h.id == id) {
             h.warm_since = warm.then(Instant::now);
+            h.info.lock().unwrap().warm_since = warm.then(|| store::now_ms() as u64);
         }
         if !warm {
             return;
@@ -486,6 +543,12 @@ pub struct Info {
     /// Seconds until the next stage (keep-alive, warm).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_ends_in: Option<f64>,
+    /// When the next stage starts (Unix milliseconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_ends_at: Option<u64>,
+    /// Since when it's been warm (Unix milliseconds): over `max_warm`, the earliest goes cold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warm_since: Option<u64>,
     pub subscribers: Vec<SubscriberInfo>,
     pub rows: usize,
     /// Whether the rows are in memory (live) or only on disk (warm).
@@ -529,6 +592,8 @@ impl Info {
             forks: Vec::new(),
             stage: "starting",
             stage_ends_in: None,
+            stage_ends_at: None,
+            warm_since: None,
             subscribers: Vec::new(),
             rows: 0,
             in_memory: true,
@@ -1535,9 +1600,10 @@ impl Entry {
         } else {
             self.stage.name()
         };
-        info.stage_ends_in = self.deadline.map(|d| {
-            d.saturating_duration_since(tokio::time::Instant::now())
-                .as_secs_f64()
+        // as a time, so listings count down between steps
+        info.stage_ends_at = self.deadline.map(|d| {
+            let left = d.saturating_duration_since(tokio::time::Instant::now());
+            store::now_ms() as u64 + left.as_millis() as u64
         });
         info.subscribers = self
             .subs

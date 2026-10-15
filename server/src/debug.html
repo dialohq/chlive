@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chlive debug</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f5; --panel: #ffffff; --fg: #1d1d1b; --muted: #6b6b66; --line: #e3e3de;
+    --accent: #2f6fd6; --bad: #c73a2e; --badbg: #fbe9e7; --hover: #f1f1ec;
+    --live: #1f9d55; --keep: #c98a00; --warm: #d9622b; --cold: #3b7dd8; --start: #8a63d2;
+    --bar: #e9e9e4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --panel: #1d1d1b; --fg: #ececea; --muted: #9a9a94; --line: #2f2f2c;
+      --accent: #6aa0ff; --bad: #ff7b6e; --badbg: #3a1f1c; --hover: #262624;
+      --live: #3ccf7f; --keep: #f0b429; --warm: #ff8a50; --cold: #6aa0ff; --start: #b394ff;
+      --bar: #2a2a28;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  code, .mono, td.num, .k { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  header {
+    position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 8px 16px;
+    align-items: center; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+  header .meta { color: var(--muted); }
+  header .spacer { flex: 1; }
+  button, select, input {
+    font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 8px;
+  }
+  button { cursor: pointer; }
+  button:hover { background: var(--hover); }
+  main { padding: 16px; display: grid; gap: 16px; max-width: 1600px; margin: 0 auto; }
+  .banner { padding: 8px 12px; border-radius: 6px; background: var(--badbg); color: var(--bad); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .card .sub { color: var(--muted); font-size: 12px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+  section > h2 {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    font-size: 13px; margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--line);
+  }
+  section > h2 .count { color: var(--muted); font-weight: 400; }
+  section > h2 .tools { margin-left: auto; display: flex; gap: 8px; font-weight: 400; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { padding: 5px 10px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.sql { white-space: normal; min-width: 260px; max-width: 560px; overflow-wrap: anywhere; }
+  tr.entry { cursor: pointer; }
+  tr.entry:hover, tr.hl { background: var(--hover); }
+  tr.detail td { background: var(--bg); white-space: normal; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .empty { color: var(--muted); padding: 12px; }
+  .muted { color: var(--muted); }
+  .bad { color: var(--bad); }
+  .chip {
+    display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+    color: #fff; background: var(--muted);
+  }
+  .chip.live { background: var(--live); } .chip.keep_alive { background: var(--keep); }
+  .chip.warm { background: var(--warm); } .chip.cold { background: var(--cold); }
+  .chip.starting { background: var(--start); }
+  .flag { display: inline-block; padding: 0 5px; border: 1px solid var(--line); border-radius: 4px; font-size: 11px; color: var(--muted); }
+  .flag.on { color: var(--fg); border-color: var(--muted); }
+  .bar { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin: 6px 0 2px; }
+  .bar > div { height: 100%; background: var(--accent); }
+  .bar.over > div { background: var(--bad); }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; padding: 12px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  .grid2 { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 16px; }
+  @media (max-width: 1100px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+  details > summary { cursor: pointer; padding: 10px 12px; font-weight: 600; }
+  a.k { color: var(--accent); text-decoration: none; }
+  a.k:hover { text-decoration: underline; }
+  pre { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<header>
+  <h1>chlive</h1>
+  <span class="meta" id="meta">loading…</span>
+  <span class="spacer"></span>
+  <span class="meta" id="updated"></span>
+  <select id="every" title="Refresh every">
+    <option value="1000">1 s</option>
+    <option value="5000">5 s</option>
+  </select>
+  <button id="pause">Pause</button>
+</header>
+<main>
+  <div id="banner" class="banner" hidden></div>
+  <div id="cards" class="cards"></div>
+  <section>
+    <h2>Shared results <span class="count" id="stagecounts"></span>
+      <span class="tools"><input id="filter" type="search" placeholder="Filter by query, key, lineage"></span>
+    </h2>
+    <div class="scroll" id="entries"></div>
+  </section>
+  <div class="grid2">
+    <section><h2>Disk store</h2><div id="store"></div></section>
+    <section><h2>Snapshots <span class="count" id="snapcount"></span></h2><div class="scroll" id="snapshots"></div></section>
+  </div>
+  <section><h2>Connections <span class="count" id="conncount"></span></h2><div class="scroll" id="connections"></div></section>
+  <section><details><summary>Cache settings</summary><div id="settings"></div></details></section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const STAGES = ["starting", "live", "keep_alive", "warm", "cold"];
+
+let state = null;      // the last /debug/state
+let skew = 0;          // server clock minus ours
+let lastOk = 0;        // when the last poll succeeded (our clock)
+let paused = false;
+let timer = null;
+const open = new Set(); // expanded entry keys
+
+function bytes(n) {
+  if (n == null) return "–";
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(n < 10 ? 2 : 1) : n) + " " + u[i];
+}
+function dur(ms) {
+  if (ms == null || !isFinite(ms)) return "–";
+  const s = Math.max(0, ms) / 1000;
+  if (s < 60) return s.toFixed(s < 10 ? 1 : 0) + "s";
+  const m = s / 60;
+  if (m < 60) return Math.floor(m) + "m " + Math.floor(s % 60) + "s";
+  const h = m / 60;
+  if (h < 48) return Math.floor(h) + "h " + Math.floor(m % 60) + "m";
+  return Math.floor(h / 24) + "d " + Math.floor(h % 24) + "h";
+}
+const now = () => Date.now() + skew;
+const ago = (t) => (t ? dur(now() - t) + " ago" : "–");
+const until = (t) => (t ? "in " + dur(t - now()) : "");
+const num = (n) => (n == null ? "–" : Number(n).toLocaleString());
+const chip = (stage) => `<span class="chip ${esc(stage)}">${esc(stage)}</span>`;
+const flag = (on, label, title) => `<span class="flag${on ? " on" : ""}" title="${esc(title)}">${on ? label : "no " + label}</span>`;
+const plural = (n, word) => `${num(n)} ${word}${n === 1 ? "" : "s"}`;
+const short = (s, n = 140) => (s.length > n ? s.slice(0, n) + "…" : s);
+
+function card(label, value, sub) {
+  return `<div class="card"><div class="label">${esc(label)}</div><div class="value">${value}</div><div class="sub">${sub ?? ""}</div></div>`;
+}
+
+function render() {
+  const s = state;
+  if (!s) return;
+  const srv = s.server;
+  $("meta").textContent = `v${srv.version} · up ${dur(now() - srv.startedAt)} · WebSocket at ${srv.path}`;
+
+  const entries = s.entries;
+  const counts = Object.fromEntries(STAGES.map((k) => [k, 0]));
+  let subscribers = 0;
+  for (const e of entries) {
+    counts[e.stage] = (counts[e.stage] ?? 0) + 1;
+    subscribers += e.subscribers?.length ?? 0;
+  }
+  const running = entries.filter((e) => e.stage !== "cold");
+  const rows = running.reduce((a, e) => a + (e.inMemory ? e.rows : 0), 0);
+  const st = s.store;
+  const snaps = s.snapshots;
+  const leases = snaps.reduce((a, t) => a + (t.current?.leases ?? 0), 0);
+
+  $("cards").innerHTML = [
+    card("Connections", num(srv.connections), `of ${num(srv.maxConnections)} · ${num(subscribers)} subscriptions`),
+    card("Running results", num(running.length), `${counts.live} live · ${counts.keep_alive} keep-alive · ${counts.warm} warm (max ${s.cache.maxWarm})`),
+    card("Rows in memory", num(rows), counts.starting ? `${counts.starting} starting` : "in live results"),
+    card("Cold on disk", st ? num(counts.cold) : "–", st ? `of ${num(entries.length)} results` : "no disk store"),
+    card("Disk store", st ? bytes(st.bytes) : "off", st ? `of ${bytes(st.budget)} budget · file ${bytes(st.fileBytes + st.walBytes)}` : "dir is empty"),
+    card("Snapshots", num(snaps.length), `${num(leases)} leases · ${snaps.filter((t) => t.taking).length} taking`),
+  ].join("");
+
+  $("stagecounts").textContent = STAGES.filter((k) => counts[k]).map((k) => `${counts[k]} ${k}`).join(" · ");
+  renderEntries(entries);
+  renderStore(st);
+  renderSnapshots(snaps);
+  renderConnections(s.connections);
+  renderSettings(s.cache);
+}
+
+function renderEntries(entries) {
+  const q = $("filter").value.trim().toLowerCase();
+  const shown = q
+    ? entries.filter((e) => [e.sql, e.key, e.lineage, e.stage, JSON.stringify(e.params ?? {})].join(" ").toLowerCase().includes(q))
+    : entries;
+  if (!shown.length) {
+    $("entries").innerHTML = `<div class="empty">${entries.length ? "Nothing matches the filter." : "No shared results yet."}</div>`;
+    return;
+  }
+  const head = `<tr><th>Stage</th><th>Next</th><th>Key</th><th>Query</th><th class="num">Subs</th><th class="num">Rows</th>
+    <th>Where</th><th>Cursor</th><th class="num">Log</th><th class="num">Msgs</th><th class="num">Joins s/r/w</th></tr>`;
+  const body = shown.map((e) => {
+    const cold = e.stage === "cold";
+    const lagging = (e.subscribers ?? []).filter((x) => x.lagging).length;
+    const subs = cold ? "–" : num(e.subscribers.length) + (lagging ? ` <span class="bad" title="lagging">(${lagging} lag)</span>` : "");
+    const next = cold ? `<span class="muted">used ${ago(e.usedAt)}</span>`
+      : e.stageEndsAt ? `${e.stage === "warm" ? "cold" : "warm"} ${until(e.stageEndsAt)}`
+      : "";
+    const where = cold
+      ? `<span class="flag on">disk ${bytes(e.bytes)}</span>`
+      : [flag(e.inMemory, "memory", "rows in memory"), flag(e.persisted, "disk", "mirrored to the disk store"), e.restored ? flag(true, "restored", "restored from disk") : ""].join(" ");
+    const tr = `<tr class="entry${open.has(e.key) ? " hl" : ""}" data-key="${esc(e.key)}" id="entry-${esc(e.key)}">
+      <td>${chip(e.stage)}</td><td>${next}</td><td class="k">${esc(e.key)}</td>
+      <td class="sql mono" title="${esc(e.sql)}">${esc(short(e.sql))}</td>
+      <td class="num">${subs}</td><td class="num">${cold ? "–" : num(e.rows)}</td><td>${where}</td>
+      <td class="mono">${esc(e.at ?? "–")}</td>
+      <td class="num">${cold ? num(e.logRows) : num(e.logLength)}</td>
+      <td class="num">${cold ? "–" : num(e.messages)}</td>
+      <td class="num">${cold ? "–" : `${num(e.joinsSnapshot)}/${num(e.joinsResume)}/${num(e.joinsWait)}`}</td></tr>`;
+    return tr + (open.has(e.key) ? `<tr class="detail"><td colspan="11">${entryDetail(e)}</td></tr>` : "");
+  }).join("");
+  $("entries").innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function entryDetail(e) {
+  const item = (k, v) => (v === undefined || v === null || v === "" ? "" : `<dt>${esc(k)}</dt><dd>${v}</dd>`);
+  const subs = (e.subscribers ?? []).map((x) => `conn ${x.conn} · ${esc(x.id)}${x.lagging ? ' <span class="bad">lagging</span>' : ""}`).join("<br>");
+  return `<dl>
+    ${item("Query", `<pre class="mono">${esc(e.sql)}</pre>`)}
+    ${e.params && Object.keys(e.params).length ? item("Params", `<code>${esc(JSON.stringify(e.params))}</code>`) : ""}
+    ${item("Lineage", `<code>${esc(e.lineage)}</code>`)}
+    ${e.forks?.length ? item("Forked from", e.forks.map((f) => `<code>${esc(f)}</code>`).join(", ")) : ""}
+    ${item("Cursor", e.at ? `<code>${esc(e.at)}</code>` : undefined)}
+    ${item("Log starts at", e.logStart ? `<code>${esc(e.logStart)}</code>` : undefined)}
+    ${item("Subscribers", subs || undefined)}
+    ${item("Created", e.created ? ago(e.created) : undefined)}
+    ${item("Warm since", e.warmSince ? ago(e.warmSince) : undefined)}
+    ${item("History took", e.historyMs != null ? e.historyMs + " ms" : undefined)}
+    ${item("Checkpoints", e.checkpoints != null ? num(e.checkpoints) : undefined)}
+    ${item("Catch-ups (resyncs)", e.resyncs != null ? num(e.resyncs) : undefined)}
+    ${item("On disk", e.bytes != null ? bytes(e.bytes) + `, ${num(e.logRows)} log rows` : undefined)}
+    ${item("Last used", e.usedAt ? ago(e.usedAt) : undefined)}
+    ${item("Snapshot taken", e.bornAt ? ago(e.bornAt) : undefined)}
+  </dl>`;
+}
+
+function renderStore(st) {
+  if (!st) {
+    $("store").innerHTML = `<div class="empty">No disk store: results are live, then dropped (<code>[cache] dir = ""</code>, or it couldn't be opened).</div>`;
+    return;
+  }
+  const pct = st.budget ? Math.min(100, (100 * st.bytes) / st.budget) : 0;
+  const by = st.byStage ?? {};
+  $("store").innerHTML = `<dl>
+    <dt>Used</dt><dd>${bytes(st.bytes)} of ${bytes(st.budget)} (${pct > 0 && pct < 0.01 ? "<0.01" : pct.toFixed(pct < 1 ? 2 : 0)}%)
+      <div class="bar${st.bytes > st.budget ? " over" : ""}"><div style="width:${pct}%"></div></div></dd>
+    <dt>Results</dt><dd>${["live", "warm", "cold"].map((k) => `${num(by[k] ?? 0)} ${k}`).join(" · ")}</dd>
+    <dt>File</dt><dd><code>${esc(st.path)}</code><br>${bytes(st.fileBytes)} + ${bytes(st.walBytes)} WAL</dd>
+    <dt>Writer</dt><dd>${num(st.queued)} queued · ${num(st.batches)} batches, ${num(st.ops)} writes</dd>
+    <dt>Last batch</dt><dd>${st.lastBatchAt ? `${plural(st.lastBatchOps, "write")} in ${st.lastBatchMs} ms, ${ago(st.lastBatchAt)}` : "–"}</dd>
+    <dt>Errors</dt><dd class="${st.errors ? "bad" : ""}">${num(st.errors)}</dd>
+    <dt>Evicted</dt><dd>${num(st.evictions)} results, ${bytes(st.evictedBytes)}</dd>
+  </dl>`;
+}
+
+function renderSnapshots(snaps) {
+  $("snapcount").textContent = snaps.length ? plural(snaps.length, "table") : "";
+  if (!snaps.length) {
+    $("snapshots").innerHTML = `<div class="empty">No tables snapshotted (none in use since the start, or idle).</div>`;
+    return;
+  }
+  const head = `<tr><th>Table</th><th class="num">Users</th><th>Current</th><th class="num">Leases</th><th>Watermark</th>
+    <th class="num">Taken</th><th class="num">Failed</th><th class="num">Last take</th><th>Idle</th></tr>`;
+  const body = snaps.map((t) => {
+    const c = t.current;
+    const state = t.taking ? ' <span class="chip keep_alive">taking</span>' : "";
+    const waiting = t.waiting ? ` <span class="muted">(${t.waiting} waiting)</span>` : "";
+    return `<tr>
+      <td class="mono" title="topic ${esc(t.topic)}">${esc(t.database)}.${esc(t.table)}${state}${waiting}</td>
+      <td class="num">${num(t.users)}</td>
+      <td class="mono">${c ? `${esc(c.clone.split(".").pop())} <span class="muted">${ago(c.takenAt)}</span>` : "–"}</td>
+      <td class="num">${c ? num(c.leases) : "–"}</td>
+      <td class="mono">${c ? esc(c.watermark) : "–"}</td>
+      <td class="num">${num(t.taken)}</td>
+      <td class="num${t.failed ? " bad" : ""}" title="${esc(t.lastError ?? "")}">${num(t.failed)}</td>
+      <td class="num">${t.lastTakeMs != null ? t.lastTakeMs + " ms" : "–"}</td>
+      <td>${t.users ? '<span class="muted">in use</span>' : dur(t.idleSecs * 1000)}</td></tr>`
+      + (t.lastError ? `<tr class="detail"><td colspan="9" class="bad">last error: ${esc(t.lastError)}</td></tr>` : "");
+  }).join("");
+  $("snapshots").innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function renderConnections(conns) {
+  $("conncount").textContent = conns.length ? `${conns.length} open` : "";
+  if (!conns.length) {
+    $("connections").innerHTML = `<div class="empty">No open connections.</div>`;
+    return;
+  }
+  const max = state.server.outbox;
+  const head = `<tr><th class="num">Conn</th><th>Origin</th><th>Connected</th><th class="num">Outbox</th><th>Subscriptions</th></tr>`;
+  const body = conns.map((c) => `<tr>
+      <td class="num">${c.conn}</td><td class="mono">${esc(c.origin ?? "–")}</td><td>${ago(c.connectedAt)}</td>
+      <td class="num${c.outbox != null && c.outbox > max / 2 ? " bad" : ""}">${c.outbox == null ? "–" : `${c.outbox}/${max}`}</td>
+      <td style="white-space:normal">${c.subscriptions.map((x) => `${esc(x.id)} → <a class="k" href="#entry-${esc(x.key)}" data-open="${esc(x.key)}">${esc(x.key)}</a>`).join(", ") || '<span class="muted">none</span>'}</td>
+    </tr>`).join("");
+  $("connections").innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function renderSettings(c) {
+  const d = (s) => dur(s * 1000);
+  $("settings").innerHTML = `<dl>
+    <dt>dir</dt><dd><code>${esc(c.dir ?? '""')}</code></dd>
+    <dt>keep_alive</dt><dd>${d(c.keepAlive)}</dd>
+    <dt>keep_warm</dt><dd>${d(c.keepWarm)}</dd>
+    <dt>max_warm</dt><dd>${num(c.maxWarm)}</dd>
+    <dt>log_length</dt><dd>${num(c.logLength)}</dd>
+    <dt>disk_budget</dt><dd>${bytes(c.diskBudget)}</dd>
+    <dt>max_age</dt><dd>${d(c.maxAge)}</dd>
+    <dt>max_catch_up</dt><dd>${num(c.maxCatchUp)} events</dd>
+    <dt>checkpoint_interval</dt><dd>${d(c.checkpointInterval)}</dd>
+    <dt>log_bytes</dt><dd>${bytes(c.logBytes)}</dd>
+  </dl>`;
+}
+
+function status() {
+  const every = Number($("every").value);
+  const stale = lastOk && Date.now() - lastOk > 3 * every + 1000;
+  $("updated").textContent = paused ? "paused" : lastOk ? `updated ${dur(Date.now() - lastOk)} ago` : "";
+  if (stale && !paused) {
+    $("banner").hidden = false;
+    $("banner").textContent ||= "The server isn't answering: showing what it last said.";
+  }
+}
+
+async function poll() {
+  clearTimeout(timer);
+  if (paused) return;
+  try {
+    // relative: works behind a path prefix too
+    const resp = await fetch("debug/state", { cache: "no-store" });
+    if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+    state = await resp.json();
+    skew = state.server.now - Date.now();
+    lastOk = Date.now();
+    $("banner").hidden = true;
+    $("banner").textContent = "";
+    render();
+  } catch (e) {
+    $("banner").hidden = false;
+    $("banner").textContent = `Couldn't get the state: ${e.message}` + (state ? " (showing the last one)" : "");
+  }
+  status();
+  if (!paused) timer = setTimeout(poll, Number($("every").value));
+}
+
+$("pause").onclick = () => {
+  paused = !paused;
+  $("pause").textContent = paused ? "Resume" : "Pause";
+  if (paused) clearTimeout(timer); else poll();
+  status();
+};
+$("every").onchange = () => {
+  try { localStorage.setItem("chlive-debug-every", $("every").value); } catch {}
+  poll();
+};
+$("filter").oninput = () => state && renderEntries(state.entries);
+$("entries").onclick = (ev) => {
+  if (ev.target.closest("tr.detail")) return;
+  const tr = ev.target.closest("tr.entry");
+  if (!tr) return;
+  const k = tr.dataset.key;
+  open.has(k) ? open.delete(k) : open.add(k);
+  renderEntries(state.entries);
+};
+$("connections").onclick = (ev) => {
+  const a = ev.target.closest("a[data-open]");
+  if (a) { open.add(a.dataset.open); $("filter").value = ""; renderEntries(state.entries); }
+};
+try {
+  const every = localStorage.getItem("chlive-debug-every");
+  if (every) $("every").value = every;
+} catch {}
+setInterval(status, 1000);
+poll();
+</script>
+</body>
+</html>

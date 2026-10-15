@@ -1,5 +1,6 @@
-//! `/live` (the WebSocket protocol, see [`crate::protocol`]), `/debug/subscriptions` and
-//! `/healthz`.
+//! `/live` (the WebSocket protocol, see [`crate::protocol`]), `/healthz`, and for debugging
+//! `/debug` (a page showing the server's state live), `/debug/state` (that state, as JSON) and
+//! `/debug/subscriptions` (the shared entries).
 //!
 //! Each connection has a writer task fed by a bounded channel. A subscription joins the shared
 //! entry of its query (see [`crate::hub`]), which sends it the result and its changes; a client
@@ -7,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -67,6 +68,20 @@ struct AppState {
     settings: Arc<ServerSettings>,
     next_conn: Arc<AtomicU64>,
     connections: Arc<AtomicUsize>,
+    /// The open connections, for `/debug/state`.
+    conns: Arc<Mutex<HashMap<u64, ConnInfo>>>,
+    /// Unix milliseconds.
+    started_at: u64,
+}
+
+/// An open connection, as `/debug/state` shows it.
+struct ConnInfo {
+    origin: Option<String>,
+    connected_at: u64,
+    /// Weak: the writer ends when the connection drops its sender.
+    outbox: mpsc::WeakSender<Outgoing>,
+    /// Its subscriptions: id, and the entry's key (as listed).
+    subscriptions: Vec<(String, String)>,
 }
 
 /// The routes, over a new hub of shared results.
@@ -83,9 +98,13 @@ pub fn router_with(hub: Arc<Hub>, settings: ServerSettings) -> Router {
         settings: Arc::new(settings),
         next_conn: Arc::new(AtomicU64::new(1)),
         connections: Arc::default(),
+        conns: Arc::default(),
+        started_at: crate::store::now_ms() as u64,
     };
     Router::new()
         .route(&path, get(live))
+        .route("/debug", get(debug_page))
+        .route("/debug/state", get(debug_state))
         .route("/debug/subscriptions", get(debug_subscriptions))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
@@ -94,6 +113,49 @@ pub fn router_with(hub: Arc<Hub>, settings: ServerSettings) -> Router {
 /// The shared entries, with their subscribers.
 async fn debug_subscriptions(State(s): State<AppState>) -> impl IntoResponse {
     Json(s.hub.list().await)
+}
+
+/// A page showing `/debug/state`, refreshed every second.
+async fn debug_page() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("debug.html"),
+    )
+}
+
+/// The whole server: its entries, disk store, snapshots and connections.
+async fn debug_state(State(s): State<AppState>) -> impl IntoResponse {
+    let (mut state, snapshots) = tokio::join!(s.hub.state(), s.hub.engine().snapshot_status());
+    let mut conns: Vec<serde_json::Value> = s
+        .conns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(conn, c)| {
+            serde_json::json!({
+                "conn": conn,
+                "origin": c.origin,
+                "connectedAt": c.connected_at,
+                "outbox": c.outbox.upgrade().map(|tx| OUTBOX - tx.capacity()),
+                "subscriptions": c.subscriptions.iter()
+                    .map(|(id, key)| serde_json::json!({"id": id, "key": key}))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    conns.sort_by_key(|c| c["conn"].as_u64());
+    state["server"] = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "startedAt": s.started_at,
+        "now": crate::store::now_ms(),
+        "path": s.settings.path,
+        "connections": s.connections.load(Ordering::Relaxed),
+        "maxConnections": s.settings.max_connections,
+        "outbox": OUTBOX,
+    });
+    state["snapshots"] = serde_json::to_value(snapshots).expect("statuses serialize");
+    state["connections"] = conns.into();
+    Json(state)
 }
 
 /// One open WebSocket, counted against `max_connections` until dropped.
@@ -126,16 +188,35 @@ async fn live(ws: WebSocketUpgrade, headers: HeaderMap, State(s): State<AppState
     // freed when the connection ends, or if the upgrade fails (the callback is dropped)
     let slot = Slot(s.connections.clone());
     let conn = s.next_conn.fetch_add(1, Ordering::Relaxed);
+    let origin = origin.map(str::to_string);
     ws.on_upgrade(move |socket| async move {
-        connection(socket, s, conn).await;
+        connection(socket, s, conn, origin).await;
         drop(slot);
     })
 }
 
-async fn connection(socket: WebSocket, s: AppState, conn: u64) {
+async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<String>) {
     info!(conn, "connected");
     let (mut sink, mut incoming) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Outgoing>(OUTBOX);
+    s.conns.lock().unwrap().insert(
+        conn,
+        ConnInfo {
+            origin,
+            connected_at: crate::store::now_ms() as u64,
+            outbox: tx.downgrade(),
+            subscriptions: Vec::new(),
+        },
+    );
+    let listed = |subscriptions: &HashMap<String, Joined>| {
+        if let Some(c) = s.conns.lock().unwrap().get_mut(&conn) {
+            c.subscriptions = subscriptions
+                .iter()
+                .map(|(id, j)| (id.clone(), crate::store::short(&j.key)))
+                .collect();
+            c.subscriptions.sort();
+        }
+    };
     let writer = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
             if sink.send(Message::Text(out.render().into())).await.is_err() {
@@ -212,16 +293,19 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64) {
                     .hub
                     .join(&plan, &sql, &params, conn, &id, tx.clone(), since);
                 subscriptions.insert(id, joined);
+                listed(&subscriptions);
             }
             ClientMsg::Unsubscribe { id } => {
                 debug!(conn, id, "unsubscribe");
                 if let Some(j) = subscriptions.remove(&id) {
                     s.hub.leave(&j.key, j.sub);
                 }
+                listed(&subscriptions);
             }
         }
     }
 
+    s.conns.lock().unwrap().remove(&conn);
     for j in subscriptions.into_values() {
         s.hub.leave(&j.key, j.sub);
     }

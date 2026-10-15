@@ -11,7 +11,7 @@
 
 [server]
 # listen = "0.0.0.0:8080"
-## Where the WebSocket is (/debug/subscriptions and /healthz stay where they are).
+## Where the WebSocket is (/debug, the debug page, and /healthz stay where they are).
 # path = "/live"
 ## Browsers' Origins allowed to connect; empty (or "*") allows any. Clients that send no
 ## Origin (services) are always allowed.

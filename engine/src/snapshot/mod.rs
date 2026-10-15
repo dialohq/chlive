@@ -118,6 +118,45 @@ pub trait Snapshots: Send + Sync {
     /// Stop: drop the current clones (leases still held keep reading theirs; their tables are
     /// left for the next start's sweep).
     async fn shutdown(&self) {}
+    /// What it's doing, per table (for the debug page); none if it doesn't say.
+    async fn status(&self) -> Vec<SnapshotStatus> {
+        Vec::new()
+    }
+}
+
+/// A table's snapshots, as the debug page shows them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotStatus {
+    pub database: String,
+    pub table: String,
+    pub topic: String,
+    /// Running subscriptions on it.
+    pub users: usize,
+    /// Since the last acquire, or since the last user went.
+    pub idle_secs: f64,
+    /// A snapshot is being taken.
+    pub taking: bool,
+    /// Acquires waiting for it.
+    pub waiting: usize,
+    pub current: Option<CurrentSnapshot>,
+    pub taken: u64,
+    pub failed: u64,
+    pub last_error: Option<String>,
+    /// How long the last take (pause, clone, resume) took.
+    pub last_take_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentSnapshot {
+    /// `database.name`
+    pub clone: String,
+    pub watermark: String,
+    /// Unix milliseconds.
+    pub taken_at: u64,
+    /// Leases held on it (subscriptions reading its history).
+    pub leases: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -160,8 +199,9 @@ enum Cmd {
     Acquire(SnapshotTable, oneshot::Sender<Result<Lease, SnapshotError>>),
     Use(SnapshotTable),
     Unuse(SnapshotTable),
-    Taken(SnapshotTable, Result<Snapshot, SnapshotError>),
+    Taken(SnapshotTable, Result<Snapshot, SnapshotError>, Duration),
     DropClone(String, String),
+    Status(oneshot::Sender<Vec<SnapshotStatus>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -212,6 +252,14 @@ impl Snapshots for SnapshotManager {
             let _ = rx.await;
         }
     }
+
+    async fn status(&self) -> Vec<SnapshotStatus> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Cmd::Status(reply)).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
 }
 
 struct TableState {
@@ -222,6 +270,10 @@ struct TableState {
     users: usize,
     taking: bool,
     waiting: Vec<oneshot::Sender<Result<Lease, SnapshotError>>>,
+    taken: u64,
+    failed: u64,
+    last_error: Option<String>,
+    last_take: Option<Duration>,
 }
 
 struct Task {
@@ -304,13 +356,15 @@ impl Task {
                     }
                 }
             }
-            Cmd::Taken(table, result) => {
+            Cmd::Taken(table, result, took) => {
                 let Some(state) = self.tables.get_mut(&table) else {
                     return; // forgotten meanwhile (idle): the snapshot drops its clone
                 };
                 state.taking = false;
+                state.last_take = Some(took);
                 match result {
                     Ok(snapshot) => {
+                        state.taken += 1;
                         let lease = Arc::new(snapshot);
                         for w in state.waiting.drain(..) {
                             let _ = w.send(Ok(lease.clone()));
@@ -320,6 +374,8 @@ impl Task {
                     }
                     Err(e) => {
                         tracing::warn!(table = %table.table, error = %e, "snapshot failed");
+                        state.failed += 1;
+                        state.last_error = Some(e.0.clone());
                         // keep the current one: it's still a correct starting point
                         for w in state.waiting.drain(..) {
                             let _ = w.send(Err(e.clone()));
@@ -328,6 +384,38 @@ impl Task {
                 }
             }
             Cmd::Shutdown(_) => unreachable!("handled in run"),
+            Cmd::Status(reply) => {
+                let mut out: Vec<SnapshotStatus> = self
+                    .tables
+                    .iter()
+                    .map(|(t, s)| SnapshotStatus {
+                        database: t.database.clone(),
+                        table: t.table.clone(),
+                        topic: t.topic.clone(),
+                        users: s.users,
+                        idle_secs: s.last_used.elapsed().as_secs_f64(),
+                        taking: s.taking,
+                        waiting: s.waiting.len(),
+                        current: s.current.as_ref().map(|l| CurrentSnapshot {
+                            clone: format!("{}.{}", l.database, l.name),
+                            watermark: l.watermark.describe(),
+                            taken_at: l
+                                .taken_at
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                            // the task's own reference isn't a lease
+                            leases: Arc::strong_count(l) - 1,
+                        }),
+                        taken: s.taken,
+                        failed: s.failed,
+                        last_error: s.last_error.clone(),
+                        last_take_ms: s.last_take.map(|d| d.as_millis() as u64),
+                    })
+                    .collect();
+                out.sort_by(|a, b| (&a.database, &a.table).cmp(&(&b.database, &b.table)));
+                let _ = reply.send(out);
+            }
             Cmd::DropClone(db, clone) => {
                 let cloner = self.cloner.clone();
                 tokio::spawn(async move {
@@ -346,6 +434,10 @@ impl Task {
             users: 0,
             taking: false,
             waiting: Vec::new(),
+            taken: 0,
+            failed: 0,
+            last_error: None,
+            last_take: None,
         })
     }
 
@@ -379,13 +471,14 @@ impl Task {
         let (pauser, cloner) = (self.pauser.clone(), self.cloner.clone());
         let into = self.config.database.clone();
         tokio::spawn(async move {
+            let started = Instant::now();
             let result = take(pauser.as_ref(), cloner.as_ref(), &table, into.as_deref())
                 .await
                 .map(|mut s| {
                     s.on_drop = Some(tx.clone());
                     s
                 });
-            let _ = tx.send(Cmd::Taken(table, result));
+            let _ = tx.send(Cmd::Taken(table, result, started.elapsed()));
         });
     }
 }
@@ -749,6 +842,40 @@ mod tests {
         settle().await;
         let still = m.acquire(&events()).await.unwrap();
         assert!(Arc::ptr_eq(&good, &still), "the last good snapshot stays");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_shows_each_tables_snapshot_users_and_failures() {
+        let fake = Arc::new(Fake::default());
+        let m = manager(&fake);
+        assert_eq!(m.status().await, []);
+        let guard = m.in_use(&events());
+        let lease = m.acquire(&events()).await.unwrap();
+        let status = m.status().await;
+        assert_eq!(status.len(), 1);
+        let s = &status[0];
+        assert_eq!((s.table.as_str(), s.topic.as_str()), ("events", "events"));
+        assert_eq!((s.users, s.taking, s.waiting), (1, false, 0));
+        assert_eq!((s.taken, s.failed, s.last_error.clone()), (1, 0, None));
+        assert!(s.last_take_ms.is_some());
+        let current = s.current.clone().unwrap();
+        assert_eq!(current.clone, format!("default.{}", lease.name));
+        assert_eq!(current.watermark, "{0: 9}");
+        assert_eq!(current.leases, 1);
+        drop(lease);
+        assert_eq!(m.status().await[0].current.as_ref().unwrap().leases, 0);
+
+        // a failed refresh: counted, and the last good snapshot stays current
+        fake.fail_clone.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        settle().await;
+        let s = &m.status().await[0];
+        assert_eq!((s.taken, s.failed), (1, 1));
+        assert_eq!(s.last_error.as_deref(), Some("no space"));
+        assert_eq!(s.current.as_ref().unwrap().watermark, "{0: 9}");
+        drop(guard);
+        // a Snapshots that doesn't say
+        assert_eq!(FakeSnapshotsOnly.status().await, []);
     }
 
     #[tokio::test(start_paused = true)]

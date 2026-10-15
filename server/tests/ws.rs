@@ -1197,6 +1197,80 @@ async fn warm_entries_follow_kafka_with_their_rows_on_disk() {
 }
 
 #[tokio::test]
+async fn the_debug_state_shows_the_whole_server() {
+    let live = Live::new();
+    let dir = TempDir::new();
+    let settings = dir.cache(CacheSettings {
+        keep_alive: Duration::from_millis(50),
+        keep_warm: Duration::from_secs(60),
+        ..Default::default()
+    });
+    let server = live_server(&live, settings.clone()).await;
+    let state_of = |server: &chlive_server::Server| {
+        let url = format!("http://{}/debug/state", server.addr);
+        async move { serde_json::from_str::<Value>(&http_get(&url).await).unwrap() }
+    };
+    let state = || state_of(&server);
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", "select user_id from requests").await;
+    c.expect().await;
+    let s = state().await;
+    assert_eq!(s["server"]["connections"], 1, "{s}");
+    assert_eq!(s["server"]["path"], "/live");
+    assert!(s["server"]["now"].as_i64().unwrap() >= s["server"]["startedAt"].as_i64().unwrap());
+    assert_eq!(s["cache"]["keepAlive"], 0.05);
+    assert_eq!(s["snapshots"], json!([]), "the fake snapshots don't say");
+    let e = &s["entries"][0];
+    assert_eq!(e["stage"], "live", "{e}");
+    let conns = s["connections"].as_array().unwrap();
+    assert_eq!(conns.len(), 1);
+    assert_eq!(
+        conns[0]["subscriptions"],
+        json!([{"id": "s", "key": e["key"]}]),
+        "a subscription links to its entry"
+    );
+    assert_eq!(conns[0]["outbox"], 0);
+    let store = &s["store"];
+    assert!(store["path"].as_str().unwrap().ends_with("cache.sqlite3"));
+    assert!(store["bytes"].as_u64().unwrap() > 0, "{store}");
+    assert!(store["batches"].as_u64().unwrap() >= 1);
+    assert_eq!(store["byStage"], json!({"live": 1}));
+    assert_eq!(store["budget"], 10u64 << 30);
+
+    // gone: the connection goes, the entry goes warm with a countdown to cold
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let s = state().await;
+    assert_eq!(s["connections"], json!([]));
+    let e = &s["entries"][0];
+    assert_eq!(e["stage"], "warm", "{e}");
+    let left = e["stageEndsIn"].as_f64().unwrap();
+    assert!(left > 50.0 && left <= 60.0, "{e}");
+    assert!(e["stageEndsAt"].as_u64().unwrap() > s["server"]["now"].as_u64().unwrap());
+    assert!(e["warmSince"].is_u64());
+    assert_eq!(s["store"]["byStage"], json!({"warm": 1}));
+
+    // the page polls it
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut t = TcpStream::connect(server.addr).await.unwrap();
+    t.write_all(b"GET /debug HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut page = String::new();
+    t.read_to_string(&mut page).await.unwrap();
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(page.to_lowercase().contains("content-type: text/html"));
+    assert!(page.contains(r#"fetch("debug/state""#));
+
+    // restarted: the result is cold, listed from the store
+    server.shutdown().await;
+    let server = live_server(&live, settings).await;
+    let s = state_of(&server).await;
+    assert_eq!(s["entries"][0]["stage"], "cold", "{s}");
+    assert_eq!(s["store"]["byStage"], json!({"cold": 1}));
+}
+
+#[tokio::test]
 async fn cold_entries_are_restored_from_disk_and_resume_through_the_fork() {
     let live = Live::new();
     let dir = TempDir::new();

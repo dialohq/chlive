@@ -9,6 +9,7 @@
 //! messages past the checkpoint, which a restore drops ([`Store::truncate`]).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -170,11 +171,47 @@ enum Op {
     Flush(oneshot::Sender<()>),
 }
 
+/// What the writer has done, shared with it (for the debug page).
+#[derive(Default)]
+struct Counters {
+    /// Ops sent and not yet taken by the writer.
+    queued: AtomicU64,
+    batches: AtomicU64,
+    ops: AtomicU64,
+    last_batch_ops: AtomicU64,
+    last_batch_ms: AtomicU64,
+    last_batch_at: AtomicU64,
+    /// Batches whose transaction failed.
+    errors: AtomicU64,
+    evictions: AtomicU64,
+    evicted_bytes: AtomicU64,
+}
+
+/// The store's files and its writer, as the debug page shows them.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreStats {
+    pub path: String,
+    pub file_bytes: u64,
+    pub wal_bytes: u64,
+    pub queued: u64,
+    pub batches: u64,
+    pub ops: u64,
+    pub last_batch_ops: u64,
+    pub last_batch_ms: u64,
+    /// Unix milliseconds; 0: none yet.
+    pub last_batch_at: u64,
+    pub errors: u64,
+    pub evictions: u64,
+    pub evicted_bytes: u64,
+}
+
 /// The store: a handle to the writer thread, and a connection for reads.
 pub struct Store {
     path: PathBuf,
     tx: Mutex<mpsc::Sender<Op>>,
     read: Mutex<Connection>,
+    counters: Arc<Counters>,
 }
 
 impl Store {
@@ -216,15 +253,18 @@ impl Store {
         let read = Connection::open(&path)?;
         let (tx, rx) = mpsc::channel();
         let writer_path = path.clone();
+        let counters = Arc::new(Counters::default());
+        let c = counters.clone();
         std::thread::Builder::new()
             .name("chlive-store".into())
-            .spawn(move || writer(write, rx, budget, writer_path))
+            .spawn(move || writer(write, rx, budget, writer_path, c))
             .expect("a thread");
         info!(path = %path.display(), "cache store open");
         Ok(Arc::new(Self {
             path,
             tx: Mutex::new(tx),
             read: Mutex::new(read),
+            counters,
         }))
     }
 
@@ -233,7 +273,33 @@ impl Store {
     }
 
     fn send(&self, op: Op) {
-        let _ = self.tx.lock().unwrap().send(op);
+        self.counters.queued.fetch_add(1, Ordering::Relaxed);
+        if self.tx.lock().unwrap().send(op).is_err() {
+            self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The files' sizes and what the writer has done.
+    pub fn stats(&self) -> StoreStats {
+        let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let mut wal = self.path.clone().into_os_string();
+        wal.push("-wal");
+        let c = &self.counters;
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        StoreStats {
+            path: self.path.display().to_string(),
+            file_bytes: size(&self.path),
+            wal_bytes: size(Path::new(&wal)),
+            queued: get(&c.queued),
+            batches: get(&c.batches),
+            ops: get(&c.ops),
+            last_batch_ops: get(&c.last_batch_ops),
+            last_batch_ms: get(&c.last_batch_ms),
+            last_batch_at: get(&c.last_batch_at),
+            errors: get(&c.errors),
+            evictions: get(&c.evictions),
+            evicted_bytes: get(&c.evicted_bytes),
+        }
     }
 
     pub fn create(&self, meta: Meta, at: Watermark, rows: ResultList, state: Json) {
@@ -444,13 +510,21 @@ fn write_base(tx: &rusqlite::Transaction, key: &str, rows: &ResultList) -> rusql
     Ok(bytes)
 }
 
-fn writer(mut conn: Connection, rx: mpsc::Receiver<Op>, budget: u64, path: PathBuf) {
+fn writer(
+    mut conn: Connection,
+    rx: mpsc::Receiver<Op>,
+    budget: u64,
+    path: PathBuf,
+    counters: Arc<Counters>,
+) {
     while let Ok(first) = rx.recv() {
+        counters.queued.fetch_sub(1, Ordering::Relaxed);
         let mut ops = vec![first];
         let started = Instant::now();
         while ops.len() < BATCH_OPS {
             match rx.recv_timeout(BATCH_WAIT.saturating_sub(started.elapsed())) {
                 Ok(op) => {
+                    counters.queued.fetch_sub(1, Ordering::Relaxed);
                     let flush = matches!(op, Op::Flush(_));
                     ops.push(op);
                     if flush {
@@ -460,7 +534,7 @@ fn writer(mut conn: Connection, rx: mpsc::Receiver<Op>, budget: u64, path: PathB
                 Err(_) => break,
             }
         }
-        let n = ops.len();
+        let n = ops.iter().filter(|op| !matches!(op, Op::Flush(_))).count() as u64;
         let mut flushes = Vec::new();
         let result = (|| -> rusqlite::Result<()> {
             let tx = conn.transaction()?;
@@ -474,11 +548,27 @@ fn writer(mut conn: Connection, rx: mpsc::Receiver<Op>, budget: u64, path: PathB
         })();
         if let Err(e) = result {
             warn!(path = %path.display(), error = %e, "writing the cache store failed");
+            counters.errors.fetch_add(1, Ordering::Relaxed);
         }
-        if let Err(e) = evict(&conn, budget) {
-            warn!(error = %e, "evicting from the cache store failed");
+        match evict(&conn, budget) {
+            Ok((entries, bytes)) => {
+                counters.evictions.fetch_add(entries, Ordering::Relaxed);
+                counters.evicted_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Err(e) => warn!(error = %e, "evicting from the cache store failed"),
         }
-        debug!(target: "chlive_server::store", ops = n, ms = started.elapsed().as_millis() as u64, "batch written");
+        let ms = started.elapsed().as_millis() as u64;
+        if n > 0 {
+            counters.batches.fetch_add(1, Ordering::Relaxed);
+            counters.ops.fetch_add(n, Ordering::Relaxed);
+            counters.last_batch_ops.store(n, Ordering::Relaxed);
+            counters.last_batch_ms.store(ms, Ordering::Relaxed);
+            counters
+                .last_batch_at
+                .store(now_ms() as u64, Ordering::Relaxed);
+            // flushes alone (the debug page polls) aren't counted or logged
+            debug!(target: "chlive_server::store", ops = n, ms, "batch written");
+        }
         for done in flushes {
             let _ = done.send(());
         }
@@ -674,15 +764,16 @@ fn compact(tx: &rusqlite::Transaction, key: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Over the budget: cold entries go, least recently used first.
-fn evict(conn: &Connection, budget: u64) -> rusqlite::Result<()> {
+/// Over the budget: cold entries go, least recently used first. Returns how many went, and
+/// their bytes.
+fn evict(conn: &Connection, budget: u64) -> rusqlite::Result<(u64, u64)> {
     let total: i64 = conn.query_row(
         "SELECT COALESCE(SUM(base_bytes + log_bytes + state_bytes), 0) FROM entries",
         [],
         |r| r.get(0),
     )?;
     if total as u64 <= budget {
-        return Ok(());
+        return Ok((0, 0));
     }
     let mut over = total - budget as i64;
     let victims: Vec<(String, i64)> = {
@@ -695,17 +786,20 @@ fn evict(conn: &Connection, budget: u64) -> rusqlite::Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         v
     };
+    let mut gone = (0, 0);
     for (key, bytes) in victims {
         if over <= 0 {
             break;
         }
+        gone.0 += 1;
+        gone.1 += bytes as u64;
         conn.execute("DELETE FROM entries WHERE key = ?1", params![key])?;
         conn.execute("DELETE FROM base WHERE key = ?1", params![key])?;
         conn.execute("DELETE FROM log WHERE key = ?1", params![key])?;
         over -= bytes;
         info!(target: "chlive_server::store", key = %short(&key), bytes, budget, "evicted: over the disk budget");
     }
-    Ok(())
+    Ok(gone)
 }
 
 #[cfg(test)]
@@ -808,6 +902,7 @@ mod tests {
     async fn over_the_budget_cold_entries_go_least_recently_used_first() {
         let dir = tempdir();
         let store = Store::open(&dir, 1_000_000).unwrap();
+        assert_eq!(store.stats().batches, 0);
         let big = |n: usize| {
             let mut r = ResultList::default();
             for i in 0..n {
@@ -825,6 +920,11 @@ mod tests {
         // a live one isn't evicted however old
         store.stage("a", "live");
         store.flush().await;
+        let stats = store.stats();
+        assert_eq!((stats.ops, stats.queued, stats.errors), (7, 0, 0));
+        assert!(stats.batches >= 4 && stats.last_batch_at > 0, "{stats:?}");
+        assert!(stats.file_bytes > 0 && stats.path.ends_with("cache.sqlite3"));
+        assert_eq!(stats.evictions, 0);
         drop(store);
         // a much smaller budget: the oldest cold ones go until it fits
         let store = Store::open(&dir, 3_000).unwrap();
@@ -836,6 +936,9 @@ mod tests {
             !left.contains(&"b".to_string()),
             "the oldest cold one went: {left:?}"
         );
+        let stats = store.stats();
+        assert_eq!(stats.evictions as usize, 3 - left.len());
+        assert!(stats.evicted_bytes > 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

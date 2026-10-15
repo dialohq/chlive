@@ -418,7 +418,7 @@ in
     };
 
     # As chlive_ro (snapshots as chlive_snap), against this stack. Publishes `url` (the
-    # WebSocket) and `httpUrl` (/healthz, /debug/subscriptions) as soon as its port is picked:
+    # WebSocket) and `httpUrl` (/healthz, /debug, /debug/state, /debug/subscriptions) as soon as its port is picked:
     # a cold `cargo build` can outlast the consumers' wait for them, and both reconnect.
     # The rest of its config: nix/chlive.dev.toml.
     server = {
