@@ -57,6 +57,17 @@ impl AggregateState for CountState {
         Value::Int(self.0.into())
     }
 
+    fn save(&self) -> serde_json::Value {
+        serde_json::json!(self.0)
+    }
+
+    fn load(&mut self, json: &serde_json::Value) -> Result<(), String> {
+        self.0 = json
+            .as_u64()
+            .ok_or_else(|| format!("checkpoint: bad count {json}"))?;
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -110,6 +121,28 @@ impl Total {
             Total::Unsigned(n) => Value::Int(n.into()),
             Total::Float(f) => Value::Float(f),
         }
+    }
+
+    fn save(self) -> serde_json::Value {
+        match self {
+            Total::Signed(n) => serde_json::json!({ "i": n }),
+            Total::Unsigned(n) => serde_json::json!({ "u": n }),
+            Total::Float(f) => serde_json::json!({ "f": f.to_string() }),
+        }
+    }
+
+    fn load(json: &serde_json::Value) -> Result<Self, String> {
+        let bad = || format!("checkpoint: bad sum {json}");
+        if let Some(n) = json.get("i") {
+            return n.as_i64().map(Total::Signed).ok_or_else(bad);
+        }
+        if let Some(n) = json.get("u") {
+            return n.as_u64().map(Total::Unsigned).ok_or_else(bad);
+        }
+        json.get("f")
+            .and_then(|f| f.as_str()?.parse().ok())
+            .map(Total::Float)
+            .ok_or_else(bad)
     }
 
     fn as_f64(self) -> f64 {
@@ -197,6 +230,16 @@ impl AggregateState for SumState {
         }
     }
 
+    fn save(&self) -> serde_json::Value {
+        serde_json::json!({ "total": self.total.save(), "seen": self.seen })
+    }
+
+    fn load(&mut self, json: &serde_json::Value) -> Result<(), String> {
+        self.total = Total::load(&json["total"])?;
+        self.seen = json["seen"].as_bool().ok_or("checkpoint: bad sum")?;
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -275,6 +318,16 @@ impl AggregateState for AvgState {
             (0, false) => Value::Float(f64::NAN),
             (n, _) => Value::Float(self.total.as_f64() / n as f64),
         }
+    }
+
+    fn save(&self) -> serde_json::Value {
+        serde_json::json!({ "total": self.total.save(), "count": self.count })
+    }
+
+    fn load(&mut self, json: &serde_json::Value) -> Result<(), String> {
+        self.total = Total::load(&json["total"])?;
+        self.count = json["count"].as_u64().ok_or("checkpoint: bad avg")?;
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -371,6 +424,23 @@ impl AggregateState for MinMaxState {
 
     fn finalize(&self) -> Value {
         self.best.clone().unwrap_or_else(|| self.empty.clone())
+    }
+
+    fn save(&self) -> serde_json::Value {
+        // `[value]` or `null`: a best value that is itself NULL stays one
+        serde_json::json!({ "best": self.best.as_ref().map(|v| [v.save()]) })
+    }
+
+    fn load(&mut self, json: &serde_json::Value) -> Result<(), String> {
+        self.best = match &json["best"] {
+            serde_json::Value::Null => None,
+            v => Some(
+                v.get(0)
+                    .and_then(Value::load)
+                    .ok_or_else(|| format!("checkpoint: bad min/max {v}"))?,
+            ),
+        };
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn Any {

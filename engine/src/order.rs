@@ -11,12 +11,31 @@ use std::cmp::Ordering;
 
 use std::collections::VecDeque;
 
+use serde_json::{json, Value as Json};
+
 use crate::binder::OrderKey;
 use crate::diff::{Diff, Row};
 use crate::types::Value;
 
 /// The ORDER BY values of one row, most significant first.
 pub type SortKey = Vec<Value>;
+
+/// A sort key as JSON (each value in [`Value::save`]'s form), for checkpoints.
+pub fn save_key(key: &SortKey) -> Json {
+    Json::Array(key.iter().map(Value::save).collect())
+}
+
+pub fn load_key(json: &Json) -> Result<SortKey, String> {
+    json.as_array()
+        .ok_or("a sort key isn't a list")?
+        .iter()
+        .map(|v| Value::load(v).ok_or_else(|| format!("not a saved value: {v}")))
+        .collect()
+}
+
+fn bad(what: &str) -> String {
+    format!("checkpoint: bad {what}")
+}
 
 /// Compares sort keys by ORDER BY's keys: each one's direction and NULL placement.
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +167,34 @@ impl OrderedState {
     pub fn groups(&self) -> usize {
         self.groups.len()
     }
+
+    /// The tie groups, for a checkpoint.
+    pub fn save(&self) -> Json {
+        let groups: Vec<Json> = self
+            .groups
+            .iter()
+            .map(|(k, n)| json!([save_key(k), n]))
+            .collect();
+        json!({ "groups": groups })
+    }
+
+    /// Back to a saved state (this one made by [`OrderedState::with_limit`] for the same query).
+    pub fn load(&mut self, json: &Json) -> Result<(), String> {
+        let mut groups = Vec::new();
+        for g in json["groups"]
+            .as_array()
+            .ok_or_else(|| bad("ordered state"))?
+        {
+            let n = g
+                .get(1)
+                .and_then(Json::as_u64)
+                .ok_or_else(|| bad("tie group"))? as usize;
+            groups.push((load_key(g.get(0).ok_or_else(|| bad("tie group"))?)?, n));
+        }
+        self.len = groups.iter().map(|(_, n)| n).sum();
+        self.groups = groups;
+        Ok(())
+    }
 }
 
 /// LIMIT without ORDER BY: a window of the latest N rows. Only the row count is kept.
@@ -172,6 +219,15 @@ impl WindowState {
             len: len.min(limit),
             limit,
         }
+    }
+
+    pub fn save(&self) -> Json {
+        json!({ "len": self.len })
+    }
+
+    pub fn load(&mut self, json: &Json) -> Result<(), String> {
+        self.len = json["len"].as_u64().ok_or_else(|| bad("window state"))?;
+        Ok(())
     }
 
     /// A new row: `None` with `LIMIT 0` (it never shows), otherwise whether, after appending it,
@@ -235,6 +291,36 @@ impl OffsetState {
             row: above.then(|| row.clone()),
         });
         (!above).then_some(row)
+    }
+
+    /// The keys of the top `m + n`, and the rows above the result.
+    pub fn save(&self) -> Json {
+        let entries: Vec<Json> = self
+            .entries
+            .iter()
+            .map(|e| json!({ "key": save_key(&e.key), "row": e.row }))
+            .collect();
+        json!({ "entries": entries })
+    }
+
+    pub fn load(&mut self, json: &Json) -> Result<(), String> {
+        let mut entries = Vec::new();
+        for e in json["entries"]
+            .as_array()
+            .ok_or_else(|| bad("offset state"))?
+        {
+            let row = match &e["row"] {
+                Json::Null => None,
+                Json::Object(r) => Some(r.clone()),
+                _ => return Err(bad("offset row")),
+            };
+            entries.push(OffsetEntry {
+                key: load_key(&e["key"])?,
+                row,
+            });
+        }
+        self.entries = entries;
+        Ok(())
     }
 
     /// A new row: placed after every row that sorts before it or ties with it.
@@ -317,6 +403,21 @@ impl HeldWindow {
         }
         self.visible = rows.len() as u64;
         rows
+    }
+
+    /// The held-back rows, oldest first, and how many rows the result has.
+    pub fn save(&self) -> Json {
+        json!({ "held": self.held, "visible": self.visible })
+    }
+
+    pub fn load(&mut self, json: &Json) -> Result<(), String> {
+        let mut held = VecDeque::new();
+        for r in json["held"].as_array().ok_or_else(|| bad("held rows"))? {
+            held.push_back(r.as_object().ok_or_else(|| bad("held row"))?.clone());
+        }
+        self.held = held;
+        self.visible = json["visible"].as_u64().ok_or_else(|| bad("held state"))?;
+        Ok(())
     }
 
     pub fn push(&mut self, row: Row) -> Vec<Diff> {

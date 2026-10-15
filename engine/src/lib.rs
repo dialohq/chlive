@@ -30,6 +30,7 @@ pub mod aggregate;
 pub mod ast;
 pub mod binder;
 pub mod chdb;
+pub mod checkpoint;
 pub mod cursor;
 pub mod diff;
 pub mod engine;
@@ -47,5 +48,6 @@ pub mod types;
 pub mod watermark;
 
 pub use binder::{BoundColumn, BoundExpr, BoundQuery, Params};
+pub use checkpoint::Checkpoint;
 pub use engine::{Config, Engine, EngineError, Iteration, Origin, Subscription};
 pub use plan::Plan;

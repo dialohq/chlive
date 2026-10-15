@@ -95,6 +95,53 @@ impl GroupResult {
         !self.terms.is_empty()
     }
 
+    /// The ranking, every group's row and what was sent, for a checkpoint.
+    pub fn save(&self) -> Json {
+        let ranked: Vec<Json> = self
+            .ranked
+            .iter()
+            .map(|e| serde_json::json!([e.id, crate::order::save_key(&e.key), e.seq]))
+            .collect();
+        serde_json::json!({
+            "ranked": ranked,
+            "rows": self.rows,
+            "sent": self.sent,
+            "seq": self.seq,
+        })
+    }
+
+    /// Back to a saved ranking (this one made by [`GroupResult::new`] for the same query).
+    pub fn load(&mut self, json: &Json) -> Result<(), String> {
+        let bad = |what: &str| format!("checkpoint: bad group result ({what})");
+        let mut ranked = Vec::new();
+        let mut keys = HashMap::new();
+        for e in json["ranked"].as_array().ok_or_else(|| bad("ranked"))? {
+            let id = e
+                .get(0)
+                .and_then(Json::as_str)
+                .ok_or_else(|| bad("id"))?
+                .to_string();
+            let key = crate::order::load_key(e.get(1).ok_or_else(|| bad("key"))?)?;
+            let seq = e.get(2).and_then(Json::as_u64).ok_or_else(|| bad("seq"))?;
+            keys.insert(id.clone(), (key.clone(), seq));
+            ranked.push(Entry { key, seq, id });
+        }
+        let rows = |name: &str| -> Result<HashMap<String, Row>, String> {
+            json[name]
+                .as_object()
+                .ok_or_else(|| bad(name))?
+                .iter()
+                .map(|(id, r)| Ok((id.clone(), r.as_object().ok_or_else(|| bad(name))?.clone())))
+                .collect()
+        };
+        self.rows = rows("rows")?;
+        self.sent = rows("sent")?;
+        self.seq = json["seq"].as_u64().ok_or_else(|| bad("seq"))?;
+        self.ranked = ranked;
+        self.keys = keys;
+        Ok(())
+    }
+
     /// The history: every group ranked; the window (`limit` after `offset`), in order, as
     /// appended inserts.
     ///

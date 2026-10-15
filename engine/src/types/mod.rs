@@ -284,6 +284,46 @@ pub fn decode(json: Option<&Json>, ty: &Type) -> Result<Value, DecodeError> {
 }
 
 impl Value {
+    /// The value as tagged JSON, exact for every variant (for checkpoints): `null`,
+    /// `{"i": "-12"}` (as text: i128 doesn't fit JSON numbers), `{"f": "1.5"}` (text too: NaN and
+    /// infinities), `{"s": …}`, `{"dt": [ticks, precision]}`, `{"d": days}`, `{"b": …}`,
+    /// `{"u": "<32 hex digits>"}`, `{"r": <json>}`.
+    pub fn save(&self) -> Json {
+        match self {
+            Value::Null => Json::Null,
+            Value::Int(n) => serde_json::json!({ "i": n.to_string() }),
+            Value::Float(f) => serde_json::json!({ "f": f.to_string() }),
+            Value::String(s) => serde_json::json!({ "s": s }),
+            Value::DateTime(d) => serde_json::json!({ "dt": [d.ticks, d.precision] }),
+            Value::Date(d) => serde_json::json!({ "d": d.0 }),
+            Value::Bool(b) => serde_json::json!({ "b": b }),
+            Value::Uuid(u) => serde_json::json!({ "u": format!("{:032x}", u.0) }),
+            Value::Raw(j) => serde_json::json!({ "r": j }),
+        }
+    }
+
+    /// A value from [`Value::save`]'s form.
+    pub fn load(json: &Json) -> Option<Value> {
+        if json.is_null() {
+            return Some(Value::Null);
+        }
+        let (tag, v) = json.as_object()?.iter().next()?;
+        Some(match tag.as_str() {
+            "i" => Value::Int(v.as_str()?.parse().ok()?),
+            "f" => Value::Float(v.as_str()?.parse().ok()?),
+            "s" => Value::String(v.as_str()?.to_string()),
+            "dt" => Value::DateTime(DateTime {
+                ticks: v.get(0)?.as_i64()?,
+                precision: u8::try_from(v.get(1)?.as_u64()?).ok()?,
+            }),
+            "d" => Value::Date(Date(i32::try_from(v.as_i64()?).ok()?)),
+            "b" => Value::Bool(v.as_bool()?),
+            "u" => Value::Uuid(Uuid(u128::from_str_radix(v.as_str()?, 16).ok()?)),
+            "r" => Value::Raw(v.clone()),
+            _ => return None,
+        })
+    }
+
     /// As ClickHouse's JSON output renders it.
     pub fn to_json(&self) -> Json {
         match self {
@@ -373,6 +413,36 @@ pub fn quote_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn values_save_and_load_exactly() {
+        let values = [
+            Value::Null,
+            Value::Int(-170_141_183_460_469_231_731_687_303_715_884_105_728),
+            Value::Int(42),
+            Value::Float(0.1 + 0.2),
+            Value::Float(f64::NAN),
+            Value::Float(f64::NEG_INFINITY),
+            Value::String("a \"b\"".into()),
+            Value::DateTime(DateTime {
+                ticks: -5,
+                precision: 3,
+            }),
+            Value::Date(Date(-1)),
+            Value::Bool(true),
+            Value::Uuid(Uuid(u128::MAX - 7)),
+            Value::Raw(serde_json::json!([1, {"x": null}])),
+        ];
+        for v in values {
+            let back = Value::load(&v.save()).expect("loads");
+            match (&v, &back) {
+                (Value::Float(a), Value::Float(b)) if a.is_nan() => assert!(b.is_nan()),
+                _ => assert_eq!(back, v),
+            }
+        }
+        assert_eq!(Value::load(&serde_json::json!({"x": 1})), None);
+        assert_eq!(Value::load(&serde_json::json!({"i": "nope"})), None);
+    }
     use serde_json::json;
 
     #[test]

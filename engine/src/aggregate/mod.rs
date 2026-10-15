@@ -40,6 +40,10 @@ pub trait AggregateState: Send + Sync {
     fn merge(&mut self, other: &dyn AggregateState);
     /// The result, as ClickHouse computes it.
     fn finalize(&self) -> Value;
+    /// The state as JSON, for checkpoints.
+    fn save(&self) -> serde_json::Value;
+    /// Back to a saved state (this one made by `new_state` for the same aggregate).
+    fn load(&mut self, json: &serde_json::Value) -> Result<(), String>;
     fn as_any(&self) -> &dyn Any;
     fn box_clone(&self) -> Box<dyn AggregateState>;
 }

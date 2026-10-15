@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use crate::aggregate::chdb_run::{AggregateRun, ChdbTable};
 use crate::aggregate::native_run::NativeRun;
 use crate::binder::{bind, BindError, Catalog, Params};
 use crate::chdb::{Chdb, ChdbError};
+use crate::checkpoint::{Checkpoint, Checkpointer};
 use crate::cursor;
 use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
@@ -49,6 +50,9 @@ pub enum EngineError {
     /// No snapshot of the table could be taken (pause server or ClickHouse).
     #[error("snapshot: {0}")]
     Snapshot(#[from] SnapshotError),
+    /// A checkpoint that doesn't fit the query (another shape, a bad format).
+    #[error("checkpoint: {0}")]
+    Checkpoint(String),
 }
 
 /// Everything [`Engine::connect`] needs for the standard setup: ClickHouse over HTTP (history,
@@ -270,6 +274,121 @@ impl Engine {
         Ok(subscription)
     }
 
+    /// Continue a subscription from its checkpoint: the plan re-made from the query, its state
+    /// as saved, and Kafka from right after the checkpoint's cursor. No snapshot and no history:
+    /// the first iteration is an empty catch-up at that cursor (whoever saved the checkpoint
+    /// keeps the rows). Fails when the checkpoint doesn't fit the query.
+    pub async fn restore(
+        &self,
+        sql: &str,
+        params: &Params,
+        checkpoint: &Checkpoint,
+    ) -> Result<Subscription, EngineError> {
+        let plan = self.explain_with(sql, params).await?;
+        let bad = EngineError::Checkpoint;
+        let in_use = {
+            let mut g = vec![self.snapshots.in_use(&plan.source)];
+            if let Some(semi) = &plan.semi {
+                g.push(self.snapshots.in_use(&semi.inner));
+            }
+            g
+        };
+        let at = checkpoint.at.clone();
+        let mut subscription = match (&plan.aggregate, &plan.semi) {
+            (None, None) => {
+                let state = ResultState::restore(&plan.stream, &checkpoint.state).map_err(bad)?;
+                self.start(
+                    plan,
+                    None,
+                    at.clone(),
+                    at,
+                    First::Restored,
+                    String::new(),
+                    true,
+                    Some(state),
+                )
+                .await?
+            }
+            (Some(aggregate), None) if aggregate.native.is_some() => {
+                let aggregate = aggregate.clone();
+                self.restore_native(plan, aggregate, checkpoint).await?
+            }
+            _ => return Err(bad("this query's results have no checkpoints".into())),
+        };
+        subscription.in_use = in_use;
+        Ok(subscription)
+    }
+
+    /// A native aggregate from its checkpoint (see [`Engine::restore`]).
+    async fn restore_native(
+        &self,
+        plan: Plan,
+        aggregate: AggregatePlan,
+        checkpoint: &Checkpoint,
+    ) -> Result<Subscription, EngineError> {
+        let at = checkpoint.at.clone();
+        let mut starts = Vec::new();
+        for topic in &plan.stream.topics {
+            starts.push(self.topic_start(topic, &at).await?);
+        }
+        let events = self
+            .source
+            .subscribe(&starts, &plan.stream.required_keys())
+            .await?
+            .ready_chunks(self.max_batch)
+            .boxed();
+        let native = aggregate.native.clone().expect("a native aggregate");
+        let run = NativeRun::restored(
+            self.history.clone(),
+            native,
+            plan.stream.clone(),
+            events,
+            checkpoint,
+            aggregate.result(),
+        )
+        .map_err(EngineError::Checkpoint)?;
+        tracing::info!(at = %at.describe(), "restored (aggregate, native)");
+        let checkpointer = run.checkpointer();
+        let iterations = stream::unfold(run, |mut run| async move {
+            let next = run.step().await?;
+            Some((next, run))
+        })
+        .boxed();
+        Ok(Subscription {
+            plan,
+            watermark: at,
+            history_sql: String::new(),
+            resumed: true,
+            iterations,
+            in_use: Vec::new(),
+            checkpointer: Some(checkpointer),
+        })
+    }
+
+    /// How many events a restore from `at` would read before it's up to date, or `None` if it
+    /// can't (an offset no longer in the topic, or past its end: the topic was recreated).
+    /// `Some(0)` when the source doesn't know its bounds.
+    pub async fn catch_up_events(
+        &self,
+        plan: &Plan,
+        at: &Watermark,
+    ) -> Result<Option<u64>, EngineError> {
+        let mut total = 0u64;
+        for topic in &plan.stream.topics {
+            let Some(bounds) = self.source.offset_bounds(topic).await? else {
+                continue;
+            };
+            for (p, (low, high)) in &bounds {
+                let next = at.get(*p) + 1;
+                if next < *low || next > *high {
+                    return Ok(None);
+                }
+                total += (*high - next) as u64;
+            }
+        }
+        Ok(Some(total))
+    }
+
     async fn subscribe_plan(
         &self,
         plan: Plan,
@@ -304,6 +423,7 @@ impl Engine {
                         first,
                         String::new(),
                         true,
+                        None,
                     )
                     .await;
             }
@@ -353,8 +473,17 @@ impl Engine {
             }
         };
         let resumed = matches!(first, First::CatchUp { .. });
-        self.start(plan, Some(lease), begin, at, first, history_sql, resumed)
-            .await
+        self.start(
+            plan,
+            Some(lease),
+            begin,
+            at,
+            first,
+            history_sql,
+            resumed,
+            None,
+        )
+        .await
     }
 
     /// `key IN (SELECT …)`: history over snapshots of both tables, then both topics, the
@@ -421,6 +550,7 @@ impl Engine {
             resumed: false,
             iterations,
             in_use: Vec::new(),
+            checkpointer: None,
         })
     }
 
@@ -461,6 +591,7 @@ impl Engine {
         first: First,
         history_sql: String,
         resumed: bool,
+        restored: Option<ResultState>,
     ) -> Result<Subscription, EngineError> {
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
@@ -476,7 +607,11 @@ impl Engine {
             .source
             .subscribe(&starts, &plan.stream.required_keys())
             .await?;
-        let iterations = self.iterations(&plan, lease, first, at, events);
+        let state = match &first {
+            First::Restored => restored.expect("a restored state"),
+            _ => ResultState::for_plan(&plan.stream),
+        };
+        let (iterations, checkpointer) = self.iterations(&plan, lease, first, at, events, state);
         Ok(Subscription {
             plan,
             watermark: begin,
@@ -484,6 +619,7 @@ impl Engine {
             resumed,
             iterations,
             in_use: Vec::new(),
+            checkpointer: Some(checkpointer),
         })
     }
 
@@ -508,7 +644,7 @@ impl Engine {
             .await?
             .ready_chunks(self.max_batch)
             .boxed();
-        let (history_sql, iterations) = match (
+        let (history_sql, iterations, checkpointer) = match (
             aggregate.native_history_sql(&from),
             aggregate.native.clone(),
         ) {
@@ -524,12 +660,13 @@ impl Engine {
                     watermark.clone(),
                     aggregate.result(),
                 );
+                let checkpointer = run.checkpointer();
                 let iterations = stream::unfold(run, |mut run| async move {
                     let next = run.step().await?;
                     Some((next, run))
                 })
                 .boxed();
-                (sql, iterations)
+                (sql, iterations, Some(checkpointer))
             }
             _ => {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -575,7 +712,7 @@ impl Engine {
                     Some((next, run))
                 })
                 .boxed();
-                (states, iterations)
+                (states, iterations, None)
             }
         };
         Ok(Subscription {
@@ -585,6 +722,7 @@ impl Engine {
             resumed: false,
             iterations,
             in_use: Vec::new(),
+            checkpointer,
         })
     }
 
@@ -651,10 +789,15 @@ impl Engine {
         first: First,
         at: Watermark,
         events: BoxStream<'static, Event>,
-    ) -> BoxStream<'static, Result<Iteration, EngineError>> {
+        state: ResultState,
+    ) -> (
+        BoxStream<'static, Result<Iteration, EngineError>>,
+        Checkpointer,
+    ) {
         enum Item {
             History(Result<Vec<Row>, HistoryError>),
             CatchUp(Result<Option<Vec<Row>>, HistoryError>, Vec<Event>),
+            Restored,
             Event(Event),
             Failed(EngineError),
         }
@@ -684,24 +827,49 @@ impl Engine {
                         Err(e) => stream::iter([Item::Failed(e)]).boxed(),
                     }
                 }
+                First::Restored => {
+                    drop(lease);
+                    stream::iter([Item::Restored])
+                        .chain(events.map(Item::Event))
+                        .boxed()
+                }
             }
         };
         let stream_plan = plan.stream.clone();
-        let state = (ResultState::for_plan(&stream_plan), at);
-        stream::once(items)
+        // shared with the checkpointer: each item updates it before it's yielded, so between
+        // iterations it matches the last one's cursor
+        let shared = Arc::new(Mutex::new((state, at)));
+        let checkpointer: Checkpointer = {
+            let shared = shared.clone();
+            Arc::new(move || {
+                let (state, at) = &*shared.lock().unwrap();
+                Checkpoint {
+                    at: at.clone(),
+                    state: state.save(),
+                }
+            })
+        };
+        let iterations = stream::once(items)
             .flatten()
-            .scan(state, move |(state, at), item| {
-                let iteration = match item {
+            .map(move |item| {
+                let mut guard = shared.lock().unwrap();
+                let (state, at) = &mut *guard;
+                match item {
                     Item::History(rows) => history_iteration(&stream_plan, state, at, rows),
                     Item::CatchUp(fetched, own) => {
                         catch_up_iteration(&stream_plan, state, at, fetched, own)
                     }
+                    Item::Restored => Ok(Iteration {
+                        origin: Origin::CatchUp,
+                        diffs: Vec::new(),
+                        at: at.clone(),
+                    }),
                     Item::Event(event) => Ok(event_iteration(&stream_plan, state, at, event)),
                     Item::Failed(e) => Err(e),
-                };
-                futures::future::ready(Some(iteration))
+                }
             })
-            .boxed()
+            .boxed();
+        (iterations, checkpointer)
     }
 }
 
@@ -759,6 +927,8 @@ enum First {
         /// Per partition, the client's cursor where it is past the snapshot.
         ahead: Watermark,
     },
+    /// Restored from a checkpoint: the state is seeded, the stream continues after it.
+    Restored,
 }
 
 enum Seed {
@@ -784,6 +954,40 @@ pub(crate) enum ResultState {
 }
 
 impl ResultState {
+    /// Its state, for a checkpoint: `{"shape": …, …}`.
+    pub(crate) fn save(&self) -> serde_json::Value {
+        let (shape, mut state) = match self {
+            ResultState::Append => ("append", serde_json::json!({})),
+            ResultState::Window(w) => ("window", w.save()),
+            ResultState::Ordered(o) => ("ordered", o.save()),
+            ResultState::Offset(o) => ("offset", o.save()),
+            ResultState::Held(h) => ("held", h.save()),
+        };
+        state["shape"] = shape.into();
+        state
+    }
+
+    /// The plan's state, as saved: the shape must be the plan's.
+    pub(crate) fn restore(plan: &StreamPlan, saved: &serde_json::Value) -> Result<Self, String> {
+        let mut state = Self::for_plan(plan);
+        let want = state.save()["shape"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let got = saved["shape"].as_str().unwrap_or_default();
+        if got != want {
+            return Err(format!("checkpoint of a {got} result for a {want} query"));
+        }
+        match &mut state {
+            ResultState::Append => {}
+            ResultState::Window(w) => w.load(saved)?,
+            ResultState::Ordered(o) => o.load(saved)?,
+            ResultState::Offset(o) => o.load(saved)?,
+            ResultState::Held(h) => h.load(saved)?,
+        }
+        Ok(state)
+    }
+
     pub(crate) fn for_plan(plan: &StreamPlan) -> Self {
         match (&plan.order, plan.limit, plan.offset) {
             (Some(o), limit, Some(m)) => Self::Offset(OffsetState::new(o.keys.clone(), m, limit)),
@@ -961,6 +1165,22 @@ pub struct Subscription {
     iterations: BoxStream<'static, Result<Iteration, EngineError>>,
     /// Its tables' [`InUse`] guards.
     in_use: Vec<InUse>,
+    /// Reads its placement state, for the shapes that can be checkpointed.
+    checkpointer: Option<Checkpointer>,
+}
+
+impl Subscription {
+    /// Its placement state now, complete to the cursor of the last iteration it yielded (call it
+    /// between iterations; `None` for shapes without checkpoints: chDB aggregates, semi-joins).
+    /// [`Engine::restore`] continues from it.
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        self.checkpointer.as_ref().map(|c| c())
+    }
+
+    /// Whether [`Subscription::checkpoint`] gives one.
+    pub fn checkpointable(&self) -> bool {
+        self.checkpointer.is_some()
+    }
 }
 
 impl Stream for Subscription {

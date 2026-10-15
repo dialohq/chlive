@@ -67,6 +67,7 @@ pub fn error_code(e: &EngineError) -> &'static str {
         EngineError::Source(_) => STREAM_FAILED,
         EngineError::Aggregate(_) => AGGREGATE_FAILED,
         EngineError::Snapshot(_) => SNAPSHOT_FAILED,
+        EngineError::Checkpoint(_) => SNAPSHOT_FAILED,
     }
 }
 
