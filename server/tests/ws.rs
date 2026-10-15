@@ -361,10 +361,13 @@ async fn unsubscribe_leaves_the_shared_entry() {
     let e = &listed[0];
     assert_eq!(e["sql"], "select user_id from requests");
     assert_eq!(e["stage"], "live");
+    let sub = &e["subscribers"][0];
+    assert_eq!(e["subscribers"].as_array().unwrap().len(), 1);
     assert_eq!(
-        e["subscribers"],
-        json!([{"conn": 1, "id": "s1", "lagging": false}])
+        (&sub["conn"], &sub["id"], &sub["lagging"]),
+        (&json!(1), &json!("s1"), &json!(false))
     );
+    assert_eq!(sub["served"]["source"], "clickhouse", "{sub}");
     assert_eq!(e["rows"], 4);
     assert_eq!(e["at"], "{0: 3}");
     assert_eq!(e["logStart"], "{0: 0}");
@@ -1271,6 +1274,122 @@ async fn the_debug_state_shows_the_whole_server() {
 }
 
 #[tokio::test]
+async fn each_join_says_where_its_result_came_from_and_what_it_got() {
+    let live = Live::new();
+    let dir = TempDir::new();
+    let server = live_server(
+        &live,
+        dir.cache(CacheSettings {
+            keep_alive: Duration::from_millis(50),
+            keep_warm: Duration::from_secs(60),
+            ..Default::default()
+        }),
+    )
+    .await;
+    let sql = "select user_id from requests";
+    let joins = || async {
+        let body = http_get(&format!("http://{}/debug/state", server.addr)).await;
+        serde_json::from_str::<Value>(&body).unwrap()["joins"].clone()
+    };
+    // the first: a new result, from ClickHouse, which it waited for
+    let mut a = Client::connect(&server).await;
+    a.subscribe("a", sql).await;
+    let at = a.expect().await["at"].as_str().unwrap().to_string();
+    let j = &joins().await[0];
+    assert_eq!(
+        (
+            &j["id"],
+            &j["source"],
+            &j["decision"],
+            &j["reason"],
+            &j["cursor"]
+        ),
+        (
+            &json!("a"),
+            &json!("clickhouse"),
+            &json!("snapshot"),
+            &json!("no_cursor"),
+            &json!(false)
+        ),
+        "{j}"
+    );
+    assert_eq!(j["snapshot"], "default.__chlive_snap_requests");
+    assert_eq!(j["newSnapshot"], true, "taken for it");
+    assert!(j["waitedMs"].is_u64() && j["loadMs"].is_u64(), "{j}");
+    assert!(j.get("rejected").is_none(), "nothing stored: {j}");
+    // the next: the result in memory, no wait
+    let mut b = Client::connect(&server).await;
+    b.subscribe("b", sql).await;
+    b.expect().await;
+    let j = &joins().await[0];
+    assert_eq!(
+        (&j["id"], &j["source"], &j["decision"], &j["rows"]),
+        (&json!("b"), &json!("memory"), &json!("snapshot"), &json!(1)),
+        "{j}"
+    );
+    assert!(j.get("waitedMs").is_none(), "{j}");
+    // with a cursor: a resume from the memory log
+    live.push("u1", 1);
+    users(&mut a, "a", 1).await;
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "subscribe", "id": "c", "sql": sql, "since": at}))
+        .await;
+    assert_eq!(c.expect().await["type"], "resume");
+    let j = &joins().await[0];
+    assert_eq!(
+        (
+            &j["source"],
+            &j["decision"],
+            &j["log"],
+            &j["diffs"],
+            &j["cursor"]
+        ),
+        (
+            &json!("memory"),
+            &json!("resume"),
+            &json!("memory"),
+            &json!(1),
+            &json!(true)
+        ),
+        "{j}"
+    );
+    // a cursor of another lineage: a snapshot, and why
+    let mut d = Client::connect(&server).await;
+    d.send(json!({"type": "subscribe", "id": "d", "sql": sql, "since": "nonsense"}))
+        .await;
+    d.expect().await;
+    assert_eq!(joins().await[0]["reason"], "bad_token");
+    // everyone gone, the result warm: the next one gets the rows from disk
+    drop((a, b, c, d));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let mut e = Client::connect(&server).await;
+    e.subscribe("e", sql).await;
+    e.expect().await;
+    let all = joins().await;
+    let j = &all[0];
+    assert_eq!(
+        (&j["source"], &j["decision"]),
+        (&json!("warm"), &json!("snapshot")),
+        "{j}"
+    );
+    assert!(j["loadMs"].is_u64());
+    let ids: Vec<&str> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["e", "d", "c", "b", "a"], "newest first");
+    // each subscriber also carries how it was served
+    let entry = &debug(&server).await[0];
+    assert_eq!(entry["subscribers"][0]["served"]["source"], "warm");
+    assert_eq!(
+        entry["source"]["source"], "clickhouse",
+        "how the entry started: {entry}"
+    );
+}
+
+#[tokio::test]
 async fn cold_entries_are_restored_from_disk_and_resume_through_the_fork() {
     let live = Live::new();
     let dir = TempDir::new();
@@ -1365,7 +1484,19 @@ async fn a_restarted_server_restores_from_disk_when_subscribed() {
         .map(|c| c["op"].as_str().unwrap())
         .collect();
     assert_eq!(ops, ["insert", "delete"], "{m}");
-    assert_eq!(debug(&server).await[0]["restored"], true);
+    let e = &debug(&server).await[0];
+    assert_eq!(e["restored"], true);
+    let served = &e["subscribers"][0]["served"];
+    assert_eq!(
+        (
+            &served["source"],
+            &served["decision"],
+            &served["eventsBehind"]
+        ),
+        (&json!("restored"), &json!("resume"), &json!(1)),
+        "a cold result restored, resumed through the fork: {served}"
+    );
+    assert!(served["waitedMs"].is_u64() && served["loadMs"].is_u64());
     let mut d = Client::connect(&server).await;
     d.subscribe("d", sql).await;
     assert_eq!(
@@ -1400,6 +1531,11 @@ async fn stored_results_that_cant_continue_start_from_clickhouse() {
         assert_eq!(snap["rows"], json!([{"user_id": "h1"}]), "{name}");
         let e = &debug(&server).await[0];
         assert_eq!(e["restored"], false, "{name}: {e}");
+        // the subscriber hears why
+        let served = &e["subscribers"][0]["served"];
+        assert_eq!(served["source"], "clickhouse", "{name}: {served}");
+        let rejected = served["rejected"].as_str().unwrap();
+        assert!(rejected.starts_with(name), "{name}: {rejected}");
         assert_eq!(live.subscribes(), 2, "{name}");
     }
     let _ = sql;

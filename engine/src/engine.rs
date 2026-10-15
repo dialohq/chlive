@@ -364,6 +364,7 @@ impl Engine {
             watermark: at,
             history_sql: String::new(),
             resumed: true,
+            snapshot: None,
             iterations,
             in_use: Vec::new(),
             checkpointer: Some(checkpointer),
@@ -529,6 +530,7 @@ impl Engine {
             .boxed();
         tracing::info!(history = %history_sql, keys = %keys_sql, "subscribed (semi-join)");
         let watermark = outer.watermark.clone();
+        let used = outer.used();
         let run = crate::semi::SemiRun::new(
             self.history.clone(),
             self.snapshots.clone(),
@@ -553,6 +555,7 @@ impl Engine {
             watermark,
             history_sql,
             resumed: false,
+            snapshot: Some(used),
             iterations,
             in_use: Vec::new(),
             checkpointer: None,
@@ -616,12 +619,14 @@ impl Engine {
             First::Restored => restored.expect("a restored state"),
             _ => ResultState::for_plan(&plan.stream),
         };
+        let snapshot = lease.as_ref().map(|l| l.used());
         let (iterations, checkpointer) = self.iterations(&plan, lease, first, at, events, state);
         Ok(Subscription {
             plan,
             watermark: begin,
             history_sql,
             resumed,
+            snapshot,
             iterations,
             in_use: Vec::new(),
             checkpointer: Some(checkpointer),
@@ -639,6 +644,7 @@ impl Engine {
     ) -> Result<Subscription, EngineError> {
         let watermark = lease.watermark.clone();
         let from = lease.sql_table();
+        let used = lease.used();
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
             starts.push(self.topic_start(topic, &watermark).await?);
@@ -725,6 +731,7 @@ impl Engine {
             watermark,
             history_sql,
             resumed: false,
+            snapshot: Some(used),
             iterations,
             in_use: Vec::new(),
             checkpointer,
@@ -1167,6 +1174,8 @@ pub struct Subscription {
     pub history_sql: String,
     /// Whether this resumed from a client's cursor (the first iteration is then a catch-up).
     pub resumed: bool,
+    /// The snapshot its history was read from (none when resumed or restored).
+    pub snapshot: Option<crate::snapshot::UsedSnapshot>,
     iterations: BoxStream<'static, Result<Iteration, EngineError>>,
     /// Its tables' [`InUse`] guards.
     in_use: Vec<InUse>,

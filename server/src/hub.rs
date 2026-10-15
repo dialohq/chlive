@@ -134,6 +134,69 @@ pub enum Reason {
     Ahead,
 }
 
+/// Where a subscriber's result came from.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(
+    tag = "source",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum Source {
+    /// Already in memory: the entry was live (or in keep-alive).
+    Memory,
+    /// The entry was warm: its rows were loaded from disk.
+    Warm { load_ms: u64 },
+    /// The entry was cold (or the server restarted): restored from disk and caught up from
+    /// Kafka, without ClickHouse.
+    Restored { load_ms: u64, events_behind: u64 },
+    /// A new result: its history queried from a ClickHouse snapshot.
+    Clickhouse {
+        load_ms: u64,
+        /// The clone it was read from, and whether it was taken for this result (else an
+        /// existing one was reused).
+        snapshot: Option<String>,
+        new_snapshot: Option<bool>,
+        /// Why a stored result couldn't be used instead, if there was one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rejected: Option<String>,
+    },
+}
+
+/// How a subscriber was served: where its result came from, and what it got.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Served {
+    /// Unix milliseconds.
+    pub at: u64,
+    pub conn: u64,
+    pub id: String,
+    pub key: String,
+    pub sql: String,
+    pub lineage: String,
+    /// It sent a cursor (`since`).
+    pub cursor: bool,
+    #[serde(flatten)]
+    pub source: Source,
+    /// `snapshot` or `resume`.
+    pub decision: &'static str,
+    /// Why a snapshot rather than a resume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
+    /// Resumed from the `memory` or the `disk` log, with this many diffs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diffs: Option<usize>,
+    /// Rows in the result.
+    pub rows: usize,
+    /// It joined before the result was ready, and waited this long.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited_ms: Option<u64>,
+}
+
+/// Joins kept for `/debug/state`.
+const RECENT_JOINS: usize = 200;
+
 /// How a subscriber starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -227,6 +290,8 @@ pub struct Hub {
     store: Option<Arc<Store>>,
     entries: Mutex<HashMap<String, Handle>>,
     next: AtomicU64,
+    /// The last joins, newest first.
+    recent: Mutex<VecDeque<Served>>,
 }
 
 impl Hub {
@@ -253,6 +318,7 @@ impl Hub {
             progress_interval,
             store,
             entries: Mutex::new(HashMap::new()),
+            recent: Mutex::new(VecDeque::new()),
             next: AtomicU64::new(1),
         })
     }
@@ -385,6 +451,7 @@ impl Hub {
             },
             "entries": entries,
             "store": store,
+            "joins": *self.recent.lock().unwrap(),
         })
     }
 
@@ -482,6 +549,13 @@ impl Hub {
         }
     }
 
+    /// A subscriber served: kept among the recent joins.
+    fn served(&self, served: Served) {
+        let mut recent = self.recent.lock().unwrap();
+        recent.push_front(served);
+        recent.truncate(RECENT_JOINS);
+    }
+
     /// An entry becoming warm (or not). Over `max_warm`, the one warm the longest goes cold.
     fn set_warm(&self, key: &str, id: u64, warm: bool) {
         let mut entries = self.entries.lock().unwrap();
@@ -572,6 +646,9 @@ pub struct Info {
     pub joins_resume: u64,
     pub joins_wait: u64,
     pub resyncs: u64,
+    /// How it started: from ClickHouse, or restored from disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -580,6 +657,9 @@ pub struct SubscriberInfo {
     pub conn: u64,
     pub id: String,
     pub lagging: bool,
+    /// How it was served (none while it waits for the result).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served: Option<Served>,
 }
 
 impl Info {
@@ -613,6 +693,7 @@ impl Info {
             joins_resume: 0,
             joins_wait: 0,
             resyncs: 0,
+            source: None,
         }
     }
 }
@@ -645,6 +726,8 @@ struct Sub {
     waiting: Option<Option<String>>,
     /// Its connection's queue was full: nothing is sent until it catches up.
     lagging: bool,
+    joined_at: Instant,
+    served: Option<Served>,
 }
 
 struct LogItem {
@@ -671,8 +754,12 @@ enum Sent {
 
 /// How an entry started.
 enum Start {
-    /// From a ClickHouse snapshot (its history comes as the first iteration).
-    Fresh(Subscription),
+    /// From a ClickHouse snapshot (its history comes as the first iteration); with why a stored
+    /// result couldn't be used, if there was one.
+    Fresh {
+        sub: Subscription,
+        rejected: Option<String>,
+    },
     /// From the store: the rows as of the checkpoint, the log messages up to it, and where the
     /// old lineage ended.
     Restored {
@@ -727,6 +814,14 @@ struct Entry {
     /// Bytes logged to disk since the last compaction.
     disk_log_bytes: u64,
     restored: bool,
+    /// How it started (once its result is ready): what waiting subscribers are told.
+    source: Option<Source>,
+    /// A fresh start's snapshot and why a stored result wasn't used, until the history is in.
+    fresh: Option<(
+        Option<chlive_engine::snapshot::UsedSnapshot>,
+        Option<String>,
+    )>,
+    started_at: SystemTime,
 }
 
 impl Entry {
@@ -774,6 +869,9 @@ impl Entry {
             last_checkpoint: Instant::now(),
             disk_log_bytes: 0,
             restored: false,
+            source: None,
+            fresh: None,
+            started_at: SystemTime::now(),
         }
     }
 
@@ -811,8 +909,9 @@ impl Entry {
                 r = &mut starting, if !subscribed => {
                     subscribed = true;
                     match r {
-                        Ok(Start::Fresh(s)) => {
+                        Ok(Start::Fresh { sub: s, rejected }) => {
                             self.subscribed(&s);
+                            self.fresh = Some((s.snapshot.clone(), rejected));
                             self.sub = Some(s.ready_chunks(MAX_ITERATIONS_PER_MESSAGE));
                         }
                         Ok(Start::Restored { sub, stored, rows, log, checkpoint, lag, ms }) => {
@@ -926,9 +1025,15 @@ impl Entry {
             store.create(self.meta(), at, self.rows.clone(), checkpoint.to_json());
         }
         self.last_checkpoint = Instant::now();
+        let source = Source::Restored {
+            load_ms: ms,
+            events_behind: lag,
+        };
+        self.source = Some(source.clone());
         let mut info = self.info.lock().unwrap();
         info.history_ms = Some(ms);
         info.forks = self.forks.iter().map(|(l, _)| l.clone()).collect();
+        info.source = Some(source);
         drop(info);
     }
 
@@ -984,28 +1089,77 @@ impl Entry {
                 Some((*k, s.conn, s.client_id.clone(), since))
             })
             .collect();
+        let source = self.source.clone().unwrap_or(Source::Memory);
         for (sub, conn, client_id, since) in waiting {
             debug!(key = %self.fp, lineage = %self.lineage, sub, "a waiting subscriber, now the result is ready");
-            self.join(sub, conn, client_id, since).await;
+            self.join(sub, conn, client_id, since, source.clone()).await;
         }
     }
 
     /// The history is in: waiting subscribers get the snapshot (without waiting on anything).
     fn serve_waiting_snapshot(&mut self) {
-        let waiting: Vec<u64> = self
+        let waiting: Vec<(u64, bool)> = self
             .subs
             .iter_mut()
-            .filter_map(|(k, s)| s.waiting.take().map(|_| *k))
+            .filter_map(|(k, s)| s.waiting.take().map(|since| (*k, since.is_some())))
             .collect();
         if waiting.is_empty() {
             return;
         }
         let body = self.snapshot_body();
         let at = self.at.clone().expect("ready");
-        for sub in waiting {
+        let source = self.source.clone().unwrap_or(Source::Memory);
+        for (sub, cursor) in waiting {
             debug!(key = %self.fp, lineage = %self.lineage, sub, "waiting subscriber gets the snapshot");
+            // a fresh result is a new lineage: no cursor resumes it
+            let reason = match cursor {
+                true => Reason::OtherLineage,
+                false => Reason::NoCursor,
+            };
+            self.record(sub, cursor, source.clone(), Some(reason), None);
             self.deliver(sub, body.clone(), &at);
         }
+    }
+
+    /// Remember how a subscriber was served (on the subscriber, and among the hub's recent
+    /// joins). A snapshot has a reason; a resume, its log and diffs.
+    fn record(
+        &mut self,
+        sub: u64,
+        cursor: bool,
+        source: Source,
+        reason: Option<Reason>,
+        resumed: Option<(&'static str, usize)>,
+    ) {
+        let rows = self.rows_count;
+        let Some(s) = self.subs.get_mut(&sub) else {
+            return;
+        };
+        // only a subscriber that waited for the result gets it as it started
+        let waited_ms = matches!(source, Source::Restored { .. } | Source::Clickhouse { .. })
+            .then(|| s.joined_at.elapsed().as_millis() as u64);
+        let served = Served {
+            at: store::now_ms() as u64,
+            conn: s.conn,
+            id: s.client_id.clone(),
+            key: self.fp.clone(),
+            sql: self.sql.clone(),
+            lineage: self.lineage.clone(),
+            cursor,
+            source,
+            decision: if resumed.is_some() {
+                "resume"
+            } else {
+                "snapshot"
+            },
+            reason,
+            log: resumed.map(|r| r.0),
+            diffs: resumed.map(|r| r.1),
+            rows,
+            waited_ms,
+        };
+        s.served = Some(served.clone());
+        self.hub.served(served);
     }
 
     /// One batch of iterations: the history (once), then diffs and progress, sent to everyone,
@@ -1032,8 +1186,19 @@ impl Entry {
                     self.sent_at = Some(it.at);
                     history = true;
                     let ms = started.elapsed().as_millis() as u64;
-                    info!(key = %self.fp, lineage = %self.lineage, rows = self.rows_count, ms, "history loaded");
-                    self.info.lock().unwrap().history_ms = Some(ms);
+                    let (snapshot, rejected) = self.fresh.take().unwrap_or_default();
+                    let source = Source::Clickhouse {
+                        load_ms: ms,
+                        new_snapshot: snapshot.as_ref().map(|s| s.taken_at >= self.started_at),
+                        snapshot: snapshot.map(|s| s.clone),
+                        rejected,
+                    };
+                    info!(key = %self.fp, lineage = %self.lineage, rows = self.rows_count, ms, source = ?source, "history loaded");
+                    let mut info = self.info.lock().unwrap();
+                    info.history_ms = Some(ms);
+                    info.source = Some(source.clone());
+                    drop(info);
+                    self.source = Some(source);
                     self.serve_waiting_snapshot();
                 }
                 Ok(it) => {
@@ -1271,11 +1436,16 @@ impl Entry {
                 since,
                 alive,
             } => {
+                let mut source = Source::Memory;
                 if self.stage != Stage::Live {
                     debug!(key = %self.fp, lineage = %self.lineage, from = self.stage.name(), "entry is live again");
                     if self.stage == Stage::Warm {
                         self.hub.set_warm(&self.key, self.id, false);
+                        let started = Instant::now();
                         self.load_rows().await;
+                        source = Source::Warm {
+                            load_ms: started.elapsed().as_millis() as u64,
+                        };
                         if let Some(store) = self.store() {
                             store.stage(&self.key, "live");
                         }
@@ -1293,10 +1463,12 @@ impl Entry {
                         delivered: None,
                         waiting: None,
                         lagging: false,
+                        joined_at: Instant::now(),
+                        served: None,
                     },
                 );
                 self.served += 1;
-                self.join(sub, conn, client_id, since).await;
+                self.join(sub, conn, client_id, since, source).await;
             }
             Cmd::Leave { sub } => {
                 if let Some(s) = self.subs.remove(&sub) {
@@ -1321,7 +1493,15 @@ impl Entry {
 
     /// How a new subscriber starts: a snapshot, or a resume from the memory log, or from the
     /// disk log when the memory one doesn't reach back far enough.
-    async fn join(&mut self, sub: u64, conn: u64, client_id: String, since: Option<String>) {
+    async fn join(
+        &mut self,
+        sub: u64,
+        conn: u64,
+        client_id: String,
+        since: Option<String>,
+        source: Source,
+    ) {
+        let cursor = since.is_some();
         let since_text = since.clone().unwrap_or_default();
         let waiting_since = since.clone();
         let decoded = since.map(|t| match &self.form {
@@ -1387,7 +1567,8 @@ impl Entry {
                 }
             }
             Decision::Snapshot(reason) => {
-                debug!(key = %self.fp, lineage = %self.lineage, sub, conn, id = %client_id, decision = "snapshot", ?reason, since = %since_text, rows = self.rows_count, "join");
+                debug!(key = %self.fp, lineage = %self.lineage, sub, conn, id = %client_id, decision = "snapshot", ?reason, since = %since_text, rows = self.rows_count, ?source, "join");
+                self.record(sub, cursor, source, Some(reason), None);
                 let body = self.snapshot_body();
                 let at = self.at.clone().expect("ready");
                 self.deliver(sub, body, &at);
@@ -1406,7 +1587,13 @@ impl Entry {
                         .map(|i| (i.body.clone(), i.at.clone()))
                         .collect(),
                 };
-                debug!(key = %self.fp, lineage = %self.lineage, sub, conn, id = %client_id, decision = "resume", since = %since_text, diffs = items.len(), log = if from_disk.is_some() { "disk" } else { "memory" }, "join");
+                let log = if from_disk.is_some() {
+                    "disk"
+                } else {
+                    "memory"
+                };
+                debug!(key = %self.fp, lineage = %self.lineage, sub, conn, id = %client_id, decision = "resume", since = %since_text, diffs = items.len(), log, ?source, "join");
+                self.record(sub, cursor, source, None, Some((log, items.len())));
                 let form = self.form.as_ref().expect("subscribed");
                 let resume = ServerMsg::Resume {
                     id: client_id,
@@ -1612,6 +1799,7 @@ impl Entry {
                 conn: s.conn,
                 id: s.client_id.clone(),
                 lagging: s.lagging,
+                served: s.served.clone(),
             })
             .collect();
         info.rows = self.rows_count;
@@ -1634,6 +1822,7 @@ async fn start(
     sql: String,
     params: Params,
 ) -> Result<Start, EngineError> {
+    let mut rejected = None;
     if let Some(store) = hub.store.clone() {
         let started = Instant::now();
         let k = key.clone();
@@ -1657,6 +1846,7 @@ async fn start(
                 Err(reason) => {
                     info!(key = %fp, lineage = %stored.meta.lineage, reason, "the stored result can't be used: starting from ClickHouse");
                     store.delete(&key, &reason);
+                    rejected = Some(reason);
                 }
             },
             Ok(Ok(None)) => {}
@@ -1668,7 +1858,7 @@ async fn start(
     hub.engine
         .subscribe_with(&sql, &params, None)
         .await
-        .map(Start::Fresh)
+        .map(|sub| Start::Fresh { sub, rejected })
 }
 
 type Restorable = (

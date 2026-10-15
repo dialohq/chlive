@@ -73,6 +73,10 @@
   .chip.live { background: var(--live); } .chip.keep_alive { background: var(--keep); }
   .chip.warm { background: var(--warm); } .chip.cold { background: var(--cold); }
   .chip.starting { background: var(--start); }
+  .chip.memory { background: var(--live); } .chip.restored { background: var(--cold); }
+  .chip.clickhouse { background: var(--start); } .chip.resume { background: var(--live); }
+  .chip.snapshot { background: var(--muted); }
+  .how { color: var(--muted); font-size: 12px; white-space: normal; }
   .flag { display: inline-block; padding: 0 5px; border: 1px solid var(--line); border-radius: 4px; font-size: 11px; color: var(--muted); }
   .flag.on { color: var(--fg); border-color: var(--muted); }
   .bar { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin: 6px 0 2px; }
@@ -110,6 +114,12 @@
     </h2>
     <div class="scroll" id="entries"></div>
   </section>
+  <section>
+    <h2>Recent joins <span class="count" id="joincount"></span>
+      <span class="tools"><button id="alljoins">Show all</button></span>
+    </h2>
+    <div class="scroll" id="joins"></div>
+  </section>
   <div class="grid2">
     <section><h2>Disk store</h2><div id="store"></div></section>
     <section><h2>Snapshots <span class="count" id="snapcount"></span></h2><div class="scroll" id="snapshots"></div></section>
@@ -129,6 +139,14 @@ let lastOk = 0;        // when the last poll succeeded (our clock)
 let paused = false;
 let timer = null;
 const open = new Set(); // expanded entry keys
+let allJoins = false;
+const REASONS = {
+  no_cursor: "no cursor",
+  bad_token: "unreadable cursor",
+  other_lineage: "cursor from another lineage",
+  before_log: "cursor older than the log",
+  ahead: "cursor ahead of the result",
+};
 
 function bytes(n) {
   if (n == null) return "–";
@@ -155,6 +173,35 @@ const chip = (stage) => `<span class="chip ${esc(stage)}">${esc(stage)}</span>`;
 const flag = (on, label, title) => `<span class="flag${on ? " on" : ""}" title="${esc(title)}">${on ? label : "no " + label}</span>`;
 const plural = (n, word) => `${num(n)} ${word}${n === 1 ? "" : "s"}`;
 const short = (s, n = 140) => (s.length > n ? s.slice(0, n) + "…" : s);
+
+// where a join's result came from: [chip label, chip class, what happened]
+function source(j) {
+  switch (j.source) {
+    case "memory": return ["memory", "memory", "the result was in memory"];
+    case "warm": return ["warm", "warm", `warm: rows loaded from disk in ${j.loadMs} ms`];
+    case "restored": return ["disk", "restored",
+      `cold: restored from disk, ${plural(j.eventsBehind, "event")} caught up from Kafka, in ${j.loadMs} ms`];
+    case "clickhouse": {
+      const snap = j.snapshot == null ? "" : j.newSnapshot ? " on a new snapshot" : " on a reused snapshot";
+      return ["ClickHouse", "clickhouse", `new result: history from ClickHouse${snap} in ${j.loadMs} ms`
+        + (j.rejected ? ` (the stored one couldn't be used: ${j.rejected})` : "")];
+    }
+    default: return [j.source, "", ""];
+  }
+}
+// what the client got
+function got(j) {
+  return j.decision === "resume"
+    ? `resume: ${plural(j.diffs, "diff")} from the ${j.log} log`
+    : `snapshot of ${plural(j.rows, "row")}: ${REASONS[j.reason] ?? j.reason}`;
+}
+function served(j, long) {
+  if (!j) return '<span class="muted">waiting for the result</span>';
+  const [label, cls, how] = source(j);
+  const wait = j.waitedMs != null ? `, after waiting ${j.waitedMs} ms` : "";
+  return `${chip(j.decision)} from ${`<span class="chip ${cls}">${esc(label)}</span>`}`
+    + (long ? `<div class="how">${esc(got(j))}${esc(wait)}. ${esc(how)}.</div>` : "");
+}
 
 function card(label, value, sub) {
   return `<div class="card"><div class="label">${esc(label)}</div><div class="value">${value}</div><div class="sub">${sub ?? ""}</div></div>`;
@@ -186,14 +233,44 @@ function render() {
     card("Cold on disk", st ? num(counts.cold) : "–", st ? `of ${num(entries.length)} results` : "no disk store"),
     card("Disk store", st ? bytes(st.bytes) : "off", st ? `of ${bytes(st.budget)} budget · file ${bytes(st.fileBytes + st.walBytes)}` : "dir is empty"),
     card("Snapshots", num(snaps.length), `${num(leases)} leases · ${snaps.filter((t) => t.taking).length} taking`),
+    card("Recent joins", num(s.joins.length), joinSummary(s.joins)),
   ].join("");
 
   $("stagecounts").textContent = STAGES.filter((k) => counts[k]).map((k) => `${counts[k]} ${k}`).join(" · ");
   renderEntries(entries);
+  renderJoins(s.joins);
   renderStore(st);
   renderSnapshots(snaps);
   renderConnections(s.connections);
   renderSettings(s.cache);
+}
+
+function joinSummary(joins) {
+  const n = (f) => joins.filter(f).length;
+  return `${n((j) => j.decision === "resume")} resumed · ${n((j) => j.source === "clickhouse")} from ClickHouse · ${n((j) => j.source === "restored" || j.source === "warm")} from disk`;
+}
+
+function renderJoins(joins) {
+  $("joincount").textContent = joins.length ? `last ${joins.length}, newest first` : "";
+  $("alljoins").hidden = joins.length <= 25;
+  $("alljoins").textContent = allJoins ? "Show fewer" : "Show all";
+  if (!joins.length) {
+    $("joins").innerHTML = `<div class="empty">No subscriptions served yet.</div>`;
+    return;
+  }
+  const head = `<tr><th>When</th><th>Subscription</th><th>Key</th><th>Served</th><th>How</th><th class="num">Rows</th><th class="num">Waited</th></tr>`;
+  const body = (allJoins ? joins : joins.slice(0, 25)).map((j) => {
+    const [, , how] = source(j);
+    return `<tr>
+      <td>${ago(j.at)}</td>
+      <td class="mono">conn ${j.conn} · ${esc(j.id)}${j.cursor ? ' <span class="muted" title="sent a cursor">↻</span>' : ""}</td>
+      <td><a class="k" href="#entry-${esc(j.key)}" data-open="${esc(j.key)}" title="${esc(j.sql)}">${esc(j.key)}</a></td>
+      <td>${served(j, false)}</td>
+      <td class="how">${esc(got(j))}<br>${esc(how)}</td>
+      <td class="num">${num(j.rows)}</td>
+      <td class="num">${j.waitedMs != null ? j.waitedMs + " ms" : "–"}</td></tr>`;
+  }).join("");
+  $("joins").innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
 }
 
 function renderEntries(entries) {
@@ -232,7 +309,7 @@ function renderEntries(entries) {
 
 function entryDetail(e) {
   const item = (k, v) => (v === undefined || v === null || v === "" ? "" : `<dt>${esc(k)}</dt><dd>${v}</dd>`);
-  const subs = (e.subscribers ?? []).map((x) => `conn ${x.conn} · ${esc(x.id)}${x.lagging ? ' <span class="bad">lagging</span>' : ""}`).join("<br>");
+  const subs = (e.subscribers ?? []).map((x) => `<div>conn ${x.conn} · ${esc(x.id)}${x.lagging ? ' <span class="bad">lagging</span>' : ""} ${served(x.served, true)}</div>`).join("");
   return `<dl>
     ${item("Query", `<pre class="mono">${esc(e.sql)}</pre>`)}
     ${e.params && Object.keys(e.params).length ? item("Params", `<code>${esc(JSON.stringify(e.params))}</code>`) : ""}
@@ -241,6 +318,7 @@ function entryDetail(e) {
     ${item("Cursor", e.at ? `<code>${esc(e.at)}</code>` : undefined)}
     ${item("Log starts at", e.logStart ? `<code>${esc(e.logStart)}</code>` : undefined)}
     ${item("Subscribers", subs || undefined)}
+    ${item("Started", e.source ? esc(source(e.source)[2]) : undefined)}
     ${item("Created", e.created ? ago(e.created) : undefined)}
     ${item("Warm since", e.warmSince ? ago(e.warmSince) : undefined)}
     ${item("History took", e.historyMs != null ? e.historyMs + " ms" : undefined)}
@@ -309,9 +387,14 @@ function renderConnections(conns) {
   const body = conns.map((c) => `<tr>
       <td class="num">${c.conn}</td><td class="mono">${esc(c.origin ?? "–")}</td><td>${ago(c.connectedAt)}</td>
       <td class="num${c.outbox != null && c.outbox > max / 2 ? " bad" : ""}">${c.outbox == null ? "–" : `${c.outbox}/${max}`}</td>
-      <td style="white-space:normal">${c.subscriptions.map((x) => `${esc(x.id)} → <a class="k" href="#entry-${esc(x.key)}" data-open="${esc(x.key)}">${esc(x.key)}</a>`).join(", ") || '<span class="muted">none</span>'}</td>
+      <td style="white-space:normal">${c.subscriptions.map((x) => `<div>${esc(x.id)} → <a class="k" href="#entry-${esc(x.key)}" data-open="${esc(x.key)}">${esc(x.key)}</a> ${((sub) => (sub ? served(sub.served, true) : ""))(subscriber(x.key, c.conn, x.id))}</div>`).join("") || '<span class="muted">none</span>'}</td>
     </tr>`).join("");
   $("connections").innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function subscriber(key, conn, id) {
+  const e = state.entries.find((e) => e.key === key);
+  return e?.subscribers?.find((s) => s.conn === conn && s.id === id);
 }
 
 function renderSettings(c) {
@@ -380,10 +463,13 @@ $("entries").onclick = (ev) => {
   open.has(k) ? open.delete(k) : open.add(k);
   renderEntries(state.entries);
 };
-$("connections").onclick = (ev) => {
+const openEntry = (ev) => {
   const a = ev.target.closest("a[data-open]");
   if (a) { open.add(a.dataset.open); $("filter").value = ""; renderEntries(state.entries); }
 };
+$("connections").onclick = openEntry;
+$("joins").onclick = openEntry;
+$("alljoins").onclick = () => { allJoins = !allJoins; state && renderJoins(state.joins); };
 try {
   const every = localStorage.getItem("chlive-debug-every");
   if (every) $("every").value = every;

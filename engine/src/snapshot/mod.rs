@@ -84,6 +84,14 @@ impl Snapshot {
 }
 
 impl Snapshot {
+    /// Which clone this is and when it was taken, for a subscription to say what it read.
+    pub fn used(&self) -> UsedSnapshot {
+        UsedSnapshot {
+            clone: format!("{}.{}", self.database, self.name),
+            taken_at: self.taken_at,
+        }
+    }
+
     /// The clone, quoted for SQL: what history queries read from.
     pub fn sql_table(&self) -> String {
         format!(
@@ -100,6 +108,16 @@ impl Drop for Snapshot {
             let _ = tx.send(Cmd::DropClone(self.database.clone(), self.name.clone()));
         }
     }
+}
+
+/// The snapshot a subscription's history was read from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsedSnapshot {
+    /// `database.name`
+    pub clone: String,
+    /// When the table was paused for it: after the subscription started if it was taken for
+    /// it, before if an existing one was reused.
+    pub taken_at: SystemTime,
 }
 
 /// A snapshot in use. Hold it while reading the clone; the clone outlives no lease.
