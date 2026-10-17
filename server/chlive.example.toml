@@ -59,7 +59,7 @@
 ## Everything goes over HTTP(S): history, snapshots (made on this node) and the aggregate
 ## states chDB merges from.
 # url = "http://127.0.0.1:8123"
-## Reads history: SELECT on the tables and on their snapshots.
+## Reads history: SELECT on the tables, on their snapshots, and on system.tables (engines).
 # user = "chlive_ro"
 ## A password is given as is (password), from an env var (password_env) or from a file
 ## (password_file, trailing newline trimmed); one of them at most, none means empty.
@@ -98,6 +98,8 @@
 # format = "text"
 
 [tables]
+## Tables must be MergeTree or ReplacingMergeTree (read without FINAL: every version of a row);
+## other engines are refused.
 ## Which tables queries can use: "listed" (only [tables.<name>] below) or "all" (every table
 ## in `database`, the listed ones mapped as they say).
 # expose = "listed"

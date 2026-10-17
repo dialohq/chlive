@@ -106,6 +106,8 @@ pub struct TableRef {
     pub name: String,
     /// `FROM events e` / `FROM events AS e`.
     pub alias: Option<String>,
+    /// `FROM events FINAL`: where the word is.
+    pub final_span: Option<Span>,
     pub span: Span,
 }
 

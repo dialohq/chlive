@@ -18,6 +18,7 @@ let
     "events"
     "customers"
     "orders"
+    "products"
   ];
   # partitions per topic
   partitions = 3;

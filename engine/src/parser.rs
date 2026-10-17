@@ -708,17 +708,20 @@ impl Parser {
                 }
                 _ => return Err(self.expected("an alias for the table")),
             }
-        } else if let (TokenKind::Ident(a), false) =
-            (self.peek().kind.clone(), self.at_word("OFFSET"))
-        {
+        } else if let (TokenKind::Ident(a), false) = (
+            self.peek().kind.clone(),
+            self.at_word("OFFSET") || self.at_word("FINAL"),
+        ) {
             self.next();
             Some(a)
         } else {
             None
         };
+        let final_span = self.at_word("FINAL").then(|| self.next().span);
         Ok(TableRef {
             name,
             alias,
+            final_span,
             span: t.span,
         })
     }
@@ -893,6 +896,37 @@ mod tests {
                 .as_ref()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn final_after_the_table_and_its_alias() {
+        let from = |src: &str| {
+            parse(src)
+                .unwrap_or_else(|e| panic!("{}", e.render(src)))
+                .from
+        };
+        let f = from("select * from products final");
+        assert_eq!((f.alias, f.final_span), (None, Some(Span::new(23, 28))));
+        let f = from("select * from products p FINAL");
+        assert_eq!(
+            (f.alias.as_deref(), f.final_span),
+            (Some("p"), Some(Span::new(25, 30)))
+        );
+        let f = from("select * from products as p final where p.x = 1");
+        assert_eq!(f.alias.as_deref(), Some("p"));
+        assert!(f.final_span.is_some());
+        assert_eq!(from("select * from products").final_span, None);
+        // still a column name elsewhere
+        assert_eq!(columns("select final from t final"), ["final"]);
+        let q = parse("select * from o where c in (select c from p final)").unwrap();
+        let Some(Expr::InSubquery { query, .. }) = q.selection else {
+            panic!("a sub-query")
+        };
+        assert!(query.from.final_span.is_some());
+        assert_eq!(
+            error("select * from t final final"),
+            "expected end of query, found identifier `final` at 1:23"
+        );
     }
 
     #[test]

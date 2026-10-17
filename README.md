@@ -225,8 +225,18 @@ Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 - **Output.** Event rows are rendered the way ClickHouse renders rows.
 - **Tested.** The agreement test in `engine/tests/clickhouse.rs` checks, for 22 predicates, that three setups return the same rows: everything in history; everything from the stream; and half from each, split at the snapshot (real clones, with a stand-in for the pause server). `engine/tests/kafka.rs` produces events before, around and after subscribing, against the real Redpanda and ClickHouse, and checks that each arrives exactly once.
 
+### Table engines
+
+The binder reads each table's engine from `system.tables` (so the history user needs `SELECT` on it).
+- **`MergeTree`:** as described above. `FROM t FINAL` is accepted and changes nothing.
+- **`ReplacingMergeTree`:** read without FINAL, the way ClickHouse reads one without FINAL, i.e. like a MergeTree:
+  - History has the versions the snapshot holds, as many as merges have left; every new version, a deleted one too, comes as a new row. `explain` says so.
+  - `FINAL` isn't supported yet (an error); it comes query shape by query shape.
+  - Snapshots keep the engine with its version and is-deleted columns, so `FINAL` on a snapshot dedups as on the table.
+- **Any other engine** (`Collapsing`, `Summing`, `Aggregating`, `Distributed`, views, `Shared…` on ClickHouse Cloud, …): refused.
+
 The query goes through parser → binder → planner. The binder resolves FROM, then WHERE, then SELECT, in SQL's evaluation order:
-- **FROM:** the table must exist in ClickHouse and have a Kafka topic. Snapshots (`__chlive_snap_*`) aren't tables.
+- **FROM:** the table must exist in ClickHouse and have a Kafka topic. Snapshots (`__chlive_snap_*`) aren't tables. Its engine must be a `MergeTree` or a `ReplacingMergeTree` (or their `Replicated…` forms); anything else is refused. See [Table engines](#table-engines).
 - **SELECT:** listed columns must exist. `col AS name` renames a column in the output; a column can be selected more than once under different names, but output names must be unique. An alias can't be another column's name (in ClickHouse it would shadow that column in WHERE and ORDER BY) or start with `_` (Kafka columns and the engine's hidden fields). Aliases only name output columns: WHERE and ORDER BY refer to table columns.
 
 The planner selects only the needed columns from ClickHouse, and the stream decodes only the needed JSON keys of each event; the other keys are skipped unparsed. Hard-coded naming rules map table `t` to ClickHouse `default.t` and to topic `t`, and keep column names the same on both sides; columns starting with `_` are hidden.
@@ -453,7 +463,7 @@ The engine's dialect, in full (keywords are case-insensitive):
 
 ```
 SELECT * | select_item [, select_item ...]
-FROM table [[AS] alias]
+FROM table [[AS] alias] [FINAL]                              -- FINAL: MergeTree only, for now
 [WHERE condition]
 [GROUP BY column [, column ...]]
 [ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST] | order_item [ASC|DESC] [NULLS FIRST|LAST] [, ...]]
@@ -482,7 +492,7 @@ column      := [table_or_alias.]name
 name, table, alias := identifier | "identifier" | `identifier`
 ```
 
-- **Tables:** a table needs a ClickHouse table, ingested by one sink connector (known to the pause server) from a Kafka topic of the same name.
+- **Tables:** a table needs a ClickHouse table (a `MergeTree` or `ReplacingMergeTree`; see [Table engines](#table-engines)), ingested by one sink connector (known to the pause server) from a Kafka topic of the same name.
 - **Table aliases and qualified names:** `FROM events e` (or `AS e`); `e.user_id` or `events.user_id` anywhere a column goes. In a sub-query, an unqualified name is its own table's column first, then the outer query's.
 - **Aliases** only name output columns: WHERE and (plain queries') ORDER BY refer to table columns. Output names must be unique; an alias can't be another column's name or start with `_`.
 - **ORDER BY / LIMIT:** with `ORDER BY`, each insert lands at its index; without it, rows arrive in Kafka order per partition after the snapshot. `LIMIT` keeps the top N (with `ORDER BY`) or the latest N (without), deleting the rows that fall out. Without `LIMIT`, plain results only grow. `OFFSET m` starts after the top m (with `ORDER BY`; rows above shift the result) or holds back the newest m (without); see [OFFSET](#engine-custom-dialect).

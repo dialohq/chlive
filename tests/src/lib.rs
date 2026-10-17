@@ -64,7 +64,12 @@ pub fn config() -> Config {
             .unwrap_or_else(|_| "http://127.0.0.1:18123".into()),
         user: "chlive_ro".into(),
         password: "chlive_ro".into(),
-        tables: chlive_engine::rules::TablesConfig::listed(["events", "orders", "customers"]),
+        tables: chlive_engine::rules::TablesConfig::listed([
+            "events",
+            "orders",
+            "customers",
+            "products",
+        ]),
         kafka_brokers: std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:9092".into()),
         kafka_properties: Default::default(),
         metadata_refresh: chlive_engine::source::METADATA_REFRESH,

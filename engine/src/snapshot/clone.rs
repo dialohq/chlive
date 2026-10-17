@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 
 use super::SnapshotError;
+use crate::table_engine::TableEngine;
 
 #[async_trait]
 pub trait Cloner: Send + Sync {
@@ -84,20 +85,30 @@ impl Cloner for ClickHouseCloner {
     ) -> Result<(), SnapshotError> {
         let src = format!("{}.{}", ident(database), ident(source));
         let dst = format!("{}.{}", ident(clone_database), ident(clone));
-        // a replica must have every part the connector inserted before its offsets were read
-        let engine = self
+        let described = self
             .query(&format!(
-                "SELECT engine FROM system.tables WHERE database = {} AND name = {}",
+                "SELECT engine, engine_full FROM system.tables WHERE database = {} AND name = {} \
+                 FORMAT JSONCompactEachRow",
                 string(database),
                 string(source)
             ))
             .await?;
-        if engine.trim().starts_with("Replicated") {
+        let (name, full) = serde_json::from_str::<(String, String)>(described.trim())
+            .map_err(|e| SnapshotError(format!("ClickHouse: no engine for {src}: {e}")))?;
+        let engine = TableEngine::from_system(&name, &full);
+        let clone_engine = engine
+            .clone_engine()
+            .ok_or_else(|| SnapshotError(format!("can't snapshot a {engine} table ({src})")))?;
+        // a replica must have every part the connector inserted before its offsets were read
+        if TableEngine::is_replicated(&name) {
             self.query(&format!("SYSTEM SYNC REPLICA {src}")).await?;
         }
-        // `CREATE TABLE … CLONE AS` would do both, but the Replicated database engine lacks it
-        self.query(&format!("CREATE TABLE {dst} ENGINE = MergeTree AS {src}"))
-            .await?;
+        // `CREATE TABLE … CLONE AS` would do both, but the Replicated database engine lacks it;
+        // the clone keeps the table's keys, and a ReplacingMergeTree its version columns
+        self.query(&format!(
+            "CREATE TABLE {dst} ENGINE = {clone_engine} AS {src}"
+        ))
+        .await?;
         self.query(&format!(
             "ALTER TABLE {dst} ATTACH PARTITION ALL FROM {src}"
         ))

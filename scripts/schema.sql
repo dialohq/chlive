@@ -3,7 +3,8 @@
 -- inserts each message as one row into the table of the same name, and keeps its offsets in a
 -- KeeperMap table per connector, which the pause server reads when chlive snapshots a table.
 -- Assumptions:
---  * one Kafka message = one row (JSON), plain append-only MergeTree, no per-row Kafka offsets
+--  * one Kafka message = one row (JSON), no per-row Kafka offsets
+--  * MergeTree, or ReplacingMergeTree (products: each message a new version of a product)
 --  * a message that can't be inserted goes to the dead-letter queue (and its offset counts as
 --    ingested); chlive-engine skips messages it can't decode, so history and stream agree on
 --    malformed events either way
@@ -23,6 +24,11 @@ CREATE TABLE IF NOT EXISTS default.orders (
   ts DateTime64(3), order_id String, customer_id String, amount Float64
 ) ENGINE = MergeTree ORDER BY ts;
 
+-- The latest version of each product wins (with FINAL, or once merged); deleted = 1 removes it.
+CREATE TABLE IF NOT EXISTS default.products (
+  product_id String, name String, price Float64, version UInt64, deleted UInt8
+) ENGINE = ReplacingMergeTree(version, deleted) ORDER BY product_id;
+
 -- The sink's exactly-once state (the connectors' `zkDatabase` / `zkPath`), as continuous-backup
 -- creates it: per partition (`<topic>-<p>`), the offsets of the last insert and its state.
 CREATE TABLE IF NOT EXISTS default.chlive_sink_events_state
@@ -34,12 +40,17 @@ CREATE TABLE IF NOT EXISTS default.chlive_sink_customers_state
 CREATE TABLE IF NOT EXISTS default.chlive_sink_orders_state
   (key String, minOffset Int64, maxOffset Int64, state String)
   ENGINE = KeeperMap('/chlive-sink/orders') PRIMARY KEY key;
+CREATE TABLE IF NOT EXISTS default.chlive_sink_products_state
+  (key String, minOffset Int64, maxOffset Int64, state String)
+  ENGINE = KeeperMap('/chlive-sink/products') PRIMARY KEY key;
 
 -- Read-only user chlive-server's engine connects as (DESCRIBE and history, from snapshots).
 -- readonly=2: read-only, but per-query settings are allowed (the engine sends output formats).
 CREATE USER IF NOT EXISTS chlive_ro IDENTIFIED WITH plaintext_password BY 'chlive_ro'
   SETTINGS readonly = 2, max_execution_time = 60, max_memory_usage = 4000000000;
 GRANT SELECT ON default.* TO chlive_ro;
+-- each table's engine (MergeTree or ReplacingMergeTree)
+GRANT SELECT ON system.tables TO chlive_ro;
 
 -- The user chlive-server takes snapshots as: clones (`__chlive_snap_*`) of the tables, created
 -- next to them with CREATE TABLE … AS + ATTACH PARTITION ALL FROM, and dropped when replaced.

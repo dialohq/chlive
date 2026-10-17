@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::diff::Row;
+use crate::table_engine::TableEngine;
+use crate::types::quote_string;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryError {
@@ -26,6 +28,11 @@ pub struct DescribedColumn {
 #[async_trait]
 pub trait HistorySource: Send + Sync {
     async fn describe(&self, clickhouse_table: &str) -> Result<Vec<DescribedColumn>, HistoryError>;
+    /// The table's engine (fakes: a MergeTree).
+    async fn table_engine(&self, database: &str, table: &str) -> Result<TableEngine, HistoryError> {
+        let _ = (database, table);
+        Ok(TableEngine::MergeTree)
+    }
     async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError>;
 }
 
@@ -99,6 +106,25 @@ impl HistorySource for ClickHouseHttp {
                 Err(HistoryError::UnknownTable(clickhouse_table.to_string()))
             }
             other => other,
+        }
+    }
+
+    async fn table_engine(&self, database: &str, table: &str) -> Result<TableEngine, HistoryError> {
+        #[derive(Deserialize)]
+        struct Described {
+            engine: String,
+            engine_full: String,
+        }
+        let rows: Vec<Described> = self
+            .json_each_row(&format!(
+                "SELECT engine, engine_full FROM system.tables WHERE database = {} AND name = {}",
+                quote_string(database),
+                quote_string(table)
+            ))
+            .await?;
+        match rows.first() {
+            Some(d) => Ok(TableEngine::from_system(&d.engine, &d.engine_full)),
+            None => Err(HistoryError::UnknownTable(format!("{database}.{table}"))),
         }
     }
 

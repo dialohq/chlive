@@ -18,3 +18,4 @@ level = "info,chlive_server::hub=debug,chlive_server::store=debug"
 [tables.events]
 [tables.orders]
 [tables.customers]
+[tables.products]

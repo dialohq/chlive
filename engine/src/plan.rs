@@ -12,6 +12,7 @@ use crate::binder::{
 use crate::diff::Row;
 use crate::order::{KeyOrder, SortKey};
 use crate::rules::{quote_ident, TopicId};
+use crate::table_engine::TableEngine;
 use crate::types::quote_string;
 use crate::types::{decode, DecodeError, Type, Value};
 
@@ -20,6 +21,8 @@ pub struct Plan {
     pub table: String,
     /// What history snapshots are taken of: the ClickHouse table and its topic.
     pub source: crate::snapshot::SnapshotTable,
+    /// The table's engine; a ReplacingMergeTree is read without FINAL (every version).
+    pub engine: TableEngine,
     /// Output columns, in output order.
     pub columns: Vec<BoundColumn>,
     pub history: HistoryPlan,
@@ -40,6 +43,7 @@ pub struct SemiPlan {
     pub inner_topic: TopicId,
     /// The inner table, quoted (`db.t`), for explain and the cursor.
     pub inner_table: String,
+    pub inner_engine: TableEngine,
     /// Decodes the inner topic's events: the key (if any) and the filter's columns.
     pub inner_stream: StreamPlan,
     /// The inner key, in `inner_stream`'s decoded rows; `None`: an uncorrelated EXISTS, where
@@ -785,6 +789,12 @@ fn to_dialect(expr: &BoundExpr, table: &BoundTable) -> String {
     }
 }
 
+/// What explain says about a table's engine: nothing for a MergeTree.
+fn engine_note(engine: &TableEngine) -> Option<String> {
+    matches!(engine, TableEngine::Replacing { .. })
+        .then(|| format!("{engine}, read without FINAL: every version of a row"))
+}
+
 /// What `--explain` shows.
 impl std::fmt::Display for Plan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -797,6 +807,9 @@ impl std::fmt::Display for Plan {
             .map(|c| format!("{} {}", c.json_key, c.ty))
             .collect();
         writeln!(f, "table:   {}", self.table)?;
+        if let Some(note) = engine_note(&self.engine) {
+            writeln!(f, "engine:  {note}")?;
+        }
         writeln!(f, "columns: {}", columns.join(", "))?;
         if let Some(a) = &self.aggregate {
             let names: Vec<String> = a.columns.iter().map(|(n, t)| format!("{n} {t}")).collect();
@@ -869,6 +882,9 @@ impl std::fmt::Display for Plan {
                 s.condition("<inner snapshot>"),
                 s.inner_table
             )?;
+            if let Some(note) = engine_note(&s.inner_engine) {
+                writeln!(f, "         {}: {note}", s.inner_table)?;
+            }
             match s.keys_condition(&["…".into()]) {
                 Some(c) => writeln!(
                     f,
@@ -1099,6 +1115,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
     Plan {
         table: table.name.clone(),
         source: table.snapshot_table(),
+        engine: table.engine.clone(),
         columns,
         history,
         stream,
@@ -1150,6 +1167,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
         inner: inner.snapshot_table(),
         inner_topic: inner.topic.clone(),
         inner_table: inner.clickhouse_table.clone(),
+        inner_engine: inner.engine.clone(),
         inner_stream,
         inner_key: s.keys.map(|(_, ik)| ik),
         outer_key: s.keys.map(|(ok, _)| ok),
@@ -1219,6 +1237,7 @@ mod tests {
             database: "default".into(),
             clickhouse_name: "events".into(),
             topic: TopicId("events".into()),
+            engine: TableEngine::MergeTree,
             columns: vec![
                 col(0, "ts", "DateTime64(3)"),
                 col(1, "user_id", "String"),
@@ -1273,6 +1292,30 @@ mod tests {
             ["ts", "user_id", "latency_ms", "coupon"]
         );
         assert_eq!(p.stream.filter, Filter::All);
+    }
+
+    #[test]
+    fn explain_says_a_replacing_merge_tree_is_read_without_final() {
+        let explain = |engine| {
+            let mut b = bound(&[0], None);
+            b.table.engine = engine;
+            plan(&b).to_string()
+        };
+        assert!(!explain(TableEngine::MergeTree).contains("engine:"));
+        let replacing = TableEngine::Replacing {
+            ver: Some("version".into()),
+            is_deleted: None,
+        };
+        assert!(explain(replacing.clone()).contains(
+            "engine:  ReplacingMergeTree(version), read without FINAL: every version of a row\n"
+        ));
+        // the same result either way
+        let fp = |engine| {
+            let mut b = bound(&[0], None);
+            b.table.engine = engine;
+            crate::cursor::fingerprint(&plan(&b))
+        };
+        assert_eq!(fp(replacing), fp(TableEngine::MergeTree));
     }
 
     #[test]

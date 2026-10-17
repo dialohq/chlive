@@ -176,6 +176,12 @@ async fn rejections_over_websocket() -> Result<()> {
                     "SYNTAX_ERROR",
                     "HAVING is not supported yet",
                 ),
+                (
+                    "final",
+                    "select * from products final",
+                    "INVALID_QUERY",
+                    "FINAL on products (ReplacingMergeTree) isn't supported yet at 1:24",
+                ),
             ];
             for (id, sql, _, _) in &cases {
                 conn.subscribe(id, sql);
@@ -608,6 +614,145 @@ async fn semi_join_matches_clickhouse() -> Result<()> {
             let live = conn.result("exists").unwrap();
             assert!(live.error.is_none(), "{:?}", live.error);
             assert_eq!(multiset(&live.rows), multiset(&direct), "EXISTS");
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// (product_id, version, deleted) of each row.
+fn versions(rows: &[chlive_engine::diff::Row]) -> std::collections::BTreeSet<(String, u64, u64)> {
+    rows.iter()
+        .map(|r| {
+            let n = |k: &str| r[k].as_u64().unwrap_or_else(|| panic!("{k} in {r:?}"));
+            (
+                r["product_id"].as_str().unwrap().to_string(),
+                n("version"),
+                n("deleted"),
+            )
+        })
+        .collect()
+}
+
+/// A ReplacingMergeTree read without FINAL, like a MergeTree: the snapshot's versions (as many
+/// as merges left), then every new version as a new row. Its snapshots keep the engine, so FINAL
+/// on them dedups as on the table.
+#[tokio::test]
+async fn replacing_tables_read_like_merge_tree() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    // products of this run only
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let ids: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .map(|k| format!("p{run}-{k}"))
+        .collect();
+    let product = |id: &str, version: u64, deleted: u8| {
+        format!(
+            r#"{{"product_id":"{id}","name":"n","price":1.5,"version":{version},"deleted":{deleted}}}"#
+        )
+    };
+    let list = ids
+        .iter()
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql =
+        format!("select product_id, version, deleted from products where product_id in ({list})");
+    with_server(config(), |server| {
+        async move {
+            let products = producer::Producer::new(&config().kafka_brokers, "products")?;
+            let wait = |produced: std::collections::BTreeMap<i32, i64>| async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                loop {
+                    let have = ingested_from("products").await?;
+                    if produced.iter().all(|(p, o)| have.get(p).is_some_and(|h| h >= o)) {
+                        return anyhow::Ok(());
+                    }
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "products not ingested: {have:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            };
+            // two versions of each, before subscribing
+            let before: Vec<String> = ids
+                .iter()
+                .flat_map(|id| [product(id, 1, 0), product(id, 2, 0)])
+                .collect();
+            wait(products.produce_json(&before).await?).await?;
+
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("p", &sql);
+            // FINAL on a MergeTree changes nothing
+            conn.subscribe("orders", "select order_id from orders final");
+            conn.wait_ready(&["p", "orders"], Duration::from_secs(60)).await?;
+            let orders = conn.result("orders").unwrap();
+            assert!(orders.error.is_none(), "orders FINAL: {:?}", orders.error);
+
+            // the snapshot is a ReplacingMergeTree too, with the table's keys
+            let clones = clickhouse()
+                .fetch(
+                    "SELECT name, engine_full FROM system.tables WHERE database = 'chlive_snapshots' \
+                     AND startsWith(name, '__chlive_snap_products_')",
+                )
+                .await?;
+            let clone = clones.first().expect("a snapshot of products");
+            let engine_full = clone["engine_full"].as_str().unwrap();
+            assert!(
+                engine_full.starts_with("ReplacingMergeTree(version, deleted)")
+                    && engine_full.contains("ORDER BY product_id"),
+                "{engine_full}"
+            );
+            let latest = |table: String| {
+                let list = list.clone();
+                async move {
+                    clickhouse()
+                        .fetch(&format!(
+                            "SELECT product_id, version, deleted FROM {table} FINAL \
+                             WHERE product_id IN ({list})"
+                        ))
+                        .await
+                }
+            };
+            let final_rows = versions(&latest("default.products".into()).await?);
+            let clone_name = clone["name"].as_str().unwrap();
+            assert_eq!(
+                versions(&latest(format!("chlive_snapshots.`{clone_name}`")).await?),
+                final_rows,
+                "FINAL on the snapshot"
+            );
+            assert_eq!(final_rows.len(), 3, "{final_rows:?}");
+
+            // what merges left of the versions: at least the latest, at most all
+            let live = conn.result("p").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            let seen = versions(&live.rows);
+            let all: std::collections::BTreeSet<_> = ids
+                .iter()
+                .flat_map(|id| [(id.clone(), 1, 0), (id.clone(), 2, 0)])
+                .collect();
+            assert!(seen.is_superset(&final_rows), "{seen:?} lacks some of {final_rows:?}");
+            assert!(seen.is_subset(&all), "{seen:?} has more than {all:?}");
+
+            // new versions are new rows, a deleted one too (without FINAL)
+            let after = [product(&ids[0], 3, 0), product(&ids[1], 4, 1)];
+            wait(products.produce_json(&after).await?).await?;
+            conn.wait_quiet(Duration::from_millis(1000), Duration::from_secs(60))
+                .await?;
+            let live = conn.result("p").unwrap();
+            assert!(live.protocol_violations.is_empty(), "{:?}", live.protocol_violations);
+            let now = versions(&live.rows);
+            assert_eq!(live.rows.len(), seen.len() + 2, "{now:?}");
+            assert!(now.contains(&(ids[0].clone(), 2, 0)) && now.contains(&(ids[0].clone(), 3, 0)));
+            assert!(now.contains(&(ids[1].clone(), 4, 1)), "{now:?}");
             Ok(())
         }
         .boxed()

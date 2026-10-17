@@ -13,6 +13,7 @@ use crate::error::{render_at, Span};
 use crate::history::{HistoryError, HistorySource};
 use crate::rules::{NamingRules, TopicId};
 use crate::source::{EventSource, SourceError};
+use crate::table_engine::TableEngine;
 use crate::types::{Kind, LiteralError, Type, Value};
 
 /// What the binder can look things up in.
@@ -59,6 +60,8 @@ pub struct BoundTable {
     pub clickhouse_name: String,
     pub topic: TopicId,
     pub columns: Vec<BoundColumn>,
+    /// Its ClickHouse engine: a MergeTree or a ReplacingMergeTree (read without FINAL).
+    pub engine: TableEngine,
 }
 
 impl BoundTable {
@@ -1162,6 +1165,33 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
         }
         Err(e) => return Err(BindError::History(e)),
     };
+    let engine = catalog
+        .history
+        .table_engine(&database, &clickhouse_name)
+        .await
+        .map_err(BindError::History)?;
+    match (&engine, from.final_span) {
+        (TableEngine::Other(name), _) => {
+            return Err(BindError::at(
+                format!(
+                "table {} is a {name} table; chlive reads MergeTree and ReplacingMergeTree tables",
+                from.name
+            ),
+                from.span,
+            ))
+        }
+        (TableEngine::Replacing { .. }, Some(span)) => {
+            return Err(BindError::at(
+                format!(
+                    "FINAL on {} (ReplacingMergeTree) isn't supported yet",
+                    from.name
+                ),
+                span,
+            ))
+        }
+        // FINAL on a MergeTree: nothing to merge
+        _ => {}
+    }
     let topic = catalog.rules.topic(&from.name);
     if catalog
         .source
@@ -1209,6 +1239,7 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
         clickhouse_name,
         topic,
         columns,
+        engine,
     })
 }
 
@@ -1564,21 +1595,39 @@ mod tests {
                     col("parent", "Nullable(UUID)"),
                     col("user_id", "String"),
                 ]),
+                "default.products" => Ok(vec![
+                    col("product_id", "String"),
+                    col("version", "UInt64"),
+                    col("deleted", "UInt8"),
+                ]),
+                "default.ledger" => Ok(vec![col("user_id", "String"), col("sign", "Int8")]),
                 _ => Err(HistoryError::UnknownTable(table.into())),
             }
+        }
+        async fn table_engine(&self, _: &str, table: &str) -> Result<TableEngine, HistoryError> {
+            Ok(match table {
+                "products" => TableEngine::Replacing {
+                    ver: Some("version".into()),
+                    is_deleted: Some("deleted".into()),
+                },
+                "ledger" => TableEngine::Other("CollapsingMergeTree".into()),
+                _ => TableEngine::MergeTree,
+            })
         }
         async fn fetch(&self, _sql: &str) -> Result<Vec<Row>, HistoryError> {
             unreachable!("the binder never fetches")
         }
     }
 
-    /// Only `events`, `plain` and `sessions` have a stream.
+    /// Only `events`, `plain`, `sessions`, `products` and `ledger` have a stream.
     fn topics() -> MemorySource {
         let mut source = MemorySource::new();
         source
             .partition("events", 0)
             .partition("plain", 0)
-            .partition("sessions", 0);
+            .partition("sessions", 0)
+            .partition("products", 0)
+            .partition("ledger", 0);
         source
     }
 
@@ -1608,6 +1657,48 @@ mod tests {
 
     fn configured(tables: serde_json::Value) -> ConfiguredRules {
         ConfiguredRules::new(serde_json::from_value(tables).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn replacing_merge_trees_are_read_without_final_and_other_engines_refused() {
+        let q = bind_sql("select product_id, version from products")
+            .await
+            .unwrap();
+        assert!(matches!(q.table.engine, TableEngine::Replacing { .. }));
+        assert_eq!(
+            bind_sql("select * from products p final")
+                .await
+                .unwrap_err(),
+            "FINAL on products (ReplacingMergeTree) isn't supported yet at 1:26"
+        );
+        // FINAL on a MergeTree changes nothing
+        let plain = bind_sql("select ts from events where latency_ms > 5")
+            .await
+            .unwrap();
+        let final_ = bind_sql("select ts from events final where latency_ms > 5")
+            .await
+            .unwrap();
+        assert_eq!(final_, plain);
+        assert_eq!(
+            bind_sql("select * from ledger").await.unwrap_err(),
+            "table ledger is a CollapsingMergeTree table; chlive reads MergeTree and \
+             ReplacingMergeTree tables at 1:15"
+        );
+        assert_eq!(
+            bind_sql("select ts from events where user_id in (select user_id from ledger)")
+                .await
+                .unwrap_err(),
+            "table ledger is a CollapsingMergeTree table; chlive reads MergeTree and \
+             ReplacingMergeTree tables at 1:61"
+        );
+        assert_eq!(
+            bind_sql(
+                "select ts from events where user_id in (select product_id from products final)"
+            )
+            .await
+            .unwrap_err(),
+            "FINAL on products (ReplacingMergeTree) isn't supported yet at 1:73"
+        );
     }
 
     #[tokio::test]
