@@ -9,7 +9,7 @@
 
 use std::cmp::Ordering;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{json, Value as Json};
 
@@ -50,6 +50,158 @@ impl KeyOrder {
             }
         }
         Ordering::Equal
+    }
+}
+
+/// One ranked row: its sort key, and `seq`, when it got that key (ties: later goes after).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub key: SortKey,
+    pub seq: u64,
+    pub id: String,
+}
+
+/// Rows with ids, in ORDER BY order: an id's index found by a binary search on its (key, seq),
+/// which are unique. A row placed (new, or with a new key) goes after the rows it ties with.
+/// Inserting, removing and moving shift the list (O(n)), as applying the diff does on a client.
+#[derive(Debug, Clone)]
+pub struct Ranking {
+    order: KeyOrder,
+    ranked: Vec<Entry>,
+    keys: HashMap<String, (SortKey, u64)>,
+    seq: u64,
+}
+
+impl Ranking {
+    pub fn new(order: KeyOrder) -> Self {
+        Self {
+            order,
+            ranked: Vec::new(),
+            keys: HashMap::new(),
+            seq: 0,
+        }
+    }
+
+    pub fn order(&self) -> &KeyOrder {
+        &self.order
+    }
+
+    /// The history: rows in arrival order, ranked by (key, arrival). Sorted once, rather than
+    /// placed one at a time (which would shift the list on every row, O(n²)); when they
+    /// arrive in order already, the order stays.
+    pub fn history(&mut self, rows: impl IntoIterator<Item = (String, SortKey)>) {
+        debug_assert!(self.ranked.is_empty(), "history comes first");
+        let mut entries: Vec<Entry> = rows
+            .into_iter()
+            .map(|(id, key)| {
+                self.seq += 1;
+                Entry {
+                    key,
+                    seq: self.seq,
+                    id,
+                }
+            })
+            .collect();
+        let order = &self.order;
+        entries.sort_by(|a, b| order.cmp(&a.key, &b.key).then(a.seq.cmp(&b.seq)));
+        for e in &entries {
+            self.keys.insert(e.id.clone(), (e.key.clone(), e.seq));
+        }
+        self.ranked = entries;
+    }
+
+    /// Rank a row by `key`, after the rows it ties with; its index.
+    pub fn place(&mut self, id: &str, key: SortKey) -> usize {
+        self.seq += 1;
+        let seq = self.seq;
+        let at = self
+            .ranked
+            .partition_point(|e| self.cmp(&key, seq, e) == Ordering::Greater);
+        self.keys.insert(id.to_string(), (key.clone(), seq));
+        self.ranked.insert(
+            at,
+            Entry {
+                key,
+                seq,
+                id: id.to_string(),
+            },
+        );
+        at
+    }
+
+    /// Take a row out; where it was.
+    pub fn remove(&mut self, id: &str) -> Option<usize> {
+        let at = self.position(id)?;
+        self.ranked.remove(at);
+        self.keys.remove(id);
+        Some(at)
+    }
+
+    /// Where a row is.
+    pub fn position(&self, id: &str) -> Option<usize> {
+        let (key, seq) = self.keys.get(id)?;
+        let at = self
+            .ranked
+            .partition_point(|e| self.cmp(key, *seq, e) == Ordering::Greater);
+        debug_assert_eq!(self.ranked[at].id, id);
+        Some(at)
+    }
+
+    /// A row's sort key.
+    pub fn key(&self, id: &str) -> Option<&SortKey> {
+        self.keys.get(id).map(|(k, _)| k)
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Entry> {
+        self.ranked.get(index)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
+        self.ranked.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranked.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranked.is_empty()
+    }
+
+    fn cmp(&self, a: &SortKey, a_seq: u64, b: &Entry) -> Ordering {
+        self.order.cmp(a, &b.key).then(a_seq.cmp(&b.seq))
+    }
+
+    /// For a checkpoint: `{"ranked": [[id, key, seq], …], "seq": n}`.
+    pub fn save(&self) -> Json {
+        let ranked: Vec<Json> = self
+            .ranked
+            .iter()
+            .map(|e| json!([e.id, save_key(&e.key), e.seq]))
+            .collect();
+        json!({ "ranked": ranked, "seq": self.seq })
+    }
+
+    /// Back to a saved ranking (of the same ORDER BY): the fields of `json` [`Self::save`] wrote.
+    pub fn load(&mut self, json: &Json) -> Result<(), String> {
+        let bad = |what: &str| format!("checkpoint: bad ranking ({what})");
+        let mut ranked = Vec::new();
+        let mut keys = HashMap::new();
+        for e in json["ranked"].as_array().ok_or_else(|| bad("ranked"))? {
+            let id = e
+                .get(0)
+                .and_then(Json::as_str)
+                .ok_or_else(|| bad("id"))?
+                .to_string();
+            let key = load_key(e.get(1).ok_or_else(|| bad("key"))?)?;
+            let seq = e.get(2).and_then(Json::as_u64).ok_or_else(|| bad("seq"))?;
+            keys.insert(id.clone(), (key.clone(), seq));
+            ranked.push(Entry { key, seq, id });
+        }
+        self.seq = json["seq"].as_u64().ok_or_else(|| bad("seq"))?;
+        self.ranked = ranked;
+        self.keys = keys;
+        Ok(())
     }
 }
 
@@ -691,6 +843,71 @@ mod tests {
                 let got: Vec<i64> = list.iter().map(|r| r["n"].as_i64().unwrap()).collect();
                 assert_eq!(got, want, "offset {offset}, limit {limit:?}");
             }
+        }
+    }
+
+    fn ids(r: &Ranking) -> Vec<&str> {
+        r.iter().map(|e| e.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_ranking_places_rows_after_their_ties() {
+        let mut r = Ranking::new(order(&[(false, false)]));
+        // the history keeps arrival order within ties
+        r.history([
+            ("a".into(), int(2)),
+            ("b".into(), int(1)),
+            ("c".into(), int(2)),
+        ]);
+        assert_eq!(ids(&r), ["b", "a", "c"]);
+        assert_eq!(r.place("d", int(2)), 3);
+        assert_eq!(r.place("e", int(0)), 0);
+        assert_eq!(ids(&r), ["e", "b", "a", "c", "d"]);
+        // a move: out, then after its new ties
+        assert_eq!(r.remove("b"), Some(1));
+        assert_eq!(r.place("b", int(2)), 4);
+        assert_eq!(ids(&r), ["e", "a", "c", "d", "b"]);
+        assert_eq!((r.position("c"), r.key("c")), (Some(2), Some(&int(2))));
+        assert_eq!(r.remove("nope"), None);
+        // a checkpoint keeps the order within ties
+        let mut back = Ranking::new(order(&[(false, false)]));
+        back.load(&serde_json::from_str(&r.save().to_string()).unwrap())
+            .unwrap();
+        assert_eq!(ids(&back), ids(&r));
+        assert_eq!(back.place("f", int(2)), r.place("f", int(2)));
+    }
+
+    /// Every row's position is where it is, through random places, moves and removes.
+    #[test]
+    fn a_ranking_finds_its_rows() {
+        let mut seed: u64 = 3;
+        let mut rand = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut r = Ranking::new(order(&[(true, false)]));
+        for i in 0..2000 {
+            let id = format!("r{}", rand(60));
+            match rand(3) {
+                0 => {
+                    r.remove(&id);
+                }
+                _ => {
+                    r.remove(&id);
+                    r.place(&id, int(rand(10) as i128));
+                }
+            }
+            for (at, e) in r.iter().enumerate() {
+                assert_eq!(r.position(&e.id), Some(at), "step {i}");
+            }
+            let keys: Vec<&SortKey> = r.iter().map(|e| &e.key).collect();
+            assert!(
+                keys.windows(2)
+                    .all(|w| r.order().cmp(w[0], w[1]) != Ordering::Greater),
+                "step {i}: out of order"
+            );
         }
     }
 }

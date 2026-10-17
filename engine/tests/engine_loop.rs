@@ -131,6 +131,11 @@ impl HistorySource for FakeHistory {
              FROM default.products FINAL WHERE price > 2" => Ok(vec![row(
                 json!({"product_id": "a", "price": 5, "__key_0": "a", "__ver": 1}),
             )]),
+            "SELECT product_id, price, product_id AS __key_0, version AS __ver \
+             FROM default.products FINAL ORDER BY price DESC NULLS LAST" => Ok(vec![
+                row(json!({"product_id": "a", "price": 5, "__key_0": "a", "__ver": 1})),
+                row(json!({"product_id": "b", "price": 3, "__key_0": "b", "__ver": 1})),
+            ]),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -661,6 +666,46 @@ async fn final_replaces_each_keys_row_with_its_latest_version() {
             "products/0:5 - [\"a\"]",
             "products/0:6 - [\"b\"]",
             "products/0:7 + [\"a\"] {\"product_id\":\"a\",\"price\":4}",
+        ]
+    );
+}
+
+/// FINAL with ORDER BY: rows are inserted at their places, and move (an update with an index)
+/// when a new version changes their sort values.
+#[tokio::test]
+async fn final_rows_move_as_their_versions_change() {
+    let mut source = MemorySource::new();
+    let p = |id: &str, price: u32, version: u64, deleted: u8| {
+        format!(
+            r#"{{"product_id": "{id}", "price": {price}, "version": {version}, "deleted": {deleted}}}"#
+        )
+    };
+    source
+        .push("products", 0, p("a", 5, 1, 0)) // offset 0: history (a 5, b 3)
+        .push("products", 0, p("c", 4, 1, 0)) // between them
+        .push("products", 0, p("a", 5, 2, 0)) // the same price: stays
+        .push("products", 0, p("b", 9, 2, 0)) // to the top
+        .push("products", 0, p("c", 4, 2, 1)) // deleted
+        .push("products", 0, p("a", 1, 3, 0)); // already last: no move
+    let sql = "select product_id, price from products final order by price desc";
+    let lines: Vec<String> = engine(source)
+        .with_max_batch(1)
+        .subscribe(sql)
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines,
+        [
+            "+ [\"a\"] {\"product_id\":\"a\",\"price\":5}\n\
+             + [\"b\"] {\"product_id\":\"b\",\"price\":3}\nhistory: 2 rows",
+            "products/0:1 + @1 [\"c\"] {\"product_id\":\"c\",\"price\":4}",
+            "products/0:2 ~ [\"a\"] {\"product_id\":\"a\",\"price\":5}",
+            "products/0:3 ~ [\"b\"] @0 {\"product_id\":\"b\",\"price\":9}",
+            "products/0:4 - [\"c\"]",
+            "products/0:5 ~ [\"a\"] {\"product_id\":\"a\",\"price\":1}",
         ]
     );
 }

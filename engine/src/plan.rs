@@ -994,11 +994,13 @@ impl std::fmt::Display for Plan {
             Filter::Where { text, .. } => write!(f, "filter:  {text}")?,
         }
         if let Some(order) = &self.stream.order {
-            write!(
-                f,
-                "\norder:   {} (a new row goes after the last row it ties with)",
-                order.text
-            )?;
+            let how = if self.stream.keyed.is_some() {
+                "rows move as new versions change their values; a moved or new row goes after \
+                 the rows it ties with"
+            } else {
+                "a new row goes after the last row it ties with"
+            };
+            write!(f, "\norder:   {} ({how})", order.text)?;
         }
         match (self.stream.limit, &self.stream.order) {
             (Some(n), Some(_)) => write!(
@@ -1483,6 +1485,22 @@ mod tests {
             keyed.event(&decoded),
             ("[\"u1\"]".into(), Value::Int(6), false)
         );
+
+        // ORDER BY an unselected column: its hidden field comes before the key's
+        b.order = vec![OrderKey {
+            column: ColumnId(3),
+            desc: true,
+            nulls_first: false,
+        }];
+        let p = plan(&b);
+        assert_eq!(
+            p.history.sql("db.snap"),
+            "SELECT ts, latency_ms, coupon AS __order_0, user_id AS __key_0, latency_ms AS __ver \
+             FROM db.snap FINAL ORDER BY coupon DESC NULLS LAST"
+        );
+        assert!(p.to_string().contains(
+            "order:   coupon DESC NULLS LAST (rows move as new versions change their values"
+        ));
     }
 
     #[test]

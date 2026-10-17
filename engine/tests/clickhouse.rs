@@ -1318,12 +1318,58 @@ async fn final_matches_clickhouse() {
             )
         })
         .collect();
-    const CASES: &[&str] = &[
-        "select * from products final",
-        "select product_id, price from products final where price > 50",
-        "select name, version from products final where price < 30 or product_id = 'k3'",
-        "select product_id from products final where deleted = 0 and price >= 10",
+    // (query, the output columns it's ordered by: compared in order, tie groups as sets)
+    const CASES: &[(&str, &[&str])] = &[
+        ("select * from products final", &[]),
+        (
+            "select product_id, price from products final where price > 50",
+            &[],
+        ),
+        (
+            "select name, version from products final where price < 30 or product_id = 'k3'",
+            &[],
+        ),
+        (
+            "select product_id from products final where deleted = 0 and price >= 10",
+            &[],
+        ),
+        // ordered: rows move as their versions change their sort values
+        (
+            "select product_id, price from products final order by price desc, product_id",
+            &["price", "product_id"],
+        ),
+        (
+            "select product_id, version from products final where price > 20 order by version",
+            &["version"],
+        ),
+        (
+            "select name, price from products final order by price nulls first",
+            &["price"],
+        ),
+        // by a hidden column: the order isn't visible in the rows, only the set
+        (
+            "select product_id from products final order by version desc",
+            &[],
+        ),
     ];
+    // rows in order, each tie group (by the ordered columns) as a sorted set
+    let tie_groups =
+        |rows: &[chlive_engine::diff::Row], keys: &[&str]| -> Vec<(String, Vec<String>)> {
+            let mut out: Vec<(String, Vec<String>)> = Vec::new();
+            for r in rows {
+                let key: Vec<String> = keys.iter().map(|k| r[*k].to_string()).collect();
+                let key = key.join("|");
+                let text = serde_json::Value::Object(r.clone()).to_string();
+                match out.last_mut() {
+                    Some((last, rs)) if *last == key => rs.push(text),
+                    _ => out.push((key, vec![text])),
+                }
+            }
+            for (_, rs) in &mut out {
+                rs.sort();
+            }
+            out
+        };
     let mut engines = Vec::new();
     for (database, in_clickhouse) in [
         ("chlive_engine_final_history", events.len()),
@@ -1364,7 +1410,7 @@ async fn final_matches_clickhouse() {
         v.sort();
         v
     };
-    for sql in CASES {
+    for (sql, keys) in CASES {
         use chlive_engine::history::HistorySource;
         let want = direct
             .fetch(&sql.replace("from products", "from chlive_engine_final_history.products"))
@@ -1397,6 +1443,13 @@ async fn final_matches_clickhouse() {
                 }
             }
             assert_eq!(canon(&list.rows), canon(&want), "{database}: {sql}");
+            if !keys.is_empty() {
+                assert_eq!(
+                    tie_groups(&list.rows, keys),
+                    tie_groups(&want, keys),
+                    "{database}: {sql}: order"
+                );
+            }
             if *database == "chlive_engine_final_stream" {
                 assert!(
                     updates > 0 && deletes > 0,

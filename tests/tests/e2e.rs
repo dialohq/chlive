@@ -178,9 +178,9 @@ async fn rejections_over_websocket() -> Result<()> {
                 ),
                 (
                     "final",
-                    "select * from products final order by version",
+                    "select * from products final limit 5",
                     "INVALID_QUERY",
-                    "FINAL on products (ReplacingMergeTree) with ORDER BY isn't supported yet at 1:24",
+                    "FINAL on products (ReplacingMergeTree) with LIMIT isn't supported yet at 1:24",
                 ),
             ];
             for (id, sql, _, _) in &cases {
@@ -784,6 +784,8 @@ async fn final_results_match_clickhouse() -> Result<()> {
         "select product_id, price, version from products final \
          where product_id in ({list}) and price > 20"
     );
+    // the same, ordered: rows move as their prices change
+    let ordered = format!("{sql} order by price desc");
     // each product: versions that only grow, prices in and out of the WHERE, some deleted
     let versions = move |round: u64| -> Vec<(String, String)> {
         ids.iter()
@@ -826,7 +828,9 @@ async fn final_results_match_clickhouse() -> Result<()> {
             }
             let conn = LiveConn::connect(server).await?;
             conn.subscribe("f", &sql);
-            conn.wait_ready(&["f"], Duration::from_secs(60)).await?;
+            conn.subscribe("ordered", &ordered);
+            conn.wait_ready(&["f", "ordered"], Duration::from_secs(60))
+                .await?;
             for round in 4..=9 {
                 wait(products.produce_keyed(&versions(round)).await?).await?;
             }
@@ -852,6 +856,21 @@ async fn final_results_match_clickhouse() -> Result<()> {
             );
             assert!(live.updated > 0 && live.deleted > 0);
             assert_eq!(multiset(&live.rows), multiset(&direct));
+            let live = conn.result("ordered").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert!(
+                live.protocol_violations.is_empty(),
+                "{:?}",
+                live.protocol_violations
+            );
+            let direct = clickhouse()
+                .fetch(&ordered.replace("from products", "from default.products"))
+                .await?;
+            assert_eq!(
+                tie_groups(&live.rows, &["price"]),
+                tie_groups(&direct, &["price"]),
+                "ordered"
+            );
             Ok(())
         }
         .boxed()

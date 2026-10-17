@@ -1336,8 +1336,6 @@ fn check_final_shape(query: &Query, table: &BoundTable) -> Result<(), BindError>
     };
     let what = if query.group_by.is_some() {
         "GROUP BY"
-    } else if query.order.is_some() {
-        "ORDER BY"
     } else if query.limit.is_some() {
         "LIMIT"
     } else if offset_of(query).is_some() {
@@ -1884,9 +1882,15 @@ mod tests {
                 "FINAL on products (ReplacingMergeTree) with {what} isn't supported yet at {at}"
             )
         };
+        // ORDER BY is followed, LIMIT not yet
+        assert!(
+            bind_sql("select * from products final order by version desc")
+                .await
+                .is_ok()
+        );
         assert_eq!(
-            err("select * from products final order by version").await,
-            unsupported("ORDER BY", "1:24")
+            err("select * from products final order by version limit 5").await,
+            unsupported("LIMIT", "1:24")
         );
         assert_eq!(
             err("select * from products final limit 5").await,

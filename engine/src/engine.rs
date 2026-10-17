@@ -1012,7 +1012,7 @@ impl ResultState {
 
     pub(crate) fn for_plan(plan: &StreamPlan) -> Self {
         if plan.keyed.is_some() {
-            return Self::Keyed(KeyedState::default());
+            return Self::Keyed(KeyedState::new(plan.order.as_ref().map(|o| o.keys.clone())));
         }
         match (&plan.order, plan.limit, plan.offset) {
             (Some(o), limit, Some(m)) => Self::Offset(OffsetState::new(o.keys.clone(), m, limit)),
@@ -1061,8 +1061,15 @@ impl ResultState {
         match (self, &plan.keyed) {
             (ResultState::Keyed(state), Some(keyed)) => {
                 let (id, ver, deleted) = keyed.event(row);
+                let key = plan
+                    .order
+                    .as_ref()
+                    .map(|o| o.event_key(row))
+                    .unwrap_or_default();
                 state
-                    .event(id, ver, deleted, plan.matches(row), || plan.project(row))
+                    .event(id, ver, key, deleted, plan.matches(row), || {
+                        plan.project(row)
+                    })
                     .into_iter()
                     .collect()
             }
@@ -1105,15 +1112,20 @@ pub(crate) fn history_iteration(
             rows = shown;
         }
         (ResultState::Held(w), _) => rows = w.history(rows),
-        (ResultState::Keyed(state), _) => {
+        (ResultState::Keyed(state), order) => {
             let keyed = plan.keyed.as_ref().expect("a keyed plan");
-            let diffs = rows
+            let rows = rows
                 .into_iter()
                 .map(|mut row| {
+                    let key = match order {
+                        Some(o) => o.history_key(&mut row).map_err(bad_history_row)?,
+                        None => Vec::new(),
+                    };
                     let (id, ver) = keyed.history_row(&mut row).map_err(bad_history_row)?;
-                    Ok(state.history(id, ver, row))
+                    Ok((id, ver, key, row))
                 })
                 .collect::<Result<_, EngineError>>()?;
+            let diffs = state.history(rows);
             return Ok(Iteration {
                 origin: Origin::History,
                 diffs,

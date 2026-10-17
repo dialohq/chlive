@@ -21,7 +21,7 @@ use serde_json::Value as Json;
 
 use crate::binder::{ColumnId, OrderKey};
 use crate::diff::{Diff, Row};
-use crate::order::{KeyOrder, SortKey};
+use crate::order::{KeyOrder, Ranking, SortKey};
 use crate::types::{decode, Type, Value};
 
 /// An ORDER BY term of an aggregated result: the row column holding its value.
@@ -33,30 +33,19 @@ pub struct GroupOrderTerm {
     pub nulls_first: bool,
 }
 
-struct Entry {
-    key: SortKey,
-    /// Ties are broken by when the group got its key: later goes after.
-    seq: u64,
-    id: String,
-}
-
 pub struct GroupResult {
     terms: Vec<GroupOrderTerm>,
-    order: KeyOrder,
     limit: usize,
     /// The window starts after this many groups (OFFSET).
     offset: usize,
     /// Columns computed only to order by (`__o0`, …), never sent.
     hidden: Vec<String>,
     /// Every group, in result order.
-    ranked: Vec<Entry>,
-    /// Each group's place in `ranked`: its key and seq.
-    keys: HashMap<String, (SortKey, u64)>,
+    ranking: Ranking,
     /// Each group's latest row (without hidden columns).
     rows: HashMap<String, Row>,
     /// What the client has: the rows of the groups in the result, as sent.
     sent: HashMap<String, Row>,
-    seq: u64,
 }
 
 impl GroupResult {
@@ -79,15 +68,12 @@ impl GroupResult {
         );
         Self {
             terms,
-            order,
             limit: limit.map_or(usize::MAX, |n| n as usize),
             offset: offset.map_or(0, |m| m as usize),
             hidden,
-            ranked: Vec::new(),
-            keys: HashMap::new(),
+            ranking: Ranking::new(order),
             rows: HashMap::new(),
             sent: HashMap::new(),
-            seq: 0,
         }
     }
 
@@ -97,35 +83,16 @@ impl GroupResult {
 
     /// The ranking, every group's row and what was sent, for a checkpoint.
     pub fn save(&self) -> Json {
-        let ranked: Vec<Json> = self
-            .ranked
-            .iter()
-            .map(|e| serde_json::json!([e.id, crate::order::save_key(&e.key), e.seq]))
-            .collect();
-        serde_json::json!({
-            "ranked": ranked,
-            "rows": self.rows,
-            "sent": self.sent,
-            "seq": self.seq,
-        })
+        let mut json = self.ranking.save();
+        json["rows"] = serde_json::json!(self.rows);
+        json["sent"] = serde_json::json!(self.sent);
+        json
     }
 
     /// Back to a saved ranking (this one made by [`GroupResult::new`] for the same query).
     pub fn load(&mut self, json: &Json) -> Result<(), String> {
         let bad = |what: &str| format!("checkpoint: bad group result ({what})");
-        let mut ranked = Vec::new();
-        let mut keys = HashMap::new();
-        for e in json["ranked"].as_array().ok_or_else(|| bad("ranked"))? {
-            let id = e
-                .get(0)
-                .and_then(Json::as_str)
-                .ok_or_else(|| bad("id"))?
-                .to_string();
-            let key = crate::order::load_key(e.get(1).ok_or_else(|| bad("key"))?)?;
-            let seq = e.get(2).and_then(Json::as_u64).ok_or_else(|| bad("seq"))?;
-            keys.insert(id.clone(), (key.clone(), seq));
-            ranked.push(Entry { key, seq, id });
-        }
+        self.ranking.load(json)?;
         let rows = |name: &str| -> Result<HashMap<String, Row>, String> {
             json[name]
                 .as_object()
@@ -136,9 +103,6 @@ impl GroupResult {
         };
         self.rows = rows("rows")?;
         self.sent = rows("sent")?;
-        self.seq = json["seq"].as_u64().ok_or_else(|| bad("seq"))?;
-        self.ranked = ranked;
-        self.keys = keys;
         Ok(())
     }
 
@@ -148,26 +112,15 @@ impl GroupResult {
     /// The groups are sorted once by (key, arrival), the order [`Self::place`] keeps: placing
     /// them one at a time would shift the list on every insert, O(groups²).
     pub fn history(&mut self, groups: Vec<(String, Row)>) -> Vec<Diff> {
-        debug_assert!(self.ranked.is_empty(), "history comes first");
-        let mut entries = Vec::with_capacity(groups.len());
+        let mut keys = Vec::with_capacity(groups.len());
         for (id, row) in groups {
             let (key, row) = self.split(row);
-            self.seq += 1;
             self.rows.insert(id.clone(), row);
-            entries.push(Entry {
-                key,
-                seq: self.seq,
-                id,
-            });
+            keys.push((id, key));
         }
-        let order = &self.order;
-        entries.sort_by(|a, b| order.cmp(&a.key, &b.key).then(a.seq.cmp(&b.seq)));
-        for e in &entries {
-            self.keys.insert(e.id.clone(), (e.key.clone(), e.seq));
-        }
-        self.ranked = entries;
+        self.ranking.history(keys);
         let mut diffs = Vec::new();
-        for e in self.ranked.iter().skip(self.offset).take(self.limit) {
+        for e in self.ranking.iter().skip(self.offset).take(self.limit) {
             let row = self.rows[&e.id].clone();
             self.sent.insert(e.id.clone(), row.clone());
             diffs.push(Diff::Insert {
@@ -193,18 +146,16 @@ impl GroupResult {
             return self.touch_window(id, row, diffs);
         }
         let (key, row) = self.split(row);
-        let old = self.position(&id);
-        let moved = match old {
-            Some(p) => self.order.cmp(&self.ranked[p].key, &key) != Ordering::Equal,
+        let old = self.ranking.position(&id);
+        let moved = match self.ranking.key(&id) {
+            Some(k) => self.ranking.order().cmp(k, &key) != Ordering::Equal,
             None => true,
         };
         if moved {
-            if let Some(p) = old {
-                self.ranked.remove(p);
-            }
-            self.place(&id, key);
+            self.ranking.remove(&id);
+            self.ranking.place(&id, key);
         }
-        let new = self.position(&id).expect("just placed");
+        let new = self.ranking.position(&id).expect("just placed");
         self.rows.insert(id.clone(), row.clone());
         let n = self.limit;
         let ordered = self.ordered();
@@ -231,7 +182,7 @@ impl GroupResult {
                     index: old.expect("a sent group is ranked"),
                 });
                 self.sent.remove(&id);
-                if let Some(next) = self.ranked.get(n - 1).map(|e| e.id.clone()) {
+                if let Some(next) = self.ranking.get(n - 1).map(|e| e.id.clone()) {
                     let row = self.rows[&next].clone();
                     self.sent.insert(next.clone(), row.clone());
                     diffs.push(Diff::Insert {
@@ -249,7 +200,7 @@ impl GroupResult {
                     id: Some(id),
                 });
                 // the group pushed past the LIMIT goes
-                if let Some(out) = self.ranked.get(n).map(|e| e.id.clone()) {
+                if let Some(out) = self.ranking.get(n).map(|e| e.id.clone()) {
                     if self.sent.remove(&out).is_some() {
                         diffs.push(Diff::Delete { index: n });
                     }
@@ -261,7 +212,7 @@ impl GroupResult {
 
     /// The ids in the window, in order.
     fn window(&self) -> Vec<String> {
-        self.ranked
+        self.ranking
             .iter()
             .skip(self.offset)
             .take(self.limit)
@@ -277,16 +228,13 @@ impl GroupResult {
         use std::collections::HashSet;
         let before = self.window();
         let (key, row) = self.split(row);
-        let old = self.position(&id);
-        let moved = match old {
-            Some(p) => self.order.cmp(&self.ranked[p].key, &key) != Ordering::Equal,
+        let moved = match self.ranking.key(&id) {
+            Some(k) => self.ranking.order().cmp(k, &key) != Ordering::Equal,
             None => true,
         };
         if moved {
-            if let Some(p) = old {
-                self.ranked.remove(p);
-            }
-            self.place(&id, key);
+            self.ranking.remove(&id);
+            self.ranking.place(&id, key);
         }
         self.rows.insert(id.clone(), row);
         let after = self.window();
@@ -354,38 +302,6 @@ impl GroupResult {
             row.shift_remove(h);
         }
         (key, row)
-    }
-
-    fn cmp(&self, a: &SortKey, a_seq: u64, b: &Entry) -> Ordering {
-        self.order.cmp(a, &b.key).then(a_seq.cmp(&b.seq))
-    }
-
-    /// Rank a group by `key`, after the groups it ties with.
-    fn place(&mut self, id: &str, key: SortKey) {
-        self.seq += 1;
-        let seq = self.seq;
-        let at = self
-            .ranked
-            .partition_point(|e| self.cmp(&key, seq, e) == Ordering::Greater);
-        self.keys.insert(id.to_string(), (key.clone(), seq));
-        self.ranked.insert(
-            at,
-            Entry {
-                key,
-                seq,
-                id: id.to_string(),
-            },
-        );
-    }
-
-    /// Where a group is in `ranked`: a binary search by its (key, seq), which are unique.
-    fn position(&self, id: &str) -> Option<usize> {
-        let (key, seq) = self.keys.get(id)?;
-        let at = self
-            .ranked
-            .partition_point(|e| self.cmp(key, *seq, e) == Ordering::Greater);
-        debug_assert_eq!(self.ranked[at].id, id);
-        Some(at)
     }
 }
 
@@ -480,6 +396,25 @@ mod tests {
         );
     }
 
+    /// The ranking moved into `order::Ranking`; checkpoints keep their fields, so the ones
+    /// already on disk still load.
+    #[test]
+    fn checkpoints_keep_their_format() {
+        let mut r = GroupResult::new(vec![term("n", true)], Some(2), None, vec![]);
+        r.history(vec![row("a", 1), row("b", 3), row("c", 2)]);
+        let saved = r.save();
+        let mut fields: Vec<&String> = saved.as_object().unwrap().keys().collect();
+        fields.sort();
+        assert_eq!(fields, ["ranked", "rows", "sent", "seq"]);
+        let mut back = GroupResult::new(vec![term("n", true)], Some(2), None, vec![]);
+        back.load(&saved).unwrap();
+        assert_eq!(back.save(), saved);
+        assert_eq!(
+            lines(&back.batch(vec![row("a", 9)])),
+            lines(&r.batch(vec![row("a", 9)]))
+        );
+    }
+
     #[test]
     fn unordered_results_append_and_a_limit_keeps_the_first_groups() {
         let mut r = GroupResult::new(vec![], None, None, vec![]);
@@ -564,17 +499,16 @@ mod tests {
             let mut placed = GroupResult::new(terms, limit, offset, vec![]);
             for (id, row) in groups {
                 let (key, row) = placed.split(row);
-                placed.place(&id, key);
+                placed.ranking.place(&id, key);
                 placed.rows.insert(id, row);
             }
             let ranked = |r: &GroupResult| -> Vec<(String, u64)> {
-                r.ranked.iter().map(|e| (e.id.clone(), e.seq)).collect()
+                r.ranking.iter().map(|e| (e.id.clone(), e.seq)).collect()
             };
             assert_eq!(ranked(&sorted), ranked(&placed));
-            assert_eq!(sorted.keys, placed.keys);
-            assert_eq!(sorted.seq, placed.seq);
+            assert_eq!(sorted.ranking.save(), placed.ranking.save());
             let want: Vec<String> = placed
-                .ranked
+                .ranking
                 .iter()
                 .skip(offset.map_or(0, |m| m as usize))
                 .take(limit.map_or(usize::MAX, |n| n as usize))

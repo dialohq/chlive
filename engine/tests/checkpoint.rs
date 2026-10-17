@@ -120,6 +120,8 @@ const SHAPES: &[(&str, &str)] = &[
     ("native", "select count(), max(latency_ms), avg(cost) from requests"),
     ("keyed", "select user_id, latency_ms from requests final where latency_ms > 300"),
     ("keyed", "select * from requests final"),
+    ("keyed", "select user_id, latency_ms from requests final order by latency_ms desc"),
+    ("keyed", "select user_id from requests final where latency_ms > 0 order by cost nulls first, latency_ms"),
 ];
 
 #[tokio::test]
