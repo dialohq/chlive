@@ -697,20 +697,23 @@ async fn replacing_tables_read_like_merge_tree() -> Result<()> {
             let orders = conn.result("orders").unwrap();
             assert!(orders.error.is_none(), "orders FINAL: {:?}", orders.error);
 
-            // the snapshot is a ReplacingMergeTree too, with the table's keys
+            // the snapshot is a ReplacingMergeTree too, with the table's keys (others, e.g. an
+            // earlier test's not dropped yet, may exist: this server's has this run's products)
             let clones = clickhouse()
                 .fetch(
                     "SELECT name, engine_full FROM system.tables WHERE database = 'chlive_snapshots' \
                      AND startsWith(name, '__chlive_snap_products_')",
                 )
                 .await?;
-            let clone = clones.first().expect("a snapshot of products");
-            let engine_full = clone["engine_full"].as_str().unwrap();
-            assert!(
-                engine_full.starts_with("ReplacingMergeTree(version, deleted)")
-                    && engine_full.contains("ORDER BY product_id"),
-                "{engine_full}"
-            );
+            assert!(!clones.is_empty(), "a snapshot of products");
+            for clone in &clones {
+                let engine_full = clone["engine_full"].as_str().unwrap();
+                assert!(
+                    engine_full.starts_with("ReplacingMergeTree(version, deleted)")
+                        && engine_full.contains("ORDER BY product_id"),
+                    "{engine_full}"
+                );
+            }
             let latest = |table: String| {
                 let list = list.clone();
                 async move {
@@ -723,11 +726,14 @@ async fn replacing_tables_read_like_merge_tree() -> Result<()> {
                 }
             };
             let final_rows = versions(&latest("default.products".into()).await?);
-            let clone_name = clone["name"].as_str().unwrap();
-            assert_eq!(
-                versions(&latest(format!("chlive_snapshots.`{clone_name}`")).await?),
-                final_rows,
-                "FINAL on the snapshot"
+            let mut on_clones = Vec::new();
+            for clone in &clones {
+                let name = clone["name"].as_str().unwrap();
+                on_clones.push(versions(&latest(format!("chlive_snapshots.`{name}`")).await?));
+            }
+            assert!(
+                on_clones.contains(&final_rows),
+                "FINAL on the snapshot: {on_clones:?}, want {final_rows:?}"
             );
             assert_eq!(final_rows.len(), 3, "{final_rows:?}");
 
@@ -1269,6 +1275,158 @@ async fn a_warm_entry_follows_kafka_on_disk_and_serves_the_next_client() -> Resu
                 (&json!("live"), &json!(true)),
                 "{e}"
             );
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// A FINAL result on disk: updated and deleted by id while live, then (the server down) more
+/// versions; after the restart it's restored from disk (no ClickHouse) with its keys, versions
+/// and order, caught up from Kafka, and a client from before resumes through the fork. Both it
+/// and a new client end equal to ClickHouse's `SELECT … FINAL … ORDER BY`.
+#[tokio::test]
+async fn a_restarted_server_restores_final_results_from_disk() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let dir = CacheDir::new("restart-final");
+    let settings = chlive_server::ServerSettings {
+        cache: chlive_server::CacheSettings {
+            dir: Some(dir.0.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let ids: Vec<String> = (0..8).map(|k| format!("r{run}-{k}")).collect();
+    let list = ids
+        .iter()
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql: &'static str = Box::leak(
+        format!(
+            "select product_id, price, version from products final \
+             where product_id in ({list}) and price > 20 order by price desc"
+        )
+        .into_boxed_str(),
+    );
+    // each product: versions that only grow, prices in and out of the WHERE, some deleted
+    let versions = move |round: u64| -> Vec<(String, String)> {
+        ids.iter()
+            .enumerate()
+            .map(|(k, id)| {
+                let n = round * 8 + k as u64;
+                let price = (n * 37) % 50;
+                let deleted = u8::from(n % 5 == 4);
+                (
+                    id.clone(),
+                    format!(
+                        r#"{{"product_id":"{id}","name":"n","price":{price},"version":{round},"deleted":{deleted}}}"#
+                    ),
+                )
+            })
+            .collect()
+    };
+    let products = producer::Producer::new(&config().kafka_brokers, "products")?;
+    let ingested = |produced: std::collections::BTreeMap<i32, i64>| async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let have = ingested_from("products").await?;
+            if produced
+                .iter()
+                .all(|(p, o)| have.get(p).is_some_and(|h| h >= o))
+            {
+                return anyhow::Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "products not ingested: {have:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    for round in 1..=2 {
+        ingested(products.produce_keyed(&versions(round)).await?).await?;
+    }
+    let kept = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let k = kept.clone();
+    let live_versions: Vec<_> = (3..=4).map(&versions).collect();
+    with_server_settings(config(), settings.clone(), move |server| {
+        async move {
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("f", sql);
+            conn.wait_ready(&["f"], Duration::from_secs(60)).await?;
+            // live: updates, moves and deletes by id, into the stored log
+            let products = producer::Producer::new(&config().kafka_brokers, "products")?;
+            for v in &live_versions {
+                products.produce_keyed(v).await?;
+            }
+            conn.wait_quiet(Duration::from_millis(1000), Duration::from_secs(60))
+                .await?;
+            let live = conn.result("f").unwrap();
+            assert!(live.updated > 0 && live.deleted > 0, "{live:?}");
+            *k.lock().unwrap() = Some(live);
+            Ok(())
+        }
+        .boxed()
+    })
+    .await?;
+    // while the server is down
+    let mut produced = std::collections::BTreeMap::new();
+    for round in 5..=7 {
+        for (p, o) in products.produce_keyed(&versions(round)).await? {
+            let e = produced.entry(p).or_insert(o);
+            *e = (*e).max(o);
+        }
+    }
+    ingested(produced).await?;
+    let kept = kept.lock().unwrap().clone().unwrap();
+    with_server_settings(config(), settings, move |server| {
+        async move {
+            let e = &entries(server).await?;
+            assert_eq!(e.len(), 1, "{e:?}");
+            assert_eq!(e[0]["stage"], "cold");
+            let conn = LiveConn::connect(server).await?;
+            conn.resume_kept("f", sql, &kept);
+            conn.wait_ready(&["f"], Duration::from_secs(60)).await?;
+            conn.subscribe("fresh", sql);
+            conn.wait_ready(&["fresh"], Duration::from_secs(60)).await?;
+            conn.wait_quiet(Duration::from_millis(1000), Duration::from_secs(60))
+                .await?;
+            let direct = clickhouse()
+                .fetch(&sql.replace("from products", "from default.products"))
+                .await?;
+            for id in ["f", "fresh"] {
+                let live = conn.result(id).unwrap();
+                assert!(live.error.is_none(), "{id}: {:?}", live.error);
+                assert!(
+                    live.protocol_violations.is_empty(),
+                    "{id}: {:?}",
+                    live.protocol_violations
+                );
+                assert!(
+                    live.ids.iter().all(Option::is_some),
+                    "{id}: rows without ids"
+                );
+                assert_eq!(
+                    tie_groups(&live.rows, &["price"]),
+                    tie_groups(&direct, &["price"]),
+                    "{id}"
+                );
+            }
+            assert!(
+                conn.result("f").unwrap().resumed,
+                "resumed through the fork"
+            );
+            let e = &entries(server).await?[0];
+            assert_eq!(e["restored"], true, "no ClickHouse: {e}");
             Ok(())
         }
         .boxed()

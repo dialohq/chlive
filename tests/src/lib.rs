@@ -349,6 +349,22 @@ impl LiveConn {
         self.tx.send(msg.to_string()).expect("socket open");
     }
 
+    /// Resume with a whole result as kept: its rows, their ids (aggregated and FINAL results)
+    /// and its cursor.
+    pub fn resume_kept(&self, id: &str, sql: &str, kept: &LiveResult) {
+        self.results.lock().unwrap().insert(
+            id.to_string(),
+            LiveResult {
+                rows: kept.rows.clone(),
+                ids: kept.ids.clone(),
+                ..Default::default()
+            },
+        );
+        let since = kept.at.as_deref().expect("a cursor");
+        let msg = json!({"type": "subscribe", "id": id, "sql": sql, "since": since});
+        self.tx.send(msg.to_string()).expect("socket open");
+    }
+
     pub fn unsubscribe(&self, id: &str) {
         self.tx
             .send(json!({"type": "unsubscribe", "id": id}).to_string())
