@@ -21,9 +21,10 @@ use crate::checkpoint::{Checkpoint, Checkpointer};
 use crate::cursor;
 use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
+use crate::keyed::KeyedState;
 use crate::order::{HeldWindow, OffsetState, OrderedState, SortKey, WindowState};
 use crate::parser::parse;
-use crate::plan::{plan, AggregatePlan, Plan, StreamPlan};
+use crate::plan::{plan, AggregatePlan, DecodedRow, Plan, StreamPlan};
 use crate::rules::{ConfigError, ConfiguredRules, NamingRules, TablesConfig, TopicId};
 use crate::snapshot::{
     ClickHouseCloner, InUse, Lease, PauseServer, SnapshotConfig, SnapshotError, SnapshotManager,
@@ -413,7 +414,8 @@ impl Engine {
         // the client holds; without, there's nothing to rebuild, nor any snapshot to read.
         let stateful = plan.stream.order.is_some()
             || plan.stream.limit.is_some()
-            || plan.stream.offset.is_some();
+            || plan.stream.offset.is_some()
+            || plan.stream.keyed.is_some();
         if let (Some(token), false) = (since, stateful) {
             if let Some(cursor) = self.resumable(&plan, token, None).await? {
                 let first = First::CatchUp {
@@ -752,6 +754,10 @@ impl Engine {
             tracing::info!("queries with OFFSET don't resume yet; starting over");
             return Ok(None);
         }
+        if plan.stream.keyed.is_some() {
+            tracing::info!("FINAL queries don't resume yet; starting over");
+            return Ok(None);
+        }
         let Some(cursor) = cursor::decode(plan, token) else {
             tracing::info!("resume cursor is for another plan or malformed; starting over");
             return Ok(None);
@@ -963,6 +969,8 @@ pub(crate) enum ResultState {
     Offset(OffsetState),
     /// OFFSET without ORDER BY: the newest `m` rows held back, the window before them.
     Held(HeldWindow),
+    /// FINAL on a ReplacingMergeTree: the result's keys and their versions.
+    Keyed(KeyedState),
 }
 
 impl ResultState {
@@ -974,6 +982,7 @@ impl ResultState {
             ResultState::Ordered(o) => ("ordered", o.save()),
             ResultState::Offset(o) => ("offset", o.save()),
             ResultState::Held(h) => ("held", h.save()),
+            ResultState::Keyed(k) => ("keyed", k.save()),
         };
         state["shape"] = shape.into();
         state
@@ -996,11 +1005,15 @@ impl ResultState {
             ResultState::Ordered(o) => o.load(saved)?,
             ResultState::Offset(o) => o.load(saved)?,
             ResultState::Held(h) => h.load(saved)?,
+            ResultState::Keyed(k) => k.load(plan.keyed.as_ref().expect("a keyed plan"), saved)?,
         }
         Ok(state)
     }
 
     pub(crate) fn for_plan(plan: &StreamPlan) -> Self {
+        if plan.keyed.is_some() {
+            return Self::Keyed(KeyedState::default());
+        }
         match (&plan.order, plan.limit, plan.offset) {
             (Some(o), limit, Some(m)) => Self::Offset(OffsetState::new(o.keys.clone(), m, limit)),
             (None, limit, Some(m)) => Self::Held(HeldWindow::new(m, limit)),
@@ -1038,6 +1051,26 @@ impl ResultState {
             },
             ResultState::Offset(s) => s.insert(key.expect("a sort key"), row),
             ResultState::Held(w) => w.push(row),
+            ResultState::Keyed(_) => unreachable!("FINAL rows are replaced, not placed"),
+        }
+    }
+
+    /// A decoded event's diffs: a new row placed (when it matches the WHERE), or, FINAL, a new
+    /// version of its key's row.
+    pub(crate) fn event(&mut self, plan: &StreamPlan, row: &DecodedRow) -> Vec<Diff> {
+        match (self, &plan.keyed) {
+            (ResultState::Keyed(state), Some(keyed)) => {
+                let (id, ver, deleted) = keyed.event(row);
+                state
+                    .event(id, ver, deleted, plan.matches(row), || plan.project(row))
+                    .into_iter()
+                    .collect()
+            }
+            (state, _) if plan.matches(row) => {
+                let key = plan.order.as_ref().map(|o| o.event_key(row));
+                state.place(plan.project(row), key)
+            }
+            _ => Vec::new(),
         }
     }
 }
@@ -1072,6 +1105,21 @@ pub(crate) fn history_iteration(
             rows = shown;
         }
         (ResultState::Held(w), _) => rows = w.history(rows),
+        (ResultState::Keyed(state), _) => {
+            let keyed = plan.keyed.as_ref().expect("a keyed plan");
+            let diffs = rows
+                .into_iter()
+                .map(|mut row| {
+                    let (id, ver) = keyed.history_row(&mut row).map_err(bad_history_row)?;
+                    Ok(state.history(id, ver, row))
+                })
+                .collect::<Result<_, EngineError>>()?;
+            return Ok(Iteration {
+                origin: Origin::History,
+                diffs,
+                at: at.clone(),
+            });
+        }
         _ => {}
     }
     Ok(Iteration {
@@ -1110,10 +1158,7 @@ fn catch_up_iteration(
     // the client's own events after the snapshot: into the state, not sent
     for event in own {
         if let Ok(row) = plan.decode(&event.value) {
-            if plan.matches(&row) {
-                let key = plan.order.as_ref().map(|o| o.event_key(&row));
-                state.place(plan.project(&row), key);
-            }
+            state.event(plan, &row);
         }
     }
     // the client has everything up to its cursor: what it's missing comes from the stream
@@ -1133,11 +1178,7 @@ fn event_iteration(
     event: Event,
 ) -> Iteration {
     let diffs = match plan.decode(&event.value) {
-        Ok(row) if plan.matches(&row) => {
-            let key = plan.order.as_ref().map(|o| o.event_key(&row));
-            state.place(plan.project(&row), key)
-        }
-        Ok(_) => Vec::new(),
+        Ok(row) => state.event(plan, &row),
         Err(e) => {
             // ClickHouse's ingestion skips this message too
             tracing::warn!(

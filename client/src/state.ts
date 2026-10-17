@@ -136,16 +136,25 @@ export class ResultStore<R extends Row = Row> {
             throw new Error(`insert at index ${change.index} of a result with ${raw.length} rows`);
           }
           break;
-        case "delete":
-          if (Number.isInteger(change.index) && change.index >= 0 && change.index < raw.length) {
-            raw.splice(change.index, 1);
-            if (twin) next.splice(change.index, 1);
-            ids.splice(change.index, 1);
+        case "delete": {
+          let i = change.index;
+          if ((i === undefined) === (change.id === undefined)) {
+            throw new Error("a delete needs exactly one of index and id");
+          }
+          if (change.id !== undefined) {
+            i = indexOf(change.id);
+            if (i === undefined) throw new Error(`delete of unknown row ${change.id}`);
+          }
+          if (Number.isInteger(i) && i! >= 0 && i! < raw.length) {
+            raw.splice(i!, 1);
+            if (twin) next.splice(i!, 1);
+            ids.splice(i!, 1);
             moved = true;
           } else {
-            throw new Error(`delete at index ${change.index} of a result with ${raw.length} rows`);
+            throw new Error(`delete at index ${i} of a result with ${raw.length} rows`);
           }
           break;
+        }
         case "update": {
           const i = indexOf(change.id);
           if (i === undefined) throw new Error(`update of unknown row ${change.id}`);

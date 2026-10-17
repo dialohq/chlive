@@ -192,7 +192,14 @@ impl<R: DeserializeOwned> Store<R> {
                         id,
                     });
                 }
-                chlive_protocol::Change::Delete { index } => {
+                chlive_protocol::Change::Delete { index, id } => {
+                    let index = match (index, id) {
+                        (Some(i), None) => i,
+                        (None, Some(id)) => ids
+                            .position(&id)
+                            .ok_or_else(|| format!("delete of unknown row {id}"))?,
+                        _ => return Err("a delete needs exactly one of index and id".into()),
+                    };
                     if index >= len {
                         return Err(format!(
                             "delete at index {index} of a result with {len} rows"

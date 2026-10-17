@@ -87,15 +87,17 @@ impl Cloner for ClickHouseCloner {
         let dst = format!("{}.{}", ident(clone_database), ident(clone));
         let described = self
             .query(&format!(
-                "SELECT engine, engine_full FROM system.tables WHERE database = {} AND name = {} \
+                "SELECT engine, engine_full, sorting_key, partition_key FROM system.tables \
+                 WHERE database = {} AND name = {} \
                  FORMAT JSONCompactEachRow",
                 string(database),
                 string(source)
             ))
             .await?;
-        let (name, full) = serde_json::from_str::<(String, String)>(described.trim())
-            .map_err(|e| SnapshotError(format!("ClickHouse: no engine for {src}: {e}")))?;
-        let engine = TableEngine::from_system(&name, &full);
+        let (name, full, sorting, partition) =
+            serde_json::from_str::<(String, String, String, String)>(described.trim())
+                .map_err(|e| SnapshotError(format!("ClickHouse: no engine for {src}: {e}")))?;
+        let engine = TableEngine::from_system(&name, &full, &sorting, &partition);
         let clone_engine = engine
             .clone_engine()
             .ok_or_else(|| SnapshotError(format!("can't snapshot a {engine} table ({src})")))?;

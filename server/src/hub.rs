@@ -743,7 +743,8 @@ struct Form {
     order: Option<Vec<OrderTerm>>,
     limit: Option<u64>,
     offset: Option<u64>,
-    aggregated: bool,
+    /// Rows have ids (aggregated and FINAL results): snapshots send them.
+    ids: bool,
 }
 
 enum Sent {
@@ -765,7 +766,7 @@ enum Start {
     Restored {
         sub: Subscription,
         stored: Box<Stored>,
-        rows: ResultList,
+        rows: Box<ResultList>,
         log: Vec<store::LogItem>,
         checkpoint: Checkpoint,
         lag: u64,
@@ -916,7 +917,7 @@ impl Entry {
                         }
                         Ok(Start::Restored { sub, stored, rows, log, checkpoint, lag, ms }) => {
                             self.subscribed(&sub);
-                            self.restore(*stored, rows, log, checkpoint, lag, ms);
+                            self.restore(*stored, *rows, log, checkpoint, lag, ms);
                             self.sub = Some(sub.ready_chunks(MAX_ITERATIONS_PER_MESSAGE));
                             // subscribers that joined while it was being restored: their
                             // cursors may resume through the fork
@@ -981,7 +982,7 @@ impl Entry {
         self.persisted = self.hub.store.is_some() && s.checkpointable();
         debug!(key = %self.fp, lineage = %self.lineage, watermark = %s.watermark.describe(), history = %s.history_sql, persisted = self.persisted, "entry subscribed");
         self.form = Some(Form {
-            aggregated: plan.aggregate.is_some(),
+            ids: plan.aggregate.is_some() || plan.stream.keyed.is_some(),
             plan,
             columns,
             order,
@@ -1258,7 +1259,9 @@ impl Entry {
         for d in &diffs {
             match d {
                 Diff::Insert { .. } => self.rows_count += 1,
-                Diff::Delete { .. } => self.rows_count = self.rows_count.saturating_sub(1),
+                Diff::Delete { .. } | Diff::DeleteId { .. } => {
+                    self.rows_count = self.rows_count.saturating_sub(1)
+                }
                 Diff::Update { .. } => {}
             }
             if self.in_memory {
@@ -1319,7 +1322,7 @@ impl Entry {
             limit: form.limit,
             offset: form.offset,
             at: self.encode(at),
-            ids: form.aggregated.then(|| {
+            ids: form.ids.then(|| {
                 self.rows
                     .ids
                     .iter()
@@ -1836,7 +1839,7 @@ async fn start(
                     return Ok(Start::Restored {
                         sub,
                         stored: Box::new(stored),
-                        rows,
+                        rows: Box::new(rows),
                         log,
                         checkpoint,
                         lag,

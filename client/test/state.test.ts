@@ -74,6 +74,35 @@ test("LIMIT: a diff's inserts and deletes apply together", () => {
   assert.deepEqual(s.rows().map((r) => r.n), [9, 2]);
 });
 
+test("FINAL results: rows replaced and deleted by id", () => {
+  const s = new ResultStore<{ k: string; n: number }>();
+  s.applySnapshot({
+    type: "snapshot",
+    id: "a",
+    columns,
+    rows: [{ k: "a", n: 1 }, { k: "b", n: 2 }, { k: "c", n: 3 }],
+    ids: ['["a"]', '["b"]', '["c"]'],
+  });
+  s.applyDiff({
+    type: "diff",
+    id: "a",
+    changes: [
+      { op: "update", id: '["c"]', set: { k: "c", n: 30 } },
+      { op: "delete", id: '["a"]' },
+      { op: "insert", row: { k: "d", n: 4 }, id: '["d"]' },
+      // ids found where they are after the delete moved them
+      { op: "delete", id: '["c"]' },
+      { op: "update", id: '["d"]', set: { k: "d", n: 40 } },
+    ],
+  });
+  assert.deepEqual(s.rows().map((r) => [r.k, r.n]), [["b", 2], ["d", 40]]);
+  assert.deepEqual(s.ids(), ['["b"]', '["d"]']);
+  assert.throws(() => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "delete", id: '["a"]' }] }), /unknown row/);
+  assert.throws(() => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "delete" }] }), /exactly one/);
+  assert.throws(() => s.applyDiff({ type: "diff", id: "a", changes: [{ op: "delete", index: 0, id: '["b"]' }] }), /exactly one/);
+  assert.equal(s.rows().length, 2);
+});
+
 test("aggregated results: rows by id, updated in place", () => {
   const s = new ResultStore<{ country: string; n: number; avg?: number }>();
   s.applySnapshot({

@@ -315,6 +315,58 @@ async fn typed_rows_of_an_aggregated_result() {
     );
 }
 
+#[derive(Debug, serde::Deserialize, PartialEq)]
+struct Product {
+    product_id: String,
+    price: u64,
+}
+
+/// FINAL results: rows with ids, replaced by updates of the whole row and deleted by id.
+#[tokio::test]
+async fn final_rows_are_updated_and_deleted_by_id() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let mut sub = client.subscribe::<Product>("select product_id, price from products final");
+    next(&mut sub).await;
+    let mut ws = server.next().await;
+    ws.recv().await;
+    ws.send(
+        json!({"type": "snapshot", "id": "s1", "columns": [], "at": "c",
+        "rows": [{"product_id": "a", "price": 1}, {"product_id": "b", "price": 2}],
+        "ids": ["[\"a\"]", "[\"b\"]"]}),
+    )
+    .await;
+    next(&mut sub).await;
+    ws.send(json!({"type": "diff", "id": "s1", "at": "c2", "changes": [
+        {"op": "update", "id": "[\"b\"]", "set": {"product_id": "b", "price": 5}},
+        {"op": "delete", "id": "[\"a\"]"},
+        {"op": "insert", "row": {"product_id": "c", "price": 3}, "id": "[\"c\"]"}
+    ]}))
+    .await;
+    let u = next(&mut sub).await;
+    let prices: Vec<(String, u64)> = u
+        .rows
+        .iter()
+        .map(|p| (p.product_id.clone(), p.price))
+        .collect();
+    assert_eq!(prices, [("b".to_string(), 5), ("c".to_string(), 3)]);
+    assert!(
+        matches!(&u.changes[1], Change::Delete { index: 0, row } if row.product_id == "a"),
+        "{:?}",
+        u.changes
+    );
+    // a delete of an unknown id is a protocol error
+    ws.send(json!({"type": "diff", "id": "s1", "at": "c3",
+        "changes": [{"op": "delete", "id": "[\"nope\"]"}]}))
+        .await;
+    let e = next(&mut sub).await;
+    assert_eq!(e.kind, Kind::Error);
+    let Status::Error(err) = e.status else {
+        panic!("{:?}", e.status)
+    };
+    assert!(err.message.contains("unknown row"), "{}", err.message);
+}
+
 #[tokio::test]
 async fn a_snapshot_bigger_than_16_mib_arrives() {
     let mut server = FakeServer::start().await;

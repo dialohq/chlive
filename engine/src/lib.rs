@@ -36,6 +36,7 @@ pub mod diff;
 pub mod engine;
 pub mod error;
 pub mod history;
+pub mod keyed;
 pub mod lexer;
 pub mod order;
 pub mod parser;

@@ -159,6 +159,27 @@ impl Producer {
     }
 }
 
+impl Producer {
+    /// Produce these (key, JSON) messages with their Kafka keys, so each key's messages are in
+    /// one partition, in order (a keyed topic). Returns the highest acknowledged offset per
+    /// partition.
+    pub async fn produce_keyed(&self, messages: &[(String, String)]) -> Result<Offsets> {
+        let mut offsets = Offsets::new();
+        for (key, payload) in messages {
+            let d = self
+                .producer
+                .send(
+                    FutureRecord::to(&self.topic).key(key).payload(payload),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|(e, _)| anyhow::anyhow!("kafka delivery failed: {e}"))?;
+            record(&mut offsets, d);
+        }
+        Ok(offsets)
+    }
+}
+
 fn record(offsets: &mut Offsets, d: rdkafka::producer::future_producer::Delivery) {
     let e = offsets.entry(d.partition).or_insert(-1);
     *e = (*e).max(d.offset);

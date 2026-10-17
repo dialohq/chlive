@@ -193,7 +193,7 @@ pub enum Kind {
 /// the same update left them.
 #[derive(Debug)]
 pub enum Change<R> {
-    /// At `index` with ORDER BY, appended without. Aggregated rows have an `id`, their group's
+    /// At `index` with ORDER BY, appended without. Aggregated and FINAL rows have an `id`, their
     /// key (e.g. `["PL"]`).
     Insert {
         row: Arc<R>,

@@ -706,9 +706,11 @@ export class LiveClient {
   }
 
   /** Appends (their rows as they came over the wire) go straight to the cache; anything else
-   * (indexes, deletes) means a full save. */
+   * (indexes, deletes, ids, which appends don't keep) means a full save. */
   private persistDiff(rec: Result, msg: DiffMessage): void {
-    const appendOnly = msg.changes.every((c) => c.op === "insert" && c.index === undefined);
+    const appendOnly = msg.changes.every(
+      (c) => c.op === "insert" && c.index === undefined && c.id === undefined,
+    );
     if (appendOnly && rec.saved && !rec.saveTimer) {
       const rows = msg.changes.map((c) => (c as { row: Row }).row);
       this.queue(rec, (cache) => cache.append(rec.key, rows, msg.at));

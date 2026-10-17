@@ -6,6 +6,7 @@ use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
 use chlive_engine::rules::{ConfiguredRules, TopicId};
 use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Snapshots};
 use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
+use chlive_engine::table_engine::{Key, TableEngine};
 use chlive_engine::watermark::Watermark;
 use chlive_engine::{Engine, Iteration, Origin};
 use futures::stream::BoxStream;
@@ -41,8 +42,25 @@ impl HistorySource for FakeHistory {
         match table {
             "default.events" => Ok(vec![col("ts", "String"), col("user_id", "String")]),
             "default.requests" => Ok(vec![col("user_id", "String"), col("latency_ms", "UInt32")]),
+            "default.products" => Ok(vec![
+                col("product_id", "String"),
+                col("price", "UInt32"),
+                col("version", "UInt64"),
+                col("deleted", "UInt8"),
+            ]),
             _ => Err(HistoryError::UnknownTable(table.into())),
         }
+    }
+
+    async fn table_engine(&self, _: &str, table: &str) -> Result<TableEngine, HistoryError> {
+        Ok(match table {
+            "products" => TableEngine::Replacing {
+                ver: Some("version".into()),
+                is_deleted: Some("deleted".into()),
+                key: Key::from_system("product_id", ""),
+            },
+            _ => TableEngine::MergeTree,
+        })
     }
 
     async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError> {
@@ -108,6 +126,11 @@ impl HistorySource for FakeHistory {
                 row(json!({"__order_0": 500})),
                 row(json!({"__order_0": 500})),
             ]),
+            // FINAL: one row per product, with its key and version under hidden aliases
+            "SELECT product_id, price, product_id AS __key_0, version AS __ver \
+             FROM default.products FINAL WHERE price > 2" => Ok(vec![row(
+                json!({"product_id": "a", "price": 5, "__key_0": "a", "__ver": 1}),
+            )]),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -596,6 +619,48 @@ async fn group_by_runs_natively_without_chdb() {
             "requests/0:1 ~ [\"u1\"] {\"n\":2,\"total\":1000}",
             "requests/0:2 + [\"u2\"] {\"user_id\":\"u2\",\"n\":1,\"total\":50,\"top\":50}",
             "requests/0:3 ~ [\"u1\"] {\"n\":3,\"total\":2000,\"top\":1000}",
+        ]
+    );
+}
+
+/// FINAL on a ReplacingMergeTree: one row per key, its latest version; new versions update
+/// it, and leave the result when deleted or no longer matching.
+#[tokio::test]
+async fn final_replaces_each_keys_row_with_its_latest_version() {
+    let mut source = MemorySource::new();
+    let p = |id: &str, price: u32, version: u64, deleted: u8| {
+        format!(
+            r#"{{"product_id": "{id}", "price": {price}, "version": {version}, "deleted": {deleted}}}"#
+        )
+    };
+    source
+        .push("products", 0, p("a", 5, 1, 0)) // offset 0: history
+        .push("products", 0, p("a", 7, 2, 0)) // a new version: updated
+        .push("products", 0, p("b", 1, 1, 0)) // doesn't match: nothing
+        .push("products", 0, p("b", 3, 2, 0)) // now it does: inserted
+        .push("products", 0, p("a", 9, 1, 0)) // older than a's row: ignored
+        .push("products", 0, p("a", 9, 3, 1)) // deleted
+        .push("products", 0, p("b", 1, 3, 0)) // no longer matches: deleted
+        .push("products", 0, p("a", 4, 4, 0)); // back
+    let sql = "select product_id, price from products final where price > 2";
+    let subscription = engine(source)
+        .with_max_batch(1)
+        .subscribe(sql)
+        .await
+        .unwrap();
+    assert!(subscription.checkpointable());
+    let lines: Vec<String> = subscription.map(|i| i.unwrap().to_string()).collect().await;
+    assert_eq!(
+        lines,
+        [
+            "+ [\"a\"] {\"product_id\":\"a\",\"price\":5}\nhistory: 1 rows",
+            "products/0:1 ~ [\"a\"] {\"product_id\":\"a\",\"price\":7}",
+            "",
+            "products/0:3 + [\"b\"] {\"product_id\":\"b\",\"price\":3}",
+            "",
+            "products/0:5 - [\"a\"]",
+            "products/0:6 - [\"b\"]",
+            "products/0:7 + [\"a\"] {\"product_id\":\"a\",\"price\":4}",
         ]
     );
 }

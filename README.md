@@ -229,9 +229,13 @@ Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 
 The binder reads each table's engine from `system.tables` (so the history user needs `SELECT` on it).
 - **`MergeTree`:** as described above. `FROM t FINAL` is accepted and changes nothing.
-- **`ReplacingMergeTree`:** read without FINAL, the way ClickHouse reads one without FINAL, i.e. like a MergeTree:
-  - History has the versions the snapshot holds, as many as merges have left; every new version, a deleted one too, comes as a new row. `explain` says so.
-  - `FINAL` isn't supported yet (an error); it comes query shape by query shape.
+- **`ReplacingMergeTree` without FINAL:** read the way ClickHouse reads one without FINAL, i.e. like a MergeTree. History has the versions the snapshot holds, as many as merges have left; every new version, a deleted one too, comes as a new row. `explain` says so.
+- **`ReplacingMergeTree` with FINAL** (`SELECT … FROM t FINAL [WHERE …]`): one row per key, its latest version, as ClickHouse's `SELECT … FINAL` has it.
+  - **Rows have ids:** their key (the table's sorting key) as JSON, e.g. `["p1"]`. History is `… FROM <snapshot> FINAL`, with the key and version under hidden fields.
+  - **Each event is a new version of its key:** an `insert` (a key not in the result whose version matches the WHERE), an `update` of the whole row by id (a new version that still matches), or a `delete` by id (a deleted version, or one that no longer matches). An event with a lower version than its key's row is ignored. Ties, and tables without a version column, go to the later event, as ClickHouse keeps the last inserted.
+  - **Stream order is trusted:** each key's versions must only grow and all be in one Kafka partition (a keyed topic). The engine keeps only the result's keys and their versions (also in checkpoints, for the disk store), so a late, older version of a key that isn't in the result would wrongly come in.
+  - **Keys:** the sorting and partition keys must be plain columns, and the partition key's must be among the sorting key's. A key, version or is-deleted column hidden by the naming rules is still read (queries just can't name it).
+  - **Not yet:** FINAL with ORDER BY, LIMIT, OFFSET, GROUP BY or aggregates, or a sub-query, and FINAL inside a sub-query: each is a positioned error. A `since` cursor gets a fresh snapshot (the server's shared result still resumes from its change log).
   - Snapshots keep the engine with its version and is-deleted columns, so `FINAL` on a snapshot dedups as on the table.
 - **Any other engine** (`Collapsing`, `Summing`, `Aggregating`, `Distributed`, views, `Shared…` on ClickHouse Cloud, …): refused.
 
@@ -366,9 +370,10 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 {"type": "error", "id": "s1", "code": "INVALID_QUERY", "message": "unknown column nope in table events (…) at 1:8"}
 ```
 
-- `snapshot` comes first and once; `diff`s follow, each with the changes of the events that were ready (never empty). Only `insert` exists so far; clients reject ops they don't know.
+- `snapshot` comes first and once; `diff`s follow, each with the changes of the events that were ready (never empty). The ops are `insert`, `delete` and `update`; clients reject ops they don't know.
 - With an `index`, the row is inserted there: the row at that index and every row after it move one down. Without one, it's appended.
-- `{"op": "delete", "index": k}` removes the row at `k`; the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes. With OFFSET (`"offset": m` in the snapshot, informational), the diffs already account for the rows above the result: a row sliding in from above is an ordinary insert.
+- Aggregated and FINAL results have row ids (`"ids"` in the snapshot, `"id"` on inserts): `{"op": "update", "id", "set"}` sets the columns in `set` (the changed ones, or all of them), and, with an `index`, moves the row there.
+- `{"op": "delete", "index": k}` removes the row at `k`, and `{"op": "delete", "id": …}` the row with that id (FINAL); the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes. With OFFSET (`"offset": m` in the snapshot, informational), the diffs already account for the rows above the result: a row sliding in from above is an ordinary insert.
 - A `diff` is atomic: its changes apply in sequence, each index into the list as the previous change left it, and only the state after all of them is meaningful (in between, an insert and its delete can briefly make one row more than the LIMIT). The client applies a whole diff to one copy of the rows before its listeners see it.
 - **Resuming.** `snapshot`, `diff` and `{"type": "progress", "id", "at"}` carry `at`, an opaque cursor: how far the result is complete, per Kafka partition, counting events that didn't match. A client that kept a result subscribes with `"since": <at>`; the server answers `{"type": "resume", "id", "columns", "order"?, "limit"?}` instead of a snapshot (the client's rows are still valid), then diffs with only what was missed. If it can't resume (another query or schema, a cursor from an earlier server result for the query, one older than the result's change log, …), it sends a normal `snapshot`.
 - Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`, `TOO_MANY_SUBSCRIPTIONS` (over `server.max_subscriptions_per_connection`). After an error, that subscription is over.
@@ -463,7 +468,7 @@ The engine's dialect, in full (keywords are case-insensitive):
 
 ```
 SELECT * | select_item [, select_item ...]
-FROM table [[AS] alias] [FINAL]                              -- FINAL: MergeTree only, for now
+FROM table [[AS] alias] [FINAL]                              -- FINAL: see Table engines
 [WHERE condition]
 [GROUP BY column [, column ...]]
 [ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST] | order_item [ASC|DESC] [NULLS FIRST|LAST] [, ...]]

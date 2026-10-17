@@ -178,9 +178,9 @@ async fn rejections_over_websocket() -> Result<()> {
                 ),
                 (
                     "final",
-                    "select * from products final",
+                    "select * from products final order by version",
                     "INVALID_QUERY",
-                    "FINAL on products (ReplacingMergeTree) isn't supported yet at 1:24",
+                    "FINAL on products (ReplacingMergeTree) with ORDER BY isn't supported yet at 1:24",
                 ),
             ];
             for (id, sql, _, _) in &cases {
@@ -753,6 +753,105 @@ async fn replacing_tables_read_like_merge_tree() -> Result<()> {
             assert_eq!(live.rows.len(), seen.len() + 2, "{now:?}");
             assert!(now.contains(&(ids[0].clone(), 2, 0)) && now.contains(&(ids[0].clone(), 3, 0)));
             assert!(now.contains(&(ids[1].clone(), 4, 1)), "{now:?}");
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// FINAL on a ReplacingMergeTree over the WebSocket: one row per product, its latest version.
+/// Versions before and after subscribing (each product's in one partition, as a keyed topic
+/// has them), updates, deletes and rows moving in and out of the WHERE end equal to ClickHouse's
+/// `SELECT … FINAL`.
+#[tokio::test]
+async fn final_results_match_clickhouse() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let ids: Vec<String> = (0..8).map(|k| format!("f{run}-{k}")).collect();
+    let list = ids
+        .iter()
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "select product_id, price, version from products final \
+         where product_id in ({list}) and price > 20"
+    );
+    // each product: versions that only grow, prices in and out of the WHERE, some deleted
+    let versions = move |round: u64| -> Vec<(String, String)> {
+        ids.iter()
+            .enumerate()
+            .map(|(k, id)| {
+                let n = round * 8 + k as u64;
+                let price = (n * 37) % 50;
+                let deleted = u8::from(n % 5 == 4);
+                (
+                    id.clone(),
+                    format!(
+                        r#"{{"product_id":"{id}","name":"n","price":{price},"version":{round},"deleted":{deleted}}}"#
+                    ),
+                )
+            })
+            .collect()
+    };
+    with_server(config(), |server| {
+        async move {
+            let products = producer::Producer::new(&config().kafka_brokers, "products")?;
+            let wait = |produced: std::collections::BTreeMap<i32, i64>| async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                loop {
+                    let have = ingested_from("products").await?;
+                    if produced
+                        .iter()
+                        .all(|(p, o)| have.get(p).is_some_and(|h| h >= o))
+                    {
+                        return anyhow::Ok(());
+                    }
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "products not ingested: {have:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            };
+            for round in 1..=3 {
+                wait(products.produce_keyed(&versions(round)).await?).await?;
+            }
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("f", &sql);
+            conn.wait_ready(&["f"], Duration::from_secs(60)).await?;
+            for round in 4..=9 {
+                wait(products.produce_keyed(&versions(round)).await?).await?;
+            }
+            conn.wait_quiet(Duration::from_millis(1000), Duration::from_secs(60))
+                .await?;
+            let live = conn.result("f").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert!(
+                live.protocol_violations.is_empty(),
+                "{:?}",
+                live.protocol_violations
+            );
+            assert!(live.ids.iter().all(Option::is_some), "rows without ids");
+            let direct = clickhouse()
+                .fetch(&sql.replace("from products", "from default.products"))
+                .await?;
+            eprintln!(
+                "final: {} rows ({} inserts, {} updates, {} deletes)",
+                live.rows.len(),
+                live.inserted,
+                live.updated,
+                live.deleted
+            );
+            assert!(live.updated > 0 && live.deleted > 0);
+            assert_eq!(multiset(&live.rows), multiset(&direct));
             Ok(())
         }
         .boxed()

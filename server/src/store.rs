@@ -139,7 +139,7 @@ enum Op {
     Create {
         meta: Meta,
         at: Watermark,
-        rows: ResultList,
+        rows: Box<ResultList>,
         state: Json,
     },
     Append {
@@ -306,7 +306,7 @@ impl Store {
         self.send(Op::Create {
             meta,
             at,
-            rows,
+            rows: Box::new(rows),
             state,
         });
     }
@@ -390,8 +390,7 @@ impl Store {
             let chunk: Json = serde_json::from_str(&chunk?).unwrap_or(Json::Null);
             for item in chunk.as_array().into_iter().flatten() {
                 let row: Row = item["row"].as_object().cloned().unwrap_or_default();
-                base.rows.push(row);
-                base.ids.push(item["id"].as_str().map(String::from));
+                base.push(row, item["id"].as_str().map(String::from));
             }
         }
         let mut stmt = conn.prepare("SELECT seq, at, body FROM log WHERE key = ?1 ORDER BY seq")?;
@@ -477,7 +476,17 @@ pub fn apply_body(rows: &mut ResultList, body: &str) -> Result<(), String> {
     for c in changes {
         let d = match c {
             Change::Insert { row, index, id } => Diff::Insert { row, index, id },
-            Change::Delete { index } => Diff::Delete { index },
+            Change::Delete {
+                index: Some(index),
+                id: None,
+            } => Diff::Delete { index },
+            Change::Delete {
+                index: None,
+                id: Some(id),
+            } => Diff::DeleteId { id },
+            Change::Delete { .. } => {
+                return Err("a logged delete needs exactly one of index and id".into())
+            }
             Change::Update { id, set, index } => Diff::Update { id, set, index },
         };
         rows.apply(&d)?;
@@ -718,9 +727,10 @@ fn compact(tx: &rusqlite::Transaction, key: &str) -> rusqlite::Result<()> {
         for chunk in stmt.query_map(params![key], |r| r.get::<_, String>(0))? {
             let chunk: Json = serde_json::from_str(&chunk?).unwrap_or(Json::Null);
             for item in chunk.as_array().into_iter().flatten() {
-                rows.rows
-                    .push(item["row"].as_object().cloned().unwrap_or_default());
-                rows.ids.push(item["id"].as_str().map(String::from));
+                rows.push(
+                    item["row"].as_object().cloned().unwrap_or_default(),
+                    item["id"].as_str().map(String::from),
+                );
             }
         }
     }
@@ -835,13 +845,33 @@ mod tests {
         list.rows.iter().map(|r| r["x"].to_string()).collect()
     }
 
+    /// FINAL results' logged diffs: rows by id, updated and deleted by id.
+    #[test]
+    fn logged_diffs_apply_by_id() {
+        let mut rows = ResultList::default();
+        let body = diff_body(json!([
+            {"op": "insert", "row": {"x": 1}, "id": "[\"a\"]"},
+            {"op": "insert", "row": {"x": 2}, "id": "[\"b\"]"},
+            {"op": "update", "id": "[\"b\"]", "set": {"x": 3}},
+            {"op": "delete", "id": "[\"a\"]"}
+        ]));
+        apply_body(&mut rows, &body).unwrap();
+        assert_eq!(super::tests::rows(&rows), ["3"]);
+        assert_eq!(rows.ids, [Some("[\"b\"]".to_string())]);
+        for bad in [
+            json!([{"op": "delete"}]),
+            json!([{"op": "delete", "index": 0, "id": "x"}]),
+        ] {
+            assert!(apply_body(&mut rows, &diff_body(bad)).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn base_log_checkpoint_compact_and_truncate() {
         let dir = tempdir();
         let store = Store::open(&dir, u64::MAX).unwrap();
         let mut base = ResultList::default();
-        base.rows.push(row(json!({"x": 1})));
-        base.ids.push(None);
+        base.push(row(json!({"x": 1})), None);
         store.create(meta("k"), w(&[(0, 5)]), base, json!({"shape": "append"}));
         store.append(
             "k",
@@ -906,8 +936,7 @@ mod tests {
         let big = |n: usize| {
             let mut r = ResultList::default();
             for i in 0..n {
-                r.rows.push(row(json!({"x": "y".repeat(100), "i": i})));
-                r.ids.push(None);
+                r.push(row(json!({"x": "y".repeat(100), "i": i})), None);
             }
             r
         };

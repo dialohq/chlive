@@ -28,15 +28,18 @@ export type ClientMessage =
 /**
  * One change to a result; unknown ops must be rejected.
  * - `insert`: with ORDER BY, at `index` (the row there and every row after it move one down);
- *   without, appended. Rows of aggregated results carry an `id` (their group's key, e.g.
- *   `["PL"]`) that updates refer to.
- * - `delete`: the row at `index` leaves the result (pushed out by LIMIT); the rows after it move up.
- * - `update`: the row with this `id` has these new values (only the columns that changed); with
- *   an `index` (ordered aggregates), it also moves: taken out, and put back so it's at `index`.
+ *   without, appended. Rows of aggregated and FINAL results carry an `id` (their group's or
+ *   row's key, e.g. `["PL"]`) that updates and deletes refer to.
+ * - `delete`: a row leaves the result: the one at `index` (pushed out by LIMIT) or the one with
+ *   this `id` (FINAL: deleted, or no longer matching); exactly one is set. The rows after it
+ *   move up.
+ * - `update`: the row with this `id` has these new values (the columns that changed, or all of
+ *   them); with an `index` (ordered aggregates), it also moves: taken out, and put back so it's
+ *   at `index`.
  */
 export type Change =
   | { op: "insert"; row: Row; index?: number; id?: string }
-  | { op: "delete"; index: number }
+  | { op: "delete"; index?: number; id?: string }
   | { op: "update"; id: string; set: Row; index?: number };
 
 /** One ORDER BY key the result is kept in. */

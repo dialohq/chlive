@@ -114,16 +114,24 @@ impl HistorySource for ClickHouseHttp {
         struct Described {
             engine: String,
             engine_full: String,
+            sorting_key: String,
+            partition_key: String,
         }
         let rows: Vec<Described> = self
             .json_each_row(&format!(
-                "SELECT engine, engine_full FROM system.tables WHERE database = {} AND name = {}",
+                "SELECT engine, engine_full, sorting_key, partition_key FROM system.tables \
+                 WHERE database = {} AND name = {}",
                 quote_string(database),
                 quote_string(table)
             ))
             .await?;
         match rows.first() {
-            Some(d) => Ok(TableEngine::from_system(&d.engine, &d.engine_full)),
+            Some(d) => Ok(TableEngine::from_system(
+                &d.engine,
+                &d.engine_full,
+                &d.sorting_key,
+                &d.partition_key,
+            )),
             None => Err(HistoryError::UnknownTable(format!("{database}.{table}"))),
         }
     }

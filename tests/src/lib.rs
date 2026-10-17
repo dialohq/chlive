@@ -118,6 +118,8 @@ pub struct LiveResult {
     /// Row ids (aggregated results), parallel to `rows`.
     pub ids: Vec<Option<String>>,
     pub updated: usize,
+    /// Rows deleted (pushed out by a LIMIT, or FINAL's deleted keys).
+    pub deleted: usize,
     /// Rows that came as inserts after the snapshot.
     pub inserted: usize,
     pub diffs: usize,
@@ -214,15 +216,26 @@ impl LiveResult {
                                     .push(format!("update of unknown row {id:?}")),
                             }
                         }
-                        Some("delete") => match change["index"].as_u64().map(|i| i as usize) {
-                            Some(i) if i < self.rows.len() => {
-                                self.rows.remove(i);
-                                self.ids.remove(i);
+                        Some("delete") => {
+                            // by index (LIMIT), or by id (FINAL)
+                            let at = match (change["index"].as_u64(), change["id"].as_str()) {
+                                (Some(i), None) => Some(i as usize),
+                                (None, Some(id)) => {
+                                    self.ids.iter().position(|x| x.as_deref() == Some(id))
+                                }
+                                _ => None,
+                            };
+                            match at {
+                                Some(i) if i < self.rows.len() => {
+                                    self.rows.remove(i);
+                                    self.ids.remove(i);
+                                    self.deleted += 1;
+                                }
+                                _ => self
+                                    .protocol_violations
+                                    .push(format!("delete {change} of {} rows", self.rows.len())),
                             }
-                            i => self
-                                .protocol_violations
-                                .push(format!("delete at {i:?} of {} rows", self.rows.len())),
-                        },
+                        }
                         other => self
                             .protocol_violations
                             .push(format!("unknown op {other:?}")),

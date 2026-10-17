@@ -11,7 +11,14 @@ use chlive_engine::EngineError;
 pub fn change(d: Diff) -> Change {
     match d {
         Diff::Insert { row, index, id } => Change::Insert { row, index, id },
-        Diff::Delete { index } => Change::Delete { index },
+        Diff::Delete { index } => Change::Delete {
+            index: Some(index),
+            id: None,
+        },
+        Diff::DeleteId { id } => Change::Delete {
+            index: None,
+            id: Some(id),
+        },
         Diff::Update { id, set, index } => Change::Update { id, set, index },
     }
 }
@@ -160,6 +167,9 @@ mod tests {
                     index: Some(0),
                 }),
                 change(Diff::Delete { index: 0 }),
+                change(Diff::DeleteId {
+                    id: "[\"PL\"]".into(),
+                }),
             ],
             at: "c2".into(),
         };
@@ -170,7 +180,8 @@ mod tests {
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}, "index": 2},
                 {"op": "update", "id": "[\"PL\"]", "set": {"user_id": "u1", "latency_ms": 10}},
                 {"op": "update", "id": "[\"DE\"]", "set": {}, "index": 0},
-                {"op": "delete", "index": 0}
+                {"op": "delete", "index": 0},
+                {"op": "delete", "id": "[\"PL\"]"}
             ], "at": "c2"})
         );
         assert_eq!(

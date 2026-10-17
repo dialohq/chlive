@@ -460,6 +460,8 @@ pub struct HistoryPlan {
     pub limit: Option<u64>,
     /// With ORDER BY: the sort columns, the keys a resume rebuilds the order from.
     pub keys_select: Option<String>,
+    /// `FROM … FINAL`: a ReplacingMergeTree's latest version of each row.
+    pub final_: bool,
 }
 
 impl HistoryPlan {
@@ -470,7 +472,7 @@ impl HistoryPlan {
 
     /// The query with one more condition (a semi-join's, or a back-fill's keys).
     pub fn sql_where(&self, from: &str, extra: &str) -> String {
-        let mut sql = format!("SELECT {} FROM {from}", self.select);
+        let mut sql = format!("SELECT {} FROM {from}{}", self.select, self.final_sql());
         match &self.filter {
             Some(f) => sql.push_str(&format!(" WHERE ({f}) AND ({extra})")),
             None => sql.push_str(&format!(" WHERE {extra}")),
@@ -497,8 +499,16 @@ impl HistoryPlan {
         format!("SELECT count() AS n FROM ({inner})")
     }
 
+    fn final_sql(&self) -> &'static str {
+        if self.final_ {
+            " FINAL"
+        } else {
+            ""
+        }
+    }
+
     fn build(&self, select: &str, from: &str, order: Option<&str>, limit: Option<u64>) -> String {
-        let mut sql = format!("SELECT {select} FROM {from}");
+        let mut sql = format!("SELECT {select} FROM {from}{}", self.final_sql());
         if let Some(f) = &self.filter {
             sql.push_str(&format!(" WHERE {f}"));
         }
@@ -540,6 +550,69 @@ pub struct StreamPlan {
     /// OFFSET: with ORDER BY, the result starts after the top M; without, the newest M rows
     /// are held back.
     pub offset: Option<u64>,
+    /// FINAL on a ReplacingMergeTree: rows have ids (their keys), and events replace them.
+    pub keyed: Option<KeyedPlan>,
+}
+
+/// FINAL for the stream: what identifies a row, which version it is, and whether it's deleted;
+/// and where history rows carry the key and version (hidden fields, removed before output).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyedPlan {
+    pub key: Vec<KeyedColumn>,
+    pub ver: Option<KeyedColumn>,
+    pub deleted: Option<ColumnId>,
+    /// The key's column names, for `explain`.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyedColumn {
+    pub id: ColumnId,
+    pub ty: Type,
+    /// Its hidden field in history rows (`__key_<i>`, `__ver`).
+    pub history_field: String,
+}
+
+impl KeyedPlan {
+    /// A history row's id and version (as ClickHouse rendered them), removing the hidden
+    /// fields. FINAL already left out deleted rows.
+    pub fn history_row(&self, row: &mut Row) -> Result<(String, Value), RowDecodeError> {
+        let mut take = |c: &KeyedColumn| {
+            let v = decode(row.get(&c.history_field), &c.ty).map_err(|error| RowDecodeError {
+                column: c.history_field.clone(),
+                error,
+            });
+            row.shift_remove(&c.history_field);
+            v
+        };
+        let key = self
+            .key
+            .iter()
+            .map(&mut take)
+            .collect::<Result<Vec<_>, _>>()?;
+        let ver = self.ver.as_ref().map(take).transpose()?;
+        Ok((id_of(&key), ver.unwrap_or(Value::Null)))
+    }
+
+    /// A decoded event's id, version (`Null` without a version column) and whether it deletes
+    /// its row.
+    pub fn event(&self, row: &DecodedRow) -> (String, Value, bool) {
+        let key: Vec<Value> = self.key.iter().map(|c| row[c.id.0].clone()).collect();
+        let ver = self
+            .ver
+            .as_ref()
+            .map_or(Value::Null, |c| row[c.id.0].clone());
+        // is_deleted is a UInt8: 1 deletes
+        let deleted = self
+            .deleted
+            .is_some_and(|d| matches!(row[d.0], Value::Int(n) if n != 0));
+        (id_of(&key), ver, deleted)
+    }
+}
+
+/// A row's id: its key values as a JSON array, as ClickHouse renders them (`["p1"]`).
+fn id_of(key: &[Value]) -> String {
+    crate::aggregate::result::group_id(&key.iter().map(Value::to_json).collect::<Vec<_>>())
 }
 
 /// ORDER BY for the stream: the keys, and where each key's value is found in a history row.
@@ -790,9 +863,17 @@ fn to_dialect(expr: &BoundExpr, table: &BoundTable) -> String {
 }
 
 /// What explain says about a table's engine: nothing for a MergeTree.
-fn engine_note(engine: &TableEngine) -> Option<String> {
-    matches!(engine, TableEngine::Replacing { .. })
-        .then(|| format!("{engine}, read without FINAL: every version of a row"))
+fn engine_note(engine: &TableEngine, keyed: Option<&KeyedPlan>) -> Option<String> {
+    match (engine, keyed) {
+        (TableEngine::Replacing { .. }, Some(k)) => Some(format!(
+            "{engine}, FINAL: one row per {}, its latest version; deleted rows leave",
+            k.text
+        )),
+        (TableEngine::Replacing { .. }, None) => Some(format!(
+            "{engine}, read without FINAL: every version of a row"
+        )),
+        _ => None,
+    }
 }
 
 /// What `--explain` shows.
@@ -807,7 +888,7 @@ impl std::fmt::Display for Plan {
             .map(|c| format!("{} {}", c.json_key, c.ty))
             .collect();
         writeln!(f, "table:   {}", self.table)?;
-        if let Some(note) = engine_note(&self.engine) {
+        if let Some(note) = engine_note(&self.engine, self.stream.keyed.as_ref()) {
             writeln!(f, "engine:  {note}")?;
         }
         writeln!(f, "columns: {}", columns.join(", "))?;
@@ -882,7 +963,7 @@ impl std::fmt::Display for Plan {
                 s.condition("<inner snapshot>"),
                 s.inner_table
             )?;
-            if let Some(note) = engine_note(&s.inner_engine) {
+            if let Some(note) = engine_note(&s.inner_engine, None) {
                 writeln!(f, "         {}: {note}", s.inner_table)?;
             }
             match s.keys_condition(&["…".into()]) {
@@ -1013,6 +1094,35 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             .collect();
         format!("ORDER BY {}", keys.join(", "))
     });
+    // FINAL: each row's key and version, under hidden aliases
+    let keyed = table.final_key.as_ref().map(|k| {
+        let mut hidden_field = |id: ColumnId, alias: String| {
+            let c = table.column(id);
+            select_list.push(format!("{} AS {alias}", quote_ident(&c.clickhouse)));
+            KeyedColumn {
+                id,
+                ty: c.ty.clone(),
+                history_field: alias,
+            }
+        };
+        let key: Vec<KeyedColumn> = k
+            .key
+            .iter()
+            .enumerate()
+            .map(|(i, id)| hidden_field(*id, format!("__key_{i}")))
+            .collect();
+        let ver = k.ver.map(|id| hidden_field(id, "__ver".into()));
+        KeyedPlan {
+            text: key
+                .iter()
+                .map(|c| table.column(c.id).name.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            key,
+            ver,
+            deleted: k.deleted,
+        }
+    });
     let history = HistoryPlan {
         table: table.clickhouse_table.clone(),
         select: select_list.join(", "),
@@ -1039,6 +1149,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             }
             fields.join(", ")
         }),
+        final_: keyed.is_some(),
     };
 
     // Columns to decode: the output's, then the filter's and ORDER BY's that aren't output.
@@ -1075,6 +1186,13 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             needed.push(outer_key);
         }
     }
+    if let Some(k) = &table.final_key {
+        for id in k.key.iter().chain(&k.ver).chain(&k.deleted) {
+            if !needed.contains(id) {
+                needed.push(*id);
+            }
+        }
+    }
     let semi = bound.semi_join.as_ref().map(|s| semi_plan(s, table));
     let stream = StreamPlan {
         topics: vec![table.topic.clone()],
@@ -1089,7 +1207,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
                 }
             })
             .collect(),
-        width: table.columns.len(),
+        width: table.width(),
         output: columns.iter().map(|c| (c.name.clone(), c.id)).collect(),
         filter: match &bound.filter {
             None => Filter::All,
@@ -1111,6 +1229,7 @@ pub fn plan(bound: &BoundQuery) -> Plan {
         }),
         limit: bound.limit,
         offset: bound.offset,
+        keyed,
     };
     Plan {
         table: table.name.clone(),
@@ -1149,7 +1268,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
                 }
             })
             .collect(),
-        width: inner.columns.len(),
+        width: inner.width(),
         output: Vec::new(),
         filter: match &s.inner_filter {
             None => Filter::All,
@@ -1161,6 +1280,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
         order: None,
         limit: None,
         offset: None,
+        keyed: None,
     };
     let float = |t: &Type| matches!(t.kind, crate::types::Kind::Float(_));
     SemiPlan {
@@ -1238,6 +1358,8 @@ mod tests {
             clickhouse_name: "events".into(),
             topic: TopicId("events".into()),
             engine: TableEngine::MergeTree,
+            internal: Vec::new(),
+            final_key: None,
             columns: vec![
                 col(0, "ts", "DateTime64(3)"),
                 col(1, "user_id", "String"),
@@ -1305,6 +1427,7 @@ mod tests {
         let replacing = TableEngine::Replacing {
             ver: Some("version".into()),
             is_deleted: None,
+            key: crate::table_engine::Key::from_system("k", ""),
         };
         assert!(explain(replacing.clone()).contains(
             "engine:  ReplacingMergeTree(version), read without FINAL: every version of a row\n"
@@ -1316,6 +1439,50 @@ mod tests {
             crate::cursor::fingerprint(&plan(&b))
         };
         assert_eq!(fp(replacing), fp(TableEngine::MergeTree));
+    }
+
+    #[test]
+    fn final_reads_one_row_per_key() {
+        let mut b = bound(&[0, 2], None);
+        b.table.engine = TableEngine::Replacing {
+            ver: Some("latency_ms".into()),
+            is_deleted: None,
+            key: crate::table_engine::Key::from_system("user_id", ""),
+        };
+        let without = crate::cursor::fingerprint(&plan(&b));
+        b.table.final_key = Some(crate::binder::FinalKey {
+            key: vec![ColumnId(1)],
+            ver: Some(ColumnId(2)),
+            deleted: None,
+        });
+        let p = plan(&b);
+        assert_eq!(
+            p.history.sql("db.snap"),
+            "SELECT ts, latency_ms, user_id AS __key_0, latency_ms AS __ver FROM db.snap FINAL"
+        );
+        assert_eq!(p.stream.required_keys(), ["ts", "latency_ms", "user_id"]);
+        assert!(p.to_string().contains(
+            "engine:  ReplacingMergeTree(latency_ms), FINAL: one row per user_id, its latest \
+             version; deleted rows leave\n"
+        ));
+        assert_ne!(crate::cursor::fingerprint(&p), without);
+        let keyed = p.stream.keyed.as_ref().unwrap();
+        let mut row =
+            json!({"ts": "2026-10-17 00:00:00.000", "latency_ms": 5, "__key_0": "u1", "__ver": 5})
+                .as_object()
+                .unwrap()
+                .clone();
+        let (id, ver) = keyed.history_row(&mut row).unwrap();
+        assert_eq!((id.as_str(), ver), ("[\"u1\"]", Value::Int(5)));
+        assert_eq!(row.keys().collect::<Vec<_>>(), ["ts", "latency_ms"]);
+        // an event's id is the same
+        let mut decoded = vec![Value::Null; 5];
+        decoded[1] = Value::String("u1".into());
+        decoded[2] = Value::Int(6);
+        assert_eq!(
+            keyed.event(&decoded),
+            ("[\"u1\"]".into(), Value::Int(6), false)
+        );
     }
 
     #[test]

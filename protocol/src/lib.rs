@@ -14,6 +14,10 @@
 //! are inserts with an `id`, changed ones `update`s of the changed columns by `id`. Ordered,
 //! a group can move: its `update` then has an `index`, where the row is after the move.
 //!
+//! FINAL results (on a ReplacingMergeTree) have row ids too, the row's key: a new key is an
+//! insert with an `id`, a new version an `update` by `id` (of the whole row), and a deleted
+//! key, or one whose new version no longer matches the WHERE, a `delete` by `id`.
+//!
 //! With LIMIT (`limit` in the snapshot), a row pushed out is a `delete` of its index, right
 //! after the insert that pushed it; for aggregates, a group falling out is deleted and the one
 //! taking the last place inserted. Each `diff` is atomic: its changes apply in sequence (each
@@ -151,10 +155,17 @@ pub enum Change {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
-    /// The row at `index` leaves the result (pushed out by LIMIT); the rows after it move up.
-    Delete { index: usize },
-    /// The row with this `id` has these new values (only the columns that changed), and, with
-    /// an `index`, moves: it's taken out and put back so that it's at `index`.
+    /// A row leaves the result: the one at `index` (pushed out by LIMIT), or the one with this
+    /// `id` (FINAL: deleted, or no longer matching); exactly one of the two is set. The rows
+    /// after it move up.
+    Delete {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// The row with this `id` has these new values (the columns that changed, or all of them),
+    /// and, with an `index`, moves: it's taken out and put back so that it's at `index`.
     Update {
         id: String,
         set: Row,
@@ -279,9 +290,10 @@ mod tests {
             {"op": "insert", "row": {"a": 2}, "index": 0, "id": "[\"x\"]"},
             {"op": "update", "id": "[\"x\"]", "set": {"a": 3}},
             {"op": "update", "id": "[\"x\"]", "set": {}, "index": 1},
-            {"op": "delete", "index": 0}
+            {"op": "delete", "index": 0},
+            {"op": "delete", "id": "[\"x\"]"}
         ], "at": "c2"}));
-        assert!(matches!(&m, ServerMsg::Diff { changes, .. } if changes.len() == 5));
+        assert!(matches!(&m, ServerMsg::Diff { changes, .. } if changes.len() == 6));
         round_trip::<ServerMsg>(json!({"type": "progress", "id": "s1", "at": "c3"}));
         let m: ServerMsg =
             round_trip(json!({"type": "error", "code": "BAD_MESSAGE", "message": "nope"}));

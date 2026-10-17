@@ -236,6 +236,23 @@ test("a snapshot instead of a resume replaces the cached rows, and is saved in f
   client.close();
 });
 
+test("inserts with ids are saved in full, keeping their ids", async () => {
+  FakeSocket.all = [];
+  const { cache, data, calls } = memoryCache();
+  const client = new LiveClient({ url: "ws://x/live", WebSocket: FakeSocket as any, cache, saveDelayMs: 5 });
+  client.subscribe(SQL, () => {});
+  FakeSocket.all[0].open();
+  await tick(1);
+  const ws = FakeSocket.all[0];
+  ws.deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "a" }], ids: ['["a"]'], at: "c1" });
+  await tick(20);
+  ws.deliver({ type: "diff", id: "s1", changes: [{ op: "insert", row: { user_id: "b" }, id: '["b"]' }], at: "c2" });
+  await tick(20);
+  assert.deepEqual(calls, [`load ${SQL}`, "save 1@c1", "save 2@c2"]);
+  assert.deepEqual(data.get(SQL)!.ids, ['["a"]', '["b"]']);
+  client.close();
+});
+
 test("a cache miss subscribes without since, then saves the snapshot", async () => {
   FakeSocket.all = [];
   const { cache, calls } = memoryCache();

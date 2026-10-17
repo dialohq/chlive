@@ -1,6 +1,7 @@
 //! A table's ClickHouse engine, as far as chlive cares: `MergeTree`, `ReplacingMergeTree` (with
-//! its version and is-deleted columns) or anything else, which queries can't use. Replicated
-//! forms are the same engines; their clones (see [`crate::snapshot`]) aren't replicated.
+//! its version and is-deleted columns, and the key its rows are replaced by) or anything else,
+//! which queries can't use. Replicated forms are the same engines; their clones (see
+//! [`crate::snapshot`]) aren't replicated.
 
 use std::fmt;
 
@@ -13,18 +14,73 @@ pub enum TableEngine {
     Replacing {
         ver: Option<String>,
         is_deleted: Option<String>,
+        key: Key,
     },
     /// Any other engine, as ClickHouse names it (`CollapsingMergeTree`, `View`, …).
     Other(String),
 }
 
+/// What a ReplacingMergeTree replaces rows by: its sorting key, within a partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    /// Plain columns, the partition key's among the sorting key's: rows with the same sorting
+    /// key are the same row.
+    Columns {
+        sorting: Vec<String>,
+        partition: Vec<String>,
+    },
+    /// Why live FINAL can't follow it (an expression, no key, …).
+    Unsupported(String),
+}
+
+impl Key {
+    /// From `system.tables`' `sorting_key` (`k, \`my col\``) and `partition_key`.
+    pub fn from_system(sorting_key: &str, partition_key: &str) -> Key {
+        let columns = |list: &str, what: &str| -> Result<Vec<String>, String> {
+            if list.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            let wrapped = format!("({list})");
+            let parts = arguments(&wrapped)
+                .ok_or_else(|| format!("the {what} key can't be read ({list})"))?;
+            parts
+                .into_iter()
+                .map(|p| match Arg::read(p) {
+                    Arg::Ident(name) => Ok(name),
+                    _ => Err(format!("the {what} key has an expression ({p})")),
+                })
+                .collect()
+        };
+        let read = || {
+            let sorting = columns(sorting_key, "sorting")?;
+            if sorting.is_empty() {
+                return Err("the table has no sorting key".to_string());
+            }
+            let partition = columns(partition_key, "partition")?;
+            if let Some(c) = partition.iter().find(|c| !sorting.contains(c)) {
+                return Err(format!(
+                    "the partition key uses a column outside the sorting key ({c})"
+                ));
+            }
+            Ok(Key::Columns { sorting, partition })
+        };
+        read().unwrap_or_else(Key::Unsupported)
+    }
+}
+
 const REPLICATED: &str = "Replicated";
 
 impl TableEngine {
-    /// From `system.tables`: `engine` (`ReplicatedReplacingMergeTree`) and `engine_full`
-    /// (`ReplicatedReplacingMergeTree('/p', '{replica}', v) ORDER BY k SETTINGS …`). Arguments
-    /// it can't read make it [`TableEngine::Other`].
-    pub fn from_system(engine: &str, engine_full: &str) -> Self {
+    /// From `system.tables`: `engine` (`ReplicatedReplacingMergeTree`), `engine_full`
+    /// (`ReplicatedReplacingMergeTree('/p', '{replica}', v) ORDER BY k SETTINGS …`),
+    /// `sorting_key` and `partition_key`. Arguments it can't read make it
+    /// [`TableEngine::Other`].
+    pub fn from_system(
+        engine: &str,
+        engine_full: &str,
+        sorting_key: &str,
+        partition_key: &str,
+    ) -> Self {
         let other = || TableEngine::Other(engine.to_string());
         let replicated = Self::is_replicated(engine);
         let base = engine.strip_prefix(REPLICATED).unwrap_or(engine);
@@ -57,6 +113,7 @@ impl TableEngine {
                 TableEngine::Replacing {
                     ver: columns.next(),
                     is_deleted: columns.next(),
+                    key: Key::from_system(sorting_key, partition_key),
                 }
             }
             _ => other(),
@@ -82,7 +139,9 @@ impl fmt::Display for TableEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TableEngine::MergeTree => f.write_str("MergeTree"),
-            TableEngine::Replacing { ver, is_deleted } => {
+            TableEngine::Replacing {
+                ver, is_deleted, ..
+            } => {
                 let columns: Vec<String> = ver
                     .iter()
                     .chain(is_deleted)
@@ -164,14 +223,50 @@ mod tests {
 
     fn engine(engine_full: &str) -> TableEngine {
         let name = engine_full.split(['(', ' ']).next().unwrap();
-        TableEngine::from_system(name, engine_full)
+        TableEngine::from_system(name, engine_full, "k", "")
     }
 
     fn replacing(ver: Option<&str>, is_deleted: Option<&str>) -> TableEngine {
         TableEngine::Replacing {
             ver: ver.map(Into::into),
             is_deleted: is_deleted.map(Into::into),
+            key: key(&["k"], &[]),
         }
+    }
+
+    fn key(sorting: &[&str], partition: &[&str]) -> Key {
+        Key::Columns {
+            sorting: sorting.iter().map(|c| c.to_string()).collect(),
+            partition: partition.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn keys() {
+        assert_eq!(Key::from_system("k", ""), key(&["k"], &[]));
+        assert_eq!(Key::from_system("k, k2", "k2"), key(&["k", "k2"], &["k2"]));
+        assert_eq!(
+            Key::from_system("`my k`, x", "`my k`"),
+            key(&["my k", "x"], &["my k"])
+        );
+        let unsupported =
+            |sorting: &str, partition: &str| match Key::from_system(sorting, partition) {
+                Key::Unsupported(why) => why,
+                k => panic!("{sorting} / {partition}: {k:?}"),
+            };
+        assert_eq!(
+            unsupported("lower(k), d", ""),
+            "the sorting key has an expression (lower(k))"
+        );
+        assert_eq!(unsupported("", ""), "the table has no sorting key");
+        assert_eq!(
+            unsupported("k, d", "toYYYYMM(d)"),
+            "the partition key has an expression (toYYYYMM(d))"
+        );
+        assert_eq!(
+            unsupported("k", "d"),
+            "the partition key uses a column outside the sorting key (d)"
+        );
     }
 
     #[test]

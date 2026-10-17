@@ -10,6 +10,7 @@ use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
 use chlive_engine::rules::ConfiguredRules;
 use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Snapshots};
 use chlive_engine::source::MemorySource;
+use chlive_engine::table_engine::{Key, TableEngine};
 use chlive_engine::watermark::Watermark;
 use chlive_engine::{Checkpoint, Engine, EngineError, Iteration, Params};
 use futures::StreamExt;
@@ -33,6 +34,16 @@ impl HistorySource for EmptyHistory {
             ]),
             _ => Err(HistoryError::UnknownTable(table.into())),
         }
+    }
+
+    /// A ReplacingMergeTree by user (without a version column: the later event wins), so
+    /// FINAL queries are keyed; the others read it like a MergeTree.
+    async fn table_engine(&self, _: &str, _: &str) -> Result<TableEngine, HistoryError> {
+        Ok(TableEngine::Replacing {
+            ver: None,
+            is_deleted: None,
+            key: Key::from_system("user_id", ""),
+        })
     }
 
     async fn fetch(&self, _sql: &str) -> Result<Vec<Row>, HistoryError> {
@@ -107,6 +118,8 @@ const SHAPES: &[(&str, &str)] = &[
     ("native", "select user_id, sum(latency_ms) as s from requests group by user_id order by s desc limit 3"),
     ("native", "select user_id, count() as n from requests group by user_id order by n, user_id limit 2 offset 1"),
     ("native", "select count(), max(latency_ms), avg(cost) from requests"),
+    ("keyed", "select user_id, latency_ms from requests final where latency_ms > 300"),
+    ("keyed", "select * from requests final"),
 ];
 
 #[tokio::test]
@@ -183,6 +196,7 @@ async fn a_checkpoint_only_restores_its_own_kind_of_query() {
     let ordered = sub.checkpoint().unwrap();
     for other in [
         "select user_id from requests",
+        "select user_id from requests final",
         "select user_id from requests limit 3",
         "select user_id, count() from requests group by user_id",
     ] {

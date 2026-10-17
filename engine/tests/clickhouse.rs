@@ -1225,6 +1225,7 @@ async fn aggregates_match_clickhouse() {
                         Diff::Delete { .. } => {
                             assert!(limit.is_some() || offset.is_some(), "{sql}: a delete")
                         }
+                        Diff::DeleteId { .. } => panic!("{sql}: a delete by id"),
                     }
                     list.apply(d)
                         .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
@@ -1283,6 +1284,134 @@ async fn aggregates_match_clickhouse() {
         exec(&format!("DROP DATABASE {database}")).await;
     } // the only test here using chDB: close it, or the test process crashes on exit
     chlive_engine::chdb::shutdown();
+}
+
+/// FINAL on a ReplacingMergeTree, in every split of history and stream: the live result (the
+/// snapshot's FINAL, then each event a new version of its key: inserted, updated, deleted, or
+/// in and out of the WHERE) equals ClickHouse's `SELECT … FINAL` over all the data.
+#[tokio::test]
+async fn final_matches_clickhouse() {
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    // versions only grow per key, sometimes tie; some versions delete their key
+    let mut seed: u64 = 11;
+    let mut rand = |n: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let mut versions = [0u64; 12];
+    let events: Vec<String> = (0..200)
+        .map(|i| {
+            let k = rand(12) as usize;
+            if rand(6) != 0 {
+                versions[k] += 1 + rand(3);
+            }
+            format!(
+                r#"{{"product_id":"k{k}","name":"n{i}","price":{},"version":{},"deleted":{}}}"#,
+                rand(100),
+                versions[k],
+                u8::from(rand(7) == 0)
+            )
+        })
+        .collect();
+    const CASES: &[&str] = &[
+        "select * from products final",
+        "select product_id, price from products final where price > 50",
+        "select name, version from products final where price < 30 or product_id = 'k3'",
+        "select product_id from products final where deleted = 0 and price >= 10",
+    ];
+    let mut engines = Vec::new();
+    for (database, in_clickhouse) in [
+        ("chlive_engine_final_history", events.len()),
+        ("chlive_engine_final_stream", 0),
+        ("chlive_engine_final_split", events.len() / 2),
+    ] {
+        exec(&format!("DROP DATABASE IF EXISTS {database}")).await;
+        exec(&format!("CREATE DATABASE {database}")).await;
+        exec(&format!(
+            "CREATE TABLE {database}.products (product_id String, name String, price UInt32, \
+             version UInt64, deleted UInt8) \
+             ENGINE = ReplacingMergeTree(version, deleted) ORDER BY product_id"
+        ))
+        .await;
+        if in_clickhouse > 0 {
+            let rows: String = events[..in_clickhouse]
+                .iter()
+                .map(|e| format!("{e}\n"))
+                .collect();
+            exec(&format!(
+                "INSERT INTO {database}.products FORMAT JSONEachRow\n{rows}"
+            ))
+            .await;
+        }
+        let mut source = MemorySource::new();
+        for e in &events {
+            source.push("products", 0, e.as_str());
+        }
+        let engine = engine_at(database.into(), source, upto(in_clickhouse)).with_max_batch(7);
+        engines.push((database, engine));
+    }
+    let direct = ClickHouseHttp::new(&url(), "default", "");
+    let canon = |rows: &[chlive_engine::diff::Row]| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .map(|r| serde_json::Value::Object(r.clone()).to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    for sql in CASES {
+        use chlive_engine::history::HistorySource;
+        let want = direct
+            .fetch(&sql.replace("from products", "from chlive_engine_final_history.products"))
+            .await
+            .unwrap();
+        assert!(!want.is_empty(), "{sql}");
+        for (database, engine) in &engines {
+            let iterations: Vec<_> = engine
+                .subscribe(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|i| i.unwrap_or_else(|e| panic!("{database}: {sql}: {e}")))
+                .collect()
+                .await;
+            let mut list = chlive_engine::diff::ResultList::default();
+            let (mut inserts, mut updates, mut deletes) = (0, 0, 0);
+            for it in &iterations {
+                for d in &it.diffs {
+                    match d {
+                        Diff::Insert { id, .. } => {
+                            assert!(id.is_some(), "{sql}: an insert without an id");
+                            inserts += 1
+                        }
+                        Diff::Update { .. } => updates += 1,
+                        Diff::DeleteId { .. } => deletes += 1,
+                        Diff::Delete { .. } => panic!("{sql}: a delete by index"),
+                    }
+                    list.apply(d)
+                        .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
+                }
+            }
+            assert_eq!(canon(&list.rows), canon(&want), "{database}: {sql}");
+            if *database == "chlive_engine_final_stream" {
+                assert!(
+                    updates > 0 && deletes > 0,
+                    "{sql}: {updates} updates, {deletes} deletes"
+                );
+            }
+            eprintln!(
+                "{database:>28}: {sql}: {} rows, {inserts} inserts, {updates} updates, {deletes} deletes",
+                list.rows.len()
+            );
+        }
+    }
+    for (database, _) in &engines {
+        exec(&format!("DROP DATABASE {database}")).await;
+    }
 }
 
 /// `IN (SELECT …)` over two tables, in every split of history and stream for both: the live

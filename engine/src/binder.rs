@@ -10,10 +10,10 @@ use crate::ast::{
     SelectExpr,
 };
 use crate::error::{render_at, Span};
-use crate::history::{HistoryError, HistorySource};
+use crate::history::{DescribedColumn, HistoryError, HistorySource};
 use crate::rules::{NamingRules, TopicId};
 use crate::source::{EventSource, SourceError};
-use crate::table_engine::TableEngine;
+use crate::table_engine::{Key, TableEngine};
 use crate::types::{Kind, LiteralError, Type, Value};
 
 /// What the binder can look things up in.
@@ -60,8 +60,23 @@ pub struct BoundTable {
     pub clickhouse_name: String,
     pub topic: TopicId,
     pub columns: Vec<BoundColumn>,
-    /// Its ClickHouse engine: a MergeTree or a ReplacingMergeTree (read without FINAL).
+    /// Its ClickHouse engine: a MergeTree or a ReplacingMergeTree.
     pub engine: TableEngine,
+    /// Columns queries can't name but the engine needs (a FINAL key, version or is-deleted
+    /// column the naming rules hide); their ids come after `columns`'.
+    pub internal: Vec<BoundColumn>,
+    /// `FROM t FINAL` on a ReplacingMergeTree: what its rows are replaced by.
+    pub final_key: Option<FinalKey>,
+}
+
+/// A ReplacingMergeTree read with FINAL: one row per key, its latest version (the highest
+/// `ver`, the last one on ties or without), gone when that version is deleted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalKey {
+    /// The sorting key's columns.
+    pub key: Vec<ColumnId>,
+    pub ver: Option<ColumnId>,
+    pub deleted: Option<ColumnId>,
 }
 
 impl BoundTable {
@@ -76,7 +91,15 @@ impl BoundTable {
     }
 
     pub fn column(&self, id: ColumnId) -> &BoundColumn {
-        &self.columns[id.0]
+        match id.0.checked_sub(self.columns.len()) {
+            Some(i) => &self.internal[i],
+            None => &self.columns[id.0],
+        }
+    }
+
+    /// How many columns a decoded row has: the visible ones, then the internal ones.
+    pub fn width(&self) -> usize {
+        self.columns.len() + self.internal.len()
     }
 }
 
@@ -423,6 +446,7 @@ fn visit_literals(
 
 async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, BindError> {
     let table = bind_from(query, catalog).await?;
+    check_final_shape(query, &table)?;
     let (selection, sub) = match &query.selection {
         Some(expr) => split_subquery(expr)?,
         None => (None, None),
@@ -439,6 +463,9 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
         None => None,
     };
     if let Some(mut aggregation) = bind_aggregation(query, &table)? {
+        if let (Some(_), Some(span)) = (&table.final_key, query.from.final_span) {
+            return Err(final_unsupported(&table, "aggregates", span));
+        }
         if let Some(Sub::In(_, _, span) | Sub::Exists(_, span)) = sub {
             return Err(BindError::at(
                 "IN (subquery) with GROUP BY or aggregates is not supported yet",
@@ -599,6 +626,7 @@ async fn bind_semi_join(
         }
     };
     let inner = bind_from(sub, catalog).await?;
+    check_inner_final(sub, &inner)?;
     let inner_key = resolve_column(&inner, column)?;
     check_key_types(
         outer,
@@ -700,6 +728,7 @@ async fn bind_exists(
 ) -> Result<SemiJoin, BindError> {
     check_subquery_clauses(sub, "an EXISTS sub-query")?;
     let inner = bind_from(sub, catalog).await?;
+    check_inner_final(sub, &inner)?;
     let mut conjuncts = Vec::new();
     if let Some(e) = &sub.selection {
         fn split<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -1180,12 +1209,15 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
                 from.span,
             ))
         }
-        (TableEngine::Replacing { .. }, Some(span)) => {
+        (
+            TableEngine::Replacing {
+                key: Key::Unsupported(why),
+                ..
+            },
+            Some(span),
+        ) => {
             return Err(BindError::at(
-                format!(
-                    "FINAL on {} (ReplacingMergeTree) isn't supported yet",
-                    from.name
-                ),
+                format!("FINAL on {}: {why}", from.name),
                 span,
             ))
         }
@@ -1205,21 +1237,59 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
             from.span,
         ));
     }
+    let bound = |i: usize, c: &DescribedColumn| {
+        let m = catalog.rules.column(&from.name, &c.name);
+        BoundColumn {
+            id: ColumnId(i),
+            name: m.name,
+            clickhouse: c.name.clone(),
+            json_key: m.json_key,
+            ty: Type::parse(&c.ty),
+        }
+    };
     let columns: Vec<BoundColumn> = described
-        .into_iter()
+        .iter()
         .filter(|c| !catalog.rules.is_hidden(&from.name, &c.name))
         .enumerate()
-        .map(|(i, c)| {
-            let m = catalog.rules.column(&from.name, &c.name);
-            BoundColumn {
-                id: ColumnId(i),
-                name: m.name,
-                clickhouse: c.name,
-                json_key: m.json_key,
-                ty: Type::parse(&c.ty),
-            }
-        })
+        .map(|(i, c)| bound(i, c))
         .collect();
+    // FINAL: the key, version and is-deleted columns, hidden ones too
+    let mut internal: Vec<BoundColumn> = Vec::new();
+    let final_key = match (&engine, from.final_span) {
+        (
+            TableEngine::Replacing {
+                ver,
+                is_deleted,
+                key: Key::Columns { sorting, .. },
+            },
+            Some(_),
+        ) => {
+            let mut id_of = |name: &str| -> Result<ColumnId, BindError> {
+                if let Some(c) = columns
+                    .iter()
+                    .chain(&internal)
+                    .find(|c| c.clickhouse == name)
+                {
+                    return Ok(c.id);
+                }
+                let c = described.iter().find(|c| c.name == name).ok_or_else(|| {
+                    BindError::at(
+                        format!("FINAL on {}: no column {name} in ClickHouse", from.name),
+                        from.span,
+                    )
+                })?;
+                let c = bound(columns.len() + internal.len(), c);
+                internal.push(c);
+                Ok(internal.last().unwrap().id)
+            };
+            Some(FinalKey {
+                key: sorting.iter().map(|c| id_of(c)).collect::<Result<_, _>>()?,
+                ver: ver.as_deref().map(&mut id_of).transpose()?,
+                deleted: is_deleted.as_deref().map(&mut id_of).transpose()?,
+            })
+        }
+        _ => None,
+    };
     // a rename can land on another column's name
     let mut names = std::collections::BTreeSet::new();
     if let Some(dup) = columns.iter().find(|c| !names.insert(c.name.as_str())) {
@@ -1240,7 +1310,64 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
         topic,
         columns,
         engine,
+        internal,
+        final_key,
     })
+}
+
+/// FINAL on a sub-query's ReplacingMergeTree.
+fn check_inner_final(sub: &Query, inner: &BoundTable) -> Result<(), BindError> {
+    match (&inner.final_key, sub.from.final_span) {
+        (Some(_), Some(span)) => Err(BindError::at(
+            format!(
+                "FINAL on {} (ReplacingMergeTree) in a sub-query isn't supported yet",
+                inner.name
+            ),
+            span,
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `FROM t FINAL` on a ReplacingMergeTree: the shapes live FINAL doesn't follow yet.
+fn check_final_shape(query: &Query, table: &BoundTable) -> Result<(), BindError> {
+    let (Some(_), Some(span)) = (&table.final_key, query.from.final_span) else {
+        return Ok(());
+    };
+    let what = if query.group_by.is_some() {
+        "GROUP BY"
+    } else if query.order.is_some() {
+        "ORDER BY"
+    } else if query.limit.is_some() {
+        "LIMIT"
+    } else if offset_of(query).is_some() {
+        "OFFSET"
+    } else if query.selection.as_ref().is_some_and(has_subquery) {
+        "a sub-query"
+    } else {
+        return Ok(());
+    };
+    Err(final_unsupported(table, what, span))
+}
+
+fn final_unsupported(table: &BoundTable, what: &str, span: Span) -> BindError {
+    BindError::at(
+        format!(
+            "FINAL on {} (ReplacingMergeTree) with {what} isn't supported yet",
+            table.name
+        ),
+        span,
+    )
+}
+
+/// Whether a condition has an IN or EXISTS sub-query anywhere.
+fn has_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::And(l, r) | Expr::Or(l, r) => has_subquery(l) || has_subquery(r),
+        Expr::Not { expr, .. } => has_subquery(expr),
+        _ => false,
+    }
 }
 
 /// WHERE: a boolean expression over the table's columns. Comparisons need compatible types;
@@ -1601,6 +1728,12 @@ mod tests {
                     col("deleted", "UInt8"),
                 ]),
                 "default.ledger" => Ok(vec![col("user_id", "String"), col("sign", "Int8")]),
+                "default.items" => Ok(vec![
+                    col("item_id", "String"),
+                    col("name", "String"),
+                    col("_version", "UInt64"),
+                ]),
+                "default.lowered" => Ok(vec![col("k", "String")]),
                 _ => Err(HistoryError::UnknownTable(table.into())),
             }
         }
@@ -1609,6 +1742,18 @@ mod tests {
                 "products" => TableEngine::Replacing {
                     ver: Some("version".into()),
                     is_deleted: Some("deleted".into()),
+                    key: Key::from_system("product_id", ""),
+                },
+                // its version column hidden by the naming rules (`_*`)
+                "items" => TableEngine::Replacing {
+                    ver: Some("_version".into()),
+                    is_deleted: None,
+                    key: Key::from_system("item_id", ""),
+                },
+                "lowered" => TableEngine::Replacing {
+                    ver: None,
+                    is_deleted: None,
+                    key: Key::from_system("lower(k)", ""),
                 },
                 "ledger" => TableEngine::Other("CollapsingMergeTree".into()),
                 _ => TableEngine::MergeTree,
@@ -1627,7 +1772,9 @@ mod tests {
             .partition("plain", 0)
             .partition("sessions", 0)
             .partition("products", 0)
-            .partition("ledger", 0);
+            .partition("ledger", 0)
+            .partition("items", 0)
+            .partition("lowered", 0);
         source
     }
 
@@ -1665,12 +1812,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(q.table.engine, TableEngine::Replacing { .. }));
-        assert_eq!(
-            bind_sql("select * from products p final")
-                .await
-                .unwrap_err(),
-            "FINAL on products (ReplacingMergeTree) isn't supported yet at 1:26"
-        );
+        assert_eq!(q.table.final_key, None);
         // FINAL on a MergeTree changes nothing
         let plain = bind_sql("select ts from events where latency_ms > 5")
             .await
@@ -1697,8 +1839,82 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            "FINAL on products (ReplacingMergeTree) isn't supported yet at 1:73"
+            "FINAL on products (ReplacingMergeTree) in a sub-query isn't supported yet at 1:73"
         );
+    }
+
+    #[tokio::test]
+    async fn final_on_a_replacing_merge_tree_binds_its_key_version_and_deleted_columns() {
+        let q = bind_sql("select product_id from products final where version > 1")
+            .await
+            .unwrap();
+        let col = |id: ColumnId| q.table.column(id).clickhouse.clone();
+        let k = q.table.final_key.clone().expect("a FINAL key");
+        assert_eq!(
+            (
+                k.key.iter().map(|c| col(*c)).collect::<Vec<_>>(),
+                k.ver.map(col),
+                k.deleted.map(col)
+            ),
+            (
+                vec!["product_id".to_string()],
+                Some("version".into()),
+                Some("deleted".into())
+            )
+        );
+        assert!(q.table.internal.is_empty());
+        // a hidden version column is internal: the engine reads it, queries can't
+        let q = bind_sql("select * from items final").await.unwrap();
+        let k = q.table.final_key.clone().unwrap();
+        let ver = q.table.column(k.ver.unwrap());
+        assert_eq!((ver.clickhouse.as_str(), ver.id), ("_version", ColumnId(2)));
+        assert_eq!(q.table.width(), 3);
+        assert_eq!(
+            q.output().map(|c| c.name).collect::<Vec<_>>(),
+            ["item_id", "name"]
+        );
+        assert!(bind_sql("select _version from items final").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn final_refuses_the_shapes_it_does_not_follow_yet() {
+        let err = |sql: &'static str| async move { bind_sql(sql).await.unwrap_err() };
+        let unsupported = |what: &str, at: &str| {
+            format!(
+                "FINAL on products (ReplacingMergeTree) with {what} isn't supported yet at {at}"
+            )
+        };
+        assert_eq!(
+            err("select * from products final order by version").await,
+            unsupported("ORDER BY", "1:24")
+        );
+        assert_eq!(
+            err("select * from products final limit 5").await,
+            unsupported("LIMIT", "1:24")
+        );
+        assert_eq!(
+            err("select * from products final offset 5").await,
+            unsupported("OFFSET", "1:24")
+        );
+        assert_eq!(
+            err("select product_id, count() from products final group by product_id").await,
+            unsupported("GROUP BY", "1:42")
+        );
+        assert_eq!(
+            err("select count() from products final").await,
+            unsupported("aggregates", "1:30")
+        );
+        assert_eq!(
+            err("select * from products final where product_id in (select item_id from items)")
+                .await,
+            unsupported("a sub-query", "1:24")
+        );
+        assert_eq!(
+            err("select * from lowered final").await,
+            "FINAL on lowered: the sorting key has an expression (lower(k)) at 1:23"
+        );
+        // without FINAL it reads like a MergeTree
+        assert!(bind_sql("select * from lowered").await.is_ok());
     }
 
     #[tokio::test]
