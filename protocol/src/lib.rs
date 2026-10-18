@@ -8,7 +8,8 @@
 //!
 //! With ORDER BY, the snapshot is in order and says so (`order`), and every insert carries the
 //! `index` the row takes: the row at that index and all after it move one down. Without ORDER BY
-//! there is no index and rows are appended.
+//! there is no index and rows are appended, except in LIMIT and OFFSET windows, which are
+//! newest first: a new row comes in at index 0.
 //!
 //! Aggregated results (GROUP BY or aggregates) have row ids, their group's key: new groups
 //! are inserts with an `id`, changed ones `update`s of the changed columns by `id`. Ordered,

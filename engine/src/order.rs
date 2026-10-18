@@ -349,7 +349,9 @@ impl OrderedState {
     }
 }
 
-/// LIMIT without ORDER BY: a window of the latest N rows. Only the row count is kept.
+/// LIMIT without ORDER BY: a window of the latest N rows, newest first (the history's order
+/// reversed; each new row in at the top, the oldest out at the bottom once full). Only the row
+/// count is kept.
 #[derive(Debug, Clone)]
 pub struct WindowState {
     len: u64,
@@ -382,8 +384,12 @@ impl WindowState {
         Ok(())
     }
 
-    /// A new row: `None` with `LIMIT 0` (it never shows), otherwise whether, after appending it,
-    /// the first row must be deleted.
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// A new row: `None` with `LIMIT 0` (it never shows), otherwise whether, after inserting it
+    /// at the top, the last row must be deleted.
     pub fn push(&mut self) -> Option<bool> {
         if self.limit == 0 {
             return None;
@@ -520,10 +526,10 @@ impl OffsetState {
     }
 }
 
-/// No ORDER BY, with OFFSET m (and maybe LIMIT n): a sliding window over the arrival order. The
-/// newest `m` rows are held back; the result is the `n` before them. A new row is held back,
-/// the oldest held-back row comes into the result at its bottom, and, with a full result, the
-/// oldest one leaves at the top.
+/// No ORDER BY, with OFFSET m (and maybe LIMIT n): a sliding window over the arrival order,
+/// shown newest first. The newest `m` rows are held back; the result is the `n` before them. A
+/// new row is held back, the oldest held-back row comes into the result at its top, and, with a
+/// full result, the oldest one leaves at the bottom.
 #[derive(Debug, Clone)]
 pub struct HeldWindow {
     held: VecDeque<Row>,
@@ -577,13 +583,19 @@ impl HeldWindow {
         if self.held.len() <= self.offset {
             return Vec::new();
         }
+        // newest first: the oldest held-back row enters at the top; once full, the last goes
         let row = self.held.pop_front().expect("more than offset");
+        let insert = Diff::Insert {
+            row,
+            index: Some(0),
+            id: None,
+        };
         match self.limit {
             Some(0) => Vec::new(),
-            Some(n) if self.visible >= n => vec![Diff::insert(row), Diff::Delete { index: 0 }],
+            Some(n) if self.visible >= n => vec![insert, Diff::Delete { index: n as usize }],
             _ => {
                 self.visible += 1;
-                vec![Diff::insert(row)]
+                vec![insert]
             }
         }
     }
@@ -831,7 +843,9 @@ mod tests {
             let history: Vec<Row> = (0..5).map(|i| row(i, i as usize)).collect();
             let take = limit.map_or(5, |n| (offset + n).min(5) as usize);
             let mut arrived: Vec<i64> = (0..take as i64).collect();
+            // the engine shows the history newest first too
             let mut list = w.history(history.into_iter().take(take).collect());
+            list.reverse();
             for i in 5..60 {
                 arrived.push(i);
                 for d in w.push(row(i, i as usize)) {
@@ -839,7 +853,8 @@ mod tests {
                 }
                 let end = arrived.len().saturating_sub(offset as usize);
                 let start = limit.map_or(0, |n| end.saturating_sub(n as usize));
-                let want = &arrived[start..end];
+                // the same rows, newest first
+                let want: Vec<i64> = arrived[start..end].iter().rev().copied().collect();
                 let got: Vec<i64> = list.iter().map(|r| r["n"].as_i64().unwrap()).collect();
                 assert_eq!(got, want, "offset {offset}, limit {limit:?}");
             }

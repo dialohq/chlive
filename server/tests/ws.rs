@@ -461,11 +461,11 @@ async fn limit_sends_deletes_in_the_same_diff() {
         let m = c.expect().await;
         changes.extend(m["changes"].as_array().unwrap().iter().cloned());
     }
-    // each event: appended, then the first row deleted
+    // each event: in at the top (newest first), then the last row deleted
     for pair in changes.chunks(2) {
         assert_eq!(pair[0]["op"], "insert");
-        assert!(pair[0].get("index").is_none());
-        assert_eq!(pair[1], json!({"op": "delete", "index": 0}));
+        assert_eq!(pair[0]["index"], 0);
+        assert_eq!(pair[1], json!({"op": "delete", "index": 1}));
     }
     assert_eq!(changes[4]["row"], json!({"user_id": "slower"}));
 
@@ -519,7 +519,7 @@ async fn offset_holds_back_rows_and_is_in_the_snapshot() {
     let m = c.expect().await;
     assert_eq!(
         m["changes"][0],
-        json!({"op": "insert", "row": {"user_id": "h1"}})
+        json!({"op": "insert", "row": {"user_id": "h1"}, "index": 0})
     );
 }
 

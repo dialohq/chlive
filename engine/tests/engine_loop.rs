@@ -439,14 +439,14 @@ async fn limit_without_order_by_is_a_window_of_the_latest_rows() {
     assert_eq!(
         lines,
         [
-            // history had 1 row: not full yet
-            "requests/0:1 + {\"user_id\":\"e1\"}",
-            // full: append, then the first row goes, in the same iteration
-            "requests/0:3 + {\"user_id\":\"e2\"}\nrequests/0:3 - @0",
-            "requests/0:4 + {\"user_id\":\"e3\"}\nrequests/0:4 - @0",
+            // history had 1 row: not full yet; newest first
+            "requests/0:1 + @0 {\"user_id\":\"e1\"}",
+            // full: in at the top, then the last (oldest) row goes, in the same iteration
+            "requests/0:3 + @0 {\"user_id\":\"e2\"}\nrequests/0:3 - @2",
+            "requests/0:4 + @0 {\"user_id\":\"e3\"}\nrequests/0:4 - @2",
         ]
     );
-    assert_eq!(names_within(&iterations, Some(2)), ["e2", "e3"]);
+    assert_eq!(names_within(&iterations, Some(2)), ["e3", "e2"]);
 }
 
 #[tokio::test]
@@ -476,14 +476,14 @@ async fn offset_without_order_by_holds_back_the_newest_rows() {
     assert_eq!(
         lines,
         [
-            // h3, the newest of the history, is held back
-            "+ {\"user_id\":\"h1\"}\n+ {\"user_id\":\"h2\"}\nhistory: 2 rows",
-            // each new row is held back, and the oldest held one slides in
-            "requests/0:1 + {\"user_id\":\"h3\"}\nrequests/0:1 - @0",
-            "requests/0:3 + {\"user_id\":\"e1\"}\nrequests/0:3 - @0",
+            // h3, the newest of the history, is held back; newest first
+            "+ {\"user_id\":\"h2\"}\n+ {\"user_id\":\"h1\"}\nhistory: 2 rows",
+            // each new row is held back, and the oldest held one slides in at the top
+            "requests/0:1 + @0 {\"user_id\":\"h3\"}\nrequests/0:1 - @2",
+            "requests/0:3 + @0 {\"user_id\":\"e1\"}\nrequests/0:3 - @2",
         ]
     );
-    assert_eq!(names_within(&iterations, Some(2)), ["h3", "e1"]);
+    assert_eq!(names_within(&iterations, Some(2)), ["e1", "h3"]);
 }
 
 #[tokio::test]

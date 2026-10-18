@@ -1030,10 +1030,22 @@ impl ResultState {
     pub(crate) fn place(&mut self, row: Row, key: Option<SortKey>) -> Vec<Diff> {
         match self {
             ResultState::Append => vec![Diff::insert(row)],
+            // newest first: in at the top; once full, the last row goes
             ResultState::Window(w) => match w.push() {
                 None => Vec::new(),
-                Some(false) => vec![Diff::insert(row)],
-                Some(true) => vec![Diff::insert(row), Diff::Delete { index: 0 }],
+                Some(full) => {
+                    let mut diffs = vec![Diff::Insert {
+                        row,
+                        index: Some(0),
+                        id: None,
+                    }];
+                    if full {
+                        diffs.push(Diff::Delete {
+                            index: w.limit() as usize,
+                        });
+                    }
+                    diffs
+                }
             },
             ResultState::Ordered(s) => match s.insert(key.expect("a sort key")) {
                 None => Vec::new(),
@@ -1101,7 +1113,11 @@ pub(crate) fn history_iteration(
                 state.push_history(order.history_key(row).map_err(bad_history_row)?);
             }
         }
-        (ResultState::Window(w), _) => rows.iter().for_each(|_| w.push_history()),
+        // newest first: the history's arrival order (ClickHouse's) reversed
+        (ResultState::Window(w), _) => {
+            rows.iter().for_each(|_| w.push_history());
+            rows.reverse();
+        }
         (ResultState::Offset(state), Some(order)) => {
             // the rows above the result are kept, not sent
             let mut shown = Vec::new();
@@ -1111,7 +1127,10 @@ pub(crate) fn history_iteration(
             }
             rows = shown;
         }
-        (ResultState::Held(w), _) => rows = w.history(rows),
+        (ResultState::Held(w), _) => {
+            rows = w.history(rows);
+            rows.reverse();
+        }
         (ResultState::Keyed(state), order) => {
             let keyed = plan.keyed.as_ref().expect("a keyed plan");
             let rows = rows

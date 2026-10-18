@@ -754,26 +754,26 @@ async fn history_and_stream_agree_on_order_by() {
         eprintln!("{database}: {sql}: {}", names.join(" "));
         lists.push(names);
     }
-    // history: any 3; stream-only: the latest 3; split: its 2 streamed ones last
+    // history: any 3; stream-only: the latest 3, newest first; split: its 2 streamed ones first
     assert_eq!(lists[0].len(), 3);
-    assert_eq!(lists[1], ["n5", "n9", "n11"]);
+    assert_eq!(lists[1], ["n11", "n9", "n5"]);
     assert_eq!(lists[2].len(), 3);
-    assert_eq!(lists[2][1..], ["n9", "n11"]);
+    assert_eq!(lists[2][..2], ["n11", "n9"]);
 
-    // OFFSET without ORDER BY: the newest m rows are held back, the window is the n before them
-    // (the arrival order: the history in ClickHouse's order, then the stream)
-    for (sql, len, stream_only, split_tail) in [
+    // OFFSET without ORDER BY: the newest m rows are held back, the window is the n before them,
+    // newest first (the arrival order: the history in ClickHouse's order, then the stream)
+    for (sql, len, stream_only, split_head) in [
         // n1 n3 n5 n9 n11 match; the split has n1 n3 n5 in ClickHouse
         (
             "select name, n from events where n = 3 limit 2 offset 1",
             2,
-            &["n5", "n9"][..],
+            &["n9", "n5"][..],
             &["n9"][..],
         ),
         (
             "select name, n from events where n = 3 offset 2",
             3,
-            &["n1", "n3", "n5"][..],
+            &["n5", "n3", "n1"][..],
             &[][..],
         ),
     ] {
@@ -802,14 +802,10 @@ async fn history_and_stream_agree_on_order_by() {
             lists.push(names);
         }
         assert_eq!(lists[1], stream_only, "{sql}");
-        assert_eq!(
-            lists[2][lists[2].len() - split_tail.len()..],
-            *split_tail,
-            "{sql}"
-        );
-        // the split's history rows (n1 n3 n5, in ClickHouse's order) come first, all of them
-        // when nothing streamed is in the window
-        if split_tail.is_empty() {
+        assert_eq!(lists[2][..split_head.len()], *split_head, "{sql}");
+        // the split's history rows (n1 n3 n5, in ClickHouse's order reversed) come after, all
+        // of them when nothing streamed is in the window
+        if split_head.is_empty() {
             let mut got = lists[2].clone();
             got.sort();
             assert_eq!(got, ["n1", "n3", "n5"], "{sql}");

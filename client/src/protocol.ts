@@ -28,7 +28,7 @@ export type ClientMessage =
 /**
  * One change to a result; unknown ops must be rejected.
  * - `insert`: with ORDER BY, at `index` (the row there and every row after it move one down);
- *   without, appended. Rows of aggregated and FINAL results carry an `id` (their group's or
+ *   without, appended (LIMIT and OFFSET windows are newest first: at index 0). Rows of aggregated and FINAL results carry an `id` (their group's or
  *   row's key, e.g. `["PL"]`) that updates and deletes refer to.
  * - `delete`: a row leaves the result: the one at `index` (pushed out by LIMIT) or the one with
  *   this `id` (FINAL: deleted, or no longer matching); exactly one is set. The rows after it
