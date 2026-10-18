@@ -18,6 +18,7 @@ use crate::aggregate::native_run::NativeRun;
 use crate::binder::{bind, BindError, Catalog, Params};
 use crate::chdb::{Chdb, ChdbError};
 use crate::checkpoint::{Checkpoint, Checkpointer};
+use crate::clock::{Clock, Deadlines, SystemClock};
 use crate::cursor;
 use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
@@ -82,6 +83,8 @@ pub struct Config {
     pub snapshot_user: String,
     pub snapshot_password: String,
     pub snapshots: SnapshotConfig,
+    /// How often `now()` is re-read when a query doesn't say (`now(ms)`).
+    pub now_refresh: Duration,
 }
 
 impl Default for Config {
@@ -98,6 +101,7 @@ impl Default for Config {
             snapshot_user: "default".into(),
             snapshot_password: String::new(),
             snapshots: SnapshotConfig::default(),
+            now_refresh: NOW_REFRESH,
         }
     }
 }
@@ -114,6 +118,9 @@ pub struct Engine {
     semi_refresh: Duration,
     /// FINAL with LIMIT: how many rows past the window are kept to replace departures.
     final_buffer: u64,
+    /// `now()`'s clock, and how often it's re-read when a query doesn't say (`now(ms)`).
+    clock: Arc<dyn Clock>,
+    now_refresh: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +136,7 @@ impl Engine {
     pub fn connect(config: Config) -> Result<Self, ConfigError> {
         let rules = ConfiguredRules::new(config.tables)?;
         let semi_refresh = config.snapshots.refresh;
+        let now_refresh = config.now_refresh;
         let snapshots = SnapshotManager::start(
             Arc::new(PauseServer::new(&config.pause_server_url)),
             Arc::new(ClickHouseCloner::new(
@@ -149,6 +157,7 @@ impl Engine {
             snapshots,
         )
         .with_semi_refresh(semi_refresh)
+        .with_now_refresh(now_refresh)
         .with_clickhouse(&config.clickhouse_url, &config.user, &config.password))
     }
 
@@ -190,7 +199,21 @@ impl Engine {
             max_batch: 1000,
             semi_refresh: Duration::from_secs(10),
             final_buffer: crate::keyed::BUFFER,
+            clock: Arc::new(SystemClock),
+            now_refresh: NOW_REFRESH,
         }
+    }
+
+    /// How often `now()` is re-read when a query doesn't say (`now(ms)`; default 1 s).
+    pub fn with_now_refresh(mut self, every: Duration) -> Self {
+        self.now_refresh = every.max(Duration::from_millis(1));
+        self
+    }
+
+    /// `now()`'s clock (default: the system's).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// FINAL with LIMIT: how many rows past the window are kept to replace departures (default
@@ -317,6 +340,10 @@ impl Engine {
                 if let ResultState::Keyed(k) = &mut state {
                     k.restored_at(&at);
                 }
+                let deadlines = match plan.stream.windows.is_empty() {
+                    true => None,
+                    false => Some(Deadlines::load(&checkpoint.state["deadlines"]).map_err(bad)?),
+                };
                 self.start(
                     plan,
                     None,
@@ -325,7 +352,7 @@ impl Engine {
                     First::Restored,
                     String::new(),
                     true,
-                    Some(state),
+                    Some((state, deadlines)),
                 )
                 .await?
             }
@@ -429,7 +456,8 @@ impl Engine {
         let stateful = plan.stream.order.is_some()
             || plan.stream.limit.is_some()
             || plan.stream.offset.is_some()
-            || plan.stream.keyed.is_some();
+            || plan.stream.keyed.is_some()
+            || !plan.stream.windows.is_empty();
         if let (Some(token), false) = (since, stateful) {
             if let Some(cursor) = self.resumable(&plan, token, None).await? {
                 let first = First::CatchUp {
@@ -459,7 +487,11 @@ impl Engine {
         };
         let (begin, at, first, history_sql) = match resume_from {
             None => {
-                let sql = plan.history.sql(&from);
+                // with time windows, at the clock's now
+                let sql = match plan.stream.windows.is_empty() {
+                    true => plan.history.sql(&from),
+                    false => plan.history.sql_at(&from, self.clock.now_ns()),
+                };
                 (
                     watermark.clone(),
                     watermark.clone(),
@@ -615,7 +647,7 @@ impl Engine {
         first: First,
         history_sql: String,
         resumed: bool,
-        restored: Option<ResultState>,
+        restored: Option<(ResultState, Option<Deadlines>)>,
     ) -> Result<Subscription, EngineError> {
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
@@ -631,12 +663,23 @@ impl Engine {
             .source
             .subscribe(&starts, &plan.stream.required_keys())
             .await?;
-        let state = match &first {
+        let (state, deadlines) = match &first {
             First::Restored => restored.expect("a restored state"),
-            _ => ResultState::for_plan(&plan.stream),
+            _ => (ResultState::for_plan(&plan.stream), None),
         };
         let snapshot = lease.as_ref().map(|l| l.used());
-        let (iterations, checkpointer) = self.iterations(&plan, lease, first, at, events, state);
+        let (iterations, checkpointer) = match plan.stream.windows.is_empty() {
+            true => self.iterations(&plan, lease, first, at, events, state),
+            false => self.timed_iterations(
+                &plan,
+                lease,
+                first,
+                at,
+                events,
+                state,
+                deadlines.unwrap_or_default(),
+            ),
+        };
         Ok(Subscription {
             plan,
             watermark: begin,
@@ -772,6 +815,10 @@ impl Engine {
             tracing::info!("FINAL queries don't resume yet; starting over");
             return Ok(None);
         }
+        if !plan.stream.windows.is_empty() {
+            tracing::info!("queries with now() don't resume yet; starting over");
+            return Ok(None);
+        }
         let Some(cursor) = cursor::decode(plan, token) else {
             tracing::info!("resume cursor is for another plan or malformed; starting over");
             return Ok(None);
@@ -814,18 +861,14 @@ impl Engine {
         Ok(Some(cursor))
     }
 
-    fn iterations(
+    /// The items a subscription runs on: its first one (history, catch-up or a restore), then
+    /// the events.
+    fn items(
         &self,
-        plan: &Plan,
         lease: Option<Lease>,
         first: First,
-        at: Watermark,
         events: BoxStream<'static, Event>,
-        state: ResultState,
-    ) -> (
-        BoxStream<'static, Result<Iteration, EngineError>>,
-        Checkpointer,
-    ) {
+    ) -> ItemStream {
         let history = self.history.clone();
         // the first items, then the rest of the stream
         let items = async move {
@@ -860,6 +903,128 @@ impl Engine {
                 }
             }
         };
+        stream::once(items).flatten().boxed()
+    }
+
+    /// A plan with time windows (`col > now() - INTERVAL …`): the items, and between them the
+    /// clock, re-read every refresh interval; each reading deletes the rows whose deadline it
+    /// passed (one iteration, if any). It ticks on after a finite source ends.
+    #[allow(clippy::too_many_arguments)]
+    fn timed_iterations(
+        &self,
+        plan: &Plan,
+        lease: Option<Lease>,
+        first: First,
+        at: Watermark,
+        events: BoxStream<'static, Event>,
+        state: ResultState,
+        deadlines: Deadlines,
+    ) -> (
+        BoxStream<'static, Result<Iteration, EngineError>>,
+        Checkpointer,
+    ) {
+        let items = self.items(lease, first, events);
+        let stream_plan = plan.stream.clone();
+        let shared = Arc::new(Mutex::new((state, at, deadlines)));
+        let checkpointer: Checkpointer = {
+            let shared = shared.clone();
+            Arc::new(move || {
+                let (state, at, deadlines) = &*shared.lock().unwrap();
+                let mut state = state.save();
+                state["deadlines"] = deadlines.save();
+                Checkpoint {
+                    at: at.clone(),
+                    state,
+                }
+            })
+        };
+        let clock = self.clock.clone();
+        let mut ticker = tokio::time::interval(plan.stream.refresh().unwrap_or(self.now_refresh));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let iterations = stream::unfold(
+            (items, ticker, false),
+            move |(mut items, mut ticker, mut ended)| {
+                let (shared, plan, clock) = (shared.clone(), stream_plan.clone(), clock.clone());
+                async move {
+                    loop {
+                        // the clock first: it's only ready when due, so events can't starve it
+                        let item = if ended {
+                            ticker.tick().await;
+                            None
+                        } else {
+                            tokio::select! {
+                                biased;
+                                _ = ticker.tick() => None,
+                                item = items.next() => match item {
+                                    Some(item) => Some(item),
+                                    None => {
+                                        ended = true;
+                                        continue;
+                                    }
+                                },
+                            }
+                        };
+                        let mut guard = shared.lock().unwrap();
+                        let (state, at, deadlines) = &mut *guard;
+                        let now = clock.now_ns();
+                        let it = match item {
+                            Some(Item::History(rows)) => {
+                                timed_history_iteration(&plan, state, at, rows, deadlines)
+                            }
+                            Some(Item::Event(event)) => Ok(timed_event_iteration(
+                                &plan, state, at, event, now, deadlines,
+                            )),
+                            Some(Item::Restored) => Ok(Iteration {
+                                origin: Origin::CatchUp,
+                                diffs: Vec::new(),
+                                at: at.clone(),
+                            }),
+                            Some(Item::CatchUp(..)) => {
+                                unreachable!("queries with now() don't resume from a cursor")
+                            }
+                            Some(Item::Failed(e)) => Err(e),
+                            None => {
+                                // rows whose deadline the clock passed leave, from the bottom
+                                let diffs: Vec<Diff> = deadlines
+                                    .expire(now)
+                                    .into_iter()
+                                    .map(|index| {
+                                        state.remove_at(index);
+                                        Diff::Delete { index }
+                                    })
+                                    .collect();
+                                if diffs.is_empty() {
+                                    continue;
+                                }
+                                Ok(Iteration {
+                                    origin: Origin::Clock,
+                                    diffs,
+                                    at: at.clone(),
+                                })
+                            }
+                        };
+                        return Some((it, (items, ticker, ended)));
+                    }
+                }
+            },
+        )
+        .boxed();
+        (iterations, checkpointer)
+    }
+
+    fn iterations(
+        &self,
+        plan: &Plan,
+        lease: Option<Lease>,
+        first: First,
+        at: Watermark,
+        events: BoxStream<'static, Event>,
+        state: ResultState,
+    ) -> (
+        BoxStream<'static, Result<Iteration, EngineError>>,
+        Checkpointer,
+    ) {
+        let items = self.items(lease, first, events);
         let stream_plan = plan.stream.clone();
         // shared with the checkpointer: each item updates it before it's yielded, so between
         // iterations it matches the last one's cursor
@@ -892,7 +1057,6 @@ impl Engine {
                 keyed,
                 limit: w.refill_limit(),
             });
-        let items = stream::once(items).flatten().boxed();
         let iterations = stream::unfold((items, false), move |(items, wanted)| {
             let (shared, stream_plan, refill) = (shared.clone(), stream_plan.clone(), refill.clone());
             async move {
@@ -976,6 +1140,9 @@ impl Engine {
         (iterations, checkpointer)
     }
 }
+
+/// How often `now()` is re-read when neither the query (`now(ms)`) nor the server says.
+pub const NOW_REFRESH: Duration = Duration::from_secs(1);
 
 /// What a subscription's stream is made of, before it becomes iterations.
 enum Item {
@@ -1301,6 +1468,16 @@ impl ResultState {
         }
     }
 
+    /// The row at `index` left (its time window passed). Time windows run only on appended
+    /// and ordered results.
+    pub(crate) fn remove_at(&mut self, index: usize) {
+        match self {
+            ResultState::Append => {}
+            ResultState::Ordered(o) => o.remove_at(index),
+            _ => unreachable!("now() runs on appended and ordered results only"),
+        }
+    }
+
     /// A decoded event's diffs: a new row placed (when it matches the WHERE), or, FINAL, a new
     /// version of its key's row.
     pub(crate) fn event(
@@ -1444,6 +1621,65 @@ fn catch_up_iteration(
 
 /// One event: decode by column types, filter, project, and place it. An insert and the delete
 /// it causes come in the same iteration, insert first, so they always land in the same diff.
+/// The history of a plan with time windows: each row's deadline, then as usual.
+fn timed_history_iteration(
+    plan: &StreamPlan,
+    state: &mut ResultState,
+    at: &Watermark,
+    rows: Result<Vec<Row>, HistoryError>,
+    deadlines: &mut Deadlines,
+) -> Result<Iteration, EngineError> {
+    let mut rows = rows?;
+    for row in &mut rows {
+        // NULL can't be in it (the history's WHERE): it would leave at once
+        let d = plan.history_deadline(row).map_err(bad_history_row)?;
+        deadlines.push(d.unwrap_or(i128::MIN));
+    }
+    history_iteration(plan, state, at, Ok(rows))
+}
+
+/// An event of a plan with time windows: one past its deadline at `now` doesn't match.
+fn timed_event_iteration(
+    plan: &StreamPlan,
+    state: &mut ResultState,
+    at: &mut Watermark,
+    event: Event,
+    now: i128,
+    deadlines: &mut Deadlines,
+) -> Iteration {
+    let diffs = match plan.decode(&event.value) {
+        Ok(row) => match plan.deadline(&row) {
+            Some(d) if now < d => {
+                let diffs = state.event(plan, &row, (event.partition, event.offset));
+                deadlines.follow(&diffs, d);
+                diffs
+            }
+            _ => Vec::new(),
+        },
+        Err(e) => {
+            tracing::warn!(
+                topic = %event.topic,
+                partition = event.partition,
+                offset = event.offset,
+                error = %e,
+                "skipping event"
+            );
+            Vec::new()
+        }
+    };
+    let position = at.0.entry(event.partition).or_insert(event.offset);
+    *position = (*position).max(event.offset);
+    Iteration {
+        origin: Origin::Event {
+            topic: event.topic,
+            partition: event.partition,
+            offset: event.offset,
+        },
+        diffs,
+        at: at.clone(),
+    }
+}
+
 fn event_iteration(
     plan: &StreamPlan,
     state: &mut ResultState,
@@ -1538,6 +1774,8 @@ pub enum Origin {
     },
     /// FINAL with LIMIT: rows from a newer snapshot replacing departures.
     Refill,
+    /// `now()`: rows whose time window the clock passed, leaving.
+    Clock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1573,6 +1811,10 @@ impl fmt::Display for Iteration {
                     writeln!(f, "{d}")?;
                 }
                 write!(f, "refilled: {} changes", self.diffs.len())
+            }
+            Origin::Clock => {
+                let lines: Vec<String> = self.diffs.iter().map(|d| format!("clock: {d}")).collect();
+                write!(f, "{}", lines.join("\n"))
             }
             Origin::Event {
                 topic,

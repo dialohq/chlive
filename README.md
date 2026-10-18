@@ -190,7 +190,7 @@ The full grammar is under [Supported queries](#supported-queries). A condition c
 - `IS [NOT] NULL` and `[NOT] IN (…)`;
 - operands that are columns or literals: numbers, strings, `TRUE`/`FALSE`, or parameters.
 
-Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
+Functions (except `now()`, see [Time](#time)), arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 
 **Parameters** work as in ClickHouse: `WHERE session_id = {s:UUID} AND latency_ms > {l:UInt32}`, with the values sent separately (`params` in the protocol and the clients).
 - They're allowed wherever a literal is in WHERE: comparisons, `IN (…)` items and `IS NULL`, in sub-queries too.
@@ -224,6 +224,17 @@ Functions, arithmetic, `LIKE` and `BETWEEN` aren't supported yet.
 - **Literals.** They're typed and checked at bind time; for example, comparing `latency_ms` with a string is a positioned error.
 - **Output.** Event rows are rendered the way ClickHouse renders rows.
 - **Tested.** The agreement test in `engine/tests/clickhouse.rs` checks, for 22 predicates, that three setups return the same rows: everything in history; everything from the stream; and half from each, split at the snapshot (real clones, with a stand-in for the pause server). `engine/tests/kafka.rs` produces events before, around and after subscribing, against the real Redpanda and ClickHouse, and checks that each arrives exactly once.
+
+### Time
+
+`now()` is the server's clock, so a live query with it changes with no event: `WHERE ts > now() - INTERVAL 1 HOUR` keeps the last hour's rows, and rows leave as the clock passes them.
+- **The clock is re-read** every `server.now_refresh` (default 1 s), or as the query says: `now(500)` is every 500 ms. That's a refresh in milliseconds, unlike ClickHouse's `now(timezone)`.
+- **`INTERVAL n unit`** can be added or subtracted, any number of times: `now() - INTERVAL 1 HOUR - INTERVAL 30 MINUTE`. Units: `MILLISECOND`, `SECOND`, `MINUTE`, `HOUR`, `DAY`, `WEEK` (calendar units, `MONTH`/`QUARTER`/`YEAR`, aren't supported yet).
+- **The supported form** is a sliding window: a `DateTime`/`DateTime64` column `>` or `>=` `now() ± INTERVAL …` (or the same with the sides swapped), as top-level AND conditions of the WHERE, any number of them. A row holds until the clock reaches its deadline (the column's value minus the shift).
+- **History** reads the window with the clock's value inlined (`ts > fromUnixTimestamp64Nano(…)`), so history and stream agree; an event already past its deadline never comes in. The plan's identity keeps `now()` symbolic (and the refresh), so a result is shared and stored like any other.
+- **Leaving:** at each reading, the rows whose deadline it passed are deleted (`delete @i`, highest first), as one diff with no event behind it. The shared result's change log keeps them, so a client resumes through them; a result restored from disk lets everything that went overdue meanwhile go at its first reading. A `since` cursor gets a fresh snapshot.
+- **Shapes:** plain results, ORDER BY (rows leave wherever they are), and LIMIT only with ORDER BY the window's column DESC first ("the latest n in the last hour"), where rows leave from the bottom and nothing has to come in.
+- **Not yet:** rows that come in as time passes (`ts <= now()`, `<`, `=`), `now()` inside OR/NOT/IN or compared with a value, other LIMITs, OFFSET, GROUP BY and aggregates (next), FINAL, and sub-queries.
 
 ### Table engines
 
@@ -503,6 +514,7 @@ condition   := condition OR condition | condition AND condition | NOT condition 
              | EXISTS (SELECT … FROM table [[AS] alias] [WHERE inner.col = outer.col] [AND condition …])
              | operand
 operand     := column | literal
+             | now([refresh ms]) [{+ | -} INTERVAL n unit …]   -- see Time
 literal     := number | -number | 'string' | TRUE | FALSE | NULL
 column      := [table_or_alias.]name
 name, table, alias := identifier | "identifier" | `identifier`
@@ -518,4 +530,4 @@ name, table, alias := identifier | "identifier" | `identifier`
   - **OFFSET m** starts the result after the first m groups: with ORDER BY, groups come in and go out at both ends as they move; without, it's the groups after the first m seen.
 - **EXISTS (subquery)**: correlated (`… WHERE c.customer_id = e.user_id AND …`) it is the same semi-join as the matching `IN`: exactly one `inner = outer` equality, a top-level `AND` condition of the sub-query, is the key; the rest of its WHERE may only use its own table. Uncorrelated (no such equality), it's true for every row once the sub-query has a row: until then outer rows are kept back, and then they all come in. Its SELECT list doesn't matter (`SELECT 1`, `SELECT *`).
 - **IN (subquery)**: one per query (IN or EXISTS), as a top-level `AND` condition of the WHERE, over plain queries (with ORDER BY, LIMIT and OFFSET); the sub-query selects one column of one table, with an optional WHERE (the same table as the outer one is fine). See [IN and EXISTS sub-queries](#in-and-exists-sub-queries).
-- **Not yet:** `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, `NOT IN (subquery)`, `NOT EXISTS`, EXISTS with several correlations (composite keys), constants as output columns, and other sub-queries, IN sub-queries with GROUP BY, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters.
+- **Not yet:** `WITH TIES`, `LIMIT … BY`, `DISTINCT`, HAVING, joins, `NOT IN (subquery)`, `NOT EXISTS`, EXISTS with several correlations (composite keys), constants as output columns, and other sub-queries, IN sub-queries with GROUP BY, expressions and other functions (arithmetic, `LIKE`, `BETWEEN`), positions in ORDER BY/GROUP BY, parameters, `now()` beyond sliding windows (see [Time](#time)).

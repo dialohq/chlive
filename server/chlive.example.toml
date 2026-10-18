@@ -23,6 +23,9 @@
 ## At most this often, a client hears how far its result is complete when only events that
 ## didn't match it arrived.
 # progress_interval = "1s"
+## How often now() is re-read (rows leave time windows like `ts > now() - INTERVAL 1 HOUR`)
+## when a query doesn't say; `now(500)` in a query: every 500 ms.
+# now_refresh = "1s"
 
 [cache]
 ## Results are shared: every subscription to the same query (and parameter values) shares one

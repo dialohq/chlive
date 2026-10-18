@@ -42,6 +42,11 @@ impl HistorySource for FakeHistory {
         match table {
             "default.events" => Ok(vec![col("ts", "String"), col("user_id", "String")]),
             "default.requests" => Ok(vec![col("user_id", "String"), col("latency_ms", "UInt32")]),
+            "default.clicks" => Ok(vec![
+                col("ts", "DateTime64(3)"),
+                col("user_id", "String"),
+                col("latency_ms", "UInt32"),
+            ]),
             "default.products" => Ok(vec![
                 col("product_id", "String"),
                 col("price", "UInt32"),
@@ -192,9 +197,77 @@ impl HistorySource for FakeHistory {
             .iter()
             .map(|(k, p)| row(json!({"product_id": k, "price": p, "__key_0": k, "__ver": 1})))
             .collect()),
+            // now() - INTERVAL 10 SECOND at the test clock's start (B)
+            s if s == clicks_sql("SELECT user_id, ts AS __time_0", "", "") => {
+                let f = &["user_id", "__time_0"];
+                Ok(vec![click_row(f, "h1", -5_000, 1), click_row(f, "h2", -1_000, 1)])
+            }
+            s if s == clicks_sql(
+                "SELECT user_id, ts",
+                " ORDER BY ts DESC NULLS LAST",
+                " LIMIT 2",
+            ) =>
+            {
+                let f = &["user_id", "ts"];
+                Ok(vec![click_row(f, "h2", -1_000, 1), click_row(f, "h1", -5_000, 1)])
+            }
+            s if s == clicks_sql(
+                "SELECT user_id, latency_ms AS __order_0, ts AS __time_0",
+                " ORDER BY latency_ms ASC NULLS LAST",
+                "",
+            ) =>
+            {
+                let f = &["user_id", "__order_0", "__time_0"];
+                Ok(vec![click_row(f, "h2", -1_000, 1), click_row(f, "h1", -5_000, 3)])
+            }
             other => panic!("unexpected history query: {other}"),
         }
     }
+}
+
+/// The test clock's start, 2026-10-18 12:00:00 UTC, in nanoseconds since the epoch.
+const B: i128 = 1_792_324_800_000_000_000;
+
+/// The history query of `clicks` with `ts > now() - INTERVAL 10 SECOND` at B.
+fn clicks_sql(select: &str, order: &str, limit: &str) -> String {
+    format!(
+        "{select} FROM default.clicks WHERE ts > fromUnixTimestamp64Nano(toInt64({})){order}{limit}",
+        B - 10_000_000_000
+    )
+}
+
+/// `ts` at B + `ms`, as ClickHouse renders a DateTime64(3).
+fn click_ts(ms: i64) -> String {
+    chlive_engine::types::format_datetime((B / 1_000_000) as i64 + ms, 3)
+}
+
+/// A history row of `clicks`, with exactly these fields (as ClickHouse returns them).
+fn click_row(fields: &[&str], user: &str, ms: i64, latency: u32) -> Row {
+    let ts = click_ts(ms);
+    let all = json!({"user_id": user, "ts": ts, "__time_0": ts, "latency_ms": latency, "__order_0": latency});
+    fields
+        .iter()
+        .map(|f| (f.to_string(), all[*f].clone()))
+        .collect()
+}
+
+fn click(user: &str, ms: i64, latency: u32) -> String {
+    format!(
+        r#"{{"ts": "{}", "user_id": "{user}", "latency_ms": {latency}}}"#,
+        click_ts(ms)
+    )
+}
+
+/// Clicks (offset 0: the history) then events, under the test clock at B.
+fn clicks_engine(events: &[String]) -> Engine {
+    let mut source = MemorySource::new();
+    source.push("clicks", 0, click("h", 0, 1));
+    for e in events {
+        source.push("clicks", 0, e.as_str());
+    }
+    engine(source)
+        .with_max_batch(1)
+        .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)))
 }
 
 fn row(v: serde_json::Value) -> Row {
@@ -965,6 +1038,152 @@ async fn final_offset_holds_rows_back_and_follows_both_edges() {
             ),
         ]
     );
+}
+
+/// `ts > now() - INTERVAL 10 SECOND`: rows leave as the clock passes ts + 10 s (re-read every
+/// second), with no event; one past it already never comes in.
+#[tokio::test(start_paused = true)]
+async fn rows_leave_a_time_window_as_the_clock_passes() {
+    let e = clicks_engine(&[
+        click("e1", -2_000, 1),   // leaves at B + 8 s
+        click("old", -20_000, 1), // already past: never in
+        click("e2", 3_000, 1),    // leaves at B + 13 s
+    ]);
+    let sub = e
+        .subscribe("select user_id from clicks where ts > now() - interval 10 second")
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    let mut lines = Vec::new();
+    let mut at = Vec::new();
+    let mut sub = sub;
+    while lines.len() < 8 {
+        let it = sub.next().await.unwrap().unwrap();
+        at.push(start.elapsed().as_secs());
+        lines.push(it.to_string());
+    }
+    assert_eq!(
+        lines,
+        [
+            "+ {\"user_id\":\"h1\"}\n+ {\"user_id\":\"h2\"}\nhistory: 2 rows",
+            "clicks/0:1 + {\"user_id\":\"e1\"}",
+            "",
+            "clicks/0:3 + {\"user_id\":\"e2\"}",
+            // h1 (B - 5 s) at 5 s, e1 at 8 s, h2 at 9 s, e2 at 13 s
+            "clock: - @0",
+            "clock: - @1",
+            "clock: - @0",
+            "clock: - @0",
+        ]
+    );
+    assert_eq!(at[4..], [5, 8, 9, 13]);
+}
+
+/// `now(200)`: the clock re-read every 200 ms, so a row leaves within 200 ms of its deadline.
+#[tokio::test(start_paused = true)]
+async fn now_takes_its_refresh() {
+    for (sql, expect_ms) in [
+        (
+            "select user_id from clicks where ts > now(200) - interval 10 second",
+            600,
+        ),
+        (
+            "select user_id from clicks where ts > now() - interval 10 second",
+            1_000,
+        ),
+    ] {
+        // each with its own clock at B: e leaves at B + 0.5 s
+        let e = clicks_engine(&[click("e", -9_500, 1)]);
+        let mut sub = e.subscribe(sql).await.unwrap();
+        let start = tokio::time::Instant::now();
+        loop {
+            let it = sub.next().await.unwrap().unwrap();
+            if it.origin == Origin::Clock && it.to_string() == "clock: - @2" {
+                break;
+            }
+        }
+        assert_eq!(start.elapsed().as_millis(), expect_ms, "{sql}");
+    }
+}
+
+/// With ORDER BY: rows leave wherever they are; newest first with LIMIT, from the bottom.
+#[tokio::test(start_paused = true)]
+async fn rows_leave_ordered_time_windows_from_their_place() {
+    // the latest 2: h2 (B - 1 s), h1 (B - 5 s); e1 comes in between, pushing h1 out
+    let e = clicks_engine(&[click("e1", -2_000, 1)]);
+    let mut sub = e
+        .subscribe(
+            "select user_id, ts from clicks where ts > now() - interval 10 second \
+             order by ts desc limit 2",
+        )
+        .await
+        .unwrap();
+    let mut lines = Vec::new();
+    while lines.len() < 4 {
+        lines.push(sub.next().await.unwrap().unwrap().to_string());
+    }
+    let r = |u: &str, ms: i64| format!("{{\"user_id\":\"{u}\",\"ts\":\"{}\"}}", click_ts(ms));
+    assert_eq!(
+        lines,
+        [
+            format!(
+                "+ {}\n+ {}\nhistory: 2 rows",
+                r("h2", -1_000),
+                r("h1", -5_000)
+            ),
+            format!("clicks/0:1 + @1 {}\nclicks/0:1 - @2", r("e1", -2_000)),
+            "clock: - @1".into(), // e1 at 8 s
+            "clock: - @0".into(), // h2 at 9 s
+        ]
+    );
+    // ordered by something else: from the middle
+    let e = clicks_engine(&[click("e1", -2_000, 2)]);
+    let mut sub = e
+        .subscribe(
+            "select user_id from clicks where ts > now() - interval 10 second order by latency_ms",
+        )
+        .await
+        .unwrap();
+    let mut lines = Vec::new();
+    while lines.len() < 5 {
+        lines.push(sub.next().await.unwrap().unwrap().to_string());
+    }
+    assert_eq!(
+        lines,
+        [
+            "+ {\"user_id\":\"h2\"}\n+ {\"user_id\":\"h1\"}\nhistory: 2 rows",
+            "clicks/0:1 + @1 {\"user_id\":\"e1\"}", // latency 2: between h2 (1) and h1 (3)
+            "clock: - @2",                          // h1 at 5 s
+            "clock: - @1",                          // e1 at 8 s
+            "clock: - @0",                          // h2 at 9 s
+        ]
+    );
+}
+
+/// A restored time window: whatever went past its deadline while it was stored leaves at
+/// the first reading of the clock.
+#[tokio::test(start_paused = true)]
+async fn a_restored_time_window_lets_overdue_rows_go_first() {
+    let sql = "select user_id from clicks where ts > now() - interval 10 second";
+    let e = clicks_engine(&[click("e1", -2_000, 1)]);
+    let mut sub = e.subscribe(sql).await.unwrap();
+    sub.next().await.unwrap().unwrap(); // history
+    sub.next().await.unwrap().unwrap(); // e1
+    let checkpoint = sub.checkpoint().unwrap();
+    drop(sub);
+    // stored for 8.5 s: h1 (5 s) and e1 (8 s) are overdue, h2 (9 s) isn't
+    tokio::time::sleep(std::time::Duration::from_millis(8_500)).await;
+    let params = chlive_engine::Params::new();
+    let mut sub = e.restore(sql, &params, &checkpoint).await.unwrap();
+    let mut lines = Vec::new();
+    while lines.len() < 2 {
+        let it = sub.next().await.unwrap().unwrap();
+        if !it.diffs.is_empty() {
+            lines.push(it.to_string());
+        }
+    }
+    // rows [h1, h2, e1]: e1 and h1 at once (from the bottom), then h2 half a second later
+    assert_eq!(lines, ["clock: - @2\nclock: - @0", "clock: - @0"]);
 }
 
 #[tokio::test]

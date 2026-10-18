@@ -121,6 +121,22 @@ pub struct BoundQuery {
     pub aggregation: Option<Aggregation>,
     /// `key IN (SELECT …)`, a top-level AND condition of the WHERE (not part of `filter`).
     pub semi_join: Option<SemiJoin>,
+    /// `col > now() - INTERVAL …`, top-level AND conditions of the WHERE (not part of
+    /// `filter`): rows leave as time passes.
+    pub windows: Vec<TimeWindow>,
+}
+
+/// `column > now() + shift` (or `>=`): a row holds while the server's clock is before its
+/// column's value minus `shift`, re-read every `refresh_ms` (the server's default if `None`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimeWindow {
+    pub column: ColumnId,
+    /// `>=` rather than `>`.
+    pub inclusive: bool,
+    pub shift_ns: i128,
+    pub refresh_ms: Option<u64>,
+    /// The `now`'s, for errors.
+    pub span: Span,
 }
 
 /// `outer_key IN (SELECT inner_key FROM inner [WHERE inner_filter])`: the rows whose key is
@@ -441,6 +457,7 @@ fn visit_literals(
             visit_literals(expr, f)?;
             visit_query_literals(query, f)
         }
+        Expr::Now { .. } => Ok(()),
     }
 }
 
@@ -451,6 +468,7 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
         Some(expr) => split_subquery(expr)?,
         None => (None, None),
     };
+    let (selection, windows) = split_windows(selection, &table)?;
     let filter = match &selection {
         Some(expr) => Some(bind_where(expr, &table)?),
         None => None,
@@ -462,7 +480,21 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
         Some(Sub::Exists(sub, _)) => Some(bind_exists(sub, &table, catalog).await?),
         None => None,
     };
+    if let Some(w) = windows.first() {
+        if semi_join.is_some() {
+            return Err(BindError::at(
+                "now() with a sub-query isn't supported yet",
+                w.span,
+            ));
+        }
+    }
     if let Some(mut aggregation) = bind_aggregation(query, &table)? {
+        if let Some(w) = windows.first() {
+            return Err(BindError::at(
+                "now() with GROUP BY or aggregates isn't supported yet",
+                w.span,
+            ));
+        }
         if let (Some(_), Some(span)) = (&table.final_key, query.from.final_span) {
             return Err(final_unsupported(&table, "aggregates", span));
         }
@@ -486,6 +518,7 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
             offset: None,
             aggregation: Some(aggregation),
             semi_join: None,
+            windows: Vec::new(),
         });
     }
     let projection = bind_select(query, &table)?;
@@ -496,6 +529,7 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
         }
         None => Vec::new(),
     };
+    check_window_shape(query, &table, &windows, &order)?;
     Ok(BoundQuery {
         table,
         filter,
@@ -505,6 +539,7 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
         offset: offset_of(query),
         aggregation: None,
         semi_join,
+        windows,
     })
 }
 
@@ -579,6 +614,129 @@ fn split_subquery(expr: &Expr) -> Result<(Option<Expr>, Option<Sub<'_>>), BindEr
         }
     }
     Ok((rest, sub))
+}
+
+const NOW_PLACE: &str =
+    "now() is supported only as `column > now() - INTERVAL …` (or >=), a top-level AND condition";
+
+/// The WHERE without its time windows (`col > now() - INTERVAL …` as top-level AND
+/// conditions), and those, with the column on the left.
+fn split_windows(
+    selection: Option<Expr>,
+    table: &BoundTable,
+) -> Result<(Option<Expr>, Vec<TimeWindow>), BindError> {
+    fn conjuncts(e: Expr, out: &mut Vec<Expr>) {
+        match e {
+            Expr::And(l, r) => {
+                conjuncts(*l, out);
+                conjuncts(*r, out);
+            }
+            e => out.push(e),
+        }
+    }
+    let Some(selection) = selection else {
+        return Ok((None, Vec::new()));
+    };
+    let mut all = Vec::new();
+    conjuncts(selection, &mut all);
+    let (mut rest, mut windows) = (Vec::new(), Vec::new());
+    for e in all {
+        let Expr::Compare {
+            op, left, right, ..
+        } = &e
+        else {
+            rest.push(e);
+            continue;
+        };
+        // the column on the left: `now() … < col` is `col > now() …`
+        let (col, now, op) = match (&**left, &**right) {
+            (Expr::Column(c), n @ Expr::Now { .. }) => (c, n, *op),
+            (n @ Expr::Now { .. }, Expr::Column(c)) => (c, n, op.flipped()),
+            _ => {
+                rest.push(e);
+                continue;
+            }
+        };
+        let Expr::Now {
+            refresh_ms,
+            shift_ns,
+            span,
+        } = now
+        else {
+            unreachable!("matched above")
+        };
+        let inclusive = match op {
+            CmpOp::Gt => false,
+            CmpOp::GtEq => true,
+            _ => {
+                return Err(BindError::at(
+                    format!(
+                        "`column {} now()`: rows that come in as time passes aren't supported yet; \
+                         use > or >= (rows leave as time passes)",
+                        op.symbol()
+                    ),
+                    *span,
+                ))
+            }
+        };
+        let c = column(table, col)?;
+        if !matches!(c.ty.kind, Kind::DateTime(_)) {
+            return Err(BindError::at(
+                format!(
+                    "now() is compared with DateTime or DateTime64 columns; {} is {}",
+                    c.name, c.ty
+                ),
+                col.span,
+            ));
+        }
+        windows.push(TimeWindow {
+            column: c.id,
+            inclusive,
+            shift_ns: *shift_ns,
+            refresh_ms: *refresh_ms,
+            span: *span,
+        });
+    }
+    let rest = rest
+        .into_iter()
+        .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)));
+    Ok((rest, windows))
+}
+
+/// The shapes time windows don't follow yet.
+fn check_window_shape(
+    query: &Query,
+    table: &BoundTable,
+    windows: &[TimeWindow],
+    order: &[OrderKey],
+) -> Result<(), BindError> {
+    let Some(first) = windows.first() else {
+        return Ok(());
+    };
+    let unsupported =
+        |what: &str| BindError::at(format!("now() with {what} isn't supported yet"), first.span);
+    if table.final_key.is_some() {
+        return Err(unsupported("FINAL"));
+    }
+    if offset_of(query).is_some() {
+        return Err(unsupported("OFFSET"));
+    }
+    if query.limit.is_some() {
+        // rows leave from the bottom only when the newest come first
+        let by_window = order
+            .first()
+            .is_some_and(|k| k.desc && windows.iter().all(|w| w.column == k.column));
+        if !by_window {
+            return Err(BindError::at(
+                format!(
+                    "now() with LIMIT needs ORDER BY {} DESC first (rows leave from the bottom)",
+                    table.column(first.column).name
+                ),
+                first.span,
+            ));
+        }
+    }
+    Ok(())
 }
 
 const SUBQUERY_PLACE: &str =
@@ -714,7 +872,7 @@ fn outer_ref(expr: &Expr, inner: &BoundTable, outer: &BoundTable) -> Option<Span
             outer_ref(expr, inner, outer)
         }
         Expr::InSubquery { expr, .. } => outer_ref(expr, inner, outer),
-        Expr::Exists { .. } => None,
+        Expr::Exists { .. } | Expr::Now { .. } => None,
     }
 }
 
@@ -1371,6 +1529,7 @@ fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
         Expr::InSubquery { span, .. } | Expr::Exists { span, .. } => {
             Err(BindError::at(SUBQUERY_PLACE, *span))
         }
+        Expr::Now { span, .. } => Err(BindError::at(NOW_PLACE, *span)),
         Expr::And(l, r) => Ok(BoundExpr::And(
             Box::new(bind_where(l, table)?),
             Box::new(bind_where(r, table)?),
@@ -1532,6 +1691,7 @@ fn operand(expr: &Expr, table: &BoundTable) -> Result<Operand, BindError> {
             Ok(Operand::Column(col.id, col.ty.clone()))
         }
         Expr::Literal { value, span } => Ok(Operand::Literal(value.clone(), *span)),
+        Expr::Now { span, .. } => Err(BindError::at(NOW_PLACE, *span)),
         other => Err(BindError::at(
             "only columns and values can be compared",
             other.span(),
@@ -1924,6 +2084,84 @@ mod tests {
         );
         // without FINAL it reads like a MergeTree
         assert!(bind_sql("select * from lowered").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn time_windows_bind_apart_from_the_filter() {
+        const H: i128 = 3_600_000_000_000;
+        let q = bind_sql(
+            "select user_id from events where latency_ms > 5 \
+             and now(500) - interval 1 hour < ts and ts >= now() - interval 2 hour",
+        )
+        .await
+        .unwrap();
+        let ts = ColumnId(0);
+        assert_eq!(
+            q.windows
+                .iter()
+                .map(|w| (w.column, w.inclusive, w.shift_ns, w.refresh_ms))
+                .collect::<Vec<_>>(),
+            [(ts, false, -H, Some(500)), (ts, true, -2 * H, None)]
+        );
+        // the rest is the filter
+        assert!(matches!(q.filter, Some(BoundExpr::Compare { .. })));
+        // only a window: no filter
+        let q = bind_sql("select ts from events where ts > now()")
+            .await
+            .unwrap();
+        assert!(q.filter.is_none() && q.windows.len() == 1);
+        // the newest first, then LIMIT: rows leave from the bottom
+        assert!(bind_sql(
+            "select ts from events where ts > now() - interval 1 minute order by ts desc limit 5"
+        )
+        .await
+        .is_ok());
+        assert!(
+            bind_sql("select ts from events where ts > now() order by latency_ms")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn now_is_refused_where_time_windows_dont_reach_yet() {
+        let cases = [
+            (
+                "select ts from events where ts > now() or latency_ms > 1",
+                "now() is supported only as `column > now() - INTERVAL …` (or >=), a top-level AND condition at 1:34",
+            ),
+            (
+                "select ts from events where ts < now()",
+                "`column < now()`: rows that come in as time passes aren't supported yet; use > or >= (rows leave as time passes) at 1:34",
+            ),
+            (
+                "select ts from events where user_id > now()",
+                "now() is compared with DateTime or DateTime64 columns; user_id is String at 1:29",
+            ),
+            (
+                "select count() from events where ts > now()",
+                "now() with GROUP BY or aggregates isn't supported yet at 1:39",
+            ),
+            (
+                "select ts from events where ts > now() limit 3 offset 1",
+                "now() with OFFSET isn't supported yet at 1:34",
+            ),
+            (
+                "select ts from events where ts > now() limit 3",
+                "now() with LIMIT needs ORDER BY ts DESC first (rows leave from the bottom) at 1:34",
+            ),
+            (
+                "select ts from events where ts > now() order by ts limit 3",
+                "now() with LIMIT needs ORDER BY ts DESC first (rows leave from the bottom) at 1:34",
+            ),
+            (
+                "select ts from events where ts > now() and user_id in (select user_id from sessions)",
+                "now() with a sub-query isn't supported yet at 1:34",
+            ),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(bind_sql(sql).await.unwrap_err(), want, "{sql}");
+        }
     }
 
     #[tokio::test]

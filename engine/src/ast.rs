@@ -122,6 +122,17 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
+    /// The same comparison with its sides swapped: `a < b` is `b > a`.
+    pub fn flipped(self) -> CmpOp {
+        match self {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::LtEq => CmpOp::GtEq,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::GtEq => CmpOp::LtEq,
+            op => op,
+        }
+    }
+
     pub fn symbol(self) -> &'static str {
         match self {
             CmpOp::Eq => "=",
@@ -193,6 +204,13 @@ pub enum Expr {
         negated: bool,
         span: Span,
     },
+    /// `now([refresh ms]) [± INTERVAL n unit]…`: the server's clock, re-read every `refresh_ms`
+    /// (the server's default if `None`), shifted by `shift_ns`; `span` is the `now`'s.
+    Now {
+        refresh_ms: Option<u64>,
+        shift_ns: i128,
+        span: Span,
+    },
     /// `expr [NOT] IN (SELECT …)`; `span` is the `IN`'s.
     InSubquery {
         expr: Box<Expr>,
@@ -213,6 +231,7 @@ impl Expr {
             | Expr::IsNull { span, .. }
             | Expr::InList { span, .. }
             | Expr::Exists { span, .. }
+            | Expr::Now { span, .. }
             | Expr::InSubquery { span, .. } => *span,
             Expr::And(l, _) | Expr::Or(l, _) => l.span(),
         }

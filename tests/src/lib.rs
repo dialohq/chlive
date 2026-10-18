@@ -73,6 +73,7 @@ pub fn config() -> Config {
         kafka_brokers: std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:9092".into()),
         kafka_properties: Default::default(),
         metadata_refresh: chlive_engine::source::METADATA_REFRESH,
+        now_refresh: chlive_engine::engine::NOW_REFRESH,
     }
 }
 

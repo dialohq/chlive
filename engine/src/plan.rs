@@ -462,12 +462,66 @@ pub struct HistoryPlan {
     pub keys_select: Option<String>,
     /// `FROM … FINAL`: a ReplacingMergeTree's latest version of each row.
     pub final_: bool,
+    /// `col > now() - INTERVAL …`: AND conditions with the server's clock in them.
+    pub windows: Vec<HistoryWindow>,
+}
+
+/// A time window in the history query: `column op now() + shift`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryWindow {
+    /// The column, quoted.
+    pub column: String,
+    pub inclusive: bool,
+    pub shift_ns: i128,
+}
+
+impl HistoryWindow {
+    /// At `now` (nanoseconds since the epoch) a literal; otherwise `now()` itself (for the
+    /// plan's identity and explain, which mustn't change as time passes).
+    fn sql(&self, now: Option<i128>) -> String {
+        let op = if self.inclusive { ">=" } else { ">" };
+        match now {
+            Some(now) => format!(
+                "{} {op} fromUnixTimestamp64Nano(toInt64({}))",
+                self.column,
+                now + self.shift_ns
+            ),
+            None => format!(
+                "{} {op} now64(9) + toIntervalNanosecond({})",
+                self.column, self.shift_ns
+            ),
+        }
+    }
 }
 
 impl HistoryPlan {
-    /// The query, reading `from` (a snapshot of [`Self::table`]).
+    /// The query, reading `from` (a snapshot of [`Self::table`]), with `now()` as itself: for
+    /// the plan's identity and explain (see [`Self::sql_at`] for what's fetched).
     pub fn sql(&self, from: &str) -> String {
-        self.build(&self.select, from, self.order.as_deref(), self.limit)
+        self.build(&self.select, from, self.order.as_deref(), self.limit, None)
+    }
+
+    /// The query at `now` (nanoseconds since the epoch): the time windows as literals.
+    pub fn sql_at(&self, from: &str, now: i128) -> String {
+        self.build(
+            &self.select,
+            from,
+            self.order.as_deref(),
+            self.limit,
+            Some(now),
+        )
+    }
+
+    /// The WHERE: the condition and the time windows (at `now`, or symbolically).
+    fn where_sql(&self, now: Option<i128>) -> Option<String> {
+        let mut parts: Vec<String> = self.filter.iter().map(|f| format!("({f})")).collect();
+        parts.extend(self.windows.iter().map(|w| w.sql(now)));
+        match parts.len() {
+            0 => None,
+            // a lone condition as it is
+            1 if self.windows.is_empty() => self.filter.clone(),
+            _ => Some(parts.join(" AND ")),
+        }
     }
 
     /// The query with one more condition (a semi-join's, or a back-fill's keys).
@@ -489,18 +543,18 @@ impl HistoryPlan {
 
     /// The query with another LIMIT (a FINAL window's refill).
     pub fn sql_limit(&self, from: &str, limit: u64) -> String {
-        self.build(&self.select, from, self.order.as_deref(), Some(limit))
+        self.build(&self.select, from, self.order.as_deref(), Some(limit), None)
     }
 
     /// Resume: the sort keys of the result (with ORDER BY), in order.
     pub fn keys_sql(&self, from: &str) -> Option<String> {
         let select = self.keys_select.as_ref()?;
-        Some(self.build(select, from, self.order.as_deref(), self.limit))
+        Some(self.build(select, from, self.order.as_deref(), self.limit, None))
     }
 
     /// Resume: how many rows the result has, at most the LIMIT.
     pub fn count_sql(&self, from: &str) -> String {
-        let inner = self.build("1", from, None, self.limit);
+        let inner = self.build("1", from, None, self.limit, None);
         format!("SELECT count() AS n FROM ({inner})")
     }
 
@@ -512,9 +566,16 @@ impl HistoryPlan {
         }
     }
 
-    fn build(&self, select: &str, from: &str, order: Option<&str>, limit: Option<u64>) -> String {
+    fn build(
+        &self,
+        select: &str,
+        from: &str,
+        order: Option<&str>,
+        limit: Option<u64>,
+        now: Option<i128>,
+    ) -> String {
         let mut sql = format!("SELECT {select} FROM {from}{}", self.final_sql());
-        if let Some(f) = &self.filter {
+        if let Some(f) = self.where_sql(now) {
             sql.push_str(&format!(" WHERE {f}"));
         }
         if let Some(order) = order {
@@ -557,6 +618,61 @@ pub struct StreamPlan {
     pub offset: Option<u64>,
     /// FINAL on a ReplacingMergeTree: rows have ids (their keys), and events replace them.
     pub keyed: Option<KeyedPlan>,
+    /// `col > now() - INTERVAL …`: rows leave as time passes.
+    pub windows: Vec<WindowPlan>,
+}
+
+/// A time window for the stream: `column > now() + shift` (or `>=`). A row holds until the
+/// server's clock reaches its deadline, `column − shift` (`>=`: a nanosecond later).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowPlan {
+    pub column: ColumnId,
+    pub ty: Type,
+    /// The field holding it in a history row: its output name, or a hidden alias
+    /// (`__time_<i>`, removed before output).
+    pub history_field: String,
+    pub hidden: bool,
+    pub inclusive: bool,
+    pub shift_ns: i128,
+    /// `now(ms)`'s refresh, if given.
+    pub refresh_ms: Option<u64>,
+    /// The condition in dialect syntax, for `explain`.
+    pub text: String,
+}
+
+impl WindowPlan {
+    /// When a row with this value leaves (nanoseconds since the epoch); `None` for NULL
+    /// (never matching).
+    fn deadline(&self, v: &Value) -> Option<i128> {
+        let Value::DateTime(dt) = v else {
+            return None;
+        };
+        let ns = i128::from(dt.ticks) * 10i128.pow(9 - u32::from(dt.precision.min(9)));
+        Some(ns - self.shift_ns + i128::from(self.inclusive))
+    }
+}
+
+/// `now() ± INTERVAL …` in dialect syntax: the shift in its largest whole unit.
+fn now_text(shift_ns: i128) -> String {
+    if shift_ns == 0 {
+        return "now()".into();
+    }
+    let units: [(i128, &str); 6] = [
+        (7 * 86_400 * 1_000_000_000, "WEEK"),
+        (86_400 * 1_000_000_000, "DAY"),
+        (3_600 * 1_000_000_000, "HOUR"),
+        (60 * 1_000_000_000, "MINUTE"),
+        (1_000_000_000, "SECOND"),
+        (1_000_000, "MILLISECOND"),
+    ];
+    let abs = shift_ns.abs();
+    let (per, unit) = units
+        .iter()
+        .find(|(per, _)| abs % per == 0)
+        .copied()
+        .unwrap_or((1, "NANOSECOND"));
+    let sign = if shift_ns < 0 { '-' } else { '+' };
+    format!("now() {sign} INTERVAL {} {unit}", abs / per)
 }
 
 /// FINAL for the stream: what identifies a row, which version it is, and whether it's deleted;
@@ -751,6 +867,41 @@ impl StreamPlan {
             Filter::All => true,
             Filter::Where { expr, .. } => eval(expr, row) == Some(true),
         }
+    }
+
+    /// When a decoded event's row leaves as time passes: the earliest of its windows'
+    /// deadlines (`None` if it's NULL in one: it never matches).
+    pub fn deadline(&self, row: &DecodedRow) -> Option<i128> {
+        self.windows
+            .iter()
+            .map(|w| w.deadline(&row[w.column.0]))
+            .try_fold(i128::MAX, |d, w| w.map(|w| d.min(w)))
+    }
+
+    /// A history row's deadline, removing its hidden window fields.
+    pub fn history_deadline(&self, row: &mut Row) -> Result<Option<i128>, RowDecodeError> {
+        let mut deadline = Some(i128::MAX);
+        for w in &self.windows {
+            let v = decode(row.get(&w.history_field), &w.ty).map_err(|error| RowDecodeError {
+                column: w.history_field.clone(),
+                error,
+            })?;
+            deadline = deadline.zip(w.deadline(&v)).map(|(a, b)| a.min(b));
+        }
+        for w in self.windows.iter().filter(|w| w.hidden) {
+            row.shift_remove(&w.history_field);
+        }
+        Ok(deadline)
+    }
+
+    /// How often the server's clock is re-read: the smallest `now(ms)` (`None`: the
+    /// server's default).
+    pub fn refresh(&self) -> Option<std::time::Duration> {
+        self.windows
+            .iter()
+            .filter_map(|w| w.refresh_ms)
+            .min()
+            .map(std::time::Duration::from_millis)
     }
 
     /// The result row, rendered the way ClickHouse renders it.
@@ -1073,6 +1224,17 @@ impl std::fmt::Display for Plan {
             Filter::All => write!(f, "filter:  all events")?,
             Filter::Where { text, .. } => write!(f, "filter:  {text}")?,
         }
+        for w in &self.stream.windows {
+            let every = match self.stream.refresh() {
+                Some(d) => format!("{} ms", d.as_millis()),
+                None => "the server's now_refresh".into(),
+            };
+            write!(
+                f,
+                "\nwindow:  {} (rows leave as time passes; the clock re-read every {every})",
+                w.text
+            )?;
+        }
         if let Some(order) = &self.stream.order {
             let how = if self.stream.keyed.is_some() {
                 "rows move as new versions change their values; a moved or new row goes after \
@@ -1216,6 +1378,39 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             deleted: k.deleted,
         }
     });
+    // time windows: each column's value in history rows (selected, or a hidden alias)
+    let windows: Vec<WindowPlan> = bound
+        .windows
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let c = table.column(w.column);
+            let selected = bound.projection.iter().find(|p| p.column == w.column);
+            let (history_field, hidden) = match selected {
+                Some(p) => (p.name.clone(), false),
+                None => {
+                    let alias = format!("__time_{i}");
+                    select_list.push(format!("{} AS {alias}", quote_ident(&c.clickhouse)));
+                    (alias, true)
+                }
+            };
+            WindowPlan {
+                column: w.column,
+                ty: c.ty.clone(),
+                history_field,
+                hidden,
+                inclusive: w.inclusive,
+                shift_ns: w.shift_ns,
+                refresh_ms: w.refresh_ms,
+                text: format!(
+                    "{} {} {}",
+                    c.name,
+                    if w.inclusive { ">=" } else { ">" },
+                    now_text(w.shift_ns)
+                ),
+            }
+        })
+        .collect();
     let history = HistoryPlan {
         table: table.clickhouse_table.clone(),
         select: select_list.join(", "),
@@ -1247,6 +1442,15 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             fields.join(", ")
         }),
         final_: keyed.is_some(),
+        windows: bound
+            .windows
+            .iter()
+            .map(|w| HistoryWindow {
+                column: quote_ident(&table.column(w.column).clickhouse),
+                inclusive: w.inclusive,
+                shift_ns: w.shift_ns,
+            })
+            .collect(),
     };
 
     // Columns to decode: the output's, then the filter's and ORDER BY's that aren't output.
@@ -1281,6 +1485,11 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
     if let Some((outer_key, _)) = bound.semi_join.as_ref().and_then(|s| s.keys) {
         if !needed.contains(&outer_key) {
             needed.push(outer_key);
+        }
+    }
+    for w in &bound.windows {
+        if !needed.contains(&w.column) {
+            needed.push(w.column);
         }
     }
     if let Some(k) = &table.final_key {
@@ -1327,6 +1536,7 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
         limit: bound.limit,
         offset: bound.offset,
         keyed,
+        windows,
     };
     Plan {
         table: table.name.clone(),
@@ -1378,6 +1588,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
         limit: None,
         offset: None,
         keyed: None,
+        windows: Vec::new(),
     };
     let float = |t: &Type| matches!(t.kind, crate::types::Kind::Float(_));
     SemiPlan {
@@ -1483,6 +1694,7 @@ mod tests {
             offset: None,
             aggregation: None,
             semi_join: None,
+            windows: Vec::new(),
         }
     }
 
@@ -1663,6 +1875,79 @@ mod tests {
         assert!(p
             .to_string()
             .contains("OFFSET 2: every row but the first 2 (by ORDER BY), all of them kept"));
+    }
+
+    #[test]
+    fn time_windows_are_symbolic_in_the_identity_and_literal_when_fetched() {
+        const H: i128 = 3_600_000_000_000;
+        let mut b = bound(&[1], None);
+        b.windows = vec![crate::binder::TimeWindow {
+            column: ColumnId(0),
+            inclusive: false,
+            shift_ns: -H,
+            refresh_ms: Some(500),
+            span: crate::error::Span::new(0, 0),
+        }];
+        let p = plan(&b);
+        // ts isn't selected: fetched under a hidden alias, for the rows' deadlines
+        assert_eq!(
+            p.history.sql("db.snap"),
+            format!(
+                "SELECT user_id, ts AS __time_0 FROM db.snap WHERE ts > now64(9) + \
+                 toIntervalNanosecond({})",
+                -H
+            )
+        );
+        let now: i128 = 1_800_000_000_000_000_000;
+        assert_eq!(
+            p.history.sql_at("db.snap", now),
+            format!(
+                "SELECT user_id, ts AS __time_0 FROM db.snap WHERE ts > \
+                 fromUnixTimestamp64Nano(toInt64({}))",
+                now - H
+            )
+        );
+        assert_eq!(
+            p.stream.refresh(),
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert!(p.stream.required_keys().contains(&"ts".to_string()));
+        assert!(p.to_string().contains(
+            "window:  ts > now() - INTERVAL 1 HOUR (rows leave as time passes; the clock re-read \
+             every 500 ms)"
+        ));
+        // a row's deadline: when the clock gets to ts + 1 hour
+        let mut row = json!({"user_id": "u", "__time_0": "2026-10-18 12:00:00.000"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let d = p.stream.history_deadline(&mut row).unwrap().unwrap();
+        let ts = crate::types::parse_datetime("2026-10-18 12:00:00.000", 3).unwrap();
+        assert_eq!(d, i128::from(ts) * 1_000_000 + H);
+        assert_eq!(
+            row.keys().collect::<Vec<_>>(),
+            ["user_id"],
+            "the hidden field is gone"
+        );
+        // with a filter: both
+        let f = BoundExpr::Compare {
+            op: CmpOp::Gt,
+            left: Box::new(BoundExpr::Column(ColumnId(2))),
+            right: Box::new(BoundExpr::Literal(Value::Int(5))),
+        };
+        let mut b2 = bound(&[0], Some(f));
+        b2.windows = b.windows.clone();
+        b2.windows[0].inclusive = true;
+        assert!(plan(&b2).history.sql("x").ends_with(&format!(
+            "WHERE (latency_ms > 5) AND ts >= now64(9) + toIntervalNanosecond({})",
+            -H
+        )));
+        // the refresh is part of the identity
+        b2.windows[0].refresh_ms = None;
+        let fp = |b: &BoundQuery| crate::cursor::fingerprint(&plan(b));
+        let default = fp(&b2);
+        b2.windows[0].refresh_ms = Some(500);
+        assert_ne!(fp(&b2), default);
     }
 
     #[test]

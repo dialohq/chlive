@@ -177,6 +177,18 @@ async fn rejections_over_websocket() -> Result<()> {
                     "HAVING is not supported yet",
                 ),
                 (
+                    "now_or",
+                    "select * from events where ts > now() or latency_ms > 1",
+                    "INVALID_QUERY",
+                    "now() is supported only as",
+                ),
+                (
+                    "now_group",
+                    "select country, count() from events where ts > now() group by country",
+                    "INVALID_QUERY",
+                    "now() with GROUP BY or aggregates isn't supported yet",
+                ),
+                (
                     "final",
                     "select count() from products final",
                     "INVALID_QUERY",
@@ -942,6 +954,57 @@ async fn final_results_match_clickhouse() -> Result<()> {
             for r in multiset(&live.rows) {
                 assert!(all.contains(&r), "offset: {r} isn't a row of the result");
             }
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// `ts > now(200) - INTERVAL 2 SECOND`: rows produced now come in, and with no further events
+/// they leave as the server's clock passes them, within the refresh of their deadline.
+#[tokio::test]
+async fn rows_leave_a_time_window_as_time_passes() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let sql = "select user_id, ts from events where ts > now(200) - interval 2 second";
+    with_server(config(), |server| {
+        async move {
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("w", sql);
+            conn.wait_ready(&["w"], Duration::from_secs(60)).await?;
+            let produced = producer()?.produce(50, None).await?;
+            // they come in ...
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while conn.result("w").unwrap().inserted == 0 {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "no rows came in");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // ... and leave, with no further events
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !conn.result("w").unwrap().rows.is_empty() {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "rows didn't leave: {:?}",
+                    conn.result("w").unwrap().rows.len()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let live = conn.result("w").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert!(
+                live.protocol_violations.is_empty(),
+                "{:?}",
+                live.protocol_violations
+            );
+            assert!(live.deleted >= live.inserted, "every row that came in left");
+            eprintln!(
+                "window: {} in, {} out (offsets {produced:?})",
+                live.inserted, live.deleted
+            );
             Ok(())
         }
         .boxed()

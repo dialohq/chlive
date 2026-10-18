@@ -244,6 +244,23 @@ impl OrderedState {
         }
     }
 
+    /// Take out the row at `index` (one of its tie group).
+    pub fn remove_at(&mut self, index: usize) {
+        let mut at = 0;
+        for g in 0..self.groups.len() {
+            let n = self.groups[g].1;
+            if index < at + n {
+                self.groups[g].1 -= 1;
+                if self.groups[g].1 == 0 {
+                    self.groups.remove(g);
+                }
+                self.len -= 1;
+                return;
+            }
+            at += n;
+        }
+    }
+
     /// Append a row of the (already ordered and limited) history. A key equal to the previous
     /// one joins its tie group; anything else starts a new group.
     pub fn push_history(&mut self, key: SortKey) {
@@ -930,6 +947,40 @@ mod tests {
                     .all(|w| r.order().cmp(w[0], w[1]) != Ordering::Greater),
                 "step {i}: out of order"
             );
+        }
+    }
+
+    /// Removing rows by index keeps the tie groups those of the rows left.
+    #[test]
+    fn rows_come_out_of_their_tie_groups() {
+        let mut seed: u64 = 1;
+        let mut rand = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut s = OrderedState::new(order(&[(false, false)]));
+        let mut model: Vec<i128> = Vec::new();
+        for _ in 0..500 {
+            if model.is_empty() || rand(3) > 0 {
+                let k = rand(5) as i128;
+                let p = s.insert(int(k)).unwrap();
+                model.insert(p.index, k);
+            } else {
+                let i = rand(model.len() as u64) as usize;
+                s.remove_at(i);
+                model.remove(i);
+            }
+            let mut groups: Vec<(SortKey, usize)> = Vec::new();
+            for k in &model {
+                match groups.last_mut() {
+                    Some((g, n)) if *g == int(*k) => *n += 1,
+                    _ => groups.push((int(*k), 1)),
+                }
+            }
+            assert_eq!(s.groups, groups);
+            assert_eq!(s.len(), model.len());
         }
     }
 }

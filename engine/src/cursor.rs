@@ -37,6 +37,13 @@ pub fn identity(plan: &Plan) -> String {
     for t in &plan.stream.topics {
         text.push_str(&format!("|topic:{t}"));
     }
+    // a different refresh is a different result (the windows are in the history's SQL)
+    if !plan.stream.windows.is_empty() {
+        match plan.stream.refresh() {
+            Some(d) => text.push_str(&format!("|now_refresh:{}ms", d.as_millis())),
+            None => text.push_str("|now_refresh:default"),
+        }
+    }
     text
 }
 

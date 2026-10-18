@@ -1571,6 +1571,127 @@ async fn final_matches_clickhouse() {
     }
 }
 
+/// `ts > now() - INTERVAL …`: history (the window as a literal at the clock's now) and stream
+/// (each event's deadline against the clock) agree with ClickHouse's query at that time, in
+/// every split. Rows are kept well away from the window's edge, so none leave during the test.
+#[tokio::test]
+async fn time_windows_match_clickhouse() {
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    // 2026-10-18 12:00:00 UTC
+    const B: i128 = 1_792_324_800_000_000_000;
+    let ts = |s: i64| chlive_engine::types::format_datetime((B / 1_000_000) as i64 + s * 1000, 3);
+    // seconds around B: in the last minute (from B - 50 s), or out of it (B - 70 s and before)
+    let offsets: Vec<i64> = (-120..40)
+        .step_by(4)
+        .filter(|s| !(-70 < *s && *s < -50))
+        .collect();
+    let events: Vec<String> = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            format!(
+                r#"{{"ts":"{}","user_id":"u{i}","latency_ms":{}}}"#,
+                ts(*s),
+                i * 37 % 100
+            )
+        })
+        .collect();
+    const CASES: &[&str] = &[
+        "select user_id, ts from events where ts > now() - interval 1 minute",
+        "select user_id from events where latency_ms > 30 and ts >= now() - interval 1 minute",
+        "select user_id, ts from events where ts > now() - interval 1 minute order by ts desc limit 5",
+    ];
+    let mut engines = Vec::new();
+    for (database, in_clickhouse) in [
+        ("chlive_engine_time_history", events.len()),
+        ("chlive_engine_time_stream", 0),
+        ("chlive_engine_time_split", events.len() / 2),
+    ] {
+        exec(&format!("DROP DATABASE IF EXISTS {database}")).await;
+        exec(&format!("CREATE DATABASE {database}")).await;
+        exec(&format!(
+            "CREATE TABLE {database}.events (ts DateTime64(3), user_id String, latency_ms UInt32) \
+             ENGINE = MergeTree ORDER BY ts"
+        ))
+        .await;
+        if in_clickhouse > 0 {
+            let rows: String = events[..in_clickhouse]
+                .iter()
+                .map(|e| format!("{e}\n"))
+                .collect();
+            exec(&format!(
+                "INSERT INTO {database}.events FORMAT JSONEachRow\n{rows}"
+            ))
+            .await;
+        }
+        let mut source = MemorySource::new();
+        for e in &events {
+            source.push("events", 0, e.as_str());
+        }
+        let engine = engine_at(database.into(), source, upto(in_clickhouse))
+            .with_max_batch(7)
+            .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)));
+        engines.push((database, engine, in_clickhouse));
+    }
+    let direct = ClickHouseHttp::new(&url(), "default", "");
+    for sql in CASES {
+        use chlive_engine::history::HistorySource;
+        // ClickHouse's answer at B
+        let at_b = sql
+            .replace("from events", "from chlive_engine_time_history.events")
+            .replace(
+                "now() - interval 1 minute",
+                &format!("fromUnixTimestamp64Nano(toInt64({}))", B - 60_000_000_000),
+            );
+        let want = direct.fetch(&at_b).await.unwrap();
+        assert!(!want.is_empty(), "{sql}");
+        for (database, engine, in_clickhouse) in &engines {
+            // the history, then one iteration per event after the snapshot (the clock has
+            // nothing to say yet)
+            let n = 1 + events.len() - in_clickhouse;
+            let iterations: Vec<_> = engine
+                .subscribe(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .take(n)
+                .map(|i| i.unwrap_or_else(|e| panic!("{database}: {sql}: {e}")))
+                .collect()
+                .await;
+            let mut rows = Vec::new();
+            for it in &iterations {
+                assert_ne!(
+                    it.origin,
+                    Origin::Clock,
+                    "{database}: {sql}: nothing leaves yet"
+                );
+                for d in &it.diffs {
+                    d.apply(&mut rows).unwrap();
+                }
+            }
+            let canon = |rows: &[chlive_engine::diff::Row]| {
+                let mut v: Vec<String> = rows
+                    .iter()
+                    .map(|r| serde_json::Value::Object(r.clone()).to_string())
+                    .collect();
+                v.sort();
+                v
+            };
+            if sql.contains(" order by ") {
+                assert_eq!(rows, want, "{database}: {sql}");
+            } else {
+                assert_eq!(canon(&rows), canon(&want), "{database}: {sql}");
+            }
+            eprintln!("{database:>28}: {sql}: {} rows", rows.len());
+        }
+    }
+    for (database, _, _) in &engines {
+        exec(&format!("DROP DATABASE {database}")).await;
+    }
+}
+
 /// `IN (SELECT …)` over two tables, in every split of history and stream for both: the live
 /// result (history, then events, then users entering S with back-fills) equals ClickHouse's
 /// answer over all the data.
