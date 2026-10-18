@@ -1336,8 +1336,6 @@ fn check_final_shape(query: &Query, table: &BoundTable) -> Result<(), BindError>
     };
     let what = if query.group_by.is_some() {
         "GROUP BY"
-    } else if offset_of(query).is_some() {
-        "OFFSET"
     } else if query.selection.as_ref().is_some_and(has_subquery) {
         "a sub-query"
     } else {
@@ -1898,10 +1896,15 @@ mod tests {
         assert!(bind_sql("select * from products final limit 0")
             .await
             .is_ok());
-        assert_eq!(
-            err("select * from products final offset 5").await,
-            unsupported("OFFSET", "1:24")
-        );
+        // OFFSET too, with or without LIMIT and ORDER BY
+        for sql in [
+            "select * from products final offset 5",
+            "select * from products final limit 2 offset 5",
+            "select * from products final order by version limit 2 offset 5",
+            "select * from products final order by version offset 5",
+        ] {
+            assert!(bind_sql(sql).await.is_ok(), "{sql}");
+        }
         assert_eq!(
             err("select product_id, count() from products final group by product_id").await,
             unsupported("GROUP BY", "1:42")

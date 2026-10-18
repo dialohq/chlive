@@ -65,14 +65,16 @@ pub struct KeyedState {
     stale: u64,
 }
 
-/// FINAL with `LIMIT n`: the visible rows and the buffer, newest first, and the rows of both
-/// (a visible row can slide into the buffer and come back). `versions` has every kept id.
+/// FINAL with `LIMIT n` and/or `OFFSET m`, no ORDER BY: the kept rows, newest first, the
+/// first m held back, the next n visible, `capacity` more after them; and the rows of all (a
+/// row moves between the parts and back). `versions` has every kept id.
 #[derive(Debug, Clone)]
 struct Window {
+    offset: usize,
+    /// `usize::MAX`: no LIMIT.
     limit: usize,
     capacity: usize,
-    visible: VecDeque<String>,
-    buffered: VecDeque<String>,
+    seq: VecDeque<String>,
     rows: HashMap<String, Row>,
     /// The kept rows are every matching row (nothing past them to refill from).
     exhaustive: bool,
@@ -91,10 +93,12 @@ struct Window {
     let_go: Watermark,
 }
 
-/// FINAL with ORDER BY and `LIMIT n`: ranks `[0, n + capacity)` of the result, the first n
-/// visible, with their rows. `versions` has every kept id.
+/// FINAL with ORDER BY and `LIMIT n` and/or `OFFSET m`: ranks `[0, m + n + capacity)` of the
+/// result, `[m, m+n)` visible, with their rows. `versions` has every kept id.
 #[derive(Debug, Clone)]
 struct OrderedWindow {
+    offset: usize,
+    /// `usize::MAX`: no LIMIT.
     limit: usize,
     capacity: usize,
     ranking: Ranking,
@@ -121,15 +125,95 @@ impl OrderedWindow {
         !self.exhaustive && self.ranking.would_place(key) >= self.ranking.len()
     }
 
-    /// The row at rank `i`, as an insert there.
-    fn insert_at(&self, i: usize) -> Option<Diff> {
-        let e = self.ranking.get(i)?;
-        Some(Diff::Insert {
-            row: self.rows[&e.id].clone(),
-            index: Some(i),
-            id: Some(e.id.clone()),
-        })
+    /// The row at rank `i`.
+    fn at(&self, i: usize) -> (String, Row) {
+        let id = &self.ranking.get(i).expect("a rank").id;
+        (id.clone(), self.rows[id].clone())
     }
+
+    /// The most rows kept: the held-back ones, the window and the spare ones after it.
+    fn most(&self) -> usize {
+        self.offset
+            .saturating_add(self.limit)
+            .saturating_add(self.capacity)
+    }
+
+    fn visible(&self, i: usize) -> bool {
+        i >= self.offset && i - self.offset < self.limit
+    }
+}
+
+/// How many of a sequence's `len` rows are visible, when they're positions `[m, m+n)`.
+fn shown(len: usize, m: usize, n: usize) -> usize {
+    len.saturating_sub(m).min(n)
+}
+
+/// A row (`id`) left a sequence at position `o`; it now has `len` rows, `at(i)` the one at
+/// position i, and positions `[m, m+n)` are visible. What the client's rows get: the row out
+/// (if visible), or, if it was held back, the first visible one (now held back) out; then the
+/// row that slid into the window's last place.
+fn removed(
+    o: usize,
+    id: String,
+    len: usize,
+    (m, n): (usize, usize),
+    at: impl Fn(usize) -> (String, Row),
+) -> Vec<Diff> {
+    let (before, after) = (shown(len + 1, m, n), shown(len, m, n));
+    let mut diffs = Vec::new();
+    if o < m {
+        if before == 0 {
+            return diffs;
+        }
+        diffs.push(Diff::Delete { index: 0 });
+    } else if o - m < n {
+        diffs.push(Diff::DeleteId { id });
+    } else {
+        return diffs;
+    }
+    if after > before - 1 {
+        let (id, row) = at(m + after - 1);
+        diffs.push(Diff::Insert {
+            row,
+            index: Some(after - 1),
+            id: Some(id),
+        });
+    }
+    diffs
+}
+
+/// A row came into a sequence at position `p`; it now has `len` rows (see [`removed`]). What
+/// the client's rows get: the row in (if visible), or, if it went into the held-back part, the
+/// row pushed out of it into the window's first place; then the window's last row, if it's
+/// over n.
+fn inserted(
+    p: usize,
+    len: usize,
+    (m, n): (usize, usize),
+    at: impl Fn(usize) -> (String, Row),
+) -> Vec<Diff> {
+    let (before, after) = (shown(len - 1, m, n), shown(len, m, n));
+    let mut diffs = Vec::new();
+    let into = if p < m {
+        if after == 0 {
+            return diffs;
+        }
+        (m, 0)
+    } else if p - m < n {
+        (p, p - m)
+    } else {
+        return diffs;
+    };
+    let (id, row) = at(into.0);
+    diffs.push(Diff::Insert {
+        row,
+        index: Some(into.1),
+        id: Some(id),
+    });
+    if before + 1 > after {
+        diffs.push(Diff::Delete { index: after });
+    }
+    diffs
 }
 
 /// A refill: one row per key from a snapshot at `at` (id, version, row), and whether it had
@@ -181,10 +265,10 @@ impl Gone {
 impl Window {
     fn new(plan: KeyedWindowPlan) -> Self {
         Self {
-            limit: plan.limit as usize,
+            offset: plan.offset as usize,
+            limit: plan.limit.map_or(usize::MAX, |n| n as usize),
             capacity: plan.buffer as usize,
-            visible: VecDeque::new(),
-            buffered: VecDeque::new(),
+            seq: VecDeque::new(),
             rows: HashMap::new(),
             exhaustive: true,
             gone: Gone::default(),
@@ -197,24 +281,27 @@ impl Window {
         }
     }
 
-    /// Fewer than this many buffered rows: time for a refill.
-    fn low(&self) -> usize {
-        self.capacity / 4
+    /// The held-back and visible rows' count, and the most rows kept.
+    fn front(&self) -> usize {
+        self.offset.saturating_add(self.limit)
     }
 
-    /// Fill the visible rows from the buffer (inserts at the end).
-    fn promote(&mut self, diffs: &mut Vec<Diff>) {
-        while self.visible.len() < self.limit {
-            let Some(id) = self.buffered.pop_front() else {
-                break;
-            };
-            self.visible.push_back(id.clone());
-            diffs.push(Diff::Insert {
-                row: self.rows[&id].clone(),
-                index: Some(self.visible.len() - 1),
-                id: Some(id),
-            });
-        }
+    fn most(&self) -> usize {
+        self.front().saturating_add(self.capacity)
+    }
+
+    /// The spare rows after the window.
+    fn spare(&self) -> usize {
+        self.seq.len().saturating_sub(self.front())
+    }
+
+    fn at(&self, i: usize) -> (String, Row) {
+        let id = &self.seq[i];
+        (id.clone(), self.rows[id].clone())
+    }
+
+    fn visible(&self, i: usize) -> bool {
+        i >= self.offset && i - self.offset < self.limit
     }
 }
 
@@ -233,7 +320,8 @@ impl KeyedState {
         match order {
             Some(order) => Self {
                 ordered_window: Some(Box::new(OrderedWindow {
-                    limit: plan.limit as usize,
+                    offset: plan.offset as usize,
+                    limit: plan.limit.map_or(usize::MAX, |n| n as usize),
                     capacity: plan.buffer as usize,
                     ranking: Ranking::new(order),
                     rows: HashMap::new(),
@@ -288,7 +376,7 @@ impl KeyedState {
             return;
         };
         w.replaying = false;
-        while w.ranking.len() > w.limit + w.capacity {
+        while w.ranking.len() > w.most() {
             let last = w.ranking.get(w.ranking.len() - 1).expect("over").id.clone();
             w.ranking.remove(&last);
             self.versions.remove(&last);
@@ -309,9 +397,9 @@ impl KeyedState {
     /// With ORDER BY and LIMIT: too few rows kept, with more past them (a rebuild's shadow that
     /// needs a bigger snapshot top).
     pub fn short(&self) -> bool {
-        self.ordered_window
-            .as_ref()
-            .is_some_and(|w| !w.exhaustive && w.ranking.len() < w.limit + w.capacity / 4)
+        self.ordered_window.as_ref().is_some_and(|w| {
+            !w.exhaustive && w.ranking.len() < w.most() - w.capacity + w.capacity / 4
+        })
     }
 
     /// With ORDER BY and LIMIT: refills rebuild the window.
@@ -326,6 +414,7 @@ impl KeyedState {
         };
         w.ranking
             .iter()
+            .skip(w.offset)
             .take(w.limit)
             .map(|e| (e.id.clone(), w.rows[&e.id].clone()))
             .collect()
@@ -355,7 +444,7 @@ impl KeyedState {
         };
         if let Some(w) = &mut self.ordered_window {
             // ranked; the top n are the result
-            w.exhaustive = rows.len() < w.history_limit.unwrap_or(w.limit + w.capacity);
+            w.exhaustive = rows.len() < w.history_limit.unwrap_or(w.most());
             let mut keys = Vec::with_capacity(rows.len());
             for (id, ver, key, row) in rows {
                 self.versions.insert(id.clone(), ver);
@@ -366,22 +455,22 @@ impl KeyedState {
             return w
                 .ranking
                 .iter()
+                .skip(w.offset)
                 .take(w.limit)
                 .map(|e| insert(e.id.clone(), w.rows[&e.id].clone()))
                 .collect();
         }
         if let Some(w) = &mut self.window {
-            // the first n are the result, the rest the buffer
-            w.exhaustive = rows.len() < w.limit + w.capacity;
+            // in ClickHouse's order: the first m held back, the next n the result, the rest
+            // spare
+            w.exhaustive = rows.len() < w.most();
             let mut diffs = Vec::new();
             for (id, ver, _, row) in rows {
                 self.versions.insert(id.clone(), ver);
-                if w.visible.len() < w.limit {
-                    w.visible.push_back(id.clone());
+                if w.visible(w.seq.len()) {
                     diffs.push(insert(id.clone(), row.clone()));
-                } else {
-                    w.buffered.push_back(id.clone());
                 }
+                w.seq.push_back(id.clone());
                 w.rows.insert(id, row);
             }
             return diffs;
@@ -474,8 +563,9 @@ impl KeyedState {
         }
     }
 
-    /// A new version, with LIMIT: kept rows are updated, or leave (a visible one replaced from
-    /// the buffer); a matching key not kept comes in at the top.
+    /// A new version, with LIMIT or OFFSET (no ORDER BY): kept rows are updated, or leave (the
+    /// rows behind them move up a place); a matching key not kept comes in at the very front,
+    /// pushing the others back a place.
     fn window_event(
         &mut self,
         id: String,
@@ -485,74 +575,69 @@ impl KeyedState {
         row: impl FnOnce() -> Row,
     ) -> Vec<Diff> {
         let w = self.window.as_mut().expect("a window");
-        let mut diffs = Vec::new();
-        let visible = w.visible.iter().position(|x| *x == id);
-        let kept = visible.is_some() || self.versions.contains_key(&id);
-        match (kept, shown) {
-            (true, true) => {
+        let edges = (w.offset, w.limit);
+        let position = if self.versions.contains_key(&id) {
+            w.seq.iter().position(|x| *x == id)
+        } else {
+            None
+        };
+        match (position, shown) {
+            (Some(i), true) => {
                 let row = row();
                 self.versions.insert(id.clone(), ver);
                 w.seen.insert(id.clone(), at);
                 w.rows.insert(id.clone(), row.clone());
-                if visible.is_some() {
-                    diffs.push(Diff::Update {
+                if w.visible(i) {
+                    return vec![Diff::Update {
                         id,
                         set: row,
                         index: None,
-                    });
+                    }];
                 }
+                Vec::new()
             }
-            (true, false) => {
+            (Some(i), false) => {
                 self.versions.remove(&id);
                 w.rows.remove(&id);
                 w.seen.remove(&id);
                 w.gone.record(&id, at);
-                match visible {
-                    Some(i) => {
-                        w.visible.remove(i);
-                        diffs.push(Diff::DeleteId { id });
-                        w.promote(&mut diffs);
-                    }
-                    None => w.buffered.retain(|x| *x != id),
-                }
+                w.seq.remove(i);
+                let w = &*w;
+                removed(i, id, w.seq.len(), edges, |k| w.at(k))
             }
-            (false, true) if w.limit > 0 => {
+            (None, true) if w.limit > 0 => {
                 let row = row();
                 self.versions.insert(id.clone(), ver);
                 w.seen.insert(id.clone(), at);
-                w.rows.insert(id.clone(), row.clone());
-                w.visible.push_front(id.clone());
-                diffs.push(Diff::Insert {
-                    row,
-                    index: Some(0),
-                    id: Some(id),
-                });
-                if w.visible.len() > w.limit {
-                    // the last visible row slides into the buffer
-                    let last = w.visible.pop_back().expect("over the limit");
-                    diffs.push(Diff::Delete { index: w.limit });
-                    w.buffered.push_front(last);
-                    if w.buffered.len() > w.capacity {
-                        // let go: it still matches, but it isn't kept any more
-                        let out = w.buffered.pop_back().expect("over capacity");
-                        self.versions.remove(&out);
-                        w.rows.remove(&out);
-                        if let Some((p, o)) = w.seen.remove(&out) {
-                            let l = w.let_go.0.entry(p).or_insert(o);
-                            *l = (*l).max(o);
-                        }
-                        w.exhaustive = false;
+                w.rows.insert(id.clone(), row);
+                w.seq.push_front(id);
+                let diffs = {
+                    let w = &*w;
+                    inserted(0, w.seq.len(), edges, |k| w.at(k))
+                };
+                if w.seq.len() > w.most() {
+                    // let go: it still matches, but it isn't kept any more
+                    let out = w.seq.pop_back().expect("over capacity");
+                    self.versions.remove(&out);
+                    w.rows.remove(&out);
+                    if let Some((p, o)) = w.seen.remove(&out) {
+                        let l = w.let_go.0.entry(p).or_insert(o);
+                        *l = (*l).max(o);
                     }
+                    w.exhaustive = false;
                 }
+                diffs
             }
-            (false, true) => {}
-            (false, false) => w.gone.record(&id, at),
+            (None, true) => Vec::new(),
+            (None, false) => {
+                w.gone.record(&id, at);
+                Vec::new()
+            }
         }
-        diffs
     }
 
-    /// A new version, with ORDER BY and LIMIT: placed by its sort values within the kept ranks
-    /// (moving across the top n's edge as an insert and a delete there), or, past the bound,
+    /// A new version, with ORDER BY and LIMIT or OFFSET: placed by its sort values within the
+    /// kept ranks (crossing the window's edges as inserts and deletes there), or, past the bound,
     /// ignored (leaving, if it was kept).
     fn ordered_event(
         &mut self,
@@ -563,16 +648,15 @@ impl KeyedState {
         row: impl FnOnce() -> Row,
     ) -> Vec<Diff> {
         let w = self.ordered_window.as_mut().expect("an ordered window");
-        let n = w.limit;
+        let edges = (w.offset, w.limit);
         let kept = self.versions.contains_key(&id);
-        let mut diffs = Vec::new();
-        if !kept && (!shown || n == 0) {
-            return diffs;
+        if !kept && (!shown || w.limit == 0) {
+            return Vec::new();
         }
         if !kept && w.past_bound(&key) {
             // a matching row past what's known: dropped
             w.lost_since = true;
-            return diffs;
+            return Vec::new();
         }
         if kept {
             let same = w
@@ -583,14 +667,14 @@ impl KeyedState {
                 let row = row();
                 self.versions.insert(id.clone(), ver);
                 w.rows.insert(id.clone(), row.clone());
-                if w.ranking.position(&id).is_some_and(|o| o < n) {
-                    diffs.push(Diff::Update {
+                if w.ranking.position(&id).is_some_and(|o| w.visible(o)) {
+                    return vec![Diff::Update {
                         id,
                         set: row,
                         index: None,
-                    });
+                    }];
                 }
-                return diffs;
+                return Vec::new();
             }
             let o = w.ranking.remove(&id).expect("kept");
             if !shown || w.past_bound(&key) {
@@ -598,55 +682,40 @@ impl KeyedState {
                 w.lost_since |= shown;
                 self.versions.remove(&id);
                 w.rows.remove(&id);
-                if o < n {
-                    diffs.push(Diff::DeleteId { id });
-                    diffs.extend(w.insert_at(n - 1));
-                }
-                return diffs;
+                let w = &*w;
+                return removed(o, id, w.ranking.len(), edges, |k| w.at(k));
             }
             let row = row();
             self.versions.insert(id.clone(), ver);
             w.rows.insert(id.clone(), row.clone());
-            let p = w.ranking.place(&id, key);
-            match (o < n, p < n) {
-                (true, true) => diffs.push(Diff::Update {
+            let p = w.ranking.would_place(&key);
+            if w.visible(o) && w.visible(p) {
+                // within the window: a move
+                w.ranking.place(&id, key);
+                return vec![Diff::Update {
                     id,
                     set: row,
-                    index: (p != o).then_some(p),
-                }),
-                (true, false) => {
-                    // out of the top n: the next one comes in at its end
-                    diffs.push(Diff::DeleteId { id });
-                    diffs.extend(w.insert_at(n - 1));
-                }
-                (false, true) => {
-                    // into the top n: its last one goes
-                    diffs.push(Diff::Insert {
-                        row,
-                        index: Some(p),
-                        id: Some(id),
-                    });
-                    diffs.push(Diff::Delete { index: n });
-                }
-                (false, false) => {}
+                    index: (p != o).then_some(p - w.offset),
+                }];
             }
+            let mut diffs = {
+                let w = &*w;
+                removed(o, id.clone(), w.ranking.len(), edges, |k| w.at(k))
+            };
+            let p = w.ranking.place(&id, key);
+            let w = &*w;
+            diffs.extend(inserted(p, w.ranking.len(), edges, |k| w.at(k)));
             return diffs;
         }
         let row = row();
         self.versions.insert(id.clone(), ver);
-        w.rows.insert(id.clone(), row.clone());
+        w.rows.insert(id.clone(), row);
         let p = w.ranking.place(&id, key);
-        if p < n {
-            diffs.push(Diff::Insert {
-                row,
-                index: Some(p),
-                id: Some(id),
-            });
-            if w.ranking.len() > n {
-                diffs.push(Diff::Delete { index: n });
-            }
-        }
-        if w.ranking.len() > n + w.capacity && !w.replaying {
+        let diffs = {
+            let w = &*w;
+            inserted(p, w.ranking.len(), edges, |k| w.at(k))
+        };
+        if w.ranking.len() > w.most() && !w.replaying {
             // let go: it still matches, but what's past it isn't known any more
             let last = w.ranking.get(w.ranking.len() - 1).expect("over").id.clone();
             w.ranking.remove(&last);
@@ -662,7 +731,7 @@ impl KeyedState {
     pub fn wants_refill(&mut self) -> bool {
         if let Some(w) = &mut self.ordered_window {
             let wanted = !w.exhaustive
-                && w.ranking.len() < w.limit + w.capacity / 4
+                && w.ranking.len() < (w.most() - w.capacity).saturating_add(w.capacity / 4)
                 && !w.requested
                 && w.retry_at.is_none_or(|t| Instant::now() >= t);
             if wanted {
@@ -673,7 +742,7 @@ impl KeyedState {
         let Some(w) = &mut self.window else {
             return false;
         };
-        let low = w.buffered.len() < w.low() || w.visible.len() < w.limit;
+        let low = w.spare() < w.capacity / 4 || shown(w.seq.len(), w.offset, w.limit) < w.limit;
         let wanted = !w.exhaustive
             && low
             && !w.requested
@@ -731,22 +800,25 @@ impl KeyedState {
         // every matching row: the snapshot had all of them, none was let go after it, and
         // they all fit
         let mut all = refill.complete && refill.at.covers(&w.let_go);
+        let mut diffs = Vec::new();
+        let edges = (w.offset, w.limit);
         for (id, ver, row) in refill.rows {
             if self.versions.contains_key(&id) || w.gone.since(&id, &refill.at) {
                 continue;
             }
-            if w.buffered.len() >= w.capacity {
+            if w.seq.len() >= w.most() {
                 all = false;
                 break;
             }
-            w.buffered.push_back(id.clone());
+            // at the back: into the held-back part, the window or the spare rows
+            w.seq.push_back(id.clone());
             self.versions.insert(id.clone(), ver);
             w.rows.insert(id, row);
+            let w = &*w;
+            diffs.extend(inserted(w.seq.len() - 1, w.seq.len(), edges, |k| w.at(k)));
         }
         w.exhaustive = all;
         w.retry_at = Some(Instant::now() + REFILL_RETRY);
-        let mut diffs = Vec::new();
-        w.promote(&mut diffs);
         diffs
     }
 
@@ -801,8 +873,7 @@ impl KeyedState {
         }
         if let Some(w) = &self.window {
             json["window"] = json!({
-                "visible": w.visible,
-                "buffered": w.buffered,
+                "seq": w.seq,
                 "rows": w.rows,
                 "exhaustive": w.exhaustive,
             });
@@ -858,8 +929,15 @@ impl KeyedState {
                     .map(|id| id.as_str().map(String::from).ok_or_else(|| bad(name)))
                     .collect()
             };
-            w.visible = ids("visible")?;
-            w.buffered = ids("buffered")?;
+            w.seq = match saved.get("seq") {
+                Some(_) => ids("seq")?,
+                // before OFFSET: the visible rows, then the buffer
+                None => {
+                    let mut seq = ids("visible")?;
+                    seq.extend(ids("buffered")?);
+                    seq
+                }
+            };
             w.rows = saved["rows"]
                 .as_object()
                 .ok_or_else(|| bad("rows"))?
@@ -1134,7 +1212,8 @@ mod tests {
     fn window(limit: u64, buffer: u64) -> KeyedState {
         KeyedState::with_window(
             KeyedWindowPlan {
-                limit,
+                limit: Some(limit),
+                offset: 0,
                 buffer,
                 ordered: false,
             },
@@ -1163,11 +1242,13 @@ mod tests {
         s.event(v, || row(o))
     }
 
+    /// The visible rows, and the spare ones after them.
     fn kept(s: &KeyedState) -> (Vec<String>, Vec<String>) {
         let w = s.window.as_ref().unwrap();
+        let front = w.front().min(w.seq.len());
         (
-            w.visible.iter().cloned().collect(),
-            w.buffered.iter().cloned().collect(),
+            w.seq.iter().take(front).skip(w.offset).cloned().collect(),
+            w.seq.iter().skip(front).cloned().collect(),
         )
     }
 
@@ -1346,7 +1427,8 @@ mod tests {
         }]);
         KeyedState::with_window(
             KeyedWindowPlan {
-                limit,
+                limit: Some(limit),
+                offset: 0,
                 buffer,
                 ordered: true,
             },
@@ -1547,5 +1629,149 @@ mod tests {
         assert!(diffs.is_empty(), "the same top 5: {diffs:?}");
         assert_eq!(ranked(&s).len(), 8);
         assert_eq!(s.last_refill(), Some(wm(0)));
+    }
+
+    /// Whatever goes in and out of a sequence, anywhere, the client's rows (only ever changed by
+    /// the edge rules' diffs) are its positions `[m, m+n)`.
+    #[test]
+    fn the_edge_rules_keep_the_client_on_the_window() {
+        use crate::diff::ResultList;
+        let mut seed: u64 = 9;
+        let mut rand = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..200 {
+            let (m, n) = (rand(4) as usize, [0, 1, 2, 3, usize::MAX][rand(5) as usize]);
+            let mut seq: Vec<String> = Vec::new();
+            let mut client = ResultList::default();
+            let mut next = 0;
+            for _ in 0..60 {
+                let row_of = |id: &str| -> Row { json!({ "id": id }).as_object().unwrap().clone() };
+                let diffs = if seq.is_empty() || rand(3) > 0 {
+                    next += 1;
+                    let p = rand(seq.len() as u64 + 1) as usize;
+                    seq.insert(p, format!("r{next}"));
+                    let seq = &seq;
+                    inserted(p, seq.len(), (m, n), |k| (seq[k].clone(), row_of(&seq[k])))
+                } else {
+                    let o = rand(seq.len() as u64) as usize;
+                    let id = seq.remove(o);
+                    let seq = &seq;
+                    removed(o, id, seq.len(), (m, n), |k| {
+                        (seq[k].clone(), row_of(&seq[k]))
+                    })
+                };
+                for d in &diffs {
+                    client.apply(d).unwrap();
+                }
+                let want: Vec<&String> = seq.iter().skip(m).take(n).collect();
+                let got: Vec<&String> = client.ids.iter().map(|i| i.as_ref().unwrap()).collect();
+                assert_eq!(got, want, "m {m}, n {n}, after {diffs:?}");
+            }
+        }
+    }
+
+    fn plan(limit: Option<u64>, offset: u64, buffer: u64, ordered: bool) -> KeyedWindowPlan {
+        KeyedWindowPlan {
+            limit,
+            offset,
+            buffer,
+            ordered,
+        }
+    }
+
+    #[test]
+    fn a_window_with_an_offset_holds_the_newest_back() {
+        // OFFSET 1 LIMIT 2, 3 spare: a held back, b c shown, d e f spare
+        let mut s = KeyedState::with_window(plan(Some(2), 1, 3, false), None);
+        assert_eq!(
+            history(&mut s, &["a", "b", "c", "d", "e", "f"]),
+            ["+ b {\"v\":1}", "+ c {\"v\":1}"]
+        );
+        let out = lines([
+            // a new key, held back: the row it pushes out of the held-back part (a) comes in
+            // at the top, and the last one goes; f is let go
+            at(&mut s, "x", 1, true),
+            // a held-back row leaves: the first shown (a) is held back now, the next comes in
+            // at the end
+            at(&mut s, "x", 2, false),
+            // a shown row leaves; a spare one, and the held-back one's update: nothing
+            at(&mut s, "b", 3, false),
+            at(&mut s, "e", 4, false),
+            at(&mut s, "a", 5, true),
+            // a shown one's update
+            at(&mut s, "c", 6, true),
+        ]);
+        assert_eq!(
+            out,
+            [
+                "+ @0 a {\"v\":1}",
+                "- @2",
+                "- @0",
+                "+ @1 c {\"v\":1}",
+                "- b",
+                "+ @1 d {\"v\":1}",
+                "~ c {\"v\":6}",
+            ]
+        );
+        assert_eq!(kept(&s), (vec!["c".into(), "d".into()], vec![]));
+
+        // OFFSET 2, no LIMIT: every row but the newest two, all kept, no refills
+        let mut s = KeyedState::with_window(plan(None, 2, 3, false), None);
+        assert_eq!(
+            history(&mut s, &["a", "b", "c", "d"]),
+            ["+ c {\"v\":1}", "+ d {\"v\":1}"]
+        );
+        assert_eq!(lines([at(&mut s, "x", 1, true)]), ["+ @0 b {\"v\":1}"]);
+        assert!(s.window.as_ref().unwrap().exhaustive && !s.wants_refill());
+    }
+
+    #[test]
+    fn an_ordered_window_with_an_offset_shows_the_ranks_after_it() {
+        use crate::binder::{ColumnId, OrderKey};
+        let order = KeyOrder(vec![OrderKey {
+            column: ColumnId(0),
+            desc: false,
+            nulls_first: false,
+        }]);
+        let rows = |n: i128| -> Vec<(String, Value, SortKey, Row)> {
+            (1..=n)
+                .map(|i| {
+                    (
+                        format!("r{i}"),
+                        Value::Int(1),
+                        vec![Value::Int(i)],
+                        row(i as i64),
+                    )
+                })
+                .collect()
+        };
+        // OFFSET 1 LIMIT 2, 3 more: ranks 1 and 2 shown
+        let mut s = KeyedState::with_window(plan(Some(2), 1, 3, true), Some(order.clone()));
+        assert_eq!(s.history(rows(6)).len(), 2);
+        // a new first rank: r1 slides from the held-back part into the top
+        assert_eq!(to(&mut s, "x", 0, true), ["+ @0 r1 {\"v\":1}", "- @2"]);
+        // from the spare ranks into the window (r4 → 0, after x)
+        assert_eq!(to(&mut s, "r4", 0, true), ["+ @0 r4 {\"v\":0}", "- @2"]);
+        // within the window, to the same place: an update
+        assert_eq!(to(&mut s, "r1", 0, true), ["~ r1 {\"v\":0}"]);
+        // the held-back rank leaves: r4 is held back now, r2 comes in at the end
+        assert_eq!(to(&mut s, "x", 0, false), ["- @0", "+ @1 r2 {\"v\":2}"]);
+        assert_eq!(
+            s.visible_rows()
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["r1", "r2"]
+        );
+
+        // OFFSET 2, no LIMIT: all ranks from the third on, no bound
+        let mut s = KeyedState::with_window(plan(None, 2, 3, true), Some(order));
+        assert_eq!(s.history(rows(4)).len(), 2);
+        assert_eq!(to(&mut s, "x", 100, true), ["+ @2 x {\"v\":100}"]);
+        assert!(!s.wants_refill());
     }
 }

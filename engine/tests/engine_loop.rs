@@ -176,6 +176,22 @@ impl HistorySource for FakeHistory {
                 row(json!({"product_id": k, "price": p, "__key_0": k, "__ver": 1}))
             })
             .collect()),
+            // FINAL … LIMIT 2 OFFSET 1 (default buffer): the held-back row, the window, more
+            "SELECT product_id, price, product_id AS __key_0, version AS __ver \
+             FROM default.products FINAL LIMIT 2003" => Ok(["a", "b", "c"]
+                .iter()
+                .map(|k| row(json!({"product_id": k, "price": 5, "__key_0": k, "__ver": 1})))
+                .collect()),
+            "SELECT product_id, price, product_id AS __key_0, version AS __ver \
+             FROM default.products FINAL ORDER BY price ASC NULLS LAST LIMIT 2003" => Ok([
+                ("a", 1),
+                ("b", 2),
+                ("c", 3),
+                ("d", 4),
+            ]
+            .iter()
+            .map(|(k, p)| row(json!({"product_id": k, "price": p, "__key_0": k, "__ver": 1})))
+            .collect()),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -863,6 +879,90 @@ async fn final_order_by_limit_rebuilds_when_departures_drain_the_kept_rows() {
             format!("products/0:5 - [\"d\"]\nproducts/0:5 {}", ins(1, "g", 7)),
             // the rebuild changed nothing visible (f g), but kept x: it comes in now
             format!("products/0:6 - [\"f\"]\nproducts/0:6 {}", ins(1, "x", 8)),
+        ]
+    );
+}
+
+/// FINAL with OFFSET: the first rows are held back; rows crossing either edge of the window
+/// come in or go out there.
+#[tokio::test]
+async fn final_offset_holds_rows_back_and_follows_both_edges() {
+    let p = |id: &str, price: u32, version: u64, deleted: u8| {
+        format!(
+            r#"{{"product_id": "{id}", "price": {price}, "version": {version}, "deleted": {deleted}}}"#
+        )
+    };
+    let run = |sql: &'static str, events: Vec<String>| async move {
+        let mut source = MemorySource::new();
+        for e in &events {
+            source.push("products", 0, e.as_str());
+        }
+        engine(source)
+            .with_max_batch(1)
+            .subscribe(sql)
+            .await
+            .unwrap()
+            .map(|i| i.unwrap().to_string())
+            .collect::<Vec<_>>()
+            .await
+    };
+    let row = |k: &str, p: u32| format!("{{\"product_id\":\"{k}\",\"price\":{p}}}");
+    // newest first: a held back, b c shown
+    let lines = run(
+        "select product_id, price from products final limit 2 offset 1",
+        vec![
+            p("a", 5, 1, 0), // offset 0: history
+            p("x", 5, 1, 0), // held back: a comes in at the top, c goes
+            p("x", 5, 2, 1), // the held-back row leaves: a is held back again, c comes back
+        ],
+    )
+    .await;
+    assert_eq!(
+        lines,
+        [
+            format!(
+                "+ [\"b\"] {}\n+ [\"c\"] {}\nhistory: 2 rows",
+                row("b", 5),
+                row("c", 5)
+            ),
+            format!(
+                "products/0:1 + @0 [\"a\"] {}\nproducts/0:1 - @2",
+                row("a", 5)
+            ),
+            format!(
+                "products/0:2 - @0\nproducts/0:2 + @1 [\"c\"] {}",
+                row("c", 5)
+            ),
+        ]
+    );
+    // by price: a held back, b c shown, d after
+    let lines = run(
+        "select product_id, price from products final order by price limit 2 offset 1",
+        vec![
+            p("a", 1, 1, 0), // offset 0: history
+            p("x", 0, 1, 0), // the first rank now: a slides into the top, c goes
+            p("d", 2, 2, 0), // after b, past the window: nothing
+            p("b", 2, 2, 1), // a shown row leaves: d comes in at the end
+        ],
+    )
+    .await;
+    assert_eq!(
+        lines,
+        [
+            format!(
+                "+ [\"b\"] {}\n+ [\"c\"] {}\nhistory: 2 rows",
+                row("b", 2),
+                row("c", 3)
+            ),
+            format!(
+                "products/0:1 + @0 [\"a\"] {}\nproducts/0:1 - @2",
+                row("a", 1)
+            ),
+            String::new(),
+            format!(
+                "products/0:3 - [\"b\"]\nproducts/0:3 + @1 [\"d\"] {}",
+                row("d", 2)
+            ),
         ]
     );
 }

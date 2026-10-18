@@ -178,9 +178,9 @@ async fn rejections_over_websocket() -> Result<()> {
                 ),
                 (
                     "final",
-                    "select * from products final order by version limit 5 offset 1",
+                    "select count() from products final",
                     "INVALID_QUERY",
-                    "FINAL on products (ReplacingMergeTree) with OFFSET isn't supported yet at 1:24",
+                    "FINAL on products (ReplacingMergeTree) with aggregates isn't supported yet at 1:30",
                 ),
             ];
             for (id, sql, _, _) in &cases {
@@ -796,6 +796,9 @@ async fn final_results_match_clickhouse() -> Result<()> {
     let limited = format!("{sql} limit 3");
     // and the top 3 by price
     let top = format!("{ordered} limit 3");
+    // and with an offset: the 2 after the first, by price and the newest
+    let top_offset = format!("{ordered} limit 2 offset 1");
+    let offset = format!("{sql} limit 2 offset 1");
     // each product: versions that only grow, prices in and out of the WHERE, some deleted
     let versions = move |round: u64| -> Vec<(String, String)> {
         ids.iter()
@@ -841,8 +844,13 @@ async fn final_results_match_clickhouse() -> Result<()> {
             conn.subscribe("ordered", &ordered);
             conn.subscribe("limited", &limited);
             conn.subscribe("top", &top);
-            conn.wait_ready(&["f", "ordered", "limited", "top"], Duration::from_secs(60))
-                .await?;
+            conn.subscribe("top_offset", &top_offset);
+            conn.subscribe("offset", &offset);
+            conn.wait_ready(
+                &["f", "ordered", "limited", "top", "top_offset", "offset"],
+                Duration::from_secs(60),
+            )
+            .await?;
             for round in 4..=9 {
                 wait(products.produce_keyed(&versions(round)).await?).await?;
             }
@@ -912,6 +920,28 @@ async fn final_results_match_clickhouse() -> Result<()> {
                 .fetch(&top.replace("from products", "from default.products"))
                 .await?;
             check_limited("top", &top, &["price"], &live, &want);
+            let live = conn.result("top_offset").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            let want = clickhouse()
+                .fetch(&top_offset.replace("from products", "from default.products"))
+                .await?;
+            check_limited("top_offset", &top_offset, &["price"], &live, &want);
+            // any 2 rows after any 1
+            let live = conn.result("offset").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert!(
+                live.protocol_violations.is_empty(),
+                "{:?}",
+                live.protocol_violations
+            );
+            assert_eq!(
+                live.rows.len(),
+                all.len().saturating_sub(1).min(2),
+                "offset"
+            );
+            for r in multiset(&live.rows) {
+                assert!(all.contains(&r), "offset: {r} isn't a row of the result");
+            }
             Ok(())
         }
         .boxed()

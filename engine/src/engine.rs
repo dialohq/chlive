@@ -881,7 +881,7 @@ impl Engine {
             .keyed
             .as_ref()
             .and_then(|k| k.window.map(|w| (k.clone(), w)))
-            .filter(|(_, w)| w.limit > 0)
+            .filter(|(_, w)| w.limit.is_some_and(|n| n > 0))
             .map(|(keyed, w)| RefillSource {
                 snapshots: self.snapshots.clone(),
                 history: self.history.clone(),

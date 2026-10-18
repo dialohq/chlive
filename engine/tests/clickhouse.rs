@@ -1362,6 +1362,17 @@ async fn final_matches_clickhouse() {
             "select product_id, version from products final where price < 60 order by version, product_id limit 4",
             &["version", "product_id"],
         ),
+        // OFFSET: the first rows held back, with and without LIMIT and ORDER BY
+        (
+            "select product_id, price from products final order by price desc limit 3 offset 2",
+            &["price"],
+        ),
+        (
+            "select product_id, version from products final order by version, product_id offset 3",
+            &["version", "product_id"],
+        ),
+        ("select product_id, price from products final limit 3 offset 2", &[]),
+        ("select product_id, price from products final offset 4", &[]),
     ];
     // rows in order, each tie group (by the ordered columns) as a sorted set
     let tie_groups =
@@ -1425,8 +1436,14 @@ async fn final_matches_clickhouse() {
     };
     for (sql, keys) in CASES {
         use chlive_engine::history::HistorySource;
-        // with LIMIT: the whole result, which any n rows are taken from
-        let whole = sql.split(" limit ").next().unwrap();
+        // with LIMIT or OFFSET: the whole result, which the window is taken from
+        let whole = sql
+            .split(" limit ")
+            .next()
+            .unwrap()
+            .split(" offset ")
+            .next()
+            .unwrap();
         let want = direct
             .fetch(&whole.replace("from products", "from chlive_engine_final_history.products"))
             .await
@@ -1453,7 +1470,10 @@ async fn final_matches_clickhouse() {
                         Diff::DeleteId { .. } => deletes += 1,
                         // LIMIT: the last visible row sliding into the buffer
                         Diff::Delete { .. } => {
-                            assert!(sql.contains(" limit "), "{sql}: a delete by index");
+                            assert!(
+                                sql.contains(" limit ") || sql.contains(" offset "),
+                                "{sql}: a delete by index"
+                            );
                             deletes += 1
                         }
                     }
@@ -1461,14 +1481,27 @@ async fn final_matches_clickhouse() {
                         .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
                 }
             }
-            if let (Some((_, n)), false) = (sql.split_once(" limit "), keys.is_empty()) {
-                // the top n, in order; which rows of the last tie group make it is arbitrary
-                let n: usize = n.parse().unwrap();
-                let top: Vec<_> = want.iter().take(n).cloned().collect();
+            let (limit, offset) = window_of(sql);
+            if (limit.is_some() || offset.is_some()) && !keys.is_empty() {
+                // ranks [m, m+n), in order; which rows of the tie groups at the edges make it
+                // is arbitrary
+                let top: Vec<_> = want
+                    .iter()
+                    .skip(offset.unwrap_or(0))
+                    .take(limit.unwrap_or(usize::MAX))
+                    .cloned()
+                    .collect();
                 let boundary = |rows: &[chlive_engine::diff::Row]| {
                     let mut g = tie_groups(rows, keys);
-                    if let Some((key, rows)) = g.last_mut() {
-                        *rows = vec![format!("{key}: {} rows", rows.len())];
+                    if limit.is_some() {
+                        if let Some((key, rows)) = g.last_mut() {
+                            *rows = vec![format!("{key}: {} rows", rows.len())];
+                        }
+                    }
+                    if offset.is_some() {
+                        if let Some((key, rows)) = g.first_mut() {
+                            *rows = vec![format!("{key}: {} rows", rows.len())];
+                        }
                     }
                     g
                 };
@@ -1480,9 +1513,9 @@ async fn final_matches_clickhouse() {
                 );
                 continue;
             }
-            if let Some((_, n)) = sql.split_once(" limit ") {
-                // any n rows: as many as there are (up to n), each one of the result's
-                let n: usize = n.parse().unwrap();
+            if limit.is_some() || offset.is_some() {
+                // any n rows after any m: as many as there are (up to n), each one of the result's
+                let n = limit.unwrap_or(usize::MAX);
                 let rows = canon(&list.rows);
                 let all = canon(&want);
                 for r in &rows {
@@ -1495,16 +1528,17 @@ async fn final_matches_clickhouse() {
                 ids.sort();
                 ids.dedup();
                 assert_eq!(ids.len(), rows.len(), "{database}: {sql}: ids not unique");
+                let count = n.min(all.len().saturating_sub(offset.unwrap_or(0)));
                 assert!(
-                    rows.len() <= n.min(all.len()),
+                    rows.len() <= count,
                     "{database}: {sql}: {} rows",
                     rows.len()
                 );
                 // a refill brings rows from the snapshot only, and here it never moves on: rows
                 // that came later and were let go can't come back; with everything in the
-                // snapshot, the count is exact
-                if *database == "chlive_engine_final_history" {
-                    assert_eq!(rows.len(), n.min(all.len()), "{database}: {sql}");
+                // snapshot, or without LIMIT (every row kept), the count is exact
+                if *database == "chlive_engine_final_history" || limit.is_none() {
+                    assert_eq!(rows.len(), count, "{database}: {sql}");
                 }
                 eprintln!(
                     "{database:>28}: {sql}: {} rows, {inserts} inserts, {updates} updates, {deletes} deletes",

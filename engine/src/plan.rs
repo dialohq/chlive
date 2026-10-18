@@ -572,23 +572,37 @@ pub struct KeyedPlan {
     pub window: Option<KeyedWindowPlan>,
 }
 
-/// FINAL with `LIMIT n`: the history reads `n + buffer` rows. A refill reads `n + 2·buffer`
-/// (candidates for the buffer), or with ORDER BY `n + buffer` (a fresh top, rebuilt).
+/// FINAL with `LIMIT n` and/or `OFFSET m`: rows `[m, m+n)` of a kept sequence (the newest first,
+/// or ranked by ORDER BY), the first m held back and `buffer` more after them. The history
+/// reads `m + n + buffer` rows (all of them without LIMIT). A refill reads `m + n + 2·buffer`
+/// (candidates for the buffer), or with ORDER BY `m + n + buffer` (a fresh top, rebuilt).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KeyedWindowPlan {
-    pub limit: u64,
+    /// `None`: no LIMIT, every row after the first m.
+    pub limit: Option<u64>,
+    pub offset: u64,
     pub buffer: u64,
-    /// With ORDER BY: the top n and the next `buffer` ranks.
+    /// With ORDER BY: ranked, not newest first.
     pub ordered: bool,
 }
 
 impl KeyedWindowPlan {
+    /// How many rows the history reads (`None`: all of them).
+    pub fn history_limit(&self) -> Option<u64> {
+        match self.limit {
+            Some(0) => Some(0),
+            Some(n) => Some(self.offset + n + self.buffer),
+            None => None,
+        }
+    }
+
     /// How many rows a refill reads from a snapshot.
     pub fn refill_limit(&self) -> u64 {
+        let n = self.offset + self.limit.unwrap_or(0);
         if self.ordered {
-            self.limit + self.buffer
+            n + self.buffer
         } else {
-            self.limit + 2 * self.buffer
+            n + 2 * self.buffer
         }
     }
 }
@@ -899,16 +913,38 @@ fn engine_note(engine: &TableEngine, keyed: Option<&KeyedPlan>) -> Option<String
                 k.text
             );
             match k.window {
-                Some(w) if w.ordered => note.push_str(&format!(
-                    "; LIMIT {}: the top {}, and the next {} kept to replace departures, \
-                     refilled by a rebuild from a newer snapshot",
-                    w.limit, w.limit, w.buffer
+                Some(w) if w.offset > 0 && w.limit.is_none() => note.push_str(&format!(
+                    "; OFFSET {}: every row but the first {} ({}), all of them kept",
+                    w.offset,
+                    w.offset,
+                    if w.ordered {
+                        "by ORDER BY"
+                    } else {
+                        "the newest"
+                    }
                 )),
-                Some(w) => note.push_str(&format!(
-                    "; LIMIT {}: the most recently active rows, newest first, with a buffer of \
-                     {} more to refill departures",
-                    w.limit, w.buffer
-                )),
+                Some(w) => {
+                    let n = w.limit.unwrap_or(0);
+                    if w.ordered {
+                        note.push_str(&format!(
+                            "; LIMIT {n}: the top {n}, and the next {} kept to replace \
+                             departures, refilled by a rebuild from a newer snapshot",
+                            w.buffer
+                        ));
+                    } else {
+                        note.push_str(&format!(
+                            "; LIMIT {n}: the most recently active rows, newest first, with a \
+                             buffer of {} more to refill departures",
+                            w.buffer
+                        ));
+                    }
+                    if w.offset > 0 {
+                        note.push_str(&format!(
+                            "; OFFSET {}: the first {} held back",
+                            w.offset, w.offset
+                        ));
+                    }
+                }
                 None => {}
             }
             Some(note)
@@ -1164,8 +1200,9 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             .collect();
         let ver = k.ver.map(|id| hidden_field(id, "__ver".into()));
         KeyedPlan {
-            window: bound.limit.map(|limit| KeyedWindowPlan {
-                limit,
+            window: (bound.limit.is_some() || bound.offset.is_some()).then(|| KeyedWindowPlan {
+                limit: bound.limit,
+                offset: bound.offset.unwrap_or(0),
                 buffer: final_buffer,
                 ordered: !bound.order.is_empty(),
             }),
@@ -1186,9 +1223,9 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
         order: order_sql,
         // with OFFSET the engine needs the rows above the window too: the first m + n
         limit: match keyed.as_ref().and_then(|k| k.window) {
-            // FINAL: the window and its buffer (LIMIT 0: nothing)
-            Some(w) if w.limit > 0 => Some(w.limit + w.buffer),
-            _ => bound.limit.map(|n| n + bound.offset.unwrap_or(0)),
+            // FINAL: the held-back rows, the window and its buffer (LIMIT 0: nothing)
+            Some(w) => w.history_limit(),
+            None => bound.limit.map(|n| n + bound.offset.unwrap_or(0)),
         },
         keys_select: (!order_columns.is_empty()).then(|| {
             let mut fields: Vec<String> = Vec::new();
@@ -1601,6 +1638,31 @@ mod tests {
         assert!(p
             .to_string()
             .contains("LIMIT 3: the top 3, and the next 100 kept to replace departures"));
+
+        // OFFSET: the held-back rows are read too; without LIMIT, the whole result
+        b.offset = Some(2);
+        let p = plan_with(&b, 100);
+        assert!(p.history.sql("db.snap").ends_with(" LIMIT 105"));
+        assert_eq!(
+            p.stream
+                .keyed
+                .as_ref()
+                .unwrap()
+                .window
+                .unwrap()
+                .refill_limit(),
+            105
+        );
+        assert!(p.to_string().contains("; OFFSET 2: the first 2 held back"));
+        b.limit = None;
+        let p = plan_with(&b, 100);
+        assert!(p
+            .history
+            .sql("db.snap")
+            .ends_with("FINAL ORDER BY ts ASC NULLS LAST"));
+        assert!(p
+            .to_string()
+            .contains("OFFSET 2: every row but the first 2 (by ORDER BY), all of them kept"));
     }
 
     #[test]
