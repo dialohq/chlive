@@ -21,10 +21,10 @@ use crate::checkpoint::{Checkpoint, Checkpointer};
 use crate::cursor;
 use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
-use crate::keyed::KeyedState;
+use crate::keyed::{KeyedState, NewVersion, Refill};
 use crate::order::{HeldWindow, OffsetState, OrderedState, SortKey, WindowState};
 use crate::parser::parse;
-use crate::plan::{plan, AggregatePlan, DecodedRow, Plan, StreamPlan};
+use crate::plan::{plan_with, AggregatePlan, DecodedRow, Plan, StreamPlan};
 use crate::rules::{ConfigError, ConfiguredRules, NamingRules, TablesConfig, TopicId};
 use crate::snapshot::{
     ClickHouseCloner, InUse, Lease, PauseServer, SnapshotConfig, SnapshotError, SnapshotManager,
@@ -112,6 +112,8 @@ pub struct Engine {
     max_batch: usize,
     /// How often a semi-join looks for a newer snapshot of its outer table.
     semi_refresh: Duration,
+    /// FINAL with LIMIT: how many rows past the window are kept to replace departures.
+    final_buffer: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +189,15 @@ impl Engine {
             },
             max_batch: 1000,
             semi_refresh: Duration::from_secs(10),
+            final_buffer: crate::keyed::BUFFER,
         }
+    }
+
+    /// FINAL with LIMIT: how many rows past the window are kept to replace departures (default
+    /// 2000); a refill reads twice that from a newer snapshot when departures drain them.
+    pub fn with_final_buffer(mut self, rows: u64) -> Self {
+        self.final_buffer = rows.max(1);
+        self
     }
 
     /// How often a semi-join (`IN (SELECT …)`) moves to a newer snapshot of its outer table,
@@ -226,7 +236,7 @@ impl Engine {
             BindError::Source(e) => EngineError::Source(e),
             e => EngineError::Bind(e.render(sql)),
         })?;
-        Ok(plan(&bound))
+        Ok(plan_with(&bound, self.final_buffer))
     }
 
     /// Plan a query and start it: the history first, then one iteration per event of the
@@ -302,7 +312,11 @@ impl Engine {
         let at = checkpoint.at.clone();
         let mut subscription = match (&plan.aggregate, &plan.semi) {
             (None, None) => {
-                let state = ResultState::restore(&plan.stream, &checkpoint.state).map_err(bad)?;
+                let mut state =
+                    ResultState::restore(&plan.stream, &checkpoint.state).map_err(bad)?;
+                if let ResultState::Keyed(k) = &mut state {
+                    k.restored_at(&at);
+                }
                 self.start(
                     plan,
                     None,
@@ -867,12 +881,63 @@ impl Engine {
                 }
             })
         };
-        let iterations = stream::once(items)
-            .flatten()
-            .map(move |item| {
+        // FINAL with LIMIT: refills from a newer snapshot when departures drain the buffer,
+        // fetched between two events
+        let refill = plan
+            .stream
+            .keyed
+            .as_ref()
+            .and_then(|k| k.window.map(|w| (k.clone(), w)))
+            .filter(|(_, w)| w.limit > 0)
+            .map(|(keyed, w)| RefillSource {
+                snapshots: self.snapshots.clone(),
+                history: self.history.clone(),
+                table: plan.source.clone(),
+                plan: plan.history.clone(),
+                keyed,
+                limit: w.refill_limit(),
+            });
+        let items = stream::once(items).flatten().boxed();
+        let iterations = stream::unfold((items, false), move |(mut items, wanted)| {
+            let (shared, stream_plan, refill) = (shared.clone(), stream_plan.clone(), refill.clone());
+            async move {
+                if let (true, Some(r)) = (wanted, &refill) {
+                    let last = match &*shared.lock().unwrap() {
+                        (ResultState::Keyed(k), _) => k.last_refill(),
+                        _ => None,
+                    };
+                    let fetched = r.fetch(last.as_ref()).await;
+                    let mut guard = shared.lock().unwrap();
+                    let (state, at) = &mut *guard;
+                    if let ResultState::Keyed(k) = state {
+                        let diffs = match fetched {
+                            Ok(Some(fetched)) => k.refill(fetched, at),
+                            // the same snapshot as the last refill: wait for a newer one
+                            Ok(None) => {
+                                k.refill_failed();
+                                Vec::new()
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "refilling a FINAL window failed; trying again later");
+                                k.refill_failed();
+                                Vec::new()
+                            }
+                        };
+                        if !diffs.is_empty() {
+                            let more = k.wants_refill();
+                            let it = Iteration {
+                                origin: Origin::Refill,
+                                diffs,
+                                at: at.clone(),
+                            };
+                            return Some((Ok(it), (items, more)));
+                        }
+                    }
+                }
+                let item = items.next().await?;
                 let mut guard = shared.lock().unwrap();
                 let (state, at) = &mut *guard;
-                match item {
+                let it = match item {
                     Item::History(rows) => history_iteration(&stream_plan, state, at, rows),
                     Item::CatchUp(fetched, own) => {
                         catch_up_iteration(&stream_plan, state, at, fetched, own)
@@ -884,10 +949,55 @@ impl Engine {
                     }),
                     Item::Event(event) => Ok(event_iteration(&stream_plan, state, at, event)),
                     Item::Failed(e) => Err(e),
-                }
-            })
-            .boxed();
+                };
+                let wants = match state {
+                    ResultState::Keyed(k) => refill.is_some() && k.wants_refill(),
+                    _ => false,
+                };
+                Some((it, (items, wants)))
+            }
+        })
+        .boxed();
         (iterations, checkpointer)
+    }
+}
+
+/// Where a FINAL window's refills come from: the table's current snapshot, read with a bigger
+/// LIMIT.
+#[derive(Clone)]
+struct RefillSource {
+    snapshots: Arc<dyn Snapshots>,
+    history: Arc<dyn HistorySource>,
+    table: crate::snapshot::SnapshotTable,
+    plan: crate::plan::HistoryPlan,
+    keyed: crate::plan::KeyedPlan,
+    limit: u64,
+}
+
+impl RefillSource {
+    /// From the table's current snapshot; `None` if it's still `last`'s.
+    async fn fetch(&self, last: Option<&Watermark>) -> Result<Option<Refill>, EngineError> {
+        let lease = self.snapshots.acquire(&self.table).await?;
+        if last == Some(&lease.watermark) {
+            return Ok(None);
+        }
+        let mut rows = self
+            .history
+            .fetch(&self.plan.sql_limit(&lease.sql_table(), self.limit))
+            .await?;
+        let complete = (rows.len() as u64) < self.limit;
+        let rows = rows
+            .iter_mut()
+            .map(|row| {
+                let (id, ver) = self.keyed.history_row(row).map_err(bad_history_row)?;
+                Ok((id, ver, std::mem::take(row)))
+            })
+            .collect::<Result<_, EngineError>>()?;
+        Ok(Some(Refill {
+            rows,
+            at: lease.watermark.clone(),
+            complete,
+        }))
     }
 }
 
@@ -1011,8 +1121,11 @@ impl ResultState {
     }
 
     pub(crate) fn for_plan(plan: &StreamPlan) -> Self {
-        if plan.keyed.is_some() {
-            return Self::Keyed(KeyedState::new(plan.order.as_ref().map(|o| o.keys.clone())));
+        if let Some(keyed) = &plan.keyed {
+            return Self::Keyed(match keyed.window {
+                Some(w) => KeyedState::with_window(w),
+                None => KeyedState::new(plan.order.as_ref().map(|o| o.keys.clone())),
+            });
         }
         match (&plan.order, plan.limit, plan.offset) {
             (Some(o), limit, Some(m)) => Self::Offset(OffsetState::new(o.keys.clone(), m, limit)),
@@ -1069,7 +1182,12 @@ impl ResultState {
 
     /// A decoded event's diffs: a new row placed (when it matches the WHERE), or, FINAL, a new
     /// version of its key's row.
-    pub(crate) fn event(&mut self, plan: &StreamPlan, row: &DecodedRow) -> Vec<Diff> {
+    pub(crate) fn event(
+        &mut self,
+        plan: &StreamPlan,
+        row: &DecodedRow,
+        at: (i32, i64),
+    ) -> Vec<Diff> {
         match (self, &plan.keyed) {
             (ResultState::Keyed(state), Some(keyed)) => {
                 let (id, ver, deleted) = keyed.event(row);
@@ -1078,12 +1196,15 @@ impl ResultState {
                     .as_ref()
                     .map(|o| o.event_key(row))
                     .unwrap_or_default();
-                state
-                    .event(id, ver, key, deleted, plan.matches(row), || {
-                        plan.project(row)
-                    })
-                    .into_iter()
-                    .collect()
+                let v = NewVersion {
+                    id,
+                    ver,
+                    key,
+                    deleted,
+                    matches: plan.matches(row),
+                    at,
+                };
+                state.event(v, || plan.project(row))
             }
             (state, _) if plan.matches(row) => {
                 let key = plan.order.as_ref().map(|o| o.event_key(row));
@@ -1189,7 +1310,7 @@ fn catch_up_iteration(
     // the client's own events after the snapshot: into the state, not sent
     for event in own {
         if let Ok(row) = plan.decode(&event.value) {
-            state.event(plan, &row);
+            state.event(plan, &row, (event.partition, event.offset));
         }
     }
     // the client has everything up to its cursor: what it's missing comes from the stream
@@ -1208,8 +1329,8 @@ fn event_iteration(
     at: &mut Watermark,
     event: Event,
 ) -> Iteration {
-    let diffs = match plan.decode(&event.value) {
-        Ok(row) => state.event(plan, &row),
+    let mut diffs = match plan.decode(&event.value) {
+        Ok(row) => state.event(plan, &row, (event.partition, event.offset)),
         Err(e) => {
             // ClickHouse's ingestion skips this message too
             tracing::warn!(
@@ -1224,6 +1345,10 @@ fn event_iteration(
     };
     let position = at.0.entry(event.partition).or_insert(event.offset);
     *position = (*position).max(event.offset);
+    // a FINAL window's refill, waiting for the stream to reach its snapshot
+    if let ResultState::Keyed(k) = state {
+        diffs.extend(k.advanced(at));
+    }
     Iteration {
         origin: Origin::Event {
             topic: event.topic,
@@ -1290,6 +1415,8 @@ pub enum Origin {
         partition: i32,
         offset: i64,
     },
+    /// FINAL with LIMIT: rows from a newer snapshot replacing departures.
+    Refill,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1319,6 +1446,12 @@ impl fmt::Display for Iteration {
                     writeln!(f, "{d}")?;
                 }
                 write!(f, "caught up: {} changes", self.diffs.len())
+            }
+            Origin::Refill => {
+                for d in &self.diffs {
+                    writeln!(f, "{d}")?;
+                }
+                write!(f, "refilled: {} changes", self.diffs.len())
             }
             Origin::Event {
                 topic,

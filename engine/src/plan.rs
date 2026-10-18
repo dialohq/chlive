@@ -487,6 +487,11 @@ impl HistoryPlan {
         sql
     }
 
+    /// The query with another LIMIT (a FINAL window's refill).
+    pub fn sql_limit(&self, from: &str, limit: u64) -> String {
+        self.build(&self.select, from, self.order.as_deref(), Some(limit))
+    }
+
     /// Resume: the sort keys of the result (with ORDER BY), in order.
     pub fn keys_sql(&self, from: &str) -> Option<String> {
         let select = self.keys_select.as_ref()?;
@@ -563,6 +568,22 @@ pub struct KeyedPlan {
     pub deleted: Option<ColumnId>,
     /// The key's column names, for `explain`.
     pub text: String,
+    /// `LIMIT n` (no ORDER BY): the n most recently active rows, and a buffer of more.
+    pub window: Option<KeyedWindowPlan>,
+}
+
+/// FINAL with `LIMIT n`: the history reads `n + buffer` rows; a refill `n + 2·buffer`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyedWindowPlan {
+    pub limit: u64,
+    pub buffer: u64,
+}
+
+impl KeyedWindowPlan {
+    /// How many rows a refill reads from a snapshot.
+    pub fn refill_limit(&self) -> u64 {
+        self.limit + 2 * self.buffer
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -865,10 +886,20 @@ fn to_dialect(expr: &BoundExpr, table: &BoundTable) -> String {
 /// What explain says about a table's engine: nothing for a MergeTree.
 fn engine_note(engine: &TableEngine, keyed: Option<&KeyedPlan>) -> Option<String> {
     match (engine, keyed) {
-        (TableEngine::Replacing { .. }, Some(k)) => Some(format!(
-            "{engine}, FINAL: one row per {}, its latest version; deleted rows leave",
-            k.text
-        )),
+        (TableEngine::Replacing { .. }, Some(k)) => {
+            let mut note = format!(
+                "{engine}, FINAL: one row per {}, its latest version; deleted rows leave",
+                k.text
+            );
+            if let Some(w) = k.window {
+                note.push_str(&format!(
+                    "; LIMIT {}: the most recently active rows, newest first, with a buffer of \
+                     {} more to refill departures",
+                    w.limit, w.buffer
+                ));
+            }
+            Some(note)
+        }
         (TableEngine::Replacing { .. }, None) => Some(format!(
             "{engine}, read without FINAL: every version of a row"
         )),
@@ -1040,6 +1071,11 @@ fn order_modifiers(k: &OrderKey) -> String {
 }
 
 pub fn plan(bound: &BoundQuery) -> Plan {
+    plan_with(bound, crate::keyed::BUFFER)
+}
+
+/// [`plan`], with a FINAL window's buffer of `final_buffer` rows.
+pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
     let table = &bound.table;
     let columns: Vec<BoundColumn> = bound.output().collect();
     let mut select_list: Vec<String> = columns
@@ -1115,6 +1151,10 @@ pub fn plan(bound: &BoundQuery) -> Plan {
             .collect();
         let ver = k.ver.map(|id| hidden_field(id, "__ver".into()));
         KeyedPlan {
+            window: bound.limit.map(|limit| KeyedWindowPlan {
+                limit,
+                buffer: final_buffer,
+            }),
             text: key
                 .iter()
                 .map(|c| table.column(c.id).name.clone())
@@ -1131,7 +1171,11 @@ pub fn plan(bound: &BoundQuery) -> Plan {
         filter: bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
         order: order_sql,
         // with OFFSET the engine needs the rows above the window too: the first m + n
-        limit: bound.limit.map(|n| n + bound.offset.unwrap_or(0)),
+        limit: match keyed.as_ref().and_then(|k| k.window) {
+            // FINAL: the window and its buffer (LIMIT 0: nothing)
+            Some(w) if w.limit > 0 => Some(w.limit + w.buffer),
+            _ => bound.limit.map(|n| n + bound.offset.unwrap_or(0)),
+        },
         keys_select: (!order_columns.is_empty()).then(|| {
             let mut fields: Vec<String> = Vec::new();
             for o in &order_columns {
@@ -1501,6 +1545,29 @@ mod tests {
         assert!(p.to_string().contains(
             "order:   coupon DESC NULLS LAST (rows move as new versions change their values"
         ));
+
+        // LIMIT without ORDER BY: the window and its buffer; a refill reads twice the buffer
+        b.order = Vec::new();
+        b.limit = Some(3);
+        let p = plan_with(&b, 100);
+        assert_eq!(
+            p.history.sql("db.snap"),
+            "SELECT ts, latency_ms, user_id AS __key_0, latency_ms AS __ver FROM db.snap FINAL \
+             LIMIT 103"
+        );
+        let w = p.stream.keyed.as_ref().unwrap().window.unwrap();
+        assert_eq!(
+            p.history.sql_limit("db.snap", w.refill_limit()),
+            p.history.sql("db.snap").replace("LIMIT 103", "LIMIT 203")
+        );
+        assert!(p.to_string().contains(
+            "LIMIT 3: the most recently active rows, newest first, with a buffer of 100 more"
+        ));
+        b.limit = Some(0);
+        assert!(
+            plan(&b).history.sql("x").ends_with(" LIMIT 0"),
+            "LIMIT 0 reads nothing"
+        );
     }
 
     #[test]

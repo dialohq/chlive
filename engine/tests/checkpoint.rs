@@ -122,6 +122,8 @@ const SHAPES: &[(&str, &str)] = &[
     ("keyed", "select * from requests final"),
     ("keyed", "select user_id, latency_ms from requests final order by latency_ms desc"),
     ("keyed", "select user_id from requests final where latency_ms > 0 order by cost nulls first, latency_ms"),
+    ("keyed", "select user_id, latency_ms from requests final limit 3"),
+    ("keyed", "select user_id, cost from requests final where latency_ms > 300 limit 2"),
 ];
 
 #[tokio::test]

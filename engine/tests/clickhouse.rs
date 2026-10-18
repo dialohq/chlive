@@ -1347,6 +1347,12 @@ async fn final_matches_clickhouse() {
             "select product_id from products final order by version desc",
             &[],
         ),
+        // LIMIT alone: any n rows (the newest), with a buffer of 3 to force refills
+        ("select product_id, price from products final limit 3", &[]),
+        (
+            "select product_id, version from products final where price > 30 limit 2",
+            &[],
+        ),
     ];
     // rows in order, each tie group (by the ordered columns) as a sorted set
     let tie_groups =
@@ -1394,7 +1400,9 @@ async fn final_matches_clickhouse() {
         for e in &events {
             source.push("products", 0, e.as_str());
         }
-        let engine = engine_at(database.into(), source, upto(in_clickhouse)).with_max_batch(7);
+        let engine = engine_at(database.into(), source, upto(in_clickhouse))
+            .with_max_batch(7)
+            .with_final_buffer(3);
         engines.push((database, engine));
     }
     let direct = ClickHouseHttp::new(&url(), "default", "");
@@ -1408,8 +1416,10 @@ async fn final_matches_clickhouse() {
     };
     for (sql, keys) in CASES {
         use chlive_engine::history::HistorySource;
+        // with LIMIT: the whole result, which any n rows are taken from
+        let whole = sql.split(" limit ").next().unwrap();
         let want = direct
-            .fetch(&sql.replace("from products", "from chlive_engine_final_history.products"))
+            .fetch(&whole.replace("from products", "from chlive_engine_final_history.products"))
             .await
             .unwrap();
         assert!(!want.is_empty(), "{sql}");
@@ -1432,11 +1442,47 @@ async fn final_matches_clickhouse() {
                         }
                         Diff::Update { .. } => updates += 1,
                         Diff::DeleteId { .. } => deletes += 1,
-                        Diff::Delete { .. } => panic!("{sql}: a delete by index"),
+                        // LIMIT: the last visible row sliding into the buffer
+                        Diff::Delete { .. } => {
+                            assert!(sql.contains(" limit "), "{sql}: a delete by index");
+                            deletes += 1
+                        }
                     }
                     list.apply(d)
                         .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
                 }
+            }
+            if let Some((_, n)) = sql.split_once(" limit ") {
+                // any n rows: as many as there are (up to n), each one of the result's
+                let n: usize = n.parse().unwrap();
+                let rows = canon(&list.rows);
+                let all = canon(&want);
+                for r in &rows {
+                    assert!(
+                        all.contains(r),
+                        "{database}: {sql}: {r} isn't a row of the result"
+                    );
+                }
+                let mut ids: Vec<_> = list.ids.iter().map(|i| i.clone().expect("an id")).collect();
+                ids.sort();
+                ids.dedup();
+                assert_eq!(ids.len(), rows.len(), "{database}: {sql}: ids not unique");
+                assert!(
+                    rows.len() <= n.min(all.len()),
+                    "{database}: {sql}: {} rows",
+                    rows.len()
+                );
+                // a refill brings rows from the snapshot only, and here it never moves on: rows
+                // that came later and were let go can't come back; with everything in the
+                // snapshot, the count is exact
+                if *database == "chlive_engine_final_history" {
+                    assert_eq!(rows.len(), n.min(all.len()), "{database}: {sql}");
+                }
+                eprintln!(
+                    "{database:>28}: {sql}: {} rows, {inserts} inserts, {updates} updates, {deletes} deletes",
+                    list.rows.len()
+                );
+                continue;
             }
             assert_eq!(canon(&list.rows), canon(&want), "{database}: {sql}");
             if !keys.is_empty() {

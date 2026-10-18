@@ -1336,8 +1336,8 @@ fn check_final_shape(query: &Query, table: &BoundTable) -> Result<(), BindError>
     };
     let what = if query.group_by.is_some() {
         "GROUP BY"
-    } else if query.limit.is_some() {
-        "LIMIT"
+    } else if query.limit.is_some() && query.order.is_some() {
+        "ORDER BY and LIMIT"
     } else if offset_of(query).is_some() {
         "OFFSET"
     } else if query.selection.as_ref().is_some_and(has_subquery) {
@@ -1890,12 +1890,15 @@ mod tests {
         );
         assert_eq!(
             err("select * from products final order by version limit 5").await,
-            unsupported("LIMIT", "1:24")
+            unsupported("ORDER BY and LIMIT", "1:24")
         );
-        assert_eq!(
-            err("select * from products final limit 5").await,
-            unsupported("LIMIT", "1:24")
-        );
+        // LIMIT alone is followed
+        assert!(bind_sql("select * from products final limit 5")
+            .await
+            .is_ok());
+        assert!(bind_sql("select * from products final limit 0")
+            .await
+            .is_ok());
         assert_eq!(
             err("select * from products final offset 5").await,
             unsupported("OFFSET", "1:24")

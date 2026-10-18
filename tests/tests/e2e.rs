@@ -178,9 +178,9 @@ async fn rejections_over_websocket() -> Result<()> {
                 ),
                 (
                     "final",
-                    "select * from products final limit 5",
+                    "select * from products final order by version limit 5",
                     "INVALID_QUERY",
-                    "FINAL on products (ReplacingMergeTree) with LIMIT isn't supported yet at 1:24",
+                    "FINAL on products (ReplacingMergeTree) with ORDER BY and LIMIT isn't supported yet at 1:24",
                 ),
             ];
             for (id, sql, _, _) in &cases {
@@ -792,6 +792,8 @@ async fn final_results_match_clickhouse() -> Result<()> {
     );
     // the same, ordered: rows move as their prices change
     let ordered = format!("{sql} order by price desc");
+    // and any 3 of them: the newest
+    let limited = format!("{sql} limit 3");
     // each product: versions that only grow, prices in and out of the WHERE, some deleted
     let versions = move |round: u64| -> Vec<(String, String)> {
         ids.iter()
@@ -835,7 +837,8 @@ async fn final_results_match_clickhouse() -> Result<()> {
             let conn = LiveConn::connect(server).await?;
             conn.subscribe("f", &sql);
             conn.subscribe("ordered", &ordered);
-            conn.wait_ready(&["f", "ordered"], Duration::from_secs(60))
+            conn.subscribe("limited", &limited);
+            conn.wait_ready(&["f", "ordered", "limited"], Duration::from_secs(60))
                 .await?;
             for round in 4..=9 {
                 wait(products.produce_keyed(&versions(round)).await?).await?;
@@ -877,6 +880,28 @@ async fn final_results_match_clickhouse() -> Result<()> {
                 tie_groups(&direct, &["price"]),
                 "ordered"
             );
+            // any 3 rows of the result (fewer if it has fewer), each as ClickHouse has it
+            let live = conn.result("limited").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert!(
+                live.protocol_violations.is_empty(),
+                "{:?}",
+                live.protocol_violations
+            );
+            let all = multiset(&direct);
+            assert_eq!(
+                live.rows.len(),
+                all.len().min(3),
+                "limited: {:?}",
+                live.rows
+            );
+            for r in multiset(&live.rows) {
+                assert!(all.contains(&r), "limited: {r} isn't a row of the result");
+            }
+            let mut ids: Vec<_> = live.ids.iter().flatten().collect();
+            ids.sort();
+            ids.dedup();
+            assert_eq!(ids.len(), live.rows.len(), "limited: ids");
             Ok(())
         }
         .boxed()

@@ -136,6 +136,17 @@ impl HistorySource for FakeHistory {
                 row(json!({"product_id": "a", "price": 5, "__key_0": "a", "__ver": 1})),
                 row(json!({"product_id": "b", "price": 3, "__key_0": "b", "__ver": 1})),
             ]),
+            // FINAL LIMIT 2 with a buffer of 4: the history reads 6, a refill 10
+            "SELECT product_id, price, product_id AS __key_0, version AS __ver \
+             FROM default.products FINAL LIMIT 6" => Ok(["a", "b", "c", "d", "e", "f"]
+                .iter()
+                .map(|k| row(json!({"product_id": k, "price": 5, "__key_0": k, "__ver": 1})))
+                .collect()),
+            "SELECT product_id, price, product_id AS __key_0, version AS __ver \
+             FROM default.products FINAL LIMIT 10" => Ok(["b", "c", "g", "h"]
+                .iter()
+                .map(|k| row(json!({"product_id": k, "price": 6, "__key_0": k, "__ver": 1})))
+                .collect()),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -706,6 +717,50 @@ async fn final_rows_move_as_their_versions_change() {
             "products/0:3 ~ [\"b\"] @0 {\"product_id\":\"b\",\"price\":9}",
             "products/0:4 - [\"c\"]",
             "products/0:5 ~ [\"a\"] {\"product_id\":\"a\",\"price\":1}",
+        ]
+    );
+}
+
+/// FINAL with LIMIT: the newest rows first; departures are replaced from the buffer, and
+/// when they drain it, from a refill (a newer snapshot) that leaves out keys that left since.
+#[tokio::test]
+async fn final_limit_keeps_the_newest_rows_and_refills_departures() {
+    let mut source = MemorySource::new();
+    let p = |id: &str, price: u32, version: u64, deleted: u8| {
+        format!(
+            r#"{{"product_id": "{id}", "price": {price}, "version": {version}, "deleted": {deleted}}}"#
+        )
+    };
+    source
+        .push("products", 0, p("a", 5, 1, 0)) // offset 0: history (a b shown; c d e f buffered)
+        .push("products", 0, p("c", 5, 2, 1)) // buffered rows leave: nothing to send
+        .push("products", 0, p("d", 5, 2, 1))
+        .push("products", 0, p("e", 5, 2, 1))
+        .push("products", 0, p("f", 5, 2, 1)) // the buffer is empty: a refill (g h; not c)
+        .push("products", 0, p("a", 5, 2, 1)) // a visible row leaves: g comes in
+        .push("products", 0, p("x", 7, 1, 0)); // a new key: at the top; g slides back out
+    let sql = "select product_id, price from products final limit 2";
+    let lines: Vec<String> = engine(source)
+        .with_final_buffer(4)
+        .with_max_batch(1)
+        .subscribe(sql)
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines,
+        [
+            "+ [\"a\"] {\"product_id\":\"a\",\"price\":5}\n\
+             + [\"b\"] {\"product_id\":\"b\",\"price\":5}\nhistory: 2 rows",
+            "",
+            "",
+            "",
+            "",
+            "products/0:5 - [\"a\"]\n\
+             products/0:5 + @1 [\"g\"] {\"product_id\":\"g\",\"price\":6}",
+            "products/0:6 + @0 [\"x\"] {\"product_id\":\"x\",\"price\":7}\nproducts/0:6 - @2",
         ]
     );
 }
