@@ -13,6 +13,12 @@
 //! kept comes in at the top (the last visible row slides into the buffer, whose last one is let
 //! go), and a visible row that leaves is replaced by the buffer's first. When departures drain
 //! the buffer, it's refilled from a newer snapshot (see [`KeyedState::refill`]).
+//!
+//! With ORDER BY and `LIMIT n`, the top n and the next ranks are kept, always exactly a prefix
+//! of the result: a version is placed by its sort values, and one past the last kept row (the
+//! bound, where what's beyond isn't known) is ignored, or leaves. Those ignored versions aren't
+//! departures, so a refill can't trust a snapshot's rows as they were: it rebuilds the window
+//! from the snapshot and the events since (see the engine's refills).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
@@ -53,6 +59,8 @@ pub struct KeyedState {
     ranking: Option<Ranking>,
     /// With LIMIT: the window and its buffer.
     window: Option<Box<Window>>,
+    /// With ORDER BY and LIMIT: the top n and the next ranks.
+    ordered_window: Option<Box<OrderedWindow>>,
     /// Events older than their key's row, ignored.
     stale: u64,
 }
@@ -81,6 +89,47 @@ struct Window {
     /// snapshot before it can't have that row, so it can't say it has every row.
     seen: HashMap<String, (i32, i64)>,
     let_go: Watermark,
+}
+
+/// FINAL with ORDER BY and `LIMIT n`: ranks `[0, n + capacity)` of the result, the first n
+/// visible, with their rows. `versions` has every kept id.
+#[derive(Debug, Clone)]
+struct OrderedWindow {
+    limit: usize,
+    capacity: usize,
+    ranking: Ranking,
+    rows: HashMap<String, Row>,
+    /// Every matching row is kept: nothing past them, so no bound.
+    exhaustive: bool,
+    requested: bool,
+    retry_at: Option<Instant>,
+    last_refill: Option<Watermark>,
+    /// A matching row's latest version was dropped since the last rebuild (let go, ignored past
+    /// the bound, or leaving past it): a rebuild from the same snapshot can bring it back.
+    lost_since: bool,
+    /// A rebuild's shadow replaying the events since its snapshot: nothing is let go (what's
+    /// let go is lost to it), until [`KeyedState::settle`].
+    replaying: bool,
+    /// How many rows its history asked for (`limit + capacity`, or a rebuild's bigger top):
+    /// fewer came, so they're every matching row.
+    history_limit: Option<usize>,
+}
+
+impl OrderedWindow {
+    /// Whether a row with `key` would go past the last kept row, where rows aren't known.
+    fn past_bound(&self, key: &SortKey) -> bool {
+        !self.exhaustive && self.ranking.would_place(key) >= self.ranking.len()
+    }
+
+    /// The row at rank `i`, as an insert there.
+    fn insert_at(&self, i: usize) -> Option<Diff> {
+        let e = self.ranking.get(i)?;
+        Some(Diff::Insert {
+            row: self.rows[&e.id].clone(),
+            index: Some(i),
+            id: Some(e.id.clone()),
+        })
+    }
 }
 
 /// A refill: one row per key from a snapshot at `at` (id, version, row), and whether it had
@@ -178,12 +227,122 @@ impl KeyedState {
         }
     }
 
-    /// With `LIMIT n` (no ORDER BY): the newest n rows, and a buffer.
-    pub fn with_window(plan: KeyedWindowPlan) -> Self {
-        Self {
-            window: Some(Box::new(Window::new(plan))),
-            ..Self::default()
+    /// With `LIMIT n`: without ORDER BY the newest n rows and a buffer; with it (`order`) the
+    /// top n and the next ranks.
+    pub fn with_window(plan: KeyedWindowPlan, order: Option<KeyOrder>) -> Self {
+        match order {
+            Some(order) => Self {
+                ordered_window: Some(Box::new(OrderedWindow {
+                    limit: plan.limit as usize,
+                    capacity: plan.buffer as usize,
+                    ranking: Ranking::new(order),
+                    rows: HashMap::new(),
+                    exhaustive: true,
+                    requested: false,
+                    retry_at: None,
+                    last_refill: None,
+                    lost_since: false,
+                    replaying: false,
+                    history_limit: None,
+                })),
+                ..Self::default()
+            },
+            None => Self {
+                window: Some(Box::new(Window::new(plan))),
+                ..Self::default()
+            },
         }
+    }
+
+    /// The same kind of state, empty: a rebuild's shadow, which lets nothing go until
+    /// [`Self::settle`].
+    pub fn fresh(&self) -> Self {
+        let mut fresh = Self {
+            ranking: self
+                .ranking
+                .as_ref()
+                .map(|r| Ranking::new(r.order().clone())),
+            ..Self::default()
+        };
+        if let Some(w) = &self.ordered_window {
+            fresh.ordered_window = Some(Box::new(OrderedWindow {
+                ranking: Ranking::new(w.ranking.order().clone()),
+                rows: HashMap::new(),
+                exhaustive: true,
+                requested: false,
+                retry_at: None,
+                last_refill: None,
+                lost_since: false,
+                replaying: true,
+                history_limit: None,
+                ..(**w).clone()
+            }));
+        }
+        fresh
+    }
+
+    /// A rebuild's shadow has replayed the events since its snapshot: down to its ranks, the
+    /// rows past them let go.
+    pub fn settle(&mut self) {
+        let Some(w) = &mut self.ordered_window else {
+            return;
+        };
+        w.replaying = false;
+        while w.ranking.len() > w.limit + w.capacity {
+            let last = w.ranking.get(w.ranking.len() - 1).expect("over").id.clone();
+            w.ranking.remove(&last);
+            self.versions.remove(&last);
+            w.rows.remove(&last);
+            w.exhaustive = false;
+            // dropped: the same snapshot can bring it back
+            w.lost_since = true;
+        }
+    }
+
+    /// A rebuild's shadow reads its history with this LIMIT.
+    pub fn history_limit(&mut self, limit: u64) {
+        if let Some(w) = &mut self.ordered_window {
+            w.history_limit = Some(limit as usize);
+        }
+    }
+
+    /// With ORDER BY and LIMIT: too few rows kept, with more past them (a rebuild's shadow that
+    /// needs a bigger snapshot top).
+    pub fn short(&self) -> bool {
+        self.ordered_window
+            .as_ref()
+            .is_some_and(|w| !w.exhaustive && w.ranking.len() < w.limit + w.capacity / 4)
+    }
+
+    /// With ORDER BY and LIMIT: refills rebuild the window.
+    pub fn rebuilds(&self) -> bool {
+        self.ordered_window.is_some()
+    }
+
+    /// With ORDER BY and LIMIT: the visible rows, in order.
+    pub fn visible_rows(&self) -> Vec<(String, Row)> {
+        let Some(w) = &self.ordered_window else {
+            return Vec::new();
+        };
+        w.ranking
+            .iter()
+            .take(w.limit)
+            .map(|e| (e.id.clone(), w.rows[&e.id].clone()))
+            .collect()
+    }
+
+    /// A rebuild from the snapshot at `at` is done: the shadow takes over, and the diff that
+    /// turns the visible rows into its visible rows is what the client gets.
+    pub fn rebuilt(&mut self, mut shadow: KeyedState, at: Watermark) -> Vec<Diff> {
+        let diffs = reorder(&self.visible_rows(), &shadow.visible_rows());
+        // no wait before the next: it needs a newer snapshot or rows let go in between, and
+        // departures to drain the ranks again
+        if let Some(w) = &mut shadow.ordered_window {
+            w.last_refill = Some(at);
+        }
+        shadow.stale += self.stale;
+        *self = shadow;
+        diffs
     }
 
     /// The history: one row per key, its latest version (FINAL left out deleted ones), as
@@ -194,6 +353,23 @@ impl KeyedState {
             index: None,
             id: Some(id),
         };
+        if let Some(w) = &mut self.ordered_window {
+            // ranked; the top n are the result
+            w.exhaustive = rows.len() < w.history_limit.unwrap_or(w.limit + w.capacity);
+            let mut keys = Vec::with_capacity(rows.len());
+            for (id, ver, key, row) in rows {
+                self.versions.insert(id.clone(), ver);
+                w.rows.insert(id.clone(), row);
+                keys.push((id, key));
+            }
+            w.ranking.history(keys);
+            return w
+                .ranking
+                .iter()
+                .take(w.limit)
+                .map(|e| insert(e.id.clone(), w.rows[&e.id].clone()))
+                .collect();
+        }
         if let Some(w) = &mut self.window {
             // the first n are the result, the rest the buffer
             w.exhaustive = rows.len() < w.limit + w.capacity;
@@ -253,6 +429,9 @@ impl KeyedState {
         }
         if self.window.is_some() {
             return self.window_event(id, ver, shown, at, row);
+        }
+        if self.ordered_window.is_some() {
+            return self.ordered_event(id, ver, key, shown, row);
         }
         match self.versions.get_mut(&id) {
             Some(_) if !shown => {
@@ -372,8 +551,125 @@ impl KeyedState {
         diffs
     }
 
+    /// A new version, with ORDER BY and LIMIT: placed by its sort values within the kept ranks
+    /// (moving across the top n's edge as an insert and a delete there), or, past the bound,
+    /// ignored (leaving, if it was kept).
+    fn ordered_event(
+        &mut self,
+        id: String,
+        ver: Value,
+        key: SortKey,
+        shown: bool,
+        row: impl FnOnce() -> Row,
+    ) -> Vec<Diff> {
+        let w = self.ordered_window.as_mut().expect("an ordered window");
+        let n = w.limit;
+        let kept = self.versions.contains_key(&id);
+        let mut diffs = Vec::new();
+        if !kept && (!shown || n == 0) {
+            return diffs;
+        }
+        if !kept && w.past_bound(&key) {
+            // a matching row past what's known: dropped
+            w.lost_since = true;
+            return diffs;
+        }
+        if kept {
+            let same = w
+                .ranking
+                .key(&id)
+                .is_some_and(|k| w.ranking.order().cmp(k, &key) == Ordering::Equal);
+            if shown && same {
+                let row = row();
+                self.versions.insert(id.clone(), ver);
+                w.rows.insert(id.clone(), row.clone());
+                if w.ranking.position(&id).is_some_and(|o| o < n) {
+                    diffs.push(Diff::Update {
+                        id,
+                        set: row,
+                        index: None,
+                    });
+                }
+                return diffs;
+            }
+            let o = w.ranking.remove(&id).expect("kept");
+            if !shown || w.past_bound(&key) {
+                // leaves: deleted, not matching, or past what's known (then dropped)
+                w.lost_since |= shown;
+                self.versions.remove(&id);
+                w.rows.remove(&id);
+                if o < n {
+                    diffs.push(Diff::DeleteId { id });
+                    diffs.extend(w.insert_at(n - 1));
+                }
+                return diffs;
+            }
+            let row = row();
+            self.versions.insert(id.clone(), ver);
+            w.rows.insert(id.clone(), row.clone());
+            let p = w.ranking.place(&id, key);
+            match (o < n, p < n) {
+                (true, true) => diffs.push(Diff::Update {
+                    id,
+                    set: row,
+                    index: (p != o).then_some(p),
+                }),
+                (true, false) => {
+                    // out of the top n: the next one comes in at its end
+                    diffs.push(Diff::DeleteId { id });
+                    diffs.extend(w.insert_at(n - 1));
+                }
+                (false, true) => {
+                    // into the top n: its last one goes
+                    diffs.push(Diff::Insert {
+                        row,
+                        index: Some(p),
+                        id: Some(id),
+                    });
+                    diffs.push(Diff::Delete { index: n });
+                }
+                (false, false) => {}
+            }
+            return diffs;
+        }
+        let row = row();
+        self.versions.insert(id.clone(), ver);
+        w.rows.insert(id.clone(), row.clone());
+        let p = w.ranking.place(&id, key);
+        if p < n {
+            diffs.push(Diff::Insert {
+                row,
+                index: Some(p),
+                id: Some(id),
+            });
+            if w.ranking.len() > n {
+                diffs.push(Diff::Delete { index: n });
+            }
+        }
+        if w.ranking.len() > n + w.capacity && !w.replaying {
+            // let go: it still matches, but what's past it isn't known any more
+            let last = w.ranking.get(w.ranking.len() - 1).expect("over").id.clone();
+            w.ranking.remove(&last);
+            self.versions.remove(&last);
+            w.rows.remove(&last);
+            w.exhaustive = false;
+            w.lost_since = true;
+        }
+        diffs
+    }
+
     /// With LIMIT: whether to refill the buffer now (asked once, until it comes).
     pub fn wants_refill(&mut self) -> bool {
+        if let Some(w) = &mut self.ordered_window {
+            let wanted = !w.exhaustive
+                && w.ranking.len() < w.limit + w.capacity / 4
+                && !w.requested
+                && w.retry_at.is_none_or(|t| Instant::now() >= t);
+            if wanted {
+                w.requested = true;
+            }
+            return wanted;
+        }
         let Some(w) = &mut self.window else {
             return false;
         };
@@ -391,12 +687,22 @@ impl KeyedState {
 
     /// The snapshot the last refill came from: a refill needs a newer one.
     pub fn last_refill(&self) -> Option<Watermark> {
-        self.window.as_ref().and_then(|w| w.last_refill.clone())
+        match (&self.window, &self.ordered_window) {
+            (Some(w), _) => w.last_refill.clone(),
+            // rows dropped since: the same snapshot, replayed further, brings them back
+            (_, Some(w)) if w.lost_since => None,
+            (_, Some(w)) => w.last_refill.clone(),
+            _ => None,
+        }
     }
 
     /// A refill couldn't be fetched, or there was no newer snapshot: try again later.
     pub fn refill_failed(&mut self) {
         if let Some(w) = &mut self.window {
+            w.requested = false;
+            w.retry_at = Some(Instant::now() + REFILL_RETRY);
+        }
+        if let Some(w) = &mut self.ordered_window {
             w.requested = false;
             w.retry_at = Some(Instant::now() + REFILL_RETRY);
         }
@@ -486,6 +792,13 @@ impl KeyedState {
         if let Some(r) = &self.ranking {
             json["ranking"] = r.save();
         }
+        if let Some(w) = &self.ordered_window {
+            json["ordered_window"] = json!({
+                "ranking": w.ranking.save(),
+                "rows": w.rows,
+                "exhaustive": w.exhaustive,
+            });
+        }
         if let Some(w) = &self.window {
             json["window"] = json!({
                 "visible": w.visible,
@@ -514,6 +827,25 @@ impl KeyedState {
             .collect::<Result<_, String>>()?;
         if let Some(r) = &mut self.ranking {
             r.load(&json["ranking"])?;
+        }
+        if let Some(w) = &mut self.ordered_window {
+            let bad = |what: &str| format!("checkpoint: bad ordered keyed window ({what})");
+            let saved = &json["ordered_window"];
+            w.ranking.load(&saved["ranking"])?;
+            w.rows = saved["rows"]
+                .as_object()
+                .ok_or_else(|| bad("rows"))?
+                .iter()
+                .map(|(id, r)| {
+                    Ok((
+                        id.clone(),
+                        r.as_object().ok_or_else(|| bad("rows"))?.clone(),
+                    ))
+                })
+                .collect::<Result<_, String>>()?;
+            w.exhaustive = saved["exhaustive"]
+                .as_bool()
+                .ok_or_else(|| bad("exhaustive"))?;
         }
         if let Some(w) = &mut self.window {
             let bad = |what: &str| format!("checkpoint: bad keyed window ({what})");
@@ -545,6 +877,48 @@ impl KeyedState {
         }
         Ok(())
     }
+}
+
+/// The changes that turn the rows `old` into `new` (both ids in order, with rows): deletes of
+/// the ids that are gone, then, in `new`'s order, a move (an update with no columns) for a
+/// misplaced id and an insert for a new one.
+pub fn reorder(old: &[(String, Row)], new: &[(String, Row)]) -> Vec<Diff> {
+    use std::collections::HashSet;
+    let keep: HashSet<&String> = new.iter().map(|(id, _)| id).collect();
+    let mut list: Vec<&String> = Vec::with_capacity(old.len());
+    let mut diffs = Vec::new();
+    for (id, _) in old {
+        if keep.contains(id) {
+            list.push(id);
+        } else {
+            diffs.push(Diff::DeleteId { id: id.clone() });
+        }
+    }
+    for (j, (id, row)) in new.iter().enumerate() {
+        if list.get(j) == Some(&id) {
+            continue;
+        }
+        match list.iter().position(|x| *x == id) {
+            Some(i) => {
+                diffs.push(Diff::Update {
+                    id: id.clone(),
+                    set: Row::new(),
+                    index: Some(j),
+                });
+                let x = list.remove(i);
+                list.insert(j, x);
+            }
+            None => {
+                diffs.push(Diff::Insert {
+                    row: row.clone(),
+                    index: Some(j),
+                    id: Some(id.clone()),
+                });
+                list.insert(j, id);
+            }
+        }
+    }
+    diffs
 }
 
 /// Whether `ver` is lower than the row's `old` (never without a version column).
@@ -758,7 +1132,14 @@ mod tests {
     }
 
     fn window(limit: u64, buffer: u64) -> KeyedState {
-        KeyedState::with_window(KeyedWindowPlan { limit, buffer })
+        KeyedState::with_window(
+            KeyedWindowPlan {
+                limit,
+                buffer,
+                ordered: false,
+            },
+            None,
+        )
     }
 
     fn history(s: &mut KeyedState, ids: &[&str]) -> Vec<String> {
@@ -954,5 +1335,217 @@ mod tests {
         s2.window.as_mut().unwrap().requested = false;
         s2.refill(empty(6), &wm(9));
         assert!(s2.window.as_ref().unwrap().exhaustive);
+    }
+
+    fn top(limit: u64, buffer: u64) -> KeyedState {
+        use crate::binder::{ColumnId, OrderKey};
+        let order = KeyOrder(vec![OrderKey {
+            column: ColumnId(0),
+            desc: false,
+            nulls_first: false,
+        }]);
+        KeyedState::with_window(
+            KeyedWindowPlan {
+                limit,
+                buffer,
+                ordered: true,
+            },
+            Some(order),
+        )
+    }
+
+    /// A version of `id` with sort value `v` (its row `{"v": v}`).
+    fn to(s: &mut KeyedState, id: &str, v: i128, shown: bool) -> Vec<String> {
+        lines([ev(
+            s,
+            id,
+            Value::Int(1),
+            vec![Value::Int(v)],
+            !shown,
+            true,
+            row(v as i64),
+        )])
+    }
+
+    fn ranked(s: &KeyedState) -> Vec<String> {
+        let w = s.ordered_window.as_ref().unwrap();
+        w.ranking.iter().map(|e| e.id.clone()).collect()
+    }
+
+    /// Ranks 1 to 10: 5 visible, 5 buffered.
+    fn ten() -> KeyedState {
+        let mut s = top(5, 5);
+        let rows = (1..=10)
+            .map(|i| {
+                (
+                    format!("r{i}"),
+                    Value::Int(1),
+                    vec![Value::Int(i)],
+                    row(i as i64),
+                )
+            })
+            .collect();
+        assert_eq!(s.history(rows).len(), 5);
+        s
+    }
+
+    #[test]
+    fn the_top_n_and_the_next_ranks_follow_new_sort_values() {
+        // a key that wasn't kept (it was 20), now 5: after the 5 it ties with, the buffer's
+        // head; nothing visible changes, and 10 is let go
+        let mut s = ten();
+        assert!(to(&mut s, "x", 5, true).is_empty());
+        assert_eq!(
+            ranked(&s),
+            ["r1", "r2", "r3", "r4", "r5", "x", "r6", "r7", "r8", "r9"]
+        );
+        // now 4: into the top 5, whose last one (5) goes to the buffer
+        let mut s = ten();
+        assert_eq!(to(&mut s, "x", 4, true), ["+ @4 x {\"v\":4}", "- @5"]);
+        // a kept row past the bound (3 → 20): it leaves, and the buffer's head comes in
+        assert_eq!(to(&mut s, "r3", 20, true), ["- r3", "+ @4 r5 {\"v\":5}"]);
+        // a key that wasn't kept, past the bound: nothing
+        assert!(to(&mut s, "y", 15, true).is_empty());
+        assert_eq!(
+            ranked(&s),
+            ["r1", "r2", "r4", "x", "r5", "r6", "r7", "r8", "r9"]
+        );
+        // moves: within the top (1 → 4: after r4 and x, which are 4 too), out of it, back in
+        assert_eq!(to(&mut s, "r1", 4, true), ["~ r1 @3 {\"v\":4}"]);
+        assert_eq!(to(&mut s, "r2", 7, true), ["- r2", "+ @4 r6 {\"v\":6}"]);
+        assert_eq!(to(&mut s, "r8", 0, true), ["+ @0 r8 {\"v\":0}", "- @5"]);
+        // the same sort value: an update in place if visible, nothing if buffered
+        assert_eq!(to(&mut s, "r8", 0, true), ["~ r8 {\"v\":0}"]);
+        assert!(to(&mut s, "r9", 9, true).is_empty());
+        // a departure from the top: the next one comes in at its end
+        assert_eq!(to(&mut s, "r8", 0, false), ["- r8", "+ @4 r6 {\"v\":6}"]);
+        // a checkpoint keeps the ranks and rows
+        let mut back = top(5, 5);
+        let plan = KeyedPlan {
+            key: Vec::new(),
+            ver: None,
+            deleted: None,
+            text: "k".into(),
+            window: None,
+        };
+        back.load(&plan, &serde_json::from_str(&s.save().to_string()).unwrap())
+            .unwrap();
+        assert_eq!(ranked(&back), ranked(&s));
+        assert_eq!(back.visible_rows(), s.visible_rows());
+    }
+
+    #[test]
+    fn with_every_row_kept_there_is_no_bound() {
+        let mut s = top(2, 5);
+        let rows = (1..=3)
+            .map(|i| {
+                (
+                    format!("r{i}"),
+                    Value::Int(1),
+                    vec![Value::Int(i)],
+                    row(i as i64),
+                )
+            })
+            .collect();
+        s.history(rows);
+        assert!(s.ordered_window.as_ref().unwrap().exhaustive);
+        // far past the last row: still kept, since nothing is past it
+        assert!(to(&mut s, "x", 100, true).is_empty());
+        assert_eq!(ranked(&s), ["r1", "r2", "r3", "x"]);
+        assert!(!s.wants_refill());
+        // LIMIT 0: nothing
+        let mut none = top(0, 5);
+        none.history(Vec::new());
+        assert!(to(&mut none, "x", 1, true).is_empty());
+    }
+
+    /// Applying `reorder`'s changes to the old rows gives the new ones, whatever they are.
+    #[test]
+    fn reorder_turns_the_old_rows_into_the_new() {
+        use crate::diff::ResultList;
+        let mut seed: u64 = 5;
+        let mut rand = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..300 {
+            let (n_old, n_new) = (rand(8), rand(8));
+            let mut pick = |len: u64| -> Vec<(String, Row)> {
+                let mut ids: Vec<u64> = (0..12).collect();
+                let mut out = Vec::new();
+                for _ in 0..len {
+                    let i = rand(ids.len() as u64) as usize;
+                    let id = ids.remove(i);
+                    out.push((format!("k{id}"), row(id as i64)));
+                }
+                out
+            };
+            let (old, new) = (pick(n_old), pick(n_new));
+            let mut list = ResultList::default();
+            for (id, r) in &old {
+                list.push(r.clone(), Some(id.clone()));
+            }
+            for d in reorder(&old, &new) {
+                list.apply(&d).unwrap();
+            }
+            let got: Vec<&str> = list.ids.iter().map(|i| i.as_deref().unwrap()).collect();
+            let want: Vec<&str> = new.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(got, want);
+            assert_eq!(
+                list.rows,
+                new.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A rebuild's shadow lets nothing go while it replays, so rows it needs later aren't
+    /// lost; settling cuts it to its ranks.
+    #[test]
+    fn a_shadow_keeps_everything_until_it_settles() {
+        let mut s = ten();
+        let mut shadow = s.fresh();
+        let rows = (1..=10)
+            .map(|i| {
+                (
+                    format!("r{i}"),
+                    Value::Int(1),
+                    vec![Value::Int(i)],
+                    row(i as i64),
+                )
+            })
+            .collect();
+        shadow.history(rows);
+        for (x, v) in [("x", 0), ("y", 0), ("z", 0)] {
+            to(&mut shadow, x, v, true);
+        }
+        assert_eq!(ranked(&shadow).len(), 13, "nothing let go");
+        // departures it can now fill from what it kept
+        for i in 1..=5 {
+            to(&mut shadow, &format!("r{i}"), 0, false);
+        }
+        shadow.settle();
+        assert_eq!(
+            ranked(&shadow),
+            ["x", "y", "z", "r6", "r7", "r8", "r9", "r10"]
+        );
+        // the live state (which let r8–r10 go) takes the shadow's top over
+        for (x, v) in [("x", 0), ("y", 0), ("z", 0)] {
+            to(&mut s, x, v, true);
+        }
+        for i in 1..=5 {
+            to(&mut s, &format!("r{i}"), 0, false);
+        }
+        assert_eq!(ranked(&s), ["x", "y", "z", "r6", "r7"]);
+        assert_eq!(
+            s.last_refill(),
+            None,
+            "rows were let go: the same snapshot will do"
+        );
+        let diffs = s.rebuilt(shadow, wm(0));
+        assert!(diffs.is_empty(), "the same top 5: {diffs:?}");
+        assert_eq!(ranked(&s).len(), 8);
+        assert_eq!(s.last_refill(), Some(wm(0)));
     }
 }

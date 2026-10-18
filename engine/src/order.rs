@@ -129,6 +129,13 @@ impl Ranking {
         at
     }
 
+    /// Where a row with `key` would go if placed now (after the rows it ties with).
+    pub fn would_place(&self, key: &SortKey) -> usize {
+        let seq = self.seq + 1;
+        self.ranked
+            .partition_point(|e| self.cmp(key, seq, e) == Ordering::Greater)
+    }
+
     /// Take a row out; where it was.
     pub fn remove(&mut self, id: &str) -> Option<usize> {
         let at = self.position(id)?;

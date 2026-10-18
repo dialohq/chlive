@@ -572,17 +572,24 @@ pub struct KeyedPlan {
     pub window: Option<KeyedWindowPlan>,
 }
 
-/// FINAL with `LIMIT n`: the history reads `n + buffer` rows; a refill `n + 2·buffer`.
+/// FINAL with `LIMIT n`: the history reads `n + buffer` rows. A refill reads `n + 2·buffer`
+/// (candidates for the buffer), or with ORDER BY `n + buffer` (a fresh top, rebuilt).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KeyedWindowPlan {
     pub limit: u64,
     pub buffer: u64,
+    /// With ORDER BY: the top n and the next `buffer` ranks.
+    pub ordered: bool,
 }
 
 impl KeyedWindowPlan {
     /// How many rows a refill reads from a snapshot.
     pub fn refill_limit(&self) -> u64 {
-        self.limit + 2 * self.buffer
+        if self.ordered {
+            self.limit + self.buffer
+        } else {
+            self.limit + 2 * self.buffer
+        }
     }
 }
 
@@ -891,12 +898,18 @@ fn engine_note(engine: &TableEngine, keyed: Option<&KeyedPlan>) -> Option<String
                 "{engine}, FINAL: one row per {}, its latest version; deleted rows leave",
                 k.text
             );
-            if let Some(w) = k.window {
-                note.push_str(&format!(
+            match k.window {
+                Some(w) if w.ordered => note.push_str(&format!(
+                    "; LIMIT {}: the top {}, and the next {} kept to replace departures, \
+                     refilled by a rebuild from a newer snapshot",
+                    w.limit, w.limit, w.buffer
+                )),
+                Some(w) => note.push_str(&format!(
                     "; LIMIT {}: the most recently active rows, newest first, with a buffer of \
                      {} more to refill departures",
                     w.limit, w.buffer
-                ));
+                )),
+                None => {}
             }
             Some(note)
         }
@@ -1154,6 +1167,7 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             window: bound.limit.map(|limit| KeyedWindowPlan {
                 limit,
                 buffer: final_buffer,
+                ordered: !bound.order.is_empty(),
             }),
             text: key
                 .iter()
@@ -1568,6 +1582,25 @@ mod tests {
             plan(&b).history.sql("x").ends_with(" LIMIT 0"),
             "LIMIT 0 reads nothing"
         );
+
+        // ORDER BY and LIMIT: the top n and the next ranks; a rebuild reads the same top
+        b.limit = Some(3);
+        b.order = vec![OrderKey {
+            column: ColumnId(0),
+            desc: false,
+            nulls_first: false,
+        }];
+        let p = plan_with(&b, 100);
+        assert!(p
+            .history
+            .sql("db.snap")
+            .ends_with("FINAL ORDER BY ts ASC NULLS LAST LIMIT 103"));
+        let w = p.stream.keyed.as_ref().unwrap().window.unwrap();
+        assert!(w.ordered);
+        assert_eq!(w.refill_limit(), 103);
+        assert!(p
+            .to_string()
+            .contains("LIMIT 3: the top 3, and the next 100 kept to replace departures"));
     }
 
     #[test]

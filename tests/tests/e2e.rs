@@ -178,9 +178,9 @@ async fn rejections_over_websocket() -> Result<()> {
                 ),
                 (
                     "final",
-                    "select * from products final order by version limit 5",
+                    "select * from products final order by version limit 5 offset 1",
                     "INVALID_QUERY",
-                    "FINAL on products (ReplacingMergeTree) with ORDER BY and LIMIT isn't supported yet at 1:24",
+                    "FINAL on products (ReplacingMergeTree) with OFFSET isn't supported yet at 1:24",
                 ),
             ];
             for (id, sql, _, _) in &cases {
@@ -794,6 +794,8 @@ async fn final_results_match_clickhouse() -> Result<()> {
     let ordered = format!("{sql} order by price desc");
     // and any 3 of them: the newest
     let limited = format!("{sql} limit 3");
+    // and the top 3 by price
+    let top = format!("{ordered} limit 3");
     // each product: versions that only grow, prices in and out of the WHERE, some deleted
     let versions = move |round: u64| -> Vec<(String, String)> {
         ids.iter()
@@ -838,7 +840,8 @@ async fn final_results_match_clickhouse() -> Result<()> {
             conn.subscribe("f", &sql);
             conn.subscribe("ordered", &ordered);
             conn.subscribe("limited", &limited);
-            conn.wait_ready(&["f", "ordered", "limited"], Duration::from_secs(60))
+            conn.subscribe("top", &top);
+            conn.wait_ready(&["f", "ordered", "limited", "top"], Duration::from_secs(60))
                 .await?;
             for round in 4..=9 {
                 wait(products.produce_keyed(&versions(round)).await?).await?;
@@ -902,6 +905,13 @@ async fn final_results_match_clickhouse() -> Result<()> {
             ids.sort();
             ids.dedup();
             assert_eq!(ids.len(), live.rows.len(), "limited: ids");
+            // the top 3 by price, as ClickHouse has them (the last tie group by price and size)
+            let live = conn.result("top").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            let want = clickhouse()
+                .fetch(&top.replace("from products", "from default.products"))
+                .await?;
+            check_limited("top", &top, &["price"], &live, &want);
             Ok(())
         }
         .boxed()

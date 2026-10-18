@@ -1353,6 +1353,15 @@ async fn final_matches_clickhouse() {
             "select product_id, version from products final where price > 30 limit 2",
             &[],
         ),
+        // ORDER BY and LIMIT: the top n (buffer 3: rebuilds), the boundary's ties by key only
+        (
+            "select product_id, price from products final order by price desc limit 3",
+            &["price"],
+        ),
+        (
+            "select product_id, version from products final where price < 60 order by version, product_id limit 4",
+            &["version", "product_id"],
+        ),
     ];
     // rows in order, each tie group (by the ordered columns) as a sorted set
     let tie_groups =
@@ -1451,6 +1460,25 @@ async fn final_matches_clickhouse() {
                     list.apply(d)
                         .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
                 }
+            }
+            if let (Some((_, n)), false) = (sql.split_once(" limit "), keys.is_empty()) {
+                // the top n, in order; which rows of the last tie group make it is arbitrary
+                let n: usize = n.parse().unwrap();
+                let top: Vec<_> = want.iter().take(n).cloned().collect();
+                let boundary = |rows: &[chlive_engine::diff::Row]| {
+                    let mut g = tie_groups(rows, keys);
+                    if let Some((key, rows)) = g.last_mut() {
+                        *rows = vec![format!("{key}: {} rows", rows.len())];
+                    }
+                    g
+                };
+                assert_eq!(list.rows.len(), top.len(), "{database}: {sql}: row count");
+                assert_eq!(boundary(&list.rows), boundary(&top), "{database}: {sql}");
+                eprintln!(
+                    "{database:>28}: {sql}: {} rows, {inserts} inserts, {updates} updates, {deletes} deletes",
+                    list.rows.len()
+                );
+                continue;
             }
             if let Some((_, n)) = sql.split_once(" limit ") {
                 // any n rows: as many as there are (up to n), each one of the result's

@@ -826,13 +826,6 @@ impl Engine {
         BoxStream<'static, Result<Iteration, EngineError>>,
         Checkpointer,
     ) {
-        enum Item {
-            History(Result<Vec<Row>, HistoryError>),
-            CatchUp(Result<Option<Vec<Row>>, HistoryError>, Vec<Event>),
-            Restored,
-            Event(Event),
-            Failed(EngineError),
-        }
         let history = self.history.clone();
         // the first items, then the rest of the stream
         let items = async move {
@@ -892,16 +885,58 @@ impl Engine {
             .map(|(keyed, w)| RefillSource {
                 snapshots: self.snapshots.clone(),
                 history: self.history.clone(),
+                source: self.source.clone(),
                 table: plan.source.clone(),
                 plan: plan.history.clone(),
+                stream: plan.stream.clone(),
                 keyed,
                 limit: w.refill_limit(),
             });
         let items = stream::once(items).flatten().boxed();
-        let iterations = stream::unfold((items, false), move |(mut items, wanted)| {
+        let iterations = stream::unfold((items, false), move |(items, wanted)| {
             let (shared, stream_plan, refill) = (shared.clone(), stream_plan.clone(), refill.clone());
             async move {
                 if let (true, Some(r)) = (wanted, &refill) {
+                    // with ORDER BY: rebuilt from the snapshot and the events since
+                    let rebuild = match &*shared.lock().unwrap() {
+                        (ResultState::Keyed(k), at) if k.rebuilds() => {
+                            Some((k.last_refill(), at.clone(), k.fresh()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((last, position, shadow)) = rebuild {
+                        let rebuilt = r.rebuild(last.as_ref(), &position, shadow).await;
+                        let it = {
+                            let mut guard = shared.lock().unwrap();
+                            let (state, at) = &mut *guard;
+                            match state {
+                                ResultState::Keyed(k) => {
+                                    let diffs = match rebuilt {
+                                        Ok(Some((shadow, from))) => k.rebuilt(shadow, from),
+                                        Ok(_) => {
+                                            k.refill_failed();
+                                            Vec::new()
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "rebuilding a FINAL window failed; trying again later");
+                                            k.refill_failed();
+                                            Vec::new()
+                                        }
+                                    };
+                                    (!diffs.is_empty()).then(|| Iteration {
+                                        origin: Origin::Refill,
+                                        diffs,
+                                        at: at.clone(),
+                                    })
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(it) = it {
+                            return Some((Ok(it), (items, false)));
+                        }
+                        return next_item(items, &shared, &stream_plan, &refill).await;
+                    }
                     let last = match &*shared.lock().unwrap() {
                         (ResultState::Keyed(k), _) => k.last_refill(),
                         _ => None,
@@ -934,32 +969,52 @@ impl Engine {
                         }
                     }
                 }
-                let item = items.next().await?;
-                let mut guard = shared.lock().unwrap();
-                let (state, at) = &mut *guard;
-                let it = match item {
-                    Item::History(rows) => history_iteration(&stream_plan, state, at, rows),
-                    Item::CatchUp(fetched, own) => {
-                        catch_up_iteration(&stream_plan, state, at, fetched, own)
-                    }
-                    Item::Restored => Ok(Iteration {
-                        origin: Origin::CatchUp,
-                        diffs: Vec::new(),
-                        at: at.clone(),
-                    }),
-                    Item::Event(event) => Ok(event_iteration(&stream_plan, state, at, event)),
-                    Item::Failed(e) => Err(e),
-                };
-                let wants = match state {
-                    ResultState::Keyed(k) => refill.is_some() && k.wants_refill(),
-                    _ => false,
-                };
-                Some((it, (items, wants)))
+                next_item(items, &shared, &stream_plan, &refill).await
             }
         })
         .boxed();
         (iterations, checkpointer)
     }
+}
+
+/// What a subscription's stream is made of, before it becomes iterations.
+enum Item {
+    History(Result<Vec<Row>, HistoryError>),
+    CatchUp(Result<Option<Vec<Row>>, HistoryError>, Vec<Event>),
+    Restored,
+    Event(Event),
+    Failed(EngineError),
+}
+
+type Shared = Arc<Mutex<(ResultState, Watermark)>>;
+type ItemStream = BoxStream<'static, Item>;
+
+/// The next item as an iteration (`None` at the end), and whether the state now wants a refill.
+async fn next_item(
+    mut items: ItemStream,
+    shared: &Shared,
+    stream_plan: &StreamPlan,
+    refill: &Option<RefillSource>,
+) -> Option<(Result<Iteration, EngineError>, (ItemStream, bool))> {
+    let item = items.next().await?;
+    let mut guard = shared.lock().unwrap();
+    let (state, at) = &mut *guard;
+    let it = match item {
+        Item::History(rows) => history_iteration(stream_plan, state, at, rows),
+        Item::CatchUp(fetched, own) => catch_up_iteration(stream_plan, state, at, fetched, own),
+        Item::Restored => Ok(Iteration {
+            origin: Origin::CatchUp,
+            diffs: Vec::new(),
+            at: at.clone(),
+        }),
+        Item::Event(event) => Ok(event_iteration(stream_plan, state, at, event)),
+        Item::Failed(e) => Err(e),
+    };
+    let wants = match state {
+        ResultState::Keyed(k) => refill.is_some() && k.wants_refill(),
+        _ => false,
+    };
+    Some((it, (items, wants)))
 }
 
 /// Where a FINAL window's refills come from: the table's current snapshot, read with a bigger
@@ -968,13 +1023,78 @@ impl Engine {
 struct RefillSource {
     snapshots: Arc<dyn Snapshots>,
     history: Arc<dyn HistorySource>,
+    source: Arc<dyn EventSource>,
     table: crate::snapshot::SnapshotTable,
     plan: crate::plan::HistoryPlan,
+    stream: StreamPlan,
     keyed: crate::plan::KeyedPlan,
     limit: u64,
 }
 
 impl RefillSource {
+    /// With ORDER BY: `shadow` (an empty window) rebuilt from the current snapshot's top and
+    /// the events since it, up to `position`, re-read from Kafka; with the snapshot's watermark.
+    /// `None` if the snapshot is still `last`'s, or past `position` (the stream gets there
+    /// first).
+    async fn rebuild(
+        &self,
+        last: Option<&Watermark>,
+        position: &Watermark,
+        empty: KeyedState,
+    ) -> Result<Option<(KeyedState, Watermark)>, EngineError> {
+        let lease = self.snapshots.acquire(&self.table).await?;
+        let from = lease.watermark.clone();
+        if last == Some(&from) || !position.covers(&from) {
+            return Ok(None);
+        }
+        // the events since the snapshot, as the stream had them
+        let ahead: std::collections::BTreeMap<i32, i64> = position
+            .0
+            .iter()
+            .filter(|(p, o)| **o > from.get(**p))
+            .map(|(p, o)| (*p, *o))
+            .collect();
+        let mut since = Vec::new();
+        if !ahead.is_empty() {
+            let starts = [TopicStart {
+                topic: self.stream.topics[0].clone(),
+                partitions: ahead.keys().map(|p| (*p, from.start(*p))).collect(),
+            }];
+            let mut events = self
+                .source
+                .subscribe(&starts, &self.stream.required_keys())
+                .await?;
+            since = read_ahead(&mut events, &Watermark(ahead)).await?.0;
+        }
+        // the snapshot's top, then those events; if departures among them leave too few rows,
+        // a bigger top (until enough, or all of them)
+        let mut limit = self.limit;
+        loop {
+            let rows = self
+                .history
+                .fetch(&self.plan.sql_limit(&lease.sql_table(), limit))
+                .await?;
+            let all = (rows.len() as u64) < limit;
+            let mut empty = empty.clone();
+            empty.history_limit(limit);
+            let mut shadow = ResultState::Keyed(empty);
+            let mut at = from.clone();
+            history_iteration(&self.stream, &mut shadow, &at, Ok(rows))?;
+            for event in &since {
+                event_iteration(&self.stream, &mut shadow, &mut at, event.clone());
+            }
+            let ResultState::Keyed(mut shadow) = shadow else {
+                unreachable!("a keyed shadow")
+            };
+            shadow.settle();
+            // enough, or every row there is (a bigger top can't do better)
+            if !shadow.short() || all {
+                return Ok(Some((shadow, from)));
+            }
+            limit = limit.saturating_mul(4);
+        }
+    }
+
     /// From the table's current snapshot; `None` if it's still `last`'s.
     async fn fetch(&self, last: Option<&Watermark>) -> Result<Option<Refill>, EngineError> {
         let lease = self.snapshots.acquire(&self.table).await?;
@@ -1122,9 +1242,10 @@ impl ResultState {
 
     pub(crate) fn for_plan(plan: &StreamPlan) -> Self {
         if let Some(keyed) = &plan.keyed {
+            let order = plan.order.as_ref().map(|o| o.keys.clone());
             return Self::Keyed(match keyed.window {
-                Some(w) => KeyedState::with_window(w),
-                None => KeyedState::new(plan.order.as_ref().map(|o| o.keys.clone())),
+                Some(w) => KeyedState::with_window(w, order),
+                None => KeyedState::new(order),
             });
         }
         match (&plan.order, plan.limit, plan.offset) {

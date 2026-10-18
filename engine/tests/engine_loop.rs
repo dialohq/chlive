@@ -147,6 +147,35 @@ impl HistorySource for FakeHistory {
                 .iter()
                 .map(|k| row(json!({"product_id": k, "price": 6, "__key_0": k, "__ver": 1})))
                 .collect()),
+            // FINAL ORDER BY price LIMIT 2, buffer 4: the first snapshot (offset 0), then a later
+            // one (offset 3: a and b deleted, x added)
+            "SELECT product_id, price, product_id AS __key_0, version AS __ver \
+             FROM default.products FINAL ORDER BY price ASC NULLS LAST LIMIT 6" => Ok([
+                ("a", 1),
+                ("b", 2),
+                ("c", 3),
+                ("d", 4),
+                ("f", 6),
+                ("g", 7),
+            ]
+            .iter()
+            .map(|(k, p)| {
+                row(json!({"product_id": k, "price": p, "__key_0": k, "__ver": 1}))
+            })
+            .collect()),
+            "SELECT product_id, price, product_id AS __key_0, version AS __ver \
+             FROM default.products_later FINAL ORDER BY price ASC NULLS LAST LIMIT 6" => Ok([
+                ("c", 3),
+                ("d", 4),
+                ("f", 6),
+                ("g", 7),
+                ("x", 8),
+            ]
+            .iter()
+            .map(|(k, p)| {
+                row(json!({"product_id": k, "price": p, "__key_0": k, "__ver": 1}))
+            })
+            .collect()),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -761,6 +790,79 @@ async fn final_limit_keeps_the_newest_rows_and_refills_departures() {
             "products/0:5 - [\"a\"]\n\
              products/0:5 + @1 [\"g\"] {\"product_id\":\"g\",\"price\":6}",
             "products/0:6 + @0 [\"x\"] {\"product_id\":\"x\",\"price\":7}\nproducts/0:6 - @2",
+        ]
+    );
+}
+
+/// `products` at offset 0, then (from the second acquire on) a later snapshot at offset 3.
+struct MovingSnapshots(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl Snapshots for MovingSnapshots {
+    async fn acquire(&self, table: &SnapshotTable) -> Result<Lease, SnapshotError> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Arc::new(match n {
+            0 => Snapshot::fixed(&table.database, "products", Watermark([(0, 0)].into())),
+            _ => Snapshot::fixed(
+                &table.database,
+                "products_later",
+                Watermark([(0, 3)].into()),
+            ),
+        }))
+    }
+}
+
+/// FINAL with ORDER BY and LIMIT: the top n and the next ranks; a version past the last kept
+/// row is ignored, and when departures drain them, a rebuild (a newer snapshot and the events
+/// since) brings it back.
+#[tokio::test]
+async fn final_order_by_limit_rebuilds_when_departures_drain_the_kept_rows() {
+    let mut source = MemorySource::new();
+    let p = |id: &str, price: u32, version: u64, deleted: u8| {
+        format!(
+            r#"{{"product_id": "{id}", "price": {price}, "version": {version}, "deleted": {deleted}}}"#
+        )
+    };
+    source
+        .push("products", 0, p("a", 1, 1, 0)) // offset 0: history (a b; c d f g kept)
+        .push("products", 0, p("x", 8, 1, 0)) // past the last kept row (7): ignored
+        .push("products", 0, p("a", 1, 2, 1)) // departures from the top: the next comes in
+        .push("products", 0, p("b", 2, 2, 1))
+        .push("products", 0, p("c", 3, 2, 1))
+        .push("products", 0, p("d", 4, 2, 1)) // 2 kept: a rebuild (later snapshot + 4, 5)
+        .push("products", 0, p("f", 6, 2, 1)); // x, known again, comes in
+    let sql = "select product_id, price from products final order by price limit 2";
+    let engine = Engine::new(
+        ConfiguredRules::default(),
+        FakeHistory,
+        source,
+        MovingSnapshots(Default::default()),
+    )
+    .with_final_buffer(4)
+    .with_max_batch(1);
+    let lines: Vec<String> = engine
+        .subscribe(sql)
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    let ins = |i: usize, k: &str, p: u32| {
+        format!("+ @{i} [\"{k}\"] {{\"product_id\":\"{k}\",\"price\":{p}}}")
+    };
+    assert_eq!(
+        lines,
+        [
+            "+ [\"a\"] {\"product_id\":\"a\",\"price\":1}\n\
+             + [\"b\"] {\"product_id\":\"b\",\"price\":2}\nhistory: 2 rows"
+                .to_string(),
+            String::new(),
+            format!("products/0:2 - [\"a\"]\nproducts/0:2 {}", ins(1, "c", 3)),
+            format!("products/0:3 - [\"b\"]\nproducts/0:3 {}", ins(1, "d", 4)),
+            format!("products/0:4 - [\"c\"]\nproducts/0:4 {}", ins(1, "f", 6)),
+            format!("products/0:5 - [\"d\"]\nproducts/0:5 {}", ins(1, "g", 7)),
+            // the rebuild changed nothing visible (f g), but kept x: it comes in now
+            format!("products/0:6 - [\"f\"]\nproducts/0:6 {}", ins(1, "x", 8)),
         ]
     );
 }
