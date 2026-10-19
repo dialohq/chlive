@@ -48,6 +48,7 @@ pub mod semi;
 pub mod snapshot;
 pub mod source;
 pub mod table_engine;
+pub mod timeline;
 pub mod types;
 pub mod watermark;
 

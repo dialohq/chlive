@@ -12,7 +12,7 @@
 //! their groups, as one iteration. With FINAL, a key's new version replaces its deadline.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use futures::stream::{BoxStream, StreamExt};
@@ -38,12 +38,14 @@ struct Group {
     rows: u64,
 }
 
-/// Per row (FINAL, time windows): a row, as its values went into its group.
+/// Per row (FINAL, `now()`): a row, as its values went into its group.
+#[derive(Clone)]
 struct Kept {
     /// FINAL: its version (`Null` without a version column, or without FINAL).
     ver: Value,
-    /// Time windows: when it leaves.
-    deadline: Option<i128>,
+    /// With `now()`: whether it's in its group now, and the instants it goes out or comes in.
+    in_group: bool,
+    transitions: VecDeque<(i128, bool)>,
     group: String,
     /// Each aggregate's argument (`Null` for `count()`'s none).
     args: Vec<Value>,
@@ -60,7 +62,7 @@ struct Shared {
     result: GroupResult,
     /// Per row: every row in the result, by id (FINAL: its key; otherwise `#<n>`).
     kept: HashMap<String, Kept>,
-    /// The kept rows' deadlines, earliest first.
+    /// The kept rows' next instants, earliest first.
     expiry: BTreeSet<(i128, String)>,
     /// The last kept row's `seq` (and without FINAL, its id: `#<seq>`).
     next_row: u64,
@@ -68,23 +70,65 @@ struct Shared {
 
 impl Shared {
     fn keep(&mut self, id: String, kept: Kept) {
-        if let Some(d) = kept.deadline {
-            self.expiry.insert((d, id.clone()));
+        if let Some((t, _)) = kept.transitions.front() {
+            self.expiry.insert((*t, id.clone()));
         }
         self.kept.insert(id, kept);
     }
 
     fn forget(&mut self, id: &str) -> Option<Kept> {
         let kept = self.kept.remove(id)?;
-        if let Some(d) = kept.deadline {
-            self.expiry.remove(&(d, id.to_string()));
+        if let Some((t, _)) = kept.transitions.front() {
+            self.expiry.remove(&(*t, id.to_string()));
         }
         Some(kept)
     }
 
+    /// A row's values into its group (made if new); its group touched.
+    fn put_in(
+        &mut self,
+        plan: &NativeAggregates,
+        kept: &Kept,
+        new_states: impl FnOnce() -> Vec<Box<dyn AggregateState>>,
+        touch: &mut impl FnMut(&String),
+    ) {
+        let g = self
+            .groups
+            .entry(kept.group.clone())
+            .or_insert_with(|| Group {
+                key: serde_json::from_str(&kept.group).expect("a group's id is its key"),
+                states: new_states(),
+                rows: 0,
+            });
+        add(plan, g, &kept.args, kept.seq);
+        touch(&kept.group);
+    }
+
+    /// A new row (or key's version), with its schedule: in its group if it's in now; kept
+    /// while it can still change, and (FINAL) while it's in, for a new version to take it out.
+    fn admit(
+        &mut self,
+        plan: &NativeAggregates,
+        id: String,
+        kept: Kept,
+        keyed: bool,
+        new_states: impl FnOnce() -> Vec<Box<dyn AggregateState>>,
+        touch: &mut impl FnMut(&String),
+    ) {
+        if kept.in_group {
+            self.put_in(plan, &kept, new_states, touch);
+        }
+        if !kept.transitions.is_empty() || (keyed && kept.in_group) {
+            self.keep(id, kept);
+        }
+    }
+
     /// A row's values out of its group (gone with its last row, unless global); its group
-    /// touched.
+    /// touched. Nothing for a row that isn't in.
     fn take_out(&mut self, plan: &NativeAggregates, old: Kept, touch: &mut impl FnMut(&String)) {
+        if !old.in_group {
+            return;
+        }
         let g = self.groups.get_mut(&old.group).expect("a kept row's group");
         for (j, (agg, state)) in plan.aggs.iter().zip(&mut g.states).enumerate() {
             state.retract_row(agg.arg.map(|_| &old.args[j]), old.seq);
@@ -238,15 +282,27 @@ impl NativeRun {
                     .iter()
                     .map(load)
                     .collect::<Result<Vec<_>, _>>()?;
-                let deadline = match &k["deadline"] {
-                    Json::Null => None,
-                    d => Some(d.as_str().and_then(|d| d.parse().ok()).ok_or_else(bad)?),
+                // older checkpoints: a deadline (in, until then)
+                let transitions: VecDeque<(i128, bool)> = match (&k["t"], &k["deadline"]) {
+                    (Json::Array(t), _) => t
+                        .iter()
+                        .map(|t| {
+                            let at = t[0].as_str().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
+                            Ok((at, t[1].as_bool().ok_or_else(bad)?))
+                        })
+                        .collect::<Result<_, String>>()?,
+                    (_, Json::String(d)) => {
+                        VecDeque::from([(d.parse().map_err(|_| bad())?, false)])
+                    }
+                    _ => VecDeque::new(),
                 };
+                let in_group = k["in"].as_bool().unwrap_or(true);
                 kept.push((
                     id,
                     Kept {
                         ver: load(&k["ver"])?,
-                        deadline,
+                        in_group,
+                        transitions,
                         group: k["group"].as_str().ok_or_else(bad)?.to_string(),
                         args,
                         seq: k["seq"].as_u64().unwrap_or(0),
@@ -303,8 +359,13 @@ impl NativeRun {
                         serde_json::json!({
                             "id": id,
                             "ver": k.ver.save(),
-                            // as a string: it doesn't fit JSON's numbers
-                            "deadline": k.deadline.map(|d| d.to_string()),
+                            // instants as strings: they don't fit JSON's numbers
+                            "in": k.in_group,
+                            "t": k
+                                .transitions
+                                .iter()
+                                .map(|(t, b)| serde_json::json!([t.to_string(), b]))
+                                .collect::<Vec<_>>(),
                             "group": k.group,
                             "seq": k.seq,
                             "args": k.args.iter().map(Value::save).collect::<Vec<_>>(),
@@ -378,12 +439,26 @@ impl NativeRun {
         };
         let mut guard = self.shared.lock().unwrap();
         let shared = &mut *guard;
+        let keyed = self.stream.keyed.is_some();
         while let Some((d, id)) = shared.expiry.first().cloned() {
             if d > now {
                 break;
             }
-            let old = shared.forget(&id).expect("a due row is kept");
-            shared.take_out(&self.plan, old, &mut touch);
+            let mut kept = shared.forget(&id).expect("a due row is kept");
+            let (_, comes_in) = kept.transitions.pop_front().expect("a transition");
+            if comes_in {
+                // in its group as it comes in: its place in arrival order (groupArray) is now
+                kept.in_group = true;
+                shared.next_row += 1;
+                kept.seq = shared.next_row;
+                shared.put_in(&self.plan, &kept, || self.new_states(), &mut touch);
+            } else {
+                shared.take_out(&self.plan, kept.clone(), &mut touch);
+                kept.in_group = false;
+            }
+            if !kept.transitions.is_empty() || (keyed && kept.in_group) {
+                shared.keep(id, kept);
+            }
         }
         share_arrays(&self.plan, &shared.groups, &mut shared.result, &touched);
         let diffs = shared
@@ -466,11 +541,18 @@ impl NativeRun {
     fn history_rows(&mut self, rows: Vec<Row>) -> Result<Iteration, EngineError> {
         let keyed = self.stream.keyed.clone();
         let per_row = self.plan.per_row.clone().expect("per row");
-        let timed = !self.stream.windows.is_empty();
+        let timed = self.stream.timed();
+        let now = self.clock.now_ns();
         let bad = |e: String| EngineError::History(HistoryError::ClickHouse(e));
         let mut guard = self.shared.lock().unwrap();
         let shared = &mut *guard;
         let mut ids: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut touch = |id: &String| {
+            if seen.insert(id.clone()) {
+                ids.push(id.clone());
+            }
+        };
         if self.plan.keys.is_empty() {
             // a global aggregate has its one row, rows or not
             let id = Json::Array(Vec::new()).to_string();
@@ -482,7 +564,7 @@ impl NativeRun {
                     rows: 0,
                 },
             );
-            ids.push(id);
+            touch(&id);
         }
         for mut row in rows {
             shared.next_row += 1;
@@ -493,16 +575,23 @@ impl NativeRun {
                     .map_err(|e| bad(format!("FINAL row: {e:?}")))?,
                 None => (format!("#{seq}"), Value::Null),
             };
-            // NULL can't be in it (the history's WHERE): it would leave at once
-            let deadline = match timed {
-                true => Some(
-                    self.stream
-                        .history_deadline(&mut row)
-                        .map_err(|e| bad(format!("time window: {e:?}")))?
-                        .unwrap_or(i128::MIN),
-                ),
-                false => None,
+            // with now(): in now, or later (fetched as possible: maybe never)
+            let schedule = match timed {
+                true => {
+                    let decoded = self
+                        .stream
+                        .history_decode(&mut row)
+                        .map_err(|e| bad(format!("now(): {e:?}")))?;
+                    self.stream.schedule(&decoded, now)
+                }
+                false => crate::plan::Schedule {
+                    in_now: true,
+                    transitions: Vec::new(),
+                },
             };
+            if !schedule.in_now && schedule.transitions.is_empty() {
+                continue;
+            }
             let key: Vec<Json> = (0..self.plan.keys.len())
                 .map(|i| row.shift_remove(&format!("__k{i}")).unwrap_or(Json::Null))
                 .collect();
@@ -515,29 +604,22 @@ impl NativeRun {
                     None => Ok(Value::Null),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let group = Json::Array(key.clone()).to_string();
-            if !shared.groups.contains_key(&group) {
-                ids.push(group.clone());
-                shared.groups.insert(
-                    group.clone(),
-                    Group {
-                        key,
-                        states: self.new_states(),
-                        rows: 0,
-                    },
-                );
-            }
-            let g = shared.groups.get_mut(&group).expect("just made");
-            add(&self.plan, g, &args, seq);
-            shared.keep(
+            let group = Json::Array(key).to_string();
+            let kept = Kept {
+                ver,
+                in_group: schedule.in_now,
+                transitions: schedule.transitions.into(),
+                group,
+                args,
+                seq,
+            };
+            shared.admit(
+                &self.plan,
                 id,
-                Kept {
-                    ver,
-                    deadline,
-                    group,
-                    args,
-                    seq,
-                },
+                kept,
+                keyed.is_some(),
+                || self.new_states(),
+                &mut touch,
             );
         }
         share_arrays(&self.plan, &shared.groups, &mut shared.result, &ids);
@@ -557,7 +639,7 @@ impl NativeRun {
     /// its deadline; one already past it doesn't count.
     fn batch_rows(&mut self, events: Vec<Event>) -> Iteration {
         let keyed = self.stream.keyed.clone();
-        let timed = !self.stream.windows.is_empty();
+        let timed = self.stream.timed();
         let now = self.clock.now_ns();
         let last = events.last().expect("a non-empty batch");
         let origin = Origin::Event {
@@ -600,17 +682,19 @@ impl NativeRun {
                     shared.take_out(&self.plan, old, &mut touch);
                 }
             }
-            if deleted || !self.stream.matches(&row) {
+            if deleted {
                 continue;
             }
-            let deadline = match timed {
-                true => match self.stream.deadline(&row) {
-                    Some(d) if now < d => Some(d),
-                    // past it already (or NULL): not in the window
-                    _ => continue,
+            let schedule = match timed {
+                true => self.stream.schedule(&row, now),
+                false => crate::plan::Schedule {
+                    in_now: self.stream.matches(&row),
+                    transitions: Vec::new(),
                 },
-                false => None,
             };
+            if !schedule.in_now && schedule.transitions.is_empty() {
+                continue;
+            }
             shared.next_row += 1;
             let seq = shared.next_row;
             let id = match keyed {
@@ -624,24 +708,22 @@ impl NativeRun {
                 .iter()
                 .map(|a| a.arg.map_or(Value::Null, |c| row[c.0].clone()))
                 .collect();
-            let group = Json::Array(key.clone()).to_string();
-            let new_states = || self.new_states();
-            let g = shared.groups.entry(group.clone()).or_insert_with(|| Group {
-                key,
-                states: new_states(),
-                rows: 0,
-            });
-            add(&self.plan, g, &args, seq);
-            touch(&group);
-            shared.keep(
+            let group = Json::Array(key).to_string();
+            let kept = Kept {
+                ver,
+                in_group: schedule.in_now,
+                transitions: schedule.transitions.into(),
+                group,
+                args,
+                seq,
+            };
+            shared.admit(
+                &self.plan,
                 id,
-                Kept {
-                    ver,
-                    deadline,
-                    group,
-                    args,
-                    seq,
-                },
+                kept,
+                keyed.is_some(),
+                || self.new_states(),
+                &mut touch,
             );
         }
         share_arrays(&self.plan, &shared.groups, &mut shared.result, &touched);

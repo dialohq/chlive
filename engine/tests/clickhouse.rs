@@ -2145,6 +2145,204 @@ async fn time_window_aggregates_match_clickhouse() {
     }
 }
 
+/// General `now()` conditions (rows coming in, going out, both, OR, NOT; ORDER BY, aggregates,
+/// FINAL), in real time from B, in every split: at B + 1 s, B + 2.5 s and B + 4 s the live
+/// result equals ClickHouse's query with that literal now. Every row's instants are 0.25 s
+/// from the samples.
+#[tokio::test(flavor = "multi_thread")]
+async fn general_now_conditions_match_clickhouse() {
+    use chlive_engine::history::HistorySource;
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    const B: i128 = 1_792_324_800_000_000_000;
+    let ts = |ms: i64| chlive_engine::types::format_datetime((B / 1_000_000) as i64 + ms, 3);
+    // B - 3.25 s to B + 5.75 s, every 0.5 s (each instant ≡ 0.25 s mod 0.5 s)
+    let events: Vec<String> = (0..19)
+        .map(|i| {
+            format!(
+                r#"{{"ts":"{}","user_id":"u{i}","latency_ms":{}}}"#,
+                ts(-3_250 + i * 500),
+                i * 37 % 100
+            )
+        })
+        .collect();
+    let carts: Vec<String> = (0..24)
+        .map(|i| {
+            format!(
+                r#"{{"cart_id":"c{}","total":{},"ts":"{}","version":{i}}}"#,
+                i % 6,
+                i * 13 % 50,
+                ts(-3_250 + (i * 7 % 19) * 500)
+            )
+        })
+        .collect();
+    const CASES: &[(&str, bool)] = &[
+        ("select user_id, ts from events where ts <= now()", false),
+        (
+            "select user_id from events where ts <= now() + interval 1 second \
+             and ts > now() - interval 2 second",
+            false,
+        ),
+        (
+            "select user_id from events where not (ts > now() - interval 1 second) \
+             and latency_ms > 20",
+            false,
+        ),
+        (
+            "select user_id, ts from events where ts > now() - interval 2 second \
+             or latency_ms > 80 order by ts desc",
+            true,
+        ),
+        (
+            "select count() as n, max(latency_ms) as m from events \
+             where ts <= now() and ts > now() - interval 3 second",
+            false,
+        ),
+        (
+            "select count() as n, sum(latency_ms) as s from events \
+             where ts < now() or latency_ms > 90",
+            false,
+        ),
+        (
+            "select cart_id, total from carts final where ts <= now() + interval 1 second",
+            false,
+        ),
+        (
+            "select count() as n, sum(total) as s from carts final \
+             where ts <= now() and ts > now() - interval 2 second",
+            false,
+        ),
+    ];
+    let direct = ClickHouseHttp::new(&url(), "default", "");
+    // the whole data, for ClickHouse's answers
+    let all = "chlive_engine_now_all";
+    exec(&format!("DROP DATABASE IF EXISTS {all}")).await;
+    exec(&format!("CREATE DATABASE {all}")).await;
+    exec(&format!(
+        "CREATE TABLE {all}.events (ts DateTime64(3), user_id String, latency_ms UInt32) \
+         ENGINE = MergeTree ORDER BY ts"
+    ))
+    .await;
+    exec(&format!(
+        "CREATE TABLE {all}.carts (cart_id String, total UInt32, ts DateTime64(3), \
+         version UInt64) ENGINE = ReplacingMergeTree(version) ORDER BY cart_id"
+    ))
+    .await;
+    for (table, rows) in [("events", &events), ("carts", &carts)] {
+        let body: String = rows.iter().map(|e| format!("{e}\n")).collect();
+        exec(&format!(
+            "INSERT INTO {all}.{table} FORMAT JSONEachRow\n{body}"
+        ))
+        .await;
+    }
+    for (database, split) in [
+        ("chlive_engine_now_history", 1.0),
+        ("chlive_engine_now_stream", 0.0),
+        ("chlive_engine_now_split", 0.5),
+    ] {
+        exec(&format!("DROP DATABASE IF EXISTS {database}")).await;
+        exec(&format!("CREATE DATABASE {database}")).await;
+        exec(&format!(
+            "CREATE TABLE {database}.events (ts DateTime64(3), user_id String, latency_ms UInt32) \
+             ENGINE = MergeTree ORDER BY ts"
+        ))
+        .await;
+        exec(&format!(
+            "CREATE TABLE {database}.carts (cart_id String, total UInt32, ts DateTime64(3), \
+             version UInt64) ENGINE = ReplacingMergeTree(version) ORDER BY cart_id"
+        ))
+        .await;
+        let mut source = MemorySource::new();
+        let mut watermarks = std::collections::HashMap::new();
+        for (table, rows) in [("events", &events), ("carts", &carts)] {
+            let n = (rows.len() as f64 * split) as usize;
+            if n > 0 {
+                let body: String = rows[..n].iter().map(|e| format!("{e}\n")).collect();
+                exec(&format!(
+                    "INSERT INTO {database}.{table} FORMAT JSONEachRow\n{body}"
+                ))
+                .await;
+            }
+            for e in rows {
+                source.push(table, 0, e.as_str());
+            }
+            watermarks.insert(table.to_string(), upto(n));
+        }
+        // all cases at once, from B: each subscription followed in its own task
+        let start = tokio::time::Instant::now();
+        let engine = engine_with(database.into(), source, upto(0), watermarks)
+            .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)))
+            .with_now_coalescing(Duration::ZERO);
+        let mut lists = Vec::new();
+        for (sql, _) in CASES {
+            let mut sub = engine
+                .subscribe(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let list = Arc::new(std::sync::Mutex::new(
+                chlive_engine::diff::ResultList::default(),
+            ));
+            let l = list.clone();
+            let sql = sql.to_string();
+            tokio::spawn(async move {
+                while let Some(it) = sub.next().await {
+                    for d in &it.unwrap_or_else(|e| panic!("{sql}: {e}")).diffs {
+                        l.lock()
+                            .unwrap()
+                            .apply(d)
+                            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+                    }
+                }
+            });
+            lists.push(list);
+        }
+        for sample in [1_000u64, 2_500, 4_000] {
+            tokio::time::sleep_until(start + Duration::from_millis(sample)).await;
+            for ((sql, ordered), list) in CASES.iter().zip(&lists) {
+                let rows = list.lock().unwrap().rows.clone();
+                let now = B + i128::from(sample) * 1_000_000;
+                let want = direct
+                    .fetch(
+                        &sql.replace("from events", &format!("from {all}.events"))
+                            .replace("from carts", &format!("from {all}.carts"))
+                            .replace("now()", &format!("fromUnixTimestamp64Nano(toInt64({now}))")),
+                    )
+                    .await
+                    .unwrap();
+                let canon = |rows: &[chlive_engine::diff::Row]| -> Vec<String> {
+                    let mut v: Vec<String> = rows
+                        .iter()
+                        .map(|r| serde_json::Value::Object(r.clone()).to_string())
+                        .collect();
+                    if !ordered {
+                        v.sort();
+                    }
+                    v
+                };
+                assert_eq!(
+                    canon(&rows),
+                    canon(&want),
+                    "{database}: {sql} at B + {sample} ms"
+                );
+            }
+            eprintln!(
+                "{database}: B + {sample} ms: all {} cases agree",
+                CASES.len()
+            );
+        }
+    }
+    for database in [
+        "chlive_engine_now_history",
+        "chlive_engine_now_stream",
+        "chlive_engine_now_split",
+        "chlive_engine_now_all",
+    ] {
+        exec(&format!("DROP DATABASE IF EXISTS {database}")).await;
+    }
+}
+
 /// How big a FINAL aggregate's state gets, and how fast it runs: for RMTs of growing size, the
 /// history's load time, the heap the state keeps and the peak while loading, then 100k events
 /// replacing rows. Run by hand (`--ignored --nocapture`, release for real numbers); prints a

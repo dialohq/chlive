@@ -849,6 +849,11 @@ impl KeyedState {
         }
     }
 
+    /// The version of a key's row in the result.
+    pub fn version(&self, id: &str) -> Option<&Value> {
+        self.versions.get(id)
+    }
+
     pub fn len(&self) -> usize {
         self.versions.len()
     }

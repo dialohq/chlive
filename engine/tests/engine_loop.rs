@@ -47,6 +47,11 @@ impl HistorySource for FakeHistory {
                 col("user_id", "String"),
                 col("latency_ms", "UInt32"),
             ]),
+            "default.due" => Ok(vec![
+                col("id", "String"),
+                col("ts", "DateTime64(3)"),
+                col("latency", "UInt32"),
+            ]),
             "default.carts" => Ok(vec![
                 col("cart_id", "String"),
                 col("total", "UInt32"),
@@ -229,8 +234,8 @@ impl HistorySource for FakeHistory {
             .map(|(k, p)| row(json!({"product_id": k, "price": p, "__key_0": k, "__ver": 1})))
             .collect()),
             // now() - INTERVAL 10 SECOND at the test clock's start (B)
-            s if s == clicks_sql("SELECT user_id, ts AS __time_0", "", "") => {
-                let f = &["user_id", "__time_0"];
+            s if s == clicks_sql("SELECT user_id, ts AS __col_0", "", "") => {
+                let f = &["user_id", "__col_0"];
                 Ok(vec![click_row(f, "h1", -5_000, 1), click_row(f, "h2", -1_000, 1)])
             }
             s if s == clicks_sql(
@@ -243,12 +248,12 @@ impl HistorySource for FakeHistory {
                 Ok(vec![click_row(f, "h2", -1_000, 1), click_row(f, "h1", -5_000, 1)])
             }
             s if s == clicks_sql(
-                "SELECT user_id, latency_ms AS __order_0, ts AS __time_0",
+                "SELECT user_id, latency_ms AS __order_0, ts AS __col_0, latency_ms AS __col_2",
                 " ORDER BY latency_ms ASC NULLS LAST",
                 "",
             ) =>
             {
-                let f = &["user_id", "__order_0", "__time_0"];
+                let f = &["user_id", "__order_0", "__col_0", "__col_2"];
                 Ok(vec![click_row(f, "h2", -1_000, 1), click_row(f, "h1", -5_000, 3)])
             }
             // the calendar test's: nothing in ClickHouse
@@ -256,23 +261,61 @@ impl HistorySource for FakeHistory {
             // aggregates with now() - INTERVAL 10 SECOND at B: every row, with each field
             // any of these queries reads (u1 at B - 5 s and B - 1 s, u2 at B - 2 s)
             s if s.contains("FROM default.clicks WHERE ts > fromUnixTimestamp64Nano")
-                && s.contains("__time_0") =>
+                && (s.contains(" AS __k0") || s.contains("__arg_") || s.starts_with("SELECT ts AS __col_0 FROM")) =>
             {
                 Ok([("u1", -5_000, 3), ("u1", -1_000, 9), ("u2", -2_000, 4)]
                     .iter()
                     .map(|(u, ms, lat)| {
                         row(json!({"__k0": u, "__arg_0": lat, "__arg_1": lat, "__arg_2": lat,
-                                   "__time_0": click_ts(*ms)}))
+                                   "__col_0": click_ts(*ms)}))
                     })
                     .collect())
             }
+            // `due`: every row, whatever the WHERE (history may fetch a superset: the engine
+            // keeps what's in, or can come in)
+            s if s.contains("FROM default.due") => Ok(answer(
+                s,
+                &[
+                    json!({"id": "a", "ts": click_ts(-1_000), "latency": 200}),
+                    json!({"id": "b", "ts": click_ts(3_000), "latency": 1}),
+                ],
+            )),
             // FINAL with now(): c1 (version 1, B - 5 s)
-            s if s.contains("FROM default.carts FINAL") => Ok(vec![row(
-                json!({"__key_0": "c1", "__ver": 1, "__arg_1": 5, "__time_0": click_ts(-5_000)}),
-            )]),
+            s if s.contains("FROM default.carts FINAL") => Ok(answer(
+                s,
+                &[json!({"cart_id": "c1", "total": 5, "ts": click_ts(-5_000), "version": 1})],
+            )),
             other => panic!("unexpected history query: {other}"),
         }
     }
+}
+
+/// A history query's rows from these (by column), with exactly the fields its SELECT list
+/// names (`col` or `col AS alias`; aggregates' `count()` and the like aren't per row), sorted
+/// by its ORDER BY's first column.
+fn answer(sql: &str, rows: &[serde_json::Value]) -> Vec<Row> {
+    let select = &sql["SELECT ".len()..sql.find(" FROM ").unwrap()];
+    let fields: Vec<(&str, &str)> = select
+        .split(", ")
+        .map(|item| item.split_once(" AS ").unwrap_or((item, item)))
+        .collect();
+    let mut out: Vec<serde_json::Value> = rows.to_vec();
+    if let Some(order) = sql.split(" ORDER BY ").nth(1) {
+        let mut words = order.split(' ');
+        let (column, dir) = (words.next().unwrap(), words.next().unwrap());
+        out.sort_by_key(|r| r[column].to_string());
+        if dir == "DESC" {
+            out.reverse();
+        }
+    }
+    out.iter()
+        .map(|r| {
+            fields
+                .iter()
+                .map(|(col, name)| (name.to_string(), r[*col].clone()))
+                .collect()
+        })
+        .collect()
 }
 
 /// The test clock's start, 2026-10-18 12:00:00 UTC, in nanoseconds since the epoch.
@@ -294,7 +337,7 @@ fn click_ts(ms: i64) -> String {
 /// A history row of `clicks`, with exactly these fields (as ClickHouse returns them).
 fn click_row(fields: &[&str], user: &str, ms: i64, latency: u32) -> Row {
     let ts = click_ts(ms);
-    let all = json!({"user_id": user, "ts": ts, "__time_0": ts, "latency_ms": latency, "__order_0": latency});
+    let all = json!({"user_id": user, "ts": ts, "__col_0": ts, "latency_ms": latency, "__order_0": latency, "__col_2": latency});
     fields
         .iter()
         .map(|f| (f.to_string(), all[*f].clone()))
@@ -1405,22 +1448,23 @@ async fn aggregates_with_now_read_every_row_in_the_window() {
     let text = plan.to_string();
     assert!(
         text.contains(
-            "native:  SELECT user_id AS __k0, latency_ms AS __arg_0, ts AS __time_0 \
-             FROM <snapshot> WHERE (latency_ms > 1) AND ts > now64(9) - INTERVAL 10 SECOND"
+            "native:  SELECT user_id AS __k0, latency_ms AS __arg_0, latency_ms AS __col_2, \
+             ts AS __col_0 FROM <snapshot> WHERE (latency_ms > 1) AND \
+             (ts > now64(9) - INTERVAL 10 SECOND)"
         ),
         "{text}"
     );
     assert!(
-        text.contains("window:  ts > now() - INTERVAL 10 SECOND"),
+        text.contains("filter:  (latency_ms > 1 AND ts > now() - INTERVAL 10 SECOND)"),
         "{text}"
     );
     let a = plan.aggregate.as_ref().unwrap();
     assert_eq!(
         a.native_history_sql_at("s", B).unwrap(),
         format!(
-            "SELECT user_id AS __k0, latency_ms AS __arg_0, ts AS __time_0 FROM s \
-             WHERE (latency_ms > 1) AND ts > fromUnixTimestamp64Nano(toInt64({B})) \
-             - INTERVAL 10 SECOND"
+            "SELECT user_id AS __k0, latency_ms AS __arg_0, latency_ms AS __col_2, \
+             ts AS __col_0 FROM s WHERE (latency_ms > 1) AND \
+             (ts > fromUnixTimestamp64Nano(toInt64({B})) - INTERVAL 10 SECOND)"
         )
     );
 }
@@ -1505,6 +1549,182 @@ async fn group_arrays_change_by_edits() {
             "products/0:1 ~ [5] {\"vs\":[1,2]}",
             "products/0:2 ~ [5] {} vs[+[1]]",
         ]
+    );
+}
+
+/// `due`: a (B - 1 s, latency 200) and b (B + 3 s, latency 1) in ClickHouse, then events.
+fn due_engine(events: &[(&str, i64, u32)]) -> Engine {
+    let mut source = MemorySource::new();
+    source.push("due", 0, r#"{"id": "x"}"#); // offset 0: in the history
+    for (id, ms, latency) in events {
+        source.push(
+            "due",
+            0,
+            format!(
+                r#"{{"id": "{id}", "ts": "{}", "latency": {latency}}}"#,
+                click_ts(*ms)
+            )
+            .as_str(),
+        );
+    }
+    engine(source)
+        .with_max_batch(1)
+        .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)))
+        .with_now_coalescing(std::time::Duration::ZERO)
+}
+
+/// Rows come in as time passes (`ts <= now()`): the ones due later are held, then inserted at
+/// their place when their time comes.
+#[tokio::test(start_paused = true)]
+async fn rows_come_in_as_their_time_comes() {
+    let e = due_engine(&[("c", 1_000, 1), ("d", -500, 1)]);
+    assert_eq!(
+        timed_lines(&e, "select id from due where ts <= now() order by ts").await,
+        [
+            "0 + {\"id\":\"a\"}\nhistory: 1 rows",
+            "0 ",
+            "0 due/0:2 + @1 {\"id\":\"d\"}",
+            "1000 clock: + @2 {\"id\":\"c\"}",
+            "3000 clock: + @3 {\"id\":\"b\"}",
+        ]
+    );
+    // the history fetched what can come in: every row with a ts
+    let plan = e
+        .explain("select id from due where ts <= now() order by ts")
+        .await
+        .unwrap();
+    assert!(plan.history.sql_at("s", B).contains("WHERE ts IS NOT NULL"));
+}
+
+/// Several conditions: in, then out (a moving window around each row); OR a condition that
+/// keeps a row in; NOT, where rows come in.
+#[tokio::test(start_paused = true)]
+async fn rows_go_in_and_out_by_any_condition() {
+    // in from ts - 2 s until ts + 2 s
+    assert_eq!(
+        timed_lines(
+            &due_engine(&[("c", 1_000, 1)]),
+            "select id from due where ts <= now() + interval 2 second \
+             and ts > now() - interval 2 second",
+        )
+        .await,
+        [
+            "0 + {\"id\":\"a\"}\nhistory: 1 rows",
+            "0 due/0:1 + {\"id\":\"c\"}",
+            "1000 clock: - @0\nclock: + {\"id\":\"b\"}",
+            "3000 clock: - @0",
+            "5000 clock: - @0",
+        ]
+    );
+    // a slow row stays; b leaves 10 s after its ts
+    assert_eq!(
+        timed_lines(
+            &due_engine(&[]),
+            "select id from due where ts > now() - interval 10 second or latency > 100",
+        )
+        .await,
+        [
+            "0 + {\"id\":\"a\"}\n+ {\"id\":\"b\"}\nhistory: 2 rows",
+            "13000 clock: - @1",
+        ]
+    );
+    // NOT: rows come in 5 s after their ts
+    assert_eq!(
+        timed_lines(
+            &due_engine(&[]),
+            "select id from due where not (ts > now() - interval 5 second)",
+        )
+        .await,
+        [
+            "0 history: 0 rows",
+            "4000 clock: + {\"id\":\"a\"}",
+            "8000 clock: + {\"id\":\"b\"}",
+        ]
+    );
+}
+
+/// Aggregates with rows coming in: held out of their groups until their time.
+#[tokio::test(start_paused = true)]
+async fn aggregates_gain_rows_as_their_time_comes() {
+    assert_eq!(
+        timed_lines(
+            &due_engine(&[("c", 1_000, 1), ("d", -500, 1)]),
+            "select count() as n, groupArray(id) as ids from due where ts <= now()",
+        )
+        .await,
+        [
+            "0 + [] {\"n\":1,\"ids\":[\"a\"]}\nhistory: 1 rows",
+            "0 ",
+            "0 due/0:2 ~ [] {\"n\":2} ids[+[\"d\"]]",
+            "1000 clock: ~ [] {\"n\":3} ids[+[\"c\"]]",
+            "3000 clock: ~ [] {\"n\":4} ids[+[\"b\"]]",
+        ]
+    );
+}
+
+/// FINAL rows with now(): a key's new version replaces its schedule.
+#[tokio::test(start_paused = true)]
+async fn final_rows_follow_their_latest_versions_schedule() {
+    let cart = |id: &str, total: u32, ms: i64, version: u64| {
+        format!(
+            r#"{{"cart_id": "{id}", "total": {total}, "ts": "{}", "version": {version}}}"#,
+            click_ts(ms)
+        )
+    };
+    let mut source = MemorySource::new();
+    source
+        .push("carts", 0, cart("x", 0, 0, 1)) // offset 0: history (c1: 5, B - 5 s)
+        .push("carts", 0, cart("c1", 7, 2_000, 2)) // c1 out until 2 s
+        .push("carts", 0, cart("c2", 3, 1_000, 1)) // c2 at 1 s ...
+        .push("carts", 0, cart("c2", 3, -100, 2)) // ... no: now
+        .push("carts", 0, cart("c2", 3, 500, 1)); // an older version: ignored
+    let e = engine(source)
+        .with_max_batch(1)
+        .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)))
+        .with_now_coalescing(std::time::Duration::ZERO);
+    assert_eq!(
+        timed_lines(
+            &e,
+            "select cart_id, total from carts final where ts <= now()"
+        )
+        .await,
+        [
+            "0 + [\"c1\"] {\"cart_id\":\"c1\",\"total\":5}\nhistory: 1 rows",
+            "0 carts/0:1 - [\"c1\"]",
+            "0 ",
+            "0 carts/0:3 + [\"c2\"] {\"cart_id\":\"c2\",\"total\":3}",
+            "0 ",
+            "2000 clock: + [\"c1\"] {\"cart_id\":\"c1\",\"total\":7}",
+        ]
+    );
+}
+
+/// A restored result's pending rows come in when due: at once if their time passed while it
+/// was stored.
+#[tokio::test(start_paused = true)]
+async fn a_restored_result_lets_pending_rows_come_in() {
+    let sql = "select id from due where ts <= now()";
+    let e = due_engine(&[("c", 1_000, 1)]);
+    let mut sub = e.subscribe(sql).await.unwrap();
+    sub.next().await.unwrap().unwrap(); // history: a; b pending (3 s)
+    sub.next().await.unwrap().unwrap(); // c pending (1 s)
+    let checkpoint = sub.checkpoint().unwrap();
+    let checkpoint = chlive_engine::Checkpoint::from_json(&checkpoint.to_json()).unwrap();
+    drop(sub);
+    tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+    let params = chlive_engine::Params::new();
+    let mut sub = e.restore(sql, &params, &checkpoint).await.unwrap();
+    let start = tokio::time::Instant::now();
+    let mut lines = Vec::new();
+    while let Some(it) = sub.next().await {
+        let it = it.unwrap();
+        if !it.diffs.is_empty() {
+            lines.push(format!("{} {it}", start.elapsed().as_millis()));
+        }
+    }
+    assert_eq!(
+        lines,
+        ["0 clock: + {\"id\":\"c\"}", "1000 clock: + {\"id\":\"b\"}"]
     );
 }
 

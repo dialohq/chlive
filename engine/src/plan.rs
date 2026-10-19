@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use crate::ast::CmpOp;
 use crate::binder::{
     AggExpr, AggFunc, Aggregation, BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId,
-    OrderKey,
+    OrderKey, TimeWindow,
 };
 use crate::calendar::Interval;
 use crate::diff::Row;
@@ -135,9 +135,10 @@ pub struct AggregatePlan {
     pub hidden: Vec<String>,
     /// When every aggregate has a native implementation: how to run without chDB.
     pub native: Option<NativeAggregates>,
-    /// Time windows (`ts > now() - INTERVAL …`): in the history's WHERE, at the clock's now
-    /// when fetched (always native, per row).
+    /// `now()` in the WHERE: the comparisons' `now()` sides, and the WHERE of what's fetched
+    /// (always native, per row; see [`HistoryPlan::possible`]).
     pub windows: Vec<HistoryWindow>,
+    possible: Option<String>,
 }
 
 /// GROUP BY with native aggregates: their states come from main ClickHouse as plain SQL values
@@ -211,8 +212,12 @@ impl AggregatePlan {
     fn native_history(&self, from: &str, now: Option<i128>) -> Option<String> {
         let native = self.native.as_ref()?;
         if let Some(rows) = &native.per_row {
-            let where_ = where_with(self.filter.as_deref(), &self.windows, now)
-                .map(|w| format!(" WHERE {w}"))
+            let template = match now {
+                Some(_) => self.possible.as_ref().or(self.filter.as_ref()),
+                None => self.filter.as_ref(),
+            };
+            let where_ = template
+                .map(|t| format!(" WHERE {}", render(t, &self.windows, now)))
                 .unwrap_or_default();
             return Some(format!(
                 "SELECT {} FROM {from}{}{where_}",
@@ -273,7 +278,7 @@ impl AggregatePlan {
 
     fn where_clause(&self) -> String {
         match &self.filter {
-            Some(f) => format!(" WHERE {f}"),
+            Some(f) => format!(" WHERE {}", render(f, &self.windows, None)),
             None => String::new(),
         }
     }
@@ -340,7 +345,8 @@ fn backquote(name: &str) -> String {
 fn native_aggregates(
     agg: &Aggregation,
     table: &BoundTable,
-    windows: &[crate::binder::TimeWindow],
+    windows: &[TimeWindow],
+    where_columns: &[ColumnId],
 ) -> Option<NativeAggregates> {
     let col = |id: ColumnId| quote_ident(&table.column(id).clickhouse);
     let mut select: Vec<String> = agg
@@ -410,9 +416,12 @@ fn native_aggregates(
                 })
             })
             .collect();
-        // each window's column, for the row's deadline (as `WindowPlan::history_field`)
-        for (i, w) in windows.iter().enumerate() {
-            select.push(format!("{} AS __time_{i}", col(w.column)));
+        // with now(): the WHERE's columns, for the row's schedule (as
+        // `StreamPlan::history_fields`)
+        if !windows.is_empty() {
+            for id in where_columns {
+                select.push(format!("{} AS {}", col(*id), hidden_column(*id)));
+            }
         }
         PerRow {
             select: select.join(", "),
@@ -432,9 +441,11 @@ fn native_aggregates(
 fn aggregate_plan(
     agg: &Aggregation,
     table: &BoundTable,
-    filter: Option<String>,
-    windows: &[crate::binder::TimeWindow],
+    where_: &Where,
+    windows: &[TimeWindow],
+    where_columns: &[ColumnId],
 ) -> AggregatePlan {
+    let filter = where_.exact.clone();
     let col = |id: ColumnId| quote_ident(&table.column(id).clickhouse);
     let mut state = Vec::new();
     let mut merge = Vec::new();
@@ -482,18 +493,11 @@ fn aggregate_plan(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let native = native_aggregates(agg, table, windows);
+    let native = native_aggregates(agg, table, windows, where_columns);
     AggregatePlan {
         native,
-        windows: windows
-            .iter()
-            .map(|w| HistoryWindow {
-                column: quote_ident(&table.column(w.column).clickhouse),
-                inclusive: w.inclusive,
-                tz: w.tz,
-                intervals: w.intervals.clone(),
-            })
-            .collect(),
+        windows: history_windows(windows, table),
+        possible: where_.possible.clone(),
         columns: agg
             .items
             .iter()
@@ -544,8 +548,12 @@ pub struct HistoryPlan {
     pub table: String,
     /// The SELECT list.
     pub select: String,
-    /// The WHERE condition, rendered for ClickHouse.
+    /// The WHERE condition, rendered for ClickHouse; its `now()` comparisons as markers (see
+    /// [`render`]).
     pub filter: Option<String>,
+    /// With `now()`: the WHERE of what's fetched, every row that's in now or can come in later
+    /// (see [`possible`]).
+    pub possible: Option<String>,
     /// `ORDER BY …`, with every key's direction and NULL placement explicit.
     pub order: Option<String>,
     pub limit: Option<u64>,
@@ -553,42 +561,43 @@ pub struct HistoryPlan {
     pub keys_select: Option<String>,
     /// `FROM … FINAL`: a ReplacingMergeTree's latest version of each row.
     pub final_: bool,
-    /// `col > now() - INTERVAL …`: AND conditions with the server's clock in them.
+    /// The `now()` sides of the WHERE's comparisons.
     pub windows: Vec<HistoryWindow>,
 }
 
-/// A WHERE of a condition and time windows (at `now`, or symbolically).
-fn where_with(
-    filter: Option<&str>,
-    windows: &[HistoryWindow],
-    now: Option<i128>,
-) -> Option<String> {
-    let mut parts: Vec<String> = filter.iter().map(|f| format!("({f})")).collect();
-    parts.extend(windows.iter().map(|w| w.sql(now)));
-    match parts.len() {
-        0 => None,
-        // a lone condition as it is
-        1 if windows.is_empty() => filter.map(str::to_string),
-        _ => Some(parts.join(" AND ")),
-    }
-}
-
-/// A time window in the history query: `column op now(['tz']) ± INTERVAL …`.
+/// The `now()` side of a comparison in the history query: `now(['tz']) ± INTERVAL …`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryWindow {
-    /// The column, quoted.
+    /// The column it's compared with, quoted.
     pub column: String,
-    pub inclusive: bool,
     pub tz: Option<chrono_tz::Tz>,
     pub intervals: Vec<Interval>,
 }
 
+/// Marks a `now()` comparison in a rendered condition: the window and the operator, filled in
+/// by [`render`].
+const NOW_MARK: char = '\u{1}';
+
+/// A condition with its `now()` comparisons filled in: at `now` (nanoseconds since the epoch)
+/// as literals, otherwise as `now()` itself (for the plan's identity and explain, which
+/// mustn't change as time passes).
+fn render(template: &str, windows: &[HistoryWindow], now: Option<i128>) -> String {
+    let mut out = String::new();
+    let mut parts = template.split(NOW_MARK);
+    out.push_str(parts.next().unwrap_or(""));
+    while let (Some(mark), Some(rest)) = (parts.next(), parts.next()) {
+        let (w, op) = mark.split_once(':').expect("a window mark");
+        let w = &windows[w.parse::<usize>().expect("a window index")];
+        out.push_str(&w.sql(op, now));
+        out.push_str(rest);
+    }
+    out
+}
+
 impl HistoryWindow {
-    /// At `now` (nanoseconds since the epoch) a literal; otherwise `now()` itself (for the
-    /// plan's identity and explain, which mustn't change as time passes). The intervals stay
-    /// as written, so ClickHouse adds DAY and WEEK by the calendar in the timezone.
-    fn sql(&self, now: Option<i128>) -> String {
-        let op = if self.inclusive { ">=" } else { ">" };
+    /// `column op now(…) ± INTERVAL …`, at `now` a literal. The intervals stay as written, so
+    /// ClickHouse adds DAY and WEEK by the calendar in the timezone.
+    fn sql(&self, op: &str, now: Option<i128>) -> String {
         let tz = self.tz.map(|tz| quote_string(tz.name()));
         let now = match (now, tz) {
             (Some(n), Some(tz)) => format!("fromUnixTimestamp64Nano(toInt64({n}), {tz})"),
@@ -637,15 +646,19 @@ impl HistoryPlan {
         )
     }
 
-    /// The WHERE: the condition and the time windows (at `now`, or symbolically).
+    /// The WHERE: as written (`now()` symbolic), or at `now` what's fetched.
     fn where_sql(&self, now: Option<i128>) -> Option<String> {
-        where_with(self.filter.as_deref(), &self.windows, now)
+        let template = match now {
+            Some(_) => self.possible.as_ref().or(self.filter.as_ref()),
+            None => self.filter.as_ref(),
+        };
+        template.map(|t| render(t, &self.windows, now))
     }
 
     /// The query with one more condition (a semi-join's, or a back-fill's keys).
     pub fn sql_where(&self, from: &str, extra: &str) -> String {
         let mut sql = format!("SELECT {} FROM {from}{}", self.select, self.final_sql());
-        match &self.filter {
+        match self.where_sql(None) {
             Some(f) => sql.push_str(&format!(" WHERE ({f}) AND ({extra})")),
             None => sql.push_str(&format!(" WHERE {extra}")),
         }
@@ -736,44 +749,55 @@ pub struct StreamPlan {
     pub offset: Option<u64>,
     /// FINAL on a ReplacingMergeTree: rows have ids (their keys), and events replace them.
     pub keyed: Option<KeyedPlan>,
-    /// `col > now() - INTERVAL …`: rows leave as time passes.
+    /// The `now()` sides of the WHERE's comparisons: rows go in and out as time passes.
     pub windows: Vec<WindowPlan>,
+    /// With `now()`: the columns a history row carries to rebuild its decoded row (for its
+    /// schedule, and to come in later): each one's field, and whether it's hidden
+    /// (`__col_<id>`, removed before output).
+    pub history_fields: Vec<(ColumnId, String, bool)>,
 }
 
-/// A time window for the stream: `column > now(['tz']) ± INTERVAL …` (or `>=`). A row holds
-/// until the server's clock reaches its deadline (see [`crate::calendar::deadline`]).
+/// A row's state over time under a WHERE with `now()`: whether it's in now, then each instant
+/// it goes in (`true`) or out, in order.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Schedule {
+    pub in_now: bool,
+    pub transitions: Vec<(i128, bool)>,
+}
+
+/// The `now()` side of a comparison in the WHERE, for the stream: `column op now(['tz']) ±
+/// INTERVAL …` flips once for a row, at its threshold ([`WindowPlan::threshold`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowPlan {
     pub column: ColumnId,
     pub ty: Type,
-    /// The field holding it in a history row: its output name, or a hidden alias
-    /// (`__time_<i>`, removed before output).
-    pub history_field: String,
-    pub hidden: bool,
-    pub inclusive: bool,
     pub intervals: Vec<Interval>,
     /// The query's timezone (`now('…')`), and the one DAY and WEEK go by: the query's, or the
     /// server's (set by the engine; UTC until then).
     pub tz: Option<chrono_tz::Tz>,
     pub zone: chrono_tz::Tz,
-    /// The condition in dialect syntax, for `explain`.
+    /// `now(…) ± INTERVAL …` in dialect syntax, for `explain`.
     pub text: String,
 }
 
 impl WindowPlan {
-    /// When a row with this value leaves (nanoseconds since the epoch); `None` for NULL
-    /// (never matching).
-    fn deadline(&self, v: &Value) -> Option<i128> {
-        let Value::DateTime(dt) = v else {
+    /// When `value op now() …` flips (nanoseconds since the epoch), and how: `>`/`>=` are true
+    /// until then (the row leaves), `<`/`<=` from then on (it comes in). `None` for NULL: never
+    /// true.
+    pub fn threshold(&self, op: CmpOp, value: &Value) -> Option<(i128, bool)> {
+        let Value::DateTime(dt) = value else {
             return None;
         };
         let ns = i128::from(dt.ticks) * 10i128.pow(9 - u32::from(dt.precision.min(9)));
-        Some(crate::calendar::deadline(
-            ns,
-            &self.intervals,
-            self.zone,
-            self.inclusive,
-        ))
+        let at = |inclusive| crate::calendar::deadline(ns, &self.intervals, self.zone, inclusive);
+        Some(match op {
+            CmpOp::Gt => (at(false), false),
+            CmpOp::GtEq => (at(true), false),
+            // `v < now…` once `now…` > v, the first instant `v >= now…` stops holding
+            CmpOp::Lt => (at(true), true),
+            CmpOp::LtEq => (at(false), true),
+            CmpOp::Eq | CmpOp::NotEq => unreachable!("the binder refuses = and != with now()"),
+        })
     }
 }
 
@@ -970,36 +994,83 @@ impl StreamPlan {
         Ok(row)
     }
 
+    /// Whether a row is in the result (with `now()`: at the instant `now`).
     pub fn matches(&self, row: &DecodedRow) -> bool {
         match &self.filter {
             Filter::All => true,
-            Filter::Where { expr, .. } => eval(expr, row) == Some(true),
+            Filter::Where { expr, .. } => eval(expr, row, &|_, _| None) == Some(true),
         }
     }
 
-    /// When a decoded event's row leaves as time passes: the earliest of its windows'
-    /// deadlines (`None` if it's NULL in one: it never matches).
-    pub fn deadline(&self, row: &DecodedRow) -> Option<i128> {
-        self.windows
-            .iter()
-            .map(|w| w.deadline(&row[w.column.0]))
-            .try_fold(i128::MAX, |d, w| w.map(|w| d.min(w)))
+    /// Whether the WHERE has `now()` in it: rows go in and out as time passes.
+    pub fn timed(&self) -> bool {
+        !self.windows.is_empty()
     }
 
-    /// A history row's deadline, removing its hidden window fields.
-    pub fn history_deadline(&self, row: &mut Row) -> Result<Option<i128>, RowDecodeError> {
-        let mut deadline = Some(i128::MAX);
-        for w in &self.windows {
-            let v = decode(row.get(&w.history_field), &w.ty).map_err(|error| RowDecodeError {
-                column: w.history_field.clone(),
+    /// A row's state from `now` on: in or out now, and each instant it flips. Its `now()`
+    /// comparisons flip once each (at their thresholds), so the WHERE can only change there:
+    /// it's evaluated now and at each later threshold.
+    pub fn schedule(&self, row: &DecodedRow, now: i128) -> Schedule {
+        let Filter::Where { expr, .. } = &self.filter else {
+            return Schedule {
+                in_now: true,
+                transitions: Vec::new(),
+            };
+        };
+        let threshold =
+            |w: usize, op: CmpOp, column: ColumnId| self.windows[w].threshold(op, &row[column.0]);
+        let at = |t: i128| {
+            let cmp = |w: usize, op: CmpOp, column: ColumnId| {
+                threshold(w, op, column).map(|(d, comes_in)| (t >= d) == comes_in)
+            };
+            eval(expr, row, &|w, (op, column)| cmp(w, op, column)) == Some(true)
+        };
+        let mut instants = Vec::new();
+        expr.visit_now(&mut |w, op, column| {
+            if let Some((d, _)) = threshold(w, op, column) {
+                if d > now {
+                    instants.push(d);
+                }
+            }
+        });
+        instants.sort_unstable();
+        instants.dedup();
+        let in_now = at(now);
+        let mut state = in_now;
+        let mut transitions = Vec::new();
+        for d in instants {
+            let s = at(d);
+            if s != state {
+                transitions.push((d, s));
+                state = s;
+            }
+        }
+        Schedule {
+            in_now,
+            transitions,
+        }
+    }
+
+    /// A history row decoded (with `now()`; see [`Self::history_fields`]), removing its hidden
+    /// fields.
+    pub fn history_decode(&self, row: &mut Row) -> Result<DecodedRow, RowDecodeError> {
+        let mut decoded = vec![Value::Null; self.width];
+        for (id, field, hidden) in &self.history_fields {
+            let ty = &self
+                .columns
+                .iter()
+                .find(|c| c.id == *id)
+                .expect("a stream column")
+                .ty;
+            decoded[id.0] = decode(row.get(field), ty).map_err(|error| RowDecodeError {
+                column: field.clone(),
                 error,
             })?;
-            deadline = deadline.zip(w.deadline(&v)).map(|(a, b)| a.min(b));
+            if *hidden {
+                row.shift_remove(field);
+            }
         }
-        for w in self.windows.iter().filter(|w| w.hidden) {
-            row.shift_remove(&w.history_field);
-        }
-        Ok(deadline)
+        Ok(decoded)
     }
 
     /// The result row, rendered the way ClickHouse renders it.
@@ -1011,9 +1082,94 @@ impl StreamPlan {
     }
 }
 
-/// SQL three-valued logic: `None` is unknown (NULL).
-fn eval(expr: &BoundExpr, row: &DecodedRow) -> Option<bool> {
+/// A WHERE for ClickHouse: as written, and with `now()`, what's fetched (see [`possible`]).
+struct Where {
+    exact: Option<String>,
+    possible: Option<String>,
+}
+
+/// The rows that are in now or can come in later, a superset: the condition with its NOTs
+/// pushed down to the comparisons, each `now()` comparison a row leaves by (`>`, `>=`) as it is
+/// (at the fetch's now it's true if it can be later), and each one a row comes in by (`<`,
+/// `<=`) true unless NULL (it will be). The rest is monotone, so whatever can be true later is
+/// true of this now.
+fn possible(expr: &BoundExpr, negate: bool) -> BoundExpr {
+    let both = |l: &BoundExpr, r: &BoundExpr| {
+        (Box::new(possible(l, negate)), Box::new(possible(r, negate)))
+    };
     match expr {
+        BoundExpr::And(l, r) => {
+            let (l, r) = both(l, r);
+            if negate {
+                BoundExpr::Or(l, r)
+            } else {
+                BoundExpr::And(l, r)
+            }
+        }
+        BoundExpr::Or(l, r) => {
+            let (l, r) = both(l, r);
+            if negate {
+                BoundExpr::And(l, r)
+            } else {
+                BoundExpr::Or(l, r)
+            }
+        }
+        BoundExpr::Not(e) => possible(e, !negate),
+        BoundExpr::Now { window, column, op } => {
+            let op = if negate {
+                match op {
+                    CmpOp::Gt => CmpOp::LtEq,
+                    CmpOp::GtEq => CmpOp::Lt,
+                    CmpOp::Lt => CmpOp::GtEq,
+                    CmpOp::LtEq => CmpOp::Gt,
+                    other => *other,
+                }
+            } else {
+                *op
+            };
+            match op {
+                CmpOp::Gt | CmpOp::GtEq => BoundExpr::Now {
+                    window: *window,
+                    column: *column,
+                    op,
+                },
+                _ => BoundExpr::IsNull {
+                    expr: Box::new(BoundExpr::Column(*column)),
+                    negated: true,
+                },
+            }
+        }
+        other if negate => BoundExpr::Not(Box::new(other.clone())),
+        other => other.clone(),
+    }
+}
+
+/// The `now()` sides of the comparisons, for the history query.
+fn history_windows(windows: &[TimeWindow], table: &BoundTable) -> Vec<HistoryWindow> {
+    windows
+        .iter()
+        .map(|w| HistoryWindow {
+            column: quote_ident(&table.column(w.column).clickhouse),
+            tz: w.tz,
+            intervals: w.intervals.clone(),
+        })
+        .collect()
+}
+
+/// The name a column is fetched under in a history row with `now()`, when it isn't output.
+fn hidden_column(id: ColumnId) -> String {
+    format!("__col_{}", id.0)
+}
+
+/// SQL three-valued logic: `None` is unknown (NULL). `now` gives each `now()` comparison's
+/// value (by window, operator and column).
+fn eval(
+    expr: &BoundExpr,
+    row: &DecodedRow,
+    now: &dyn Fn(usize, (CmpOp, ColumnId)) -> Option<bool>,
+) -> Option<bool> {
+    match expr {
+        BoundExpr::Now { window, column, op } => now(*window, (*op, *column)),
         BoundExpr::Column(_) | BoundExpr::Literal(_) => match value(expr, row) {
             Value::Bool(b) => Some(*b),
             _ => None,
@@ -1029,17 +1185,17 @@ fn eval(expr: &BoundExpr, row: &DecodedRow) -> Option<bool> {
                 CmpOp::GtEq => ord != Ordering::Less,
             })
         }
-        BoundExpr::And(l, r) => match (eval(l, row), eval(r, row)) {
+        BoundExpr::And(l, r) => match (eval(l, row, now), eval(r, row, now)) {
             (Some(false), _) | (_, Some(false)) => Some(false),
             (Some(true), Some(true)) => Some(true),
             _ => None,
         },
-        BoundExpr::Or(l, r) => match (eval(l, row), eval(r, row)) {
+        BoundExpr::Or(l, r) => match (eval(l, row, now), eval(r, row, now)) {
             (Some(true), _) | (_, Some(true)) => Some(true),
             (Some(false), Some(false)) => Some(false),
             _ => None,
         },
-        BoundExpr::Not(e) => eval(e, row).map(|b| !b),
+        BoundExpr::Not(e) => eval(e, row, now).map(|b| !b),
         BoundExpr::IsNull { expr, negated } => Some((*value(expr, row) == Value::Null) != *negated),
         BoundExpr::InList {
             expr,
@@ -1069,6 +1225,9 @@ fn value<'a>(expr: &'a BoundExpr, row: &'a DecodedRow) -> &'a Value {
 /// The condition as ClickHouse SQL, from the typed tree (never from the query text).
 fn to_clickhouse(expr: &BoundExpr, table: &BoundTable) -> String {
     match expr {
+        BoundExpr::Now { window, op, .. } => {
+            format!("{NOW_MARK}{window}:{}{NOW_MARK}", op.symbol())
+        }
         BoundExpr::Column(id) => quote_ident(&table.column(*id).clickhouse),
         BoundExpr::Literal(v) => v.to_clickhouse_sql(),
         BoundExpr::Compare { op, left, right } => {
@@ -1114,12 +1273,19 @@ fn to_clickhouse(expr: &BoundExpr, table: &BoundTable) -> String {
 }
 
 /// The condition in dialect syntax, for `explain`.
-fn to_dialect(expr: &BoundExpr, table: &BoundTable) -> String {
+fn to_dialect(expr: &BoundExpr, table: &BoundTable, windows: &[TimeWindow]) -> String {
     let lit = |v: &Value| match v {
         Value::Null => "NULL".to_string(),
         other => other.to_json().to_string().replace('"', "'"),
     };
+    let to_dialect = |e: &BoundExpr, t: &BoundTable| to_dialect(e, t, windows);
     match expr {
+        BoundExpr::Now { window, column, op } => format!(
+            "{} {} {}",
+            table.column(*column).name,
+            op.symbol(),
+            now_text(windows[*window].tz, &windows[*window].intervals)
+        ),
         BoundExpr::Column(id) => table.column(*id).name.clone(),
         BoundExpr::Literal(v) => lit(v),
         BoundExpr::Compare { op, left, right } => {
@@ -1234,7 +1400,7 @@ impl std::fmt::Display for Plan {
                 Some(sql) if a.native.as_ref().is_some_and(|n| n.per_row.is_some()) => writeln!(
                     f,
                     "native:  {sql} (every row's values in the engine, taken back out when \
-                     a version replaces the row or it passes its deadline; chDB unused)"
+                     a version replaces the row or, with now(), it goes out; chDB unused)"
                 )?,
                 Some(sql) => writeln!(f, "native:  {sql} (states in the engine; chDB unused)")?,
                 None => writeln!(
@@ -1327,12 +1493,11 @@ impl std::fmt::Display for Plan {
             Filter::All => write!(f, "filter:  all events")?,
             Filter::Where { text, .. } => write!(f, "filter:  {text}")?,
         }
-        for w in &self.stream.windows {
+        if self.stream.timed() {
             write!(
                 f,
-                "\nwindow:  {} (rows leave as time passes, at their deadlines, within the \
-                 server's now_coalescing)",
-                w.text
+                "\nnow():   rows go in and out as time passes, at their instants (within the \
+                 server's now_coalescing)"
             )?;
         }
         if let Some(order) = &self.stream.order {
@@ -1478,44 +1643,70 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             deleted: k.deleted,
         }
     });
-    // time windows: each column's value in history rows (selected, or a hidden alias)
+    // now(): the WHERE's comparisons' `now()` sides
     let windows: Vec<WindowPlan> = bound
         .windows
         .iter()
-        .enumerate()
-        .map(|(i, w)| {
-            let c = table.column(w.column);
-            let selected = bound.projection.iter().find(|p| p.column == w.column);
-            let (history_field, hidden) = match selected {
-                Some(p) => (p.name.clone(), false),
-                None => {
-                    let alias = format!("__time_{i}");
-                    select_list.push(format!("{} AS {alias}", quote_ident(&c.clickhouse)));
-                    (alias, true)
-                }
-            };
-            WindowPlan {
-                column: w.column,
-                ty: c.ty.clone(),
-                history_field,
-                hidden,
-                inclusive: w.inclusive,
-                intervals: w.intervals.clone(),
-                tz: w.tz,
-                zone: w.tz.unwrap_or(chrono_tz::Tz::UTC),
-                text: format!(
-                    "{} {} {}",
-                    c.name,
-                    if w.inclusive { ">=" } else { ">" },
-                    now_text(w.tz, &w.intervals)
-                ),
-            }
+        .map(|w| WindowPlan {
+            column: w.column,
+            ty: table.column(w.column).ty.clone(),
+            intervals: w.intervals.clone(),
+            tz: w.tz,
+            zone: w.tz.unwrap_or(chrono_tz::Tz::UTC),
+            text: now_text(w.tz, &w.intervals),
         })
         .collect();
+    let where_ = Where {
+        exact: bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
+        possible: bound
+            .filter
+            .as_ref()
+            .filter(|_| !windows.is_empty())
+            .map(|f| to_clickhouse(&possible(f, false), table)),
+    };
+    let mut where_columns = Vec::new();
+    if let Some(f) = &bound.filter {
+        f.columns(&mut where_columns);
+    }
+    // now(): history rows carry what rebuilds them (their schedules, and rows coming in later)
+    let mut history_fields: Vec<(ColumnId, String, bool)> = Vec::new();
+    if !windows.is_empty() {
+        let mut cols: Vec<ColumnId> = bound.projection.iter().map(|p| p.column).collect();
+        cols.extend(where_columns.iter().copied());
+        cols.extend(bound.order.iter().map(|k| k.column));
+        if let Some(k) = &table.final_key {
+            cols.extend(k.key.iter().chain(&k.ver).chain(&k.deleted).copied());
+        }
+        for id in cols {
+            if history_fields.iter().any(|(c, _, _)| *c == id) {
+                continue;
+            }
+            let field = match bound.projection.iter().find(|p| p.column == id) {
+                Some(p) if bound.aggregation.is_none() => (id, p.name.clone(), false),
+                _ => {
+                    let alias = hidden_column(id);
+                    select_list.push(format!(
+                        "{} AS {alias}",
+                        quote_ident(&table.column(id).clickhouse)
+                    ));
+                    (id, alias, true)
+                }
+            };
+            history_fields.push(field);
+        }
+        if bound.aggregation.is_some() {
+            // aggregates read their own rows: the WHERE's columns, hidden
+            history_fields = where_columns
+                .iter()
+                .map(|id| (*id, hidden_column(*id), true))
+                .collect();
+        }
+    }
     let history = HistoryPlan {
         table: table.clickhouse_table.clone(),
         select: select_list.join(", "),
-        filter: bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
+        filter: where_.exact.clone(),
+        possible: where_.possible.clone(),
         order: order_sql,
         // with OFFSET the engine needs the rows above the window too: the first m + n
         limit: match keyed.as_ref().and_then(|k| k.window) {
@@ -1543,16 +1734,7 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             fields.join(", ")
         }),
         final_: keyed.is_some(),
-        windows: bound
-            .windows
-            .iter()
-            .map(|w| HistoryWindow {
-                column: quote_ident(&table.column(w.column).clickhouse),
-                inclusive: w.inclusive,
-                tz: w.tz,
-                intervals: w.intervals.clone(),
-            })
-            .collect(),
+        windows: history_windows(&bound.windows, table),
     };
 
     // Columns to decode: the output's, then the filter's and ORDER BY's that aren't output.
@@ -1570,14 +1752,10 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             needed.push(k.column);
         }
     }
-    let aggregate = bound.aggregation.as_ref().map(|a| {
-        aggregate_plan(
-            a,
-            table,
-            bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
-            &bound.windows,
-        )
-    });
+    let aggregate = bound
+        .aggregation
+        .as_ref()
+        .map(|a| aggregate_plan(a, table, &where_, &bound.windows, &where_columns));
     if let Some(a) = &aggregate {
         for (id, _) in &a.batch_columns {
             if !needed.contains(id) {
@@ -1622,7 +1800,7 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             None => Filter::All,
             Some(expr) => Filter::Where {
                 expr: expr.clone(),
-                text: to_dialect(expr, table),
+                text: to_dialect(expr, table, &bound.windows),
             },
         },
         order: (!bound.order.is_empty()).then(|| OrderPlan {
@@ -1640,6 +1818,7 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
         offset: bound.offset,
         keyed,
         windows,
+        history_fields,
     };
     Plan {
         table: table.name.clone(),
@@ -1684,7 +1863,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
             None => Filter::All,
             Some(expr) => Filter::Where {
                 expr: expr.clone(),
-                text: to_dialect(expr, inner),
+                text: to_dialect(expr, inner, &[]),
             },
         },
         order: None,
@@ -1692,6 +1871,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
         offset: None,
         keyed: None,
         windows: Vec::new(),
+        history_fields: Vec::new(),
     };
     let float = |t: &Type| matches!(t.kind, crate::types::Kind::Float(_));
     SemiPlan {
@@ -1980,79 +2160,116 @@ mod tests {
             .contains("OFFSET 2: every row but the first 2 (by ORDER BY), all of them kept"));
     }
 
-    #[test]
-    fn time_windows_are_symbolic_in_the_identity_and_literal_when_fetched() {
-        const H: i128 = 3_600_000_000_000;
-        let mut b = bound(&[1], None);
-        b.windows = vec![crate::binder::TimeWindow {
+    fn window(tz: Option<chrono_tz::Tz>, intervals: &[(i64, crate::calendar::Unit)]) -> TimeWindow {
+        TimeWindow {
             column: ColumnId(0),
-            inclusive: false,
-            tz: None,
-            intervals: vec![crate::calendar::Interval {
-                amount: -1,
-                unit: crate::calendar::Unit::Hour,
-            }],
+            tz,
+            intervals: intervals
+                .iter()
+                .map(|(amount, unit)| crate::calendar::Interval {
+                    amount: *amount,
+                    unit: *unit,
+                })
+                .collect(),
             span: crate::error::Span::new(0, 0),
-        }];
+        }
+    }
+
+    fn now_cmp(window: usize, op: CmpOp) -> BoundExpr {
+        BoundExpr::Now {
+            window,
+            column: ColumnId(0),
+            op,
+        }
+    }
+
+    fn history_row(v: serde_json::Value) -> Row {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn now_is_symbolic_in_the_identity_and_literal_when_fetched() {
+        use crate::calendar::Unit;
+        const H: i128 = 3_600_000_000_000;
+        let mut b = bound(&[1], Some(now_cmp(0, CmpOp::Gt)));
+        b.windows = vec![window(None, &[(-1, Unit::Hour)])];
         let p = plan(&b);
-        // ts isn't selected: fetched under a hidden alias, for the rows' deadlines
+        // ts isn't selected: fetched under a hidden alias, for the rows' schedules
         assert_eq!(
             p.history.sql("db.snap"),
-            "SELECT user_id, ts AS __time_0 FROM db.snap WHERE ts > now64(9) - INTERVAL 1 HOUR"
+            "SELECT user_id, ts AS __col_0 FROM db.snap WHERE ts > now64(9) - INTERVAL 1 HOUR"
         );
         let now: i128 = 1_800_000_000_000_000_000;
         assert_eq!(
             p.history.sql_at("db.snap", now),
             format!(
-                "SELECT user_id, ts AS __time_0 FROM db.snap WHERE ts > \
+                "SELECT user_id, ts AS __col_0 FROM db.snap WHERE ts > \
                  fromUnixTimestamp64Nano(toInt64({now})) - INTERVAL 1 HOUR"
             )
         );
         assert!(p.stream.required_keys().contains(&"ts".to_string()));
-        assert!(p.to_string().contains(
-            "window:  ts > now() - INTERVAL 1 HOUR (rows leave as time passes, at their \
-             deadlines, within the server's now_coalescing)"
-        ));
-        // a row's deadline: when the clock gets to ts + 1 hour
-        let mut row = json!({"user_id": "u", "__time_0": "2026-10-18 12:00:00.000"})
-            .as_object()
-            .unwrap()
-            .clone();
-        let d = p.stream.history_deadline(&mut row).unwrap().unwrap();
-        let ts = crate::types::parse_datetime("2026-10-18 12:00:00.000", 3).unwrap();
-        assert_eq!(d, i128::from(ts) * 1_000_000 + H);
-        assert_eq!(
-            row.keys().collect::<Vec<_>>(),
-            ["user_id"],
-            "the hidden field is gone"
+        let text = p.to_string();
+        assert!(
+            text.contains("filter:  ts > now() - INTERVAL 1 HOUR"),
+            "{text}"
         );
-        // with a filter: both
-        let f = BoundExpr::Compare {
-            op: CmpOp::Gt,
-            left: Box::new(BoundExpr::Column(ColumnId(2))),
-            right: Box::new(BoundExpr::Literal(Value::Int(5))),
-        };
+        assert!(
+            text.contains("now():   rows go in and out as time passes"),
+            "{text}"
+        );
+        // a row's schedule: in until ts + 1 hour; the hidden field is gone
+        let mut row = history_row(json!({"user_id": "u", "__col_0": "2026-10-18 12:00:00.000"}));
+        let decoded = p.stream.history_decode(&mut row).unwrap();
+        assert_eq!(row.keys().collect::<Vec<_>>(), ["user_id"]);
+        let ts = i128::from(crate::types::parse_datetime("2026-10-18 12:00:00.000", 3).unwrap())
+            * 1_000_000;
+        assert_eq!(
+            p.stream.schedule(&decoded, ts),
+            Schedule {
+                in_now: true,
+                transitions: vec![(ts + H, false)]
+            }
+        );
+
+        // with a filter, and rows that come in: fetched if they're in now or can come in
+        let f = BoundExpr::Or(
+            Box::new(BoundExpr::And(
+                Box::new(BoundExpr::Compare {
+                    op: CmpOp::Gt,
+                    left: col(2),
+                    right: lit(Value::Int(5)),
+                }),
+                Box::new(now_cmp(0, CmpOp::GtEq)),
+            )),
+            Box::new(BoundExpr::Not(Box::new(BoundExpr::Or(
+                Box::new(now_cmp(1, CmpOp::Lt)),
+                Box::new(now_cmp(0, CmpOp::Gt)),
+            )))),
+        );
         let mut b2 = bound(&[0], Some(f));
-        b2.windows = b.windows.clone();
-        b2.windows[0].inclusive = true;
-        assert!(plan(&b2)
-            .history
-            .sql("x")
-            .ends_with("WHERE (latency_ms > 5) AND ts >= now64(9) - INTERVAL 1 HOUR"));
-        // a timezone: in the query (so in its identity), and ClickHouse adds DAYs by it
-        let mut b3 = bound(&[1], None);
-        b3.windows = b.windows.clone();
-        b3.windows[0].tz = Some(chrono_tz::Europe::Warsaw);
-        b3.windows[0].intervals = vec![
-            crate::calendar::Interval {
-                amount: -1,
-                unit: crate::calendar::Unit::Day,
-            },
-            crate::calendar::Interval {
-                amount: 2,
-                unit: crate::calendar::Unit::Hour,
-            },
+        b2.windows = vec![
+            window(None, &[(-1, Unit::Hour)]),
+            window(None, &[(1, Unit::Day)]),
         ];
+        let p2 = plan(&b2);
+        assert!(p2.history.sql("x").ends_with(
+            "WHERE ((latency_ms > 5) AND (ts >= now64(9) - INTERVAL 1 HOUR)) OR \
+             (NOT ((ts < now64(9) + INTERVAL 1 DAY) OR (ts > now64(9) - INTERVAL 1 HOUR)))"
+        ));
+        // NOT pushed down: `ts >= now + 1 day` stays (a row can only leave it), `ts <= now -
+        // 1 hour` will be true unless NULL
+        assert!(p2.history.sql_at("x", now).ends_with(&format!(
+            "WHERE ((latency_ms > 5) AND (ts >= fromUnixTimestamp64Nano(toInt64({now})) - \
+             INTERVAL 1 HOUR)) OR ((ts >= fromUnixTimestamp64Nano(toInt64({now})) + INTERVAL 1 \
+             DAY) AND (ts IS NOT NULL))"
+        )));
+
+        // a timezone: in the query (so in its identity), and ClickHouse adds DAYs by it
+        let mut b3 = bound(&[1], Some(now_cmp(0, CmpOp::Gt)));
+        b3.windows = vec![window(
+            Some(chrono_tz::Europe::Warsaw),
+            &[(-1, Unit::Day), (2, Unit::Hour)],
+        )];
         let p3 = plan(&b3);
         assert!(p3
             .history
@@ -2064,20 +2281,175 @@ mod tests {
         )));
         assert!(p3
             .to_string()
-            .contains("window:  ts > now('Europe/Warsaw') - INTERVAL 1 DAY + INTERVAL 2 HOUR"));
+            .contains("filter:  ts > now('Europe/Warsaw') - INTERVAL 1 DAY + INTERVAL 2 HOUR"));
         assert_ne!(p3.history.sql("x"), {
             let mut b4 = b3.clone();
             b4.windows[0].tz = Some(chrono_tz::Europe::London);
             plan(&b4).history.sql("x")
         });
-        // its deadlines by the Warsaw calendar: the day before the clocks go back is 25 h
-        let mut row = json!({"user_id": "u", "__time_0": "2026-10-24 10:00:00.000"})
-            .as_object()
-            .unwrap()
-            .clone();
-        let d = p3.stream.history_deadline(&mut row).unwrap().unwrap();
-        let ts = crate::types::parse_datetime("2026-10-24 10:00:00.000", 3).unwrap();
-        assert_eq!(d, i128::from(ts) * 1_000_000 + 25 * H - 2 * H);
+        // its schedule by the Warsaw calendar: the day before the clocks go back is 25 h
+        let mut p3 = p3;
+        p3.stream.windows[0].zone = chrono_tz::Europe::Warsaw;
+        let mut row = history_row(json!({"user_id": "u", "__col_0": "2026-10-24 10:00:00.000"}));
+        let decoded = p3.stream.history_decode(&mut row).unwrap();
+        let ts = i128::from(crate::types::parse_datetime("2026-10-24 10:00:00.000", 3).unwrap())
+            * 1_000_000;
+        assert_eq!(
+            p3.stream.schedule(&decoded, ts).transitions,
+            [(ts + 25 * H - 2 * H, false)]
+        );
+    }
+
+    /// Schedules: each operator at its threshold, rows coming in and going out, and agreement
+    /// with evaluating the WHERE at many instants.
+    #[test]
+    fn schedules_follow_the_where_through_time() {
+        use crate::calendar::Unit;
+        const S: i128 = 1_000_000_000;
+        let ts = |sec: i64| {
+            Value::DateTime(crate::types::DateTime {
+                ticks: sec * 1000,
+                precision: 3,
+            })
+        };
+        let at = |sec: i64| i128::from(sec) * S;
+        let stream = |f: BoundExpr, windows: Vec<TimeWindow>| {
+            let mut b = bound(&[0], Some(f));
+            b.windows = windows;
+            plan(&b).stream
+        };
+        let w0 = window(None, &[]);
+        let row = |sec: i64, latency: i128| {
+            let mut r = vec![Value::Null; 5];
+            r[0] = ts(sec);
+            r[2] = Value::Int(latency);
+            r
+        };
+        // `ts > now()`: in until ts; `>=`: a nanosecond longer
+        let p = stream(now_cmp(0, CmpOp::Gt), vec![w0.clone()]);
+        assert_eq!(
+            p.schedule(&row(100, 0), at(0)).transitions,
+            [(at(100), false)]
+        );
+        let p = stream(now_cmp(0, CmpOp::GtEq), vec![w0.clone()]);
+        assert_eq!(
+            p.schedule(&row(100, 0), at(0)).transitions,
+            [(at(100) + 1, false)]
+        );
+        // `ts <= now()`: comes in at ts; `<`: a nanosecond later
+        let p = stream(now_cmp(0, CmpOp::LtEq), vec![w0.clone()]);
+        let s = p.schedule(&row(100, 0), at(0));
+        assert!(!s.in_now);
+        assert_eq!(s.transitions, [(at(100), true)]);
+        let p = stream(now_cmp(0, CmpOp::Lt), vec![w0.clone()]);
+        assert_eq!(
+            p.schedule(&row(100, 0), at(0)).transitions,
+            [(at(100) + 1, true)]
+        );
+        // `ts <= now() and ts > now() - 10 s`: in at ts, out 10 s later
+        let p = stream(
+            BoundExpr::And(
+                Box::new(now_cmp(0, CmpOp::LtEq)),
+                Box::new(now_cmp(1, CmpOp::Gt)),
+            ),
+            vec![w0.clone(), window(None, &[(-10, Unit::Second)])],
+        );
+        assert_eq!(
+            p.schedule(&row(100, 0), at(0)).transitions,
+            [(at(100), true), (at(110), false)]
+        );
+        // past both: never again
+        assert_eq!(p.schedule(&row(100, 0), at(200)), Schedule::default());
+        // OR an ordinary condition: a slow row never leaves
+        let p = stream(
+            BoundExpr::Or(
+                Box::new(now_cmp(0, CmpOp::Gt)),
+                Box::new(BoundExpr::Compare {
+                    op: CmpOp::Gt,
+                    left: col(2),
+                    right: lit(Value::Int(100)),
+                }),
+            ),
+            vec![w0.clone()],
+        );
+        assert_eq!(
+            p.schedule(&row(100, 500), at(0)),
+            Schedule {
+                in_now: true,
+                transitions: vec![]
+            }
+        );
+        assert_eq!(
+            p.schedule(&row(100, 5), at(0)).transitions,
+            [(at(100), false)]
+        );
+        // a NULL column: never in
+        let mut null = row(100, 0);
+        null[0] = Value::Null;
+        assert_eq!(p.schedule(&null, at(0)).transitions, []);
+
+        // random expressions of comparisons: the schedule says what evaluating says, at every
+        // instant
+        let mut seed: u64 = 5;
+        let mut rand = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let windows: Vec<TimeWindow> = (0..3)
+            .map(|i| window(None, &[(i as i64 * 7 - 7, Unit::Second)]))
+            .collect();
+        fn random(rand: &mut impl FnMut(u64) -> u64, depth: u32) -> BoundExpr {
+            let ops = [CmpOp::Gt, CmpOp::GtEq, CmpOp::Lt, CmpOp::LtEq];
+            match if depth == 0 { 0 } else { rand(4) } {
+                0 => now_cmp(rand(3) as usize, ops[rand(4) as usize]),
+                1 => BoundExpr::And(
+                    Box::new(random(rand, depth - 1)),
+                    Box::new(random(rand, depth - 1)),
+                ),
+                2 => BoundExpr::Or(
+                    Box::new(random(rand, depth - 1)),
+                    Box::new(random(rand, depth - 1)),
+                ),
+                _ => BoundExpr::Not(Box::new(random(rand, depth - 1))),
+            }
+        }
+        for _ in 0..300 {
+            let f = random(&mut rand, 3);
+            let p = stream(f.clone(), windows.clone());
+            let r = row(rand(40) as i64, 0);
+            let now = at(rand(40) as i64);
+            let s = p.schedule(&r, now);
+            // the possible WHERE (as evaluated) is true if the row is in at any later instant
+            let possible = possible(&f, false);
+            let in_possible = eval(&possible, &r, &|w, (op, c)| {
+                p.windows[w]
+                    .threshold(op, &r[c.0])
+                    .map(|(d, comes_in)| (now >= d) == comes_in)
+            }) == Some(true);
+            for k in 0..120 {
+                let t = now + i128::from(k) * S / 2 - 3 * S;
+                if t < now {
+                    continue;
+                }
+                let want = eval(&f, &r, &|w, (op, c)| {
+                    p.windows[w]
+                        .threshold(op, &r[c.0])
+                        .map(|(d, comes_in)| (t >= d) == comes_in)
+                }) == Some(true);
+                let got = s
+                    .transitions
+                    .iter()
+                    .take_while(|(d, _)| *d <= t)
+                    .last()
+                    .map_or(s.in_now, |(_, b)| *b);
+                assert_eq!(got, want, "{f:?} at {t}");
+                if want {
+                    assert!(in_possible, "{f:?}: in at {t}, but not possible at {now}");
+                }
+            }
+        }
     }
 
     #[test]

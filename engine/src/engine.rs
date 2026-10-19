@@ -18,7 +18,7 @@ use crate::aggregate::native_run::NativeRun;
 use crate::binder::{bind, BindError, Catalog, Params};
 use crate::chdb::{Chdb, ChdbError};
 use crate::checkpoint::{Checkpoint, Checkpointer};
-use crate::clock::{Clock, Deadlines, SystemClock};
+use crate::clock::{Clock, SystemClock};
 use crate::cursor;
 use crate::diff::{Diff, Row};
 use crate::history::{ClickHouseHttp, HistoryError, HistorySource};
@@ -32,6 +32,7 @@ use crate::snapshot::{
     Snapshots,
 };
 use crate::source::{Event, EventSource, KafkaSource, SourceError, TopicStart};
+use crate::timeline::{Entry, KeyEntry, KeyTimeline, Timeline};
 use crate::watermark::Watermark;
 
 #[derive(Debug, thiserror::Error)]
@@ -369,9 +370,9 @@ impl Engine {
                 if let ResultState::Keyed(k) = &mut state {
                     k.restored_at(&at);
                 }
-                let deadlines = match plan.stream.windows.is_empty() {
-                    true => None,
-                    false => Some(Deadlines::load(&checkpoint.state["deadlines"]).map_err(bad)?),
+                let deadlines = match plan.stream.timed() {
+                    false => None,
+                    true => Some(Timed::load(&plan.stream, &checkpoint.state).map_err(bad)?),
                 };
                 self.start(
                     plan,
@@ -487,7 +488,7 @@ impl Engine {
             || plan.stream.limit.is_some()
             || plan.stream.offset.is_some()
             || plan.stream.keyed.is_some()
-            || !plan.stream.windows.is_empty();
+            || plan.stream.timed();
         if let (Some(token), false) = (since, stateful) {
             if let Some(cursor) = self.resumable(&plan, token, None).await? {
                 let first = First::CatchUp {
@@ -517,10 +518,10 @@ impl Engine {
         };
         let (begin, at, first, history_sql) = match resume_from {
             None => {
-                // with time windows, at the clock's now
-                let sql = match plan.stream.windows.is_empty() {
-                    true => plan.history.sql(&from),
-                    false => plan.history.sql_at(&from, self.clock.now_ns()),
+                // with now(), at the clock's now
+                let sql = match plan.stream.timed() {
+                    false => plan.history.sql(&from),
+                    true => plan.history.sql_at(&from, self.clock.now_ns()),
                 };
                 (
                     watermark.clone(),
@@ -677,7 +678,7 @@ impl Engine {
         first: First,
         history_sql: String,
         resumed: bool,
-        restored: Option<(ResultState, Option<Deadlines>)>,
+        restored: Option<(ResultState, Option<Timed>)>,
     ) -> Result<Subscription, EngineError> {
         let mut starts = Vec::new();
         for topic in &plan.stream.topics {
@@ -698,17 +699,12 @@ impl Engine {
             _ => (ResultState::for_plan(&plan.stream), None),
         };
         let snapshot = lease.as_ref().map(|l| l.used());
-        let (iterations, checkpointer) = match plan.stream.windows.is_empty() {
-            true => self.iterations(&plan, lease, first, at, events, state),
-            false => self.timed_iterations(
-                &plan,
-                lease,
-                first,
-                at,
-                events,
-                state,
-                deadlines.unwrap_or_default(),
-            ),
+        let (iterations, checkpointer) = match plan.stream.timed() {
+            false => self.iterations(&plan, lease, first, at, events, state),
+            true => {
+                let timed = deadlines.unwrap_or_else(|| Timed::for_plan(&plan.stream));
+                self.timed_iterations(&plan, lease, first, at, events, state, timed)
+            }
         };
         Ok(Subscription {
             plan,
@@ -847,7 +843,7 @@ impl Engine {
             tracing::info!("FINAL queries don't resume yet; starting over");
             return Ok(None);
         }
-        if !plan.stream.windows.is_empty() {
+        if plan.stream.timed() {
             tracing::info!("queries with now() don't resume yet; starting over");
             return Ok(None);
         }
@@ -938,9 +934,10 @@ impl Engine {
         stream::once(items).flatten().boxed()
     }
 
-    /// A plan with time windows (`col > now() - INTERVAL …`): the items, and between them the
-    /// clock, re-read every refresh interval; each reading deletes the rows whose deadline it
-    /// passed (one iteration, if any). It ticks on after a finite source ends.
+    /// A plan with `now()` in its WHERE: the items, and between them the clock, waking at the
+    /// earliest instant a row goes out or comes in (plus the coalescing window); each wake
+    /// deletes and inserts the rows due (one iteration, if anything changed). It goes on after
+    /// a finite source ends, while rows can still change.
     #[allow(clippy::too_many_arguments)]
     fn timed_iterations(
         &self,
@@ -950,7 +947,7 @@ impl Engine {
         at: Watermark,
         events: BoxStream<'static, Event>,
         state: ResultState,
-        deadlines: Deadlines,
+        deadlines: Timed,
     ) -> (
         BoxStream<'static, Result<Iteration, EngineError>>,
         Checkpointer,
@@ -963,7 +960,7 @@ impl Engine {
             Arc::new(move || {
                 let (state, at, deadlines) = &*shared.lock().unwrap();
                 let mut state = state.save();
-                state["deadlines"] = deadlines.save();
+                state["timeline"] = deadlines.save();
                 Checkpoint {
                     at: at.clone(),
                     state,
@@ -976,12 +973,15 @@ impl Engine {
             let (shared, plan, clock) = (shared.clone(), stream_plan.clone(), clock.clone());
             async move {
                 loop {
-                    // wake at the earliest deadline, plus the window for the rows due
-                    // close after it; re-armed every turn (an event can bring it forward)
+                    // wake at the earliest instant a row goes out or comes in, plus the
+                    // window for the ones due close after it; re-armed every turn (an event
+                    // can bring it forward)
                     let earliest = shared.lock().unwrap().2.earliest();
                     let wake = crate::clock::wait_for(clock.as_ref(), earliest, coalescing);
                     // the clock first: it's only ready when due, so events can't starve it
                     let item = if ended {
+                        // nothing more to come, by event or by clock: the end
+                        earliest?;
                         wake.await;
                         None
                     } else {
@@ -1002,7 +1002,7 @@ impl Engine {
                     let now = clock.now_ns();
                     let it = match item {
                         Some(Item::History(rows)) => {
-                            timed_history_iteration(&plan, state, at, rows, deadlines)
+                            timed_history_iteration(&plan, state, at, rows, deadlines, now)
                         }
                         Some(Item::Event(event)) => Ok(timed_event_iteration(
                             &plan, state, at, event, now, deadlines,
@@ -1017,15 +1017,8 @@ impl Engine {
                         }
                         Some(Item::Failed(e)) => Err(e),
                         None => {
-                            // rows whose deadline the clock passed leave, from the bottom
-                            let diffs: Vec<Diff> = deadlines
-                                .expire(now)
-                                .into_iter()
-                                .map(|index| {
-                                    state.remove_at(index);
-                                    Diff::Delete { index }
-                                })
-                                .collect();
+                            // the rows due go out (from the bottom) and come in
+                            let diffs = deadlines.due(&plan, state, now);
                             if diffs.is_empty() {
                                 continue;
                             }
@@ -1518,6 +1511,19 @@ impl ResultState {
         row: &DecodedRow,
         at: (i32, i64),
     ) -> Vec<Diff> {
+        let matches = plan.matches(row);
+        self.event_matching(plan, row, at, matches)
+    }
+
+    /// [`Self::event`], with whether the row is in the result decided by the caller (with
+    /// `now()`: by its schedule).
+    pub(crate) fn event_matching(
+        &mut self,
+        plan: &StreamPlan,
+        row: &DecodedRow,
+        at: (i32, i64),
+        matches: bool,
+    ) -> Vec<Diff> {
         match (self, &plan.keyed) {
             (ResultState::Keyed(state), Some(keyed)) => {
                 let (id, ver, deleted) = keyed.event(row);
@@ -1531,12 +1537,12 @@ impl ResultState {
                     ver,
                     key,
                     deleted,
-                    matches: plan.matches(row),
+                    matches,
                     at,
                 };
                 state.event(v, || plan.project(row))
             }
-            (state, _) if plan.matches(row) => {
+            (state, _) if matches => {
                 let key = plan.order.as_ref().map(|o| o.event_key(row));
                 state.place(plan.project(row), key)
             }
@@ -1653,40 +1659,182 @@ fn catch_up_iteration(
 
 /// One event: decode by column types, filter, project, and place it. An insert and the delete
 /// it causes come in the same iteration, insert first, so they always land in the same diff.
-/// The history of a plan with time windows: each row's deadline, then as usual.
+/// The rows of a result with `now()` in its WHERE, as time passes.
+#[derive(Debug, Clone)]
+pub(crate) enum Timed {
+    /// Plain rows: by their place in the result.
+    Rows(Timeline),
+    /// FINAL: by key.
+    Keys(KeyTimeline),
+}
+
+impl Timed {
+    fn for_plan(plan: &StreamPlan) -> Self {
+        match plan.keyed {
+            Some(_) => Timed::Keys(KeyTimeline::default()),
+            None => Timed::Rows(Timeline::default()),
+        }
+    }
+
+    fn save(&self) -> serde_json::Value {
+        match self {
+            Timed::Rows(t) => t.save(),
+            Timed::Keys(k) => k.save(),
+        }
+    }
+
+    /// From a checkpoint's state (also its older `deadlines`).
+    fn load(plan: &StreamPlan, state: &serde_json::Value) -> Result<Self, String> {
+        let saved = match &state["timeline"] {
+            serde_json::Value::Null => &state["deadlines"],
+            t => t,
+        };
+        Ok(match plan.keyed {
+            Some(_) => Timed::Keys(KeyTimeline::load(saved)?),
+            None => Timed::Rows(Timeline::load(saved)?),
+        })
+    }
+
+    fn earliest(&self) -> Option<i128> {
+        match self {
+            Timed::Rows(t) => t.earliest(),
+            Timed::Keys(k) => k.earliest(),
+        }
+    }
+
+    /// The rows due at `now` out of the result and into it: their diffs.
+    fn due(&mut self, plan: &StreamPlan, state: &mut ResultState, now: i128) -> Vec<Diff> {
+        let mut diffs = Vec::new();
+        match self {
+            Timed::Rows(t) => {
+                let (out, coming) = t.due(now);
+                for index in out {
+                    state.remove_at(index);
+                    diffs.push(Diff::Delete { index });
+                }
+                for e in coming {
+                    let row = e.row.clone().expect("a row coming in has its values");
+                    let d = state.event_matching(plan, &row, (0, -1), true);
+                    t.follow(&d, (!e.transitions.is_empty()).then_some(e));
+                    diffs.extend(d);
+                }
+            }
+            Timed::Keys(k) => {
+                for (_, e, comes_in) in k.due(now) {
+                    diffs.extend(state.event_matching(plan, &e.row, e.at, comes_in));
+                }
+            }
+        }
+        diffs
+    }
+}
+
+/// The history of a plan with `now()`: each row's schedule at `now`; the rows in now as usual,
+/// the ones that come in later held, the others (fetched as possible) dropped.
 fn timed_history_iteration(
     plan: &StreamPlan,
     state: &mut ResultState,
     at: &Watermark,
     rows: Result<Vec<Row>, HistoryError>,
-    deadlines: &mut Deadlines,
+    timed: &mut Timed,
+    now: i128,
 ) -> Result<Iteration, EngineError> {
-    let mut rows = rows?;
-    for row in &mut rows {
-        // NULL can't be in it (the history's WHERE): it would leave at once
-        let d = plan.history_deadline(row).map_err(bad_history_row)?;
-        deadlines.push(d.unwrap_or(i128::MIN));
+    let mut shown = Vec::new();
+    for mut row in rows? {
+        let decoded = plan.history_decode(&mut row).map_err(bad_history_row)?;
+        let schedule = plan.schedule(&decoded, now);
+        let in_now = schedule.in_now;
+        match timed {
+            Timed::Rows(t) => {
+                let entry = Entry::of(decoded, schedule);
+                match (in_now, entry) {
+                    (true, entry) => t.show(entry),
+                    (false, Some(entry)) => t.hold(entry),
+                    (false, None) => {}
+                }
+            }
+            Timed::Keys(k) => {
+                let keyed = plan.keyed.as_ref().expect("a keyed plan");
+                let (id, ver) = keyed
+                    .history_row(&mut row.clone())
+                    .map_err(bad_history_row)?;
+                k.set(
+                    &id,
+                    Some(KeyEntry {
+                        ver,
+                        row: decoded,
+                        at: (0, -1),
+                        transitions: schedule.transitions.into(),
+                    }),
+                );
+            }
+        }
+        if in_now {
+            shown.push(row);
+        }
     }
-    history_iteration(plan, state, at, Ok(rows))
+    history_iteration(plan, state, at, Ok(shown))
 }
 
-/// An event of a plan with time windows: one past its deadline at `now` doesn't match.
+/// An event of a plan with `now()`: in the result if it's in now, held if it comes in later
+/// (FINAL: a key's new version replaces its schedule).
 fn timed_event_iteration(
     plan: &StreamPlan,
     state: &mut ResultState,
     at: &mut Watermark,
     event: Event,
     now: i128,
-    deadlines: &mut Deadlines,
+    timed: &mut Timed,
 ) -> Iteration {
+    let place = (event.partition, event.offset);
     let diffs = match plan.decode(&event.value) {
-        Ok(row) => match plan.deadline(&row) {
-            Some(d) if now < d => {
-                let diffs = state.event(plan, &row, (event.partition, event.offset));
-                deadlines.follow(&diffs, d);
-                diffs
+        Ok(row) => match timed {
+            Timed::Rows(t) => {
+                let schedule = plan.schedule(&row, now);
+                let in_now = schedule.in_now;
+                let entry = Entry::of(row.clone(), schedule);
+                match (in_now, entry) {
+                    (true, entry) => {
+                        let diffs = state.event_matching(plan, &row, place, true);
+                        t.follow(&diffs, entry);
+                        diffs
+                    }
+                    (false, Some(entry)) => {
+                        t.hold(entry);
+                        Vec::new()
+                    }
+                    (false, None) => Vec::new(),
+                }
             }
-            _ => Vec::new(),
+            Timed::Keys(k) => {
+                let keyed = plan.keyed.as_ref().expect("a keyed plan");
+                let (id, ver, deleted) = keyed.event(&row);
+                // an older version than the key's latest (in the result, or scheduled): ignored
+                let latest = match (k.ver(&id), &*state) {
+                    (Some(v), _) => Some(v.clone()),
+                    (None, ResultState::Keyed(s)) => s.version(&id).cloned(),
+                    _ => None,
+                };
+                if latest.is_some_and(|l| ver.compare(&l) == Some(std::cmp::Ordering::Less)) {
+                    Vec::new()
+                } else {
+                    let schedule = match deleted {
+                        true => Default::default(),
+                        false => plan.schedule(&row, now),
+                    };
+                    let diffs = state.event_matching(plan, &row, place, schedule.in_now);
+                    k.set(
+                        &id,
+                        Some(KeyEntry {
+                            ver,
+                            row,
+                            at: place,
+                            transitions: schedule.transitions.into(),
+                        }),
+                    );
+                    diffs
+                }
+            }
         },
         Err(e) => {
             tracing::warn!(

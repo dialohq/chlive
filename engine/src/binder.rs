@@ -122,19 +122,18 @@ pub struct BoundQuery {
     pub aggregation: Option<Aggregation>,
     /// `key IN (SELECT …)`, a top-level AND condition of the WHERE (not part of `filter`).
     pub semi_join: Option<SemiJoin>,
-    /// `col > now() - INTERVAL …`, top-level AND conditions of the WHERE (not part of
-    /// `filter`): rows leave as time passes.
+    /// The `now()` comparisons in `filter` (`BoundExpr::Now` refers to them by index): rows go
+    /// in and out as time passes.
     pub windows: Vec<TimeWindow>,
 }
 
-/// `column > now(['tz']) ± INTERVAL …` (or `>=`): a row holds while the column's value is after
-/// the server's clock with the intervals applied (DAY and WEEK by the calendar in `tz`, the
-/// server's timezone if `None`).
+/// The `now(['tz']) ± INTERVAL …` side of a comparison in the WHERE (`BoundExpr::Now` has the
+/// column and the operator): the server's clock with the intervals applied (DAY and WEEK by the
+/// calendar in `tz`, the server's timezone if `None`). `column` is the column it's compared
+/// with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeWindow {
     pub column: ColumnId,
-    /// `>=` rather than `>`.
-    pub inclusive: bool,
     pub tz: Option<chrono_tz::Tz>,
     pub intervals: Vec<Interval>,
     /// The `now`'s, for errors.
@@ -270,9 +269,29 @@ pub enum BoundExpr {
         list: Vec<Value>,
         negated: bool,
     },
+    /// `column op now() ± INTERVAL …`, the column on the left (`<`, `<=`, `>`, `>=`); `window`
+    /// is the query's [`TimeWindow`] for the `now()` side.
+    Now {
+        window: usize,
+        column: ColumnId,
+        op: CmpOp,
+    },
 }
 
 impl BoundExpr {
+    /// Each `now()` comparison in it: window, operator, column.
+    pub fn visit_now(&self, f: &mut impl FnMut(usize, CmpOp, ColumnId)) {
+        match self {
+            BoundExpr::Now { window, column, op } => f(*window, *op, *column),
+            BoundExpr::And(l, r) | BoundExpr::Or(l, r) => {
+                l.visit_now(f);
+                r.visit_now(f);
+            }
+            BoundExpr::Not(e) => e.visit_now(f),
+            _ => {}
+        }
+    }
+
     /// Columns the expression reads, in first-use order.
     pub fn columns(&self, out: &mut Vec<ColumnId>) {
         match self {
@@ -291,6 +310,11 @@ impl BoundExpr {
             BoundExpr::Not(e)
             | BoundExpr::IsNull { expr: e, .. }
             | BoundExpr::InList { expr: e, .. } => e.columns(out),
+            BoundExpr::Now { column, .. } => {
+                if !out.contains(column) {
+                    out.push(*column);
+                }
+            }
         }
     }
 }
@@ -470,9 +494,9 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
         Some(expr) => split_subquery(expr)?,
         None => (None, None),
     };
-    let (selection, windows) = split_windows(selection, &table)?;
+    let mut windows = Vec::new();
     let filter = match &selection {
-        Some(expr) => Some(bind_where(expr, &table)?),
+        Some(expr) => Some(bind_cond(expr, &table, &mut windows, true)?),
         None => None,
     };
     let semi_join = match sub {
@@ -557,7 +581,7 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
         }
         None => Vec::new(),
     };
-    check_window_shape(query, &table, &windows, &order)?;
+    check_window_shape(query, &table, filter.as_ref(), &windows, &order)?;
     Ok(BoundQuery {
         table,
         filter,
@@ -645,102 +669,83 @@ fn split_subquery(expr: &Expr) -> Result<(Option<Expr>, Option<Sub<'_>>), BindEr
 }
 
 const NOW_PLACE: &str =
-    "now() is supported only as `column > now() - INTERVAL …` (or >=), a top-level AND condition";
+    "now() is supported only compared with a DateTime column (`ts > now() - INTERVAL 1 HOUR`), \
+     in the WHERE of the main query";
 
-/// The WHERE without its time windows (`col > now() - INTERVAL …` as top-level AND
-/// conditions), and those, with the column on the left.
-fn split_windows(
-    selection: Option<Expr>,
+/// `col op now() ± INTERVAL …` (either side; `<`, `<=`, `>`, `>=`): its window, and the
+/// condition with the column on the left; `None` when it isn't a comparison with `now()`.
+fn bind_now(
+    op: CmpOp,
+    left: &Expr,
+    right: &Expr,
     table: &BoundTable,
-) -> Result<(Option<Expr>, Vec<TimeWindow>), BindError> {
-    fn conjuncts(e: Expr, out: &mut Vec<Expr>) {
-        match e {
-            Expr::And(l, r) => {
-                conjuncts(*l, out);
-                conjuncts(*r, out);
-            }
-            e => out.push(e),
-        }
-    }
-    let Some(selection) = selection else {
-        return Ok((None, Vec::new()));
+    windows: &mut Vec<TimeWindow>,
+) -> Result<Option<BoundExpr>, BindError> {
+    // the column on the left: `now() … < col` is `col > now() …`
+    let (other, now, op) = match (left, right) {
+        (o, n @ Expr::Now { .. }) => (o, n, op),
+        (n @ Expr::Now { .. }, o) => (o, n, op.flipped()),
+        _ => return Ok(None),
     };
-    let mut all = Vec::new();
-    conjuncts(selection, &mut all);
-    let (mut rest, mut windows) = (Vec::new(), Vec::new());
-    for e in all {
-        let Expr::Compare {
-            op, left, right, ..
-        } = &e
-        else {
-            rest.push(e);
-            continue;
-        };
-        // the column on the left: `now() … < col` is `col > now() …`
-        let (col, now, op) = match (&**left, &**right) {
-            (Expr::Column(c), n @ Expr::Now { .. }) => (c, n, *op),
-            (n @ Expr::Now { .. }, Expr::Column(c)) => (c, n, op.flipped()),
-            _ => {
-                rest.push(e);
-                continue;
-            }
-        };
-        let Expr::Now {
-            tz,
-            intervals,
-            span,
-        } = now
-        else {
-            unreachable!("matched above")
-        };
-        let inclusive = match op {
-            CmpOp::Gt => false,
-            CmpOp::GtEq => true,
-            _ => {
-                return Err(BindError::at(
-                    format!(
-                        "`column {} now()`: rows that come in as time passes aren't supported yet; \
-                         use > or >= (rows leave as time passes)",
-                        op.symbol()
-                    ),
-                    *span,
-                ))
-            }
-        };
-        let c = column(table, col)?;
-        if !matches!(c.ty.kind, Kind::DateTime(_)) {
-            return Err(BindError::at(
-                format!(
-                    "now() is compared with DateTime or DateTime64 columns; {} is {}",
-                    c.name, c.ty
-                ),
-                col.span,
-            ));
-        }
-        windows.push(TimeWindow {
-            column: c.id,
-            inclusive,
-            tz: match tz {
-                None => None,
-                Some(name) => Some(
-                    name.parse::<chrono_tz::Tz>()
-                        .map_err(|_| BindError::at(format!("unknown timezone '{name}'"), *span))?,
-                ),
-            },
-            intervals: intervals.clone(),
-            span: *span,
-        });
+    let Expr::Now {
+        tz,
+        intervals,
+        span,
+    } = now
+    else {
+        unreachable!("matched above")
+    };
+    if matches!(op, CmpOp::Eq | CmpOp::NotEq) {
+        return Err(BindError::at(
+            format!(
+                "`column {} now()` is true for an instant (or all but one); use <, <=, > or >=",
+                op.symbol()
+            ),
+            *span,
+        ));
     }
-    let rest = rest
-        .into_iter()
-        .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)));
-    Ok((rest, windows))
+    let Expr::Column(col) = other else {
+        return Err(BindError::at(
+            "now() is compared with a DateTime or DateTime64 column",
+            other.span(),
+        ));
+    };
+    let c = column(table, col)?;
+    if !matches!(c.ty.kind, Kind::DateTime(_)) {
+        return Err(BindError::at(
+            format!(
+                "now() is compared with DateTime or DateTime64 columns; {} is {}",
+                c.name, c.ty
+            ),
+            col.span,
+        ));
+    }
+    windows.push(TimeWindow {
+        column: c.id,
+        tz: match tz {
+            None => None,
+            Some(name) => Some(
+                name.parse::<chrono_tz::Tz>()
+                    .map_err(|_| BindError::at(format!("unknown timezone '{name}'"), *span))?,
+            ),
+        },
+        intervals: intervals.clone(),
+        span: *span,
+    });
+    Ok(Some(BoundExpr::Now {
+        window: windows.len() - 1,
+        column: c.id,
+        op,
+    }))
 }
 
-/// The shapes time windows don't follow yet.
+/// The shapes `now()` conditions don't follow yet: plain FINAL rows or plain rows with OFFSET;
+/// LIMIT except where rows only leave from the bottom (every `now()` a top-level AND `>`/`>=`
+/// on the first ORDER BY column, DESC).
 fn check_window_shape(
     query: &Query,
     table: &BoundTable,
+    filter: Option<&BoundExpr>,
     windows: &[TimeWindow],
     order: &[OrderKey],
 ) -> Result<(), BindError> {
@@ -749,8 +754,8 @@ fn check_window_shape(
     };
     let unsupported =
         |what: &str| BindError::at(format!("now() with {what} isn't supported yet"), first.span);
-    if table.final_key.is_some() {
-        return Err(unsupported("FINAL"));
+    if table.final_key.is_some() && (query.limit.is_some() || offset_of(query).is_some()) {
+        return Err(unsupported("FINAL and LIMIT or OFFSET"));
     }
     if offset_of(query).is_some() {
         return Err(unsupported("OFFSET"));
@@ -767,6 +772,36 @@ fn check_window_shape(
                     table.column(first.column).name
                 ),
                 first.span,
+            ));
+        }
+        // and only leave, once
+        fn conjuncts<'a>(e: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+            match e {
+                BoundExpr::And(l, r) => {
+                    conjuncts(l, out);
+                    conjuncts(r, out);
+                }
+                e => out.push(e),
+            }
+        }
+        let mut top = Vec::new();
+        conjuncts(filter.expect("windows are in the WHERE"), &mut top);
+        let leaving = top
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    BoundExpr::Now {
+                        op: CmpOp::Gt | CmpOp::GtEq,
+                        ..
+                    }
+                )
+            })
+            .count();
+        if leaving != windows.len() {
+            return Err(unsupported(
+                "LIMIT where rows can come in or come back (only `column > now() …` as \
+                 top-level AND conditions)",
             ));
         }
     }
@@ -1126,6 +1161,9 @@ fn bind_call(
     span: Span,
     table: &BoundTable,
 ) -> Result<(String, Type, AggExpr), BindError> {
+    if name.eq_ignore_ascii_case("now") {
+        return Err(BindError::at(NOW_PLACE, span));
+    }
     let Some(func) = crate::aggregate::lookup(name) else {
         return Err(BindError::at(
             format!(
@@ -1557,26 +1595,44 @@ fn has_subquery(e: &Expr) -> bool {
 /// WHERE: a boolean expression over the table's columns. Comparisons need compatible types;
 /// literals are coerced to the other side's type here, once, not per event.
 fn bind_where(expr: &Expr, table: &BoundTable) -> Result<BoundExpr, BindError> {
+    bind_cond(expr, table, &mut Vec::new(), false)
+}
+
+/// A condition; with `timed`, comparisons with `now()` anywhere in it (their windows collected
+/// in `windows`).
+fn bind_cond(
+    expr: &Expr,
+    table: &BoundTable,
+    windows: &mut Vec<TimeWindow>,
+    timed: bool,
+) -> Result<BoundExpr, BindError> {
     match expr {
         Expr::InSubquery { span, .. } | Expr::Exists { span, .. } => {
             Err(BindError::at(SUBQUERY_PLACE, *span))
         }
         Expr::Now { span, .. } => Err(BindError::at(NOW_PLACE, *span)),
         Expr::And(l, r) => Ok(BoundExpr::And(
-            Box::new(bind_where(l, table)?),
-            Box::new(bind_where(r, table)?),
+            Box::new(bind_cond(l, table, windows, timed)?),
+            Box::new(bind_cond(r, table, windows, timed)?),
         )),
         Expr::Or(l, r) => Ok(BoundExpr::Or(
-            Box::new(bind_where(l, table)?),
-            Box::new(bind_where(r, table)?),
+            Box::new(bind_cond(l, table, windows, timed)?),
+            Box::new(bind_cond(r, table, windows, timed)?),
         )),
-        Expr::Not { expr, .. } => Ok(BoundExpr::Not(Box::new(bind_where(expr, table)?))),
+        Expr::Not { expr, .. } => Ok(BoundExpr::Not(Box::new(bind_cond(
+            expr, table, windows, timed,
+        )?))),
         Expr::Compare {
             op,
             left,
             right,
             span,
         } => {
+            if timed {
+                if let Some(now) = bind_now(*op, left, right, table, windows)? {
+                    return Ok(now);
+                }
+            }
             let (l, r) = (operand(left, table)?, operand(right, table)?);
             if matches!(l, Operand::Literal(Literal::Null, _))
                 || matches!(r, Operand::Literal(Literal::Null, _))
@@ -2151,8 +2207,10 @@ mod tests {
         );
     }
 
+    /// `now()` comparisons bind anywhere in the WHERE, the column on the left, each with its
+    /// own window.
     #[tokio::test]
-    async fn time_windows_bind_apart_from_the_filter() {
+    async fn now_comparisons_bind_anywhere_in_the_where() {
         const H: i128 = 3_600_000_000_000;
         let q = bind_sql(
             "select user_id from events where latency_ms > 5 \
@@ -2164,28 +2222,29 @@ mod tests {
         assert_eq!(
             q.windows
                 .iter()
-                .map(|w| (w.column, w.inclusive, shift_of(&w.intervals)))
+                .map(|w| (w.column, shift_of(&w.intervals)))
                 .collect::<Vec<_>>(),
-            [(ts, false, -H), (ts, true, -2 * H)]
+            [(ts, -H), (ts, -2 * H)]
         );
-        // the rest is the filter
-        assert!(matches!(q.filter, Some(BoundExpr::Compare { .. })));
-        // only a window: no filter
-        let q = bind_sql("select ts from events where ts > now()")
-            .await
-            .unwrap();
-        assert!(q.filter.is_none() && q.windows.len() == 1);
-        // the newest first, then LIMIT: rows leave from the bottom
-        assert!(bind_sql(
-            "select ts from events where ts > now() - interval 1 minute order by ts desc limit 5"
-        )
-        .await
-        .is_ok());
-        assert!(
-            bind_sql("select ts from events where ts > now() order by latency_ms")
-                .await
-                .is_ok()
-        );
+        let mut nows = Vec::new();
+        q.filter
+            .as_ref()
+            .unwrap()
+            .visit_now(&mut |w, op, c| nows.push((w, op, c)));
+        // `now() - 1h < ts` is `ts > now() - 1h`
+        assert_eq!(nows, [(0, CmpOp::Gt, ts), (1, CmpOp::GtEq, ts)]);
+        for sql in [
+            "select ts from events where ts > now() - interval 1 hour or latency_ms > 100",
+            "select ts from events where ts <= now()",
+            "select ts from events where not (ts > now() - interval 5 second)",
+            "select ts from events where (ts < now() and latency_ms > 1) or ts > now() + interval 1 day",
+            "select ts from events where ts > now() order by latency_ms",
+            // the newest first, then LIMIT: rows leave from the bottom
+            "select ts from events where ts > now() - interval 1 minute order by ts desc limit 5",
+        ] {
+            let q = bind_sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(!q.windows.is_empty(), "{sql}");
+        }
     }
 
     #[tokio::test]
@@ -2205,12 +2264,21 @@ mod tests {
     async fn now_is_refused_where_time_windows_dont_reach_yet() {
         let cases = [
             (
-                "select ts from events where ts > now() or latency_ms > 1",
-                "now() is supported only as `column > now() - INTERVAL …` (or >=), a top-level AND condition at 1:34",
+                "select ts from events where ts = now()",
+                "`column = now()` is true for an instant (or all but one); use <, <=, > or >= at 1:34",
             ),
             (
-                "select ts from events where ts < now()",
-                "`column < now()`: rows that come in as time passes aren't supported yet; use > or >= (rows leave as time passes) at 1:34",
+                "select ts from events where now() > 5",
+                "now() is compared with a DateTime or DateTime64 column at 1:37",
+            ),
+            (
+                "select now() from events",
+                "now() is supported only compared with a DateTime column (`ts > now() - INTERVAL 1 HOUR`), in the WHERE of the main query at 1:8",
+            ),
+            (
+                "select ts from events where ts > now() - interval 1 hour or latency_ms > 1 \
+                 order by ts desc limit 3",
+                "now() with LIMIT where rows can come in or come back (only `column > now() …` as top-level AND conditions) isn't supported yet at 1:34",
             ),
             (
                 "select ts from events where user_id > now()",

@@ -177,10 +177,10 @@ async fn rejections_over_websocket() -> Result<()> {
                     "HAVING is not supported yet",
                 ),
                 (
-                    "now_or",
-                    "select * from events where ts > now() or latency_ms > 1",
+                    "now_eq",
+                    "select * from events where ts = now()",
                     "INVALID_QUERY",
-                    "now() is supported only as",
+                    "`column = now()` is true for an instant",
                 ),
                 (
                     "now_group",
@@ -1320,6 +1320,96 @@ async fn group_arrays_are_edited_in_place() -> Result<()> {
                 live.edits,
                 live.whole_arrays
             );
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// Rows coming in as time passes, over the server: events produced 2 s ahead of the clock
+/// aren't in `ts <= now()` until then, and come in on time with no further events.
+#[tokio::test]
+async fn rows_come_in_as_time_passes() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let users: Vec<String> = (0..5).map(|k| format!("due{run}-{k}")).collect();
+    let list = users
+        .iter()
+        .map(|u| format!("'{u}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("select user_id, ts from events where user_id in ({list}) and ts <= now()");
+    with_server(config(), |server| {
+        async move {
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("d", &sql);
+            conn.wait_ready(&["d"], Duration::from_secs(60)).await?;
+            let due = chrono::Utc::now() + chrono::Duration::seconds(2);
+            let events: Vec<(String, String)> = users
+                .iter()
+                .map(|u| {
+                    (
+                        u.clone(),
+                        format!(
+                            r#"{{"ts":"{}","user_id":"{u}","country":"PL","path":"/","latency_ms":1,"amount":0}}"#,
+                            due.format("%Y-%m-%d %H:%M:%S%.3f")
+                        ),
+                    )
+                })
+                .collect();
+            producer::Producer::new(&config().kafka_brokers, "events")?
+                .produce_keyed(&events)
+                .await?;
+            // not before their time ...
+            while chrono::Utc::now() < due - chrono::Duration::milliseconds(300) {
+                anyhow::ensure!(
+                    conn.result("d").unwrap().rows.is_empty(),
+                    "rows came in early"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // ... then all of them, with no further events
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while conn.result("d").unwrap().rows.len() < 5 {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "rows didn't come in: {}",
+                    conn.result("d").unwrap().rows.len()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let came = chrono::Utc::now();
+            eprintln!("came in {} ms after their time", (came - due).num_milliseconds());
+            let live = conn.result("d").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert!(
+                live.protocol_violations.is_empty(),
+                "{:?}",
+                live.protocol_violations
+            );
+            // once ClickHouse has them too, the same rows
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let direct = clickhouse()
+                    .fetch(&sql.replace("from events", "from default.events"))
+                    .await?;
+                if multiset(&direct) == multiset(&live.rows) {
+                    break;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "ClickHouse has {direct:?}, live {:?}",
+                    live.rows
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             Ok(())
         }
         .boxed()
