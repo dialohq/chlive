@@ -119,6 +119,9 @@ pub struct LiveResult {
     /// Row ids (aggregated results), parallel to `rows`.
     pub ids: Vec<Option<String>>,
     pub updated: usize,
+    /// Array columns changed in place (`edit`s), and arrays sent whole in an update's `set`.
+    pub edits: usize,
+    pub whole_arrays: usize,
     /// Rows deleted (pushed out by a LIMIT, or FINAL's deleted keys).
     pub deleted: usize,
     /// Rows that came as inserts after the snapshot.
@@ -194,7 +197,23 @@ impl LiveResult {
                             match self.ids.iter().position(|x| x.as_deref() == id) {
                                 Some(i) => {
                                     for (k, v) in change["set"].as_object().expect("set") {
+                                        self.whole_arrays += usize::from(v.is_array());
                                         self.rows[i].insert(k.clone(), v.clone());
+                                    }
+                                    let edits = change["edit"].as_object().cloned();
+                                    for (column, e) in edits.unwrap_or_default() {
+                                        self.edits += 1;
+                                        let applied =
+                                            chlive_server::protocol::ArrayEdit::from_json(&e)
+                                                .and_then(|e| {
+                                                    match self.rows[i].get_mut(&column) {
+                                                        Some(v) => e.apply(v),
+                                                        None => Err(format!("no column {column}")),
+                                                    }
+                                                });
+                                        if let Err(e) = applied {
+                                            self.protocol_violations.push(e);
+                                        }
                                     }
                                     self.updated += 1;
                                     // ordered aggregates: the row moves to `index`

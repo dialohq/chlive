@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use serde_json::Value as Json;
 
 use crate::binder::{ColumnId, OrderKey};
-use crate::diff::{Diff, Row};
+use crate::diff::{ArrayEdit, Diff, Row};
 use crate::order::{KeyOrder, Ranking, SortKey};
 use crate::types::{decode, Type, Value};
 
@@ -46,7 +46,14 @@ pub struct GroupResult {
     rows: HashMap<String, Row>,
     /// What the client has: the rows of the groups in the result, as sent.
     sent: HashMap<String, Row>,
+    /// Array columns' elements (`groupArray`), by their identities: each group's latest, and
+    /// as sent; an update then edits the client's array instead of sending it whole.
+    arrays: HashMap<String, Arrays>,
+    sent_arrays: HashMap<String, Arrays>,
 }
+
+/// A group's array columns: each one's elements' identities, in order.
+pub type Arrays = Vec<(String, Vec<u64>)>;
 
 impl GroupResult {
     pub fn new(
@@ -74,7 +81,72 @@ impl GroupResult {
             ranking: Ranking::new(order),
             rows: HashMap::new(),
             sent: HashMap::new(),
+            arrays: HashMap::new(),
+            sent_arrays: HashMap::new(),
         }
+    }
+
+    /// The identities of a group's array elements, for its next row (before
+    /// [`Self::history`] or [`Self::changes`]).
+    pub fn set_arrays(&mut self, id: &str, arrays: Arrays) {
+        if arrays.is_empty() {
+            self.arrays.remove(id);
+        } else {
+            self.arrays.insert(id.to_string(), arrays);
+        }
+    }
+
+    /// A group's row goes to the client (whole): remembered as sent.
+    fn send(&mut self, id: &str) -> Row {
+        let row = self.rows[id].clone();
+        self.sent.insert(id.to_string(), row.clone());
+        match self.arrays.get(id) {
+            Some(a) => self.sent_arrays.insert(id.to_string(), a.clone()),
+            None => self.sent_arrays.remove(id),
+        };
+        row
+    }
+
+    /// A group leaves the client: whether it had it.
+    fn unsend(&mut self, id: &str) -> bool {
+        self.sent_arrays.remove(id);
+        self.sent.remove(id).is_some()
+    }
+
+    /// A sent group's update: the columns that changed, and the array columns among them as
+    /// edits where that's smaller (see [`ArrayEdit::between`]).
+    fn update_sent(&mut self, id: &str) -> (Row, Vec<(String, ArrayEdit)>) {
+        let sent = self.sent.get_mut(id).expect("sent");
+        let mut set: Row = self.rows[id]
+            .iter()
+            .filter(|(k, v)| sent.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (k, v) in &set {
+            sent.insert(k.clone(), v.clone());
+        }
+        let mut edit = Vec::new();
+        let new = self.arrays.get(id).cloned().unwrap_or_default();
+        if let Some(old) = self.sent_arrays.get(id) {
+            for (column, ids) in &new {
+                let Some((_, old_ids)) = old.iter().find(|(c, _)| c == column) else {
+                    continue;
+                };
+                let Some(Json::Array(values)) = set.get(column) else {
+                    continue;
+                };
+                if let Some(e) = ArrayEdit::between(old_ids, ids, values) {
+                    set.shift_remove(column);
+                    edit.push((column.clone(), e));
+                }
+            }
+        }
+        if new.is_empty() {
+            self.sent_arrays.remove(id);
+        } else {
+            self.sent_arrays.insert(id.to_string(), new);
+        }
+        (set, edit)
     }
 
     fn ordered(&self) -> bool {
@@ -86,6 +158,10 @@ impl GroupResult {
         let mut json = self.ranking.save();
         json["rows"] = serde_json::json!(self.rows);
         json["sent"] = serde_json::json!(self.sent);
+        if !self.arrays.is_empty() || !self.sent_arrays.is_empty() {
+            json["arrays"] = serde_json::json!(self.arrays);
+            json["sent_arrays"] = serde_json::json!(self.sent_arrays);
+        }
         json
     }
 
@@ -103,6 +179,15 @@ impl GroupResult {
         };
         self.rows = rows("rows")?;
         self.sent = rows("sent")?;
+        // older checkpoints have none: arrays then go whole once
+        let arrays = |name: &str| -> Result<HashMap<String, Arrays>, String> {
+            match &json[name] {
+                Json::Null => Ok(HashMap::new()),
+                v => serde_json::from_value(v.clone()).map_err(|_| bad(name)),
+            }
+        };
+        self.arrays = arrays("arrays")?;
+        self.sent_arrays = arrays("sent_arrays")?;
         Ok(())
     }
 
@@ -120,13 +205,19 @@ impl GroupResult {
         }
         self.ranking.history(keys);
         let mut diffs = Vec::new();
-        for e in self.ranking.iter().skip(self.offset).take(self.limit) {
-            let row = self.rows[&e.id].clone();
-            self.sent.insert(e.id.clone(), row.clone());
+        let window: Vec<String> = self
+            .ranking
+            .iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .map(|e| e.id.clone())
+            .collect();
+        for id in window {
+            let row = self.send(&id);
             diffs.push(Diff::Insert {
                 row,
                 index: None,
-                id: Some(e.id.clone()),
+                id: Some(id),
             });
         }
         diffs
@@ -156,6 +247,7 @@ impl GroupResult {
 
     /// A group is gone: out of the result if it was in, and (LIMIT) the next one comes in.
     fn remove(&mut self, id: String, diffs: &mut Vec<Diff>) {
+        self.arrays.remove(&id);
         let Some(old) = self.ranking.position(&id) else {
             self.rows.remove(&id);
             return;
@@ -170,7 +262,7 @@ impl GroupResult {
         }
         self.ranking.remove(&id);
         self.rows.remove(&id);
-        if self.sent.remove(&id).is_none() {
+        if !self.unsend(&id) {
             return;
         }
         diffs.push(Diff::Delete { index: old });
@@ -181,8 +273,7 @@ impl GroupResult {
         }
         if let Some(next) = self.ranking.get(n - 1).map(|e| e.id.clone()) {
             if !self.sent.contains_key(&next) {
-                let row = self.rows[&next].clone();
-                self.sent.insert(next.clone(), row.clone());
+                let row = self.send(&next);
                 diffs.push(Diff::Insert {
                     row,
                     index: self.ordered().then_some(n - 1),
@@ -202,14 +293,13 @@ impl GroupResult {
                 present.insert(x.clone());
             } else {
                 diffs.push(Diff::Delete { index: i });
-                self.sent.remove(x);
+                self.unsend(x);
             }
         }
         let ordered = self.ordered();
         for (j, x) in after.iter().enumerate() {
             if !present.contains(x) {
-                let row = self.rows[x].clone();
-                self.sent.insert(x.clone(), row.clone());
+                let row = self.send(x);
                 diffs.push(Diff::Insert {
                     row,
                     index: ordered.then_some(j),
@@ -234,24 +324,22 @@ impl GroupResult {
             self.ranking.place(&id, key);
         }
         let new = self.ranking.position(&id).expect("just placed");
-        self.rows.insert(id.clone(), row.clone());
+        self.rows.insert(id.clone(), row);
         let n = self.limit;
         let ordered = self.ordered();
         let index = move |i: usize| ordered.then_some(i);
         let was_in = self.sent.contains_key(&id);
         match (was_in, new < n) {
             (true, true) => {
-                let sent = self.sent.get_mut(&id).expect("sent");
-                let set: Row = row
-                    .into_iter()
-                    .filter(|(k, v)| sent.get(k) != Some(v))
-                    .collect();
-                for (k, v) in &set {
-                    sent.insert(k.clone(), v.clone());
-                }
+                let (set, edit) = self.update_sent(&id);
                 let to = (old != Some(new)).then_some(new);
-                if !set.is_empty() || to.is_some() {
-                    diffs.push(Diff::Update { id, set, index: to });
+                if !set.is_empty() || !edit.is_empty() || to.is_some() {
+                    diffs.push(Diff::Update {
+                        id,
+                        set,
+                        index: to,
+                        edit,
+                    });
                 }
             }
             (true, false) => {
@@ -259,10 +347,9 @@ impl GroupResult {
                 diffs.push(Diff::Delete {
                     index: old.expect("a sent group is ranked"),
                 });
-                self.sent.remove(&id);
+                self.unsend(&id);
                 if let Some(next) = self.ranking.get(n - 1).map(|e| e.id.clone()) {
-                    let row = self.rows[&next].clone();
-                    self.sent.insert(next.clone(), row.clone());
+                    let row = self.send(&next);
                     diffs.push(Diff::Insert {
                         row,
                         index: index(n - 1),
@@ -271,7 +358,7 @@ impl GroupResult {
                 }
             }
             (false, true) => {
-                self.sent.insert(id.clone(), row.clone());
+                let row = self.send(&id);
                 diffs.push(Diff::Insert {
                     row,
                     index: index(new),
@@ -279,7 +366,7 @@ impl GroupResult {
                 });
                 // the group pushed past the LIMIT goes
                 if let Some(out) = self.ranking.get(n).map(|e| e.id.clone()) {
-                    if self.sent.remove(&out).is_some() {
+                    if self.unsend(&out) {
                         diffs.push(Diff::Delete { index: n });
                     }
                 }
@@ -321,7 +408,7 @@ impl GroupResult {
         for i in (0..list.len()).rev() {
             if !staying.contains(&list[i]) {
                 diffs.push(Diff::Delete { index: i });
-                self.sent.remove(&list[i]);
+                self.unsend(&list[i]);
                 list.remove(i);
             }
         }
@@ -332,25 +419,18 @@ impl GroupResult {
                 .filter(|x| kept.contains(x))
                 .position(|x| *x == id)
                 .expect("stays");
-            let sent = self.sent.get_mut(&id).expect("sent");
-            let set: Row = self.rows[&id]
-                .iter()
-                .filter(|(k, v)| sent.get(*k) != Some(*v))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            for (k, v) in &set {
-                sent.insert(k.clone(), v.clone());
-            }
+            let (set, edit) = self.update_sent(&id);
             let to = (target != cur).then_some(target);
             if let Some(t) = to {
                 let x = list.remove(cur);
                 list.insert(t, x);
             }
-            if !set.is_empty() || to.is_some() {
+            if !set.is_empty() || !edit.is_empty() || to.is_some() {
                 diffs.push(Diff::Update {
                     id: id.clone(),
                     set,
                     index: to,
+                    edit,
                 });
             }
         }
@@ -358,8 +438,7 @@ impl GroupResult {
         let present: HashSet<String> = list.iter().cloned().collect();
         for (j, x) in after.iter().enumerate() {
             if !present.contains(x) {
-                let row = self.rows[x].clone();
-                self.sent.insert(x.clone(), row.clone());
+                let row = self.send(x);
                 diffs.push(Diff::Insert {
                     row,
                     index: ordered.then_some(j),
@@ -551,6 +630,83 @@ mod tests {
             lines(&r.changes(vec![gone("b")])),
             ["- @0", r#"+ @0 ["a"] {"g":"a","n":1}"#]
         );
+    }
+
+    /// A group with an array column `xs` of these elements (identity `i` holds `10 * i`).
+    fn with_xs(r: &mut GroupResult, g: &str, n: i64, xs: &[u64]) -> (String, Row) {
+        let (id, mut row) = row(g, n);
+        row.insert(
+            "xs".into(),
+            json!(xs.iter().map(|i| i * 10).collect::<Vec<_>>()),
+        );
+        r.set_arrays(&id, vec![("xs".into(), xs.to_vec())]);
+        (id, row)
+    }
+
+    #[test]
+    fn array_columns_change_by_edits() {
+        let mut r = GroupResult::new(vec![], None, None, vec![]);
+        let h = with_xs(&mut r, "a", 1, &[1, 2, 3, 4]);
+        r.history(vec![h]);
+        // appended
+        let t = with_xs(&mut r, "a", 2, &[1, 2, 3, 4, 5]);
+        assert_eq!(lines(&r.batch(vec![t])), [r#"~ ["a"] {"n":2} xs[+[50]]"#]);
+        // the oldest leave (time windows)
+        let t = with_xs(&mut r, "a", 2, &[3, 4, 5]);
+        assert_eq!(lines(&r.batch(vec![t])), [r#"~ ["a"] {} xs[-0+2 +[]]"#]);
+        // one replaced (FINAL): out of its place, in at the end
+        let t = with_xs(&mut r, "a", 2, &[3, 5, 6]);
+        assert_eq!(lines(&r.batch(vec![t])), [r#"~ ["a"] {} xs[-1+1 +[60]]"#]);
+        // mostly new: whole
+        let t = with_xs(&mut r, "a", 2, &[7, 8]);
+        assert_eq!(lines(&r.batch(vec![t])), [r#"~ ["a"] {"xs":[70,80]}"#]);
+        // the checkpoint keeps what was sent
+        let mut back = GroupResult::new(vec![], None, None, vec![]);
+        back.load(&r.save()).unwrap();
+        let t = with_xs(&mut back, "a", 2, &[7, 8, 9]);
+        assert_eq!(lines(&back.batch(vec![t])), [r#"~ ["a"] {} xs[+[90]]"#]);
+    }
+
+    /// Random arrays (elements gone anywhere, new ones at the end) in random groups, with a
+    /// LIMIT and ORDER BY: the client's list, built from the diffs alone, has every array.
+    #[test]
+    fn edits_rebuild_the_arrays() {
+        let mut rand = lcg(9);
+        for (limit, offset) in [(None, None), (Some(3), None), (Some(2), Some(1))] {
+            let mut r = GroupResult::new(vec![term("n", true)], limit, offset, vec![]);
+            let mut list = ResultList::default();
+            let mut arrays: HashMap<String, (i64, Vec<u64>)> = HashMap::new();
+            let mut next = 0;
+            for d in r.history(vec![]) {
+                list.apply(&d).unwrap();
+            }
+            for _ in 0..500 {
+                let g = format!("g{}", rand(5));
+                let id = format!("[\"{g}\"]");
+                let (n, mut xs) = arrays.remove(&id).unwrap_or((0, Vec::new()));
+                xs.retain(|_| rand(5) > 0);
+                for _ in 0..rand(3) {
+                    next += 1;
+                    xs.push(next);
+                }
+                let n = if rand(3) == 0 { rand(4) as i64 } else { n };
+                let change = if xs.is_empty() {
+                    (id.clone(), None)
+                } else {
+                    let (id, row) = with_xs(&mut r, &g, n, &xs);
+                    arrays.insert(id.clone(), (n, xs));
+                    (id, Some(row))
+                };
+                for d in r.changes(vec![change]) {
+                    list.apply(&d).unwrap_or_else(|e| panic!("{d}: {e}"));
+                }
+                for (id, row) in list.ids.iter().zip(&list.rows) {
+                    let (_, xs) = &arrays[id.as_ref().unwrap()];
+                    let want: Vec<u64> = xs.iter().map(|i| i * 10).collect();
+                    assert_eq!(row["xs"], json!(want), "{limit:?} {offset:?}");
+                }
+            }
+        }
     }
 
     #[test]

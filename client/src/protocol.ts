@@ -35,12 +35,37 @@ export type ClientMessage =
  *   move up.
  * - `update`: the row with this `id` has these new values (the columns that changed, or all of
  *   them); with an `index` (ordered aggregates), it also moves: taken out, and put back so it's
- *   at `index`.
+ *   at `index`. Array columns (`groupArray`) can change in place instead, by an `edit` per
+ *   column: the `remove` ranges (`[start, count]`, positions before the edit, ascending) go,
+ *   then `append` is added at the end. A column is in `set` or in `edit`, never both.
  */
 export type Change =
   | { op: "insert"; row: Row; index?: number; id?: string }
   | { op: "delete"; index?: number; id?: string }
-  | { op: "update"; id: string; set: Row; index?: number };
+  | { op: "update"; id: string; set: Row; index?: number; edit?: Record<string, ArrayEdit> };
+
+/** An array column's change in place: ranges removed, then values appended. */
+export interface ArrayEdit {
+  remove?: [number, number][];
+  append?: unknown[];
+}
+
+/** A new array: `array` with `edit` applied (it isn't changed); throws on a range outside it. */
+export function applyArrayEdit(array: unknown, edit: ArrayEdit): unknown[] {
+  if (!Array.isArray(array)) throw new Error(`an array edit of a non-array value ${JSON.stringify(array)}`);
+  const out: unknown[] = [];
+  let at = 0;
+  for (const [start, count] of edit.remove ?? []) {
+    if (!(Number.isInteger(start) && Number.isInteger(count)) || start < at || start + count > array.length) {
+      throw new Error(`removing [${start}, ${count}] of an array of ${array.length} elements`);
+    }
+    for (let i = at; i < start; i++) out.push(array[i]);
+    at = start + count;
+  }
+  for (let i = at; i < array.length; i++) out.push(array[i]);
+  for (const v of edit.append ?? []) out.push(v);
+  return out;
+}
 
 /** One ORDER BY key the result is kept in. */
 export interface OrderTerm {

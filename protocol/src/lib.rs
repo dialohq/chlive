@@ -13,7 +13,9 @@
 //!
 //! Aggregated results (GROUP BY or aggregates) have row ids, their group's key: new groups
 //! are inserts with an `id`, changed ones `update`s of the changed columns by `id`. Ordered,
-//! a group can move: its `update` then has an `index`, where the row is after the move.
+//! a group can move: its `update` then has an `index`, where the row is after the move. An
+//! array column (`groupArray`) changes in place, by an `edit` in the `update`: elements removed
+//! by position ranges, then values appended at the end (see [`ArrayEdit`]).
 //!
 //! FINAL results (on a ReplacingMergeTree) have row ids too, the row's key: a new key is an
 //! insert with an `id`, a new version an `update` by `id` (of the whole row), and a deleted
@@ -167,12 +169,60 @@ pub enum Change {
     },
     /// The row with this `id` has these new values (the columns that changed, or all of them),
     /// and, with an `index`, moves: it's taken out and put back so that it's at `index`.
+    ///
+    /// `edit` changes array columns in place, by column; a column is in `set` or in `edit`, never
+    /// both.
     Update {
         id: String,
         set: Row,
         #[serde(skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Edits::is_empty")]
+        edit: Edits,
     },
+}
+
+/// Array columns' edits, by column name, in column order.
+pub type Edits = serde_json::Map<String, serde_json::Value>;
+
+/// One array column's edit: the elements at the `remove` ranges (`[start, count]` positions in
+/// the array before the edit, ascending and apart) go, then `append` goes at the end.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArrayEdit {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<[usize; 2]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub append: Vec<serde_json::Value>,
+}
+
+impl ArrayEdit {
+    /// Read one from an `edit`'s value.
+    pub fn from_json(json: &serde_json::Value) -> Result<Self, String> {
+        serde_json::from_value(json.clone()).map_err(|e| format!("a bad array edit: {e}"))
+    }
+
+    /// Apply to an array value; fails on a range outside it, or on a value that isn't one.
+    pub fn apply(&self, array: &mut serde_json::Value) -> Result<(), String> {
+        let serde_json::Value::Array(items) = array else {
+            return Err(format!("an array edit of a non-array value {array}"));
+        };
+        let mut end = 0;
+        for &[start, count] in &self.remove {
+            if start < end || start + count > items.len() {
+                return Err(format!(
+                    "removing [{start}, {count}] of an array of {} elements",
+                    items.len()
+                ));
+            }
+            end = start + count;
+        }
+        for &[start, count] in self.remove.iter().rev() {
+            items.drain(start..start + count);
+        }
+        items.extend(self.append.iter().cloned());
+        Ok(())
+    }
 }
 
 /// Protocol misuse: a message the server couldn't read (no id).
@@ -291,16 +341,39 @@ mod tests {
             {"op": "insert", "row": {"a": 2}, "index": 0, "id": "[\"x\"]"},
             {"op": "update", "id": "[\"x\"]", "set": {"a": 3}},
             {"op": "update", "id": "[\"x\"]", "set": {}, "index": 1},
+            {"op": "update", "id": "[\"x\"]", "set": {}, "edit": {"a": {"remove": [[0, 2]], "append": [7]}}},
             {"op": "delete", "index": 0},
             {"op": "delete", "id": "[\"x\"]"}
         ], "at": "c2"}));
-        assert!(matches!(&m, ServerMsg::Diff { changes, .. } if changes.len() == 6));
+        assert!(matches!(&m, ServerMsg::Diff { changes, .. } if changes.len() == 7));
         round_trip::<ServerMsg>(json!({"type": "progress", "id": "s1", "at": "c3"}));
         let m: ServerMsg =
             round_trip(json!({"type": "error", "code": "BAD_MESSAGE", "message": "nope"}));
         assert_eq!(m.id(), None);
         round_trip::<ServerMsg>(
             json!({"type": "error", "id": "s1", "code": SYNTAX_ERROR, "message": "x at 1:2"}),
+        );
+    }
+
+    #[test]
+    fn array_edits_remove_then_append() {
+        let e =
+            ArrayEdit::from_json(&json!({"remove": [[0, 1], [2, 2]], "append": ["z"]})).unwrap();
+        let mut a = json!(["a", "b", "c", "d", "e"]);
+        e.apply(&mut a).unwrap();
+        assert_eq!(a, json!(["b", "e", "z"]));
+        assert!(e.apply(&mut json!(["a"])).is_err(), "outside the array");
+        assert!(
+            ArrayEdit::from_json(&json!({"remove": [[1, 1], [0, 1]]}))
+                .unwrap()
+                .apply(&mut json!([1, 2]))
+                .is_err(),
+            "not ascending"
+        );
+        assert!(ArrayEdit::from_json(&json!({"insert": [1]})).is_err());
+        assert_eq!(
+            ArrayEdit::from_json(&json!({})).unwrap(),
+            ArrayEdit::default()
         );
     }
 

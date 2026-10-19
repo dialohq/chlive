@@ -316,6 +316,18 @@ function Generator() {
 const ago = (t, now) => (t === undefined ? "—" : `${(Math.max(0, now - t) / 1000).toFixed(1)} s ago`);
 const kb = (n) => (n < 10_000 ? `${n} B` : n < 10_000_000 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 
+/** An update's array edits, e.g. ` +2 −3`: elements appended and removed. */
+function arrayEdits(edit) {
+  if (!edit) return "";
+  let added = 0;
+  let removed = 0;
+  for (const e of Object.values(edit)) {
+    added += e.append?.length ?? 0;
+    for (const [, count] of e.remove ?? []) removed += count;
+  }
+  return `${added ? ` +${added}` : ""}${removed ? ` −${removed}` : ""}`;
+}
+
 /** One line about a message: its type, and for a diff its changes, e.g. `+@3 -@10`. */
 function summarize(msg) {
   if (msg.type === "snapshot") return `snapshot: ${msg.rows.length} rows`;
@@ -333,7 +345,7 @@ function summarize(msg) {
       : c.op === "delete"
         ? `-@${c.index}`
         : c.op === "update"
-          ? `~${c.id}${c.index !== undefined ? `@${c.index}` : ""}`
+          ? `~${c.id}${c.index !== undefined ? `@${c.index}` : ""}${arrayEdits(c.edit)}`
           : c.op,
   );
   const shown = ops.length > 12 ? [...ops.slice(0, 12), `… ${ops.length - 12} more`] : ops;

@@ -499,7 +499,7 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
                         return Err(BindError::at(
                             format!(
                                 "now() with {}() isn't supported yet \
-                                 (with now(): count, sum, avg, min, max)",
+                                 (with now(): count, sum, avg, min, max, groupArray)",
                                 func.name()
                             ),
                             w.span,
@@ -516,7 +516,7 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
                         return Err(BindError::at(
                             format!(
                                 "FINAL on {} (ReplacingMergeTree) with {}() isn't supported yet \
-                                 (on FINAL: count, sum, avg, min, max)",
+                                 (on FINAL: count, sum, avg, min, max, groupArray)",
                                 table.name,
                                 func.name()
                             ),
@@ -2109,8 +2109,10 @@ mod tests {
         }
         assert_eq!(
             err("select deleted, uniq(version) from products final group by deleted").await,
-            unsupported("uniq()", "1:45")
-                .replace(" at 1:45", " (on FINAL: count, sum, avg, min, max) at 1:45")
+            unsupported("uniq()", "1:45").replace(
+                " at 1:45",
+                " (on FINAL: count, sum, avg, min, max, groupArray) at 1:45"
+            )
         );
         assert_eq!(
             err("select * from products final where product_id in (select item_id from items)")
@@ -2216,7 +2218,7 @@ mod tests {
             ),
             (
                 "select uniq(user_id) from events where ts > now()",
-                "now() with uniq() isn't supported yet (with now(): count, sum, avg, min, max) at 1:45",
+                "now() with uniq() isn't supported yet (with now(): count, sum, avg, min, max, groupArray) at 1:45",
             ),
             (
                 "select ts from events where ts > now() limit 3 offset 1",
@@ -2820,9 +2822,12 @@ mod tests {
             bind_sql("select user_id, groupArray(ts) as g from events group by user_id order by g")
                 .await
                 .unwrap_err();
-        assert!(e.contains("g"), "{e}");
-        // and it's chDB's: there's no native implementation
-        assert!(crate::aggregate::native(AggFunc::GroupArray).is_none());
+        assert!(
+            e.starts_with("ordering by g of type Array(DateTime64(3)) is not supported"),
+            "{e}"
+        );
+        // and it's native
+        assert!(crate::aggregate::native(AggFunc::GroupArray).is_some());
     }
 
     #[tokio::test]

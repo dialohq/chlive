@@ -51,6 +51,21 @@ pub trait AggregateState: Send + Sync {
         let _ = value;
         unreachable!("this state can't take values back")
     }
+    /// [`Self::update`] by a row with this identity (numbers that grow in arrival order), for
+    /// functions whose result depends on which row added what (`groupArray`).
+    fn update_row(&mut self, value: Option<&Value>, row: u64) {
+        let _ = row;
+        self.update(value)
+    }
+    /// [`Self::retract`] of what the row with this identity added.
+    fn retract_row(&mut self, value: Option<&Value>, row: u64) {
+        let _ = row;
+        self.retract(value)
+    }
+    /// An array result's elements' identities, in order (`None`: not an array).
+    fn identities(&self) -> Option<Vec<u64>> {
+        None
+    }
     /// Merge another state of the same function.
     fn merge(&mut self, other: &dyn AggregateState);
     /// The result, as ClickHouse computes it.
@@ -92,6 +107,7 @@ pub fn native(func: AggFunc) -> Option<&'static dyn AggregateFunction> {
         AggFunc::Avg => Some(&native::Avg),
         AggFunc::Min => Some(&native::MinMax { max: false }),
         AggFunc::Max => Some(&native::MinMax { max: true }),
+        AggFunc::GroupArray => Some(&native::GroupArray),
         _ => None,
     }
 }

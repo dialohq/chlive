@@ -24,11 +24,81 @@ pub enum Diff {
     /// The row with this `id` has new values in these columns (aggregated results), and, with
     /// an `index` (ordered results), it moves: it's taken out, and put back so that it is at
     /// `index`.
+    ///
+    /// `edit` changes array columns in place (a `groupArray` gaining and losing elements)
+    /// instead of setting them whole; a column is in `set` or in `edit`, never both.
     Update {
         id: String,
         set: Row,
         index: Option<usize>,
+        edit: Vec<(String, ArrayEdit)>,
     },
+}
+
+/// A change to an array column: the elements in `remove` (`(start, count)` ranges of positions
+/// in the array before it, ascending and apart) go, then `append` is added at the end.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ArrayEdit {
+    pub remove: Vec<(usize, usize)>,
+    pub append: Vec<Value>,
+}
+
+impl ArrayEdit {
+    /// Apply to an array value.
+    pub fn apply(&self, array: &mut Value) -> Result<(), String> {
+        let Value::Array(items) = array else {
+            return Err(format!("an array edit of a non-array value {array}"));
+        };
+        let mut end = 0;
+        for &(start, count) in &self.remove {
+            if start < end || start + count > items.len() {
+                return Err(format!(
+                    "removing [{start}, {count}] of an array of {} elements",
+                    items.len()
+                ));
+            }
+            end = start + count;
+        }
+        for &(start, count) in self.remove.iter().rev() {
+            items.drain(start..start + count);
+        }
+        items.extend(self.append.iter().cloned());
+        Ok(())
+    }
+
+    /// The edit from one array to the next, by the elements' identities (ascending in both):
+    /// the ones gone, and the new ones, which must all come after the old ones. `None` when
+    /// they don't, or when the edit is no smaller than the new array itself.
+    pub fn between(old: &[u64], new: &[u64], values: &[Value]) -> Option<ArrayEdit> {
+        let mut remove: Vec<(usize, usize)> = Vec::new();
+        let mut j = 0;
+        for (i, id) in old.iter().enumerate() {
+            if new.get(j) == Some(id) {
+                j += 1;
+            } else {
+                match remove.last_mut() {
+                    Some((start, count)) if *start + *count == i => *count += 1,
+                    _ => remove.push((i, 1)),
+                }
+            }
+        }
+        // what's left of the new ones: appended, after every old one
+        if old
+            .last()
+            .is_some_and(|last| new[j..].first().is_some_and(|f| f <= last))
+        {
+            return None;
+        }
+        let removed: usize = remove.iter().map(|(_, c)| c).sum();
+        let appended = new.len() - j;
+        if removed + appended >= new.len() || old.len() - removed != j {
+            return None;
+        }
+        Some(ArrayEdit {
+            remove,
+            append: values[j..].to_vec(),
+        })
+    }
 }
 
 impl Diff {
@@ -95,12 +165,23 @@ impl ResultList {
 
     pub fn apply(&mut self, diff: &Diff) -> Result<(), String> {
         match diff {
-            Diff::Update { id, set, index } => {
+            Diff::Update {
+                id,
+                set,
+                index,
+                edit,
+            } => {
                 let i = self
                     .position(id)
                     .ok_or_else(|| format!("update of unknown row {id}"))?;
                 for (k, v) in set {
                     self.rows[i].insert(k.clone(), v.clone());
+                }
+                for (column, e) in edit {
+                    let value = self.rows[i]
+                        .get_mut(column)
+                        .ok_or_else(|| format!("an edit of {id}'s unknown column {column}"))?;
+                    e.apply(value)?;
                 }
                 if let Some(to) = *index {
                     if to >= self.rows.len() {
@@ -184,12 +265,25 @@ impl std::fmt::Display for Diff {
             }
             Diff::Delete { index } => write!(f, "- @{index}"),
             Diff::DeleteId { id } => write!(f, "- {id}"),
-            Diff::Update { id, set, index } => {
+            Diff::Update {
+                id,
+                set,
+                index,
+                edit,
+            } => {
                 write!(f, "~ {id}")?;
                 if let Some(i) = index {
                     write!(f, " @{i}")?;
                 }
-                write!(f, " {}", Value::Object(set.clone()))
+                write!(f, " {}", Value::Object(set.clone()))?;
+                for (column, e) in edit {
+                    write!(f, " {column}[")?;
+                    for (start, count) in &e.remove {
+                        write!(f, "-{start}+{count} ")?;
+                    }
+                    write!(f, "+{}]", Value::Array(e.append.clone()))?;
+                }
+                Ok(())
             }
         }
     }
@@ -239,6 +333,7 @@ mod tests {
                     id: id(rand(len) as usize),
                     set: Map::new(),
                     index: (rand(2) == 0).then(|| rand(len) as usize),
+                    edit: Vec::new(),
                 },
                 _ => continue,
             };
@@ -253,5 +348,82 @@ mod tests {
             }
         }
         assert!(list.apply(&Diff::DeleteId { id: "nope".into() }).is_err());
+    }
+
+    #[test]
+    fn array_edits_remove_ranges_then_append() {
+        let mut a = serde_json::json!([0, 1, 2, 3, 4, 5]);
+        let e = ArrayEdit {
+            remove: vec![(0, 2), (4, 1)],
+            append: vec![Value::from(9)],
+        };
+        e.apply(&mut a).unwrap();
+        assert_eq!(a, serde_json::json!([2, 3, 5, 9]));
+        for bad in [vec![(5, 2)], vec![(2, 2), (3, 1)]] {
+            let e = ArrayEdit {
+                remove: bad,
+                append: vec![],
+            };
+            assert!(e.apply(&mut serde_json::json!([0, 1, 2, 3, 4])).is_err());
+        }
+        assert!(ArrayEdit::default()
+            .apply(&mut serde_json::json!(1))
+            .is_err());
+        // in a result list, by id
+        let mut list = ResultList::default();
+        list.push(
+            Map::from_iter([("a".to_string(), serde_json::json!(["x", "y"]))]),
+            Some("k".into()),
+        );
+        let d = Diff::Update {
+            id: "k".into(),
+            set: Map::new(),
+            index: None,
+            edit: vec![(
+                "a".into(),
+                ArrayEdit {
+                    remove: vec![(0, 1)],
+                    append: vec![Value::from("z")],
+                },
+            )],
+        };
+        assert_eq!(d.to_string(), r#"~ k {} a[-0+1 +["z"]]"#);
+        list.apply(&d).unwrap();
+        assert_eq!(list.rows[0]["a"], serde_json::json!(["y", "z"]));
+    }
+
+    /// Edits between random arrays (elements gone anywhere, new ones at the end) rebuild the
+    /// new array; or there's none when the whole array is smaller.
+    #[test]
+    fn edits_between_arrays_rebuild_the_new_one() {
+        let mut rand = lcg(3);
+        let mut ids: Vec<u64> = (0..10).collect();
+        let mut next = 10;
+        let mut array: Value = Value::Array(ids.iter().map(|i| Value::from(*i)).collect());
+        for _ in 0..2000 {
+            let mut new: Vec<u64> = ids.iter().copied().filter(|_| rand(6) > 0).collect();
+            for _ in 0..rand(4) {
+                new.push(next);
+                next += 1;
+            }
+            let values: Vec<Value> = new.iter().map(|i| Value::from(*i)).collect();
+            match ArrayEdit::between(&ids, &new, &values) {
+                Some(e) => {
+                    let removed: usize = e.remove.iter().map(|(_, c)| c).sum();
+                    assert!(removed + e.append.len() < new.len());
+                    e.apply(&mut array).unwrap();
+                }
+                None => array = Value::Array(values.clone()),
+            }
+            assert_eq!(array, Value::Array(values));
+            ids = new;
+            if ids.is_empty() {
+                ids.push(next);
+                next += 1;
+                array = serde_json::json!([ids[0]]);
+            }
+        }
+        // new ones before an old one: no edit
+        assert!(ArrayEdit::between(&[1, 5], &[1, 5, 3, 7, 8, 9], &vec![Value::Null; 6]).is_none());
     }
 }

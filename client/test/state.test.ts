@@ -138,6 +138,41 @@ test("aggregated results: rows by id, updated in place", () => {
   assert.equal(s.rows()[2].n, 2);
 });
 
+test("array columns are edited in place: ranges removed, then values appended", () => {
+  const s = new ResultStore<{ country: string; users: string[] }>();
+  s.applySnapshot({
+    type: "snapshot",
+    id: "a",
+    columns: [
+      { name: "country", type: "String" },
+      { name: "users", type: "Array(String)" },
+    ],
+    rows: [{ country: "PL", users: ["a", "b", "c", "d"] }],
+    ids: ['["PL"]'],
+    at: "c1",
+  });
+  const before = s.rows();
+  s.applyDiff({
+    type: "diff",
+    id: "a",
+    at: "c2",
+    changes: [{ op: "update", id: '["PL"]', set: {}, edit: { users: { remove: [[0, 1], [2, 1]], append: ["e"] } } }],
+  });
+  assert.deepEqual(s.rows(), [{ country: "PL", users: ["b", "d", "e"] }]);
+  assert.deepEqual(before[0].users, ["a", "b", "c", "d"], "earlier rows are not mutated");
+  assert.throws(
+    () =>
+      s.applyDiff({
+        type: "diff",
+        id: "a",
+        at: "c3",
+        changes: [{ op: "update", id: '["PL"]', set: {}, edit: { users: { remove: [[2, 2]] } } }],
+      }),
+    /removing \[2, 2\] of an array of 3 elements/,
+  );
+  assert.deepEqual(s.rows()[0].users, ["b", "d", "e"]);
+});
+
 test("ordered aggregates: an update with an index moves the row", () => {
   const s = new ResultStore<{ country: string; n: number }>();
   s.applySnapshot({

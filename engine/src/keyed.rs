@@ -548,6 +548,7 @@ impl KeyedState {
                     id,
                     set: row(),
                     index,
+                    edit: Vec::new(),
                 }]
             }
             None if shown => {
@@ -592,6 +593,7 @@ impl KeyedState {
                         id,
                         set: row,
                         index: None,
+                        edit: Vec::new(),
                     }];
                 }
                 Vec::new()
@@ -672,6 +674,7 @@ impl KeyedState {
                         id,
                         set: row,
                         index: None,
+                        edit: Vec::new(),
                     }];
                 }
                 return Vec::new();
@@ -696,6 +699,7 @@ impl KeyedState {
                     id,
                     set: row,
                     index: (p != o).then_some(p - w.offset),
+                    edit: Vec::new(),
                 }];
             }
             let mut diffs = {
@@ -982,6 +986,7 @@ pub fn reorder(old: &[(String, Row)], new: &[(String, Row)]) -> Vec<Diff> {
                     id: id.clone(),
                     set: Row::new(),
                     index: Some(j),
+                    edit: Vec::new(),
                 });
                 let x = list.remove(i);
                 list.insert(j, x);

@@ -506,6 +506,142 @@ impl AggregateState for MinMaxState {
     }
 }
 
+// ------------------------------------------------------------------------------ groupArray
+
+/// `groupArray(x)` / `array_agg(x)`: the values, NULLs skipped, in arrival order (the history's
+/// in ClickHouse's order, which is unspecified, then the events'). Each element has an
+/// identity: the row that added it, or the next number; a row's element can be taken out by
+/// it, and results diffed by element.
+pub struct GroupArray;
+
+#[derive(Clone)]
+struct GroupArrayState {
+    items: BTreeMap<u64, Value>,
+    /// The next identity for a value without a row's.
+    next: u64,
+    arg_ty: Type,
+}
+
+impl AggregateFunction for GroupArray {
+    fn history_sql(
+        &self,
+        arg: Option<&str>,
+        _: Option<&Type>,
+        result_ty: &Type,
+    ) -> Vec<(String, Type)> {
+        vec![(
+            format!("groupArray({})", arg.unwrap_or("")),
+            result_ty.clone(),
+        )]
+    }
+
+    fn new_state(&self, arg_ty: Option<&Type>, _: &Type) -> Box<dyn AggregateState> {
+        Box::new(GroupArrayState {
+            items: BTreeMap::new(),
+            next: 0,
+            arg_ty: arg_ty.cloned().expect("groupArray has an argument"),
+        })
+    }
+}
+
+impl GroupArrayState {
+    fn push(&mut self, value: &Value) {
+        self.items.insert(self.next, value.clone());
+        self.next += 1;
+    }
+}
+
+impl AggregateState for GroupArrayState {
+    fn merge_history(&mut self, values: &[Value]) {
+        // the array as ClickHouse renders it: each element read as the argument's type, so
+        // it's rendered as the events' are
+        if let Some(Value::Raw(serde_json::Value::Array(elements))) = values.first() {
+            for e in elements {
+                let v =
+                    crate::types::decode(Some(e), &self.arg_ty).unwrap_or(Value::Raw(e.clone()));
+                if v != Value::Null {
+                    self.push(&v);
+                }
+            }
+        }
+    }
+
+    fn update(&mut self, value: Option<&Value>) {
+        if let Some(v) = value.filter(|v| **v != Value::Null) {
+            self.push(v);
+        }
+    }
+
+    fn update_row(&mut self, value: Option<&Value>, row: u64) {
+        if let Some(v) = value.filter(|v| **v != Value::Null) {
+            self.items.insert(row, v.clone());
+            self.next = self.next.max(row + 1);
+        }
+    }
+
+    fn retract(&mut self, value: Option<&Value>) {
+        // without the row: the first equal element
+        if let Some(v) = value.filter(|v| **v != Value::Null) {
+            if let Some(k) = self.items.iter().find(|(_, x)| *x == v).map(|(k, _)| *k) {
+                self.items.remove(&k);
+            }
+        }
+    }
+
+    fn retract_row(&mut self, _: Option<&Value>, row: u64) {
+        self.items.remove(&row);
+    }
+
+    fn identities(&self) -> Option<Vec<u64>> {
+        Some(self.items.keys().copied().collect())
+    }
+
+    fn merge(&mut self, other: &dyn AggregateState) {
+        if let Some(o) = other.as_any().downcast_ref::<Self>() {
+            for v in o.items.values() {
+                self.push(v);
+            }
+        }
+    }
+
+    fn finalize(&self) -> Value {
+        Value::Raw(serde_json::Value::Array(
+            self.items.values().map(Value::to_json).collect(),
+        ))
+    }
+
+    fn save(&self) -> serde_json::Value {
+        serde_json::json!({
+            "items": self
+                .items
+                .iter()
+                .map(|(k, v)| serde_json::json!([k, v.save()]))
+                .collect::<Vec<_>>(),
+            "next": self.next,
+        })
+    }
+
+    fn load(&mut self, json: &serde_json::Value) -> Result<(), String> {
+        let bad = || format!("checkpoint: bad groupArray {json}");
+        self.items.clear();
+        for e in json["items"].as_array().ok_or_else(bad)? {
+            let k = e.get(0).and_then(|k| k.as_u64()).ok_or_else(bad)?;
+            let v = e.get(1).and_then(Value::load).ok_or_else(bad)?;
+            self.items.insert(k, v);
+        }
+        self.next = json["next"].as_u64().ok_or_else(bad)?;
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn box_clone(&self) -> Box<dyn AggregateState> {
+        Box::new(self.clone())
+    }
+}
+
 /// A value in ORDER BY's total order (NaN after the numbers), as a map key.
 #[derive(Clone)]
 struct OrdValue(Value);
@@ -798,5 +934,32 @@ mod tests {
         assert_eq!(t(AggFunc::Any, "LowCardinality(String)").unwrap(), "String");
         assert!(t(AggFunc::Avg, "String").is_err());
         assert!(native(AggFunc::UniqExact).is_none());
+    }
+
+    #[test]
+    fn group_array_keeps_values_in_arrival_order() {
+        let (mut a, rt) = state(AggFunc::GroupArray, "Nullable(UInt64)");
+        assert_eq!(rt.clickhouse, "Array(UInt64)");
+        assert_eq!(a.finalize(), Value::Raw(serde_json::json!([])), "empty: []");
+        // the history's array: elements read as UInt64 (quoted, as ClickHouse may render them),
+        // and rendered as the engine renders every value
+        a.merge_history(&[Value::Raw(serde_json::json!(["7", "3"]))]);
+        a.update(Some(&Value::Null));
+        a.update(Some(&Value::Int(5)));
+        assert_eq!(a.finalize(), Value::Raw(serde_json::json!([7, 3, 5])));
+        assert_eq!(a.identities(), Some(vec![0, 1, 2]));
+        let mut back = state(AggFunc::GroupArray, "Nullable(UInt64)").0;
+        back.load(&a.save()).unwrap();
+        assert_eq!(back.save(), a.save());
+        // by row: each row's element taken out by it, whatever the values
+        let mut r = native(AggFunc::GroupArray)
+            .unwrap()
+            .new_retractable_state(Some(&Type::parse("String")), &rt);
+        for (row, v) in [(4, "a"), (9, "b"), (12, "a")] {
+            r.update_row(Some(&Value::String(v.into())), row);
+        }
+        r.retract_row(Some(&Value::String("a".into())), 12);
+        assert_eq!(r.finalize(), Value::Raw(serde_json::json!(["a", "b"])));
+        assert_eq!(r.identities(), Some(vec![4, 9]));
     }
 }

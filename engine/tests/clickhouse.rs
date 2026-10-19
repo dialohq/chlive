@@ -44,6 +44,23 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
+/// Arrays (`groupArray`) sorted, at any depth: their order isn't defined.
+fn sorted_arrays(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Array(items) => {
+            let mut items: Vec<serde_json::Value> = items.iter().map(sorted_arrays).collect();
+            items.sort_by_key(|i| i.to_string());
+            serde_json::Value::Array(items)
+        }
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.iter()
+                .map(|(k, v)| (k.clone(), sorted_arrays(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn url() -> String {
     std::env::var("CHLIVE_CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:18123".into())
 }
@@ -1089,7 +1106,7 @@ async fn aggregates_match_clickhouse() {
         "select country, uniqExact(name), uniq(n), median(amount) from events group by country",
         "select country, any(country), anyLast(country), uniqExact(score) from events group by country",
         "select median(score), uniqExact(flag) from events",
-        // groupArray (array_agg): every value (NULLs skipped), in no defined order
+        // groupArray (array_agg), natively: every value (NULLs skipped), in no defined order
         "select country, groupArray(name), array_agg(score) from events group by country",
         "select groupArray(flag), ARRAY_AGG(ts), count() from events where n > 0",
         // ordered and limited: checked in order, tie groups compared as sets, and with LIMIT
@@ -1774,6 +1791,11 @@ async fn final_aggregates_match_clickhouse() {
             false,
         ),
         (
+            "select grp, groupArray(product_id) as ids, array_agg(discount) as ds \
+             from products final where price > 20 group by grp",
+            false,
+        ),
+        (
             "select grp, count() as n, sum(discount) as d, avg(discount) as ad, \
              min(discount) as md, max(discount) as xd from products final where price > 30 \
              group by grp",
@@ -1853,7 +1875,7 @@ async fn final_aggregates_match_clickhouse() {
     let canon = |rows: &[chlive_engine::diff::Row], ordered: bool| -> Vec<String> {
         let mut v: Vec<String> = rows
             .iter()
-            .map(|r| round(&serde_json::Value::Object(r.clone())).to_string())
+            .map(|r| round(&sorted_arrays(&serde_json::Value::Object(r.clone()))).to_string())
             .collect();
         if !ordered {
             v.sort();
@@ -1962,6 +1984,15 @@ async fn time_window_aggregates_match_clickhouse() {
              where ts > now() - interval 1 minute",
             false,
         ),
+        (
+            "select user_id, groupArray(latency_ms) as xs, array_agg(ts) as tss from events \
+             where ts > now() - interval 1 minute group by user_id",
+            false,
+        ),
+        (
+            "select groupArray(cart_id) as ids from carts final where ts > now() - interval 1 minute",
+            false,
+        ),
     ];
     let mut engines = Vec::new();
     for (database, split) in [
@@ -2011,7 +2042,7 @@ async fn time_window_aggregates_match_clickhouse() {
     let canon = |rows: &[chlive_engine::diff::Row], ordered: bool| -> Vec<String> {
         let mut v: Vec<String> = rows
             .iter()
-            .map(|r| serde_json::Value::Object(r.clone()).to_string())
+            .map(|r| sorted_arrays(&serde_json::Value::Object(r.clone())).to_string())
             .collect();
         if !ordered {
             v.sort();

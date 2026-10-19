@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chlive_engine::diff::{Diff, ResultList, Row};
+use chlive_engine::diff::{ResultList, Row};
 use chlive_engine::watermark::Watermark;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value as Json};
@@ -474,21 +474,7 @@ pub fn apply_body(rows: &mut ResultList, body: &str) -> Result<(), String> {
     let changes: Vec<Change> = serde_json::from_value(msg["changes"].clone())
         .map_err(|e| format!("a logged message's changes: {e}"))?;
     for c in changes {
-        let d = match c {
-            Change::Insert { row, index, id } => Diff::Insert { row, index, id },
-            Change::Delete {
-                index: Some(index),
-                id: None,
-            } => Diff::Delete { index },
-            Change::Delete {
-                index: None,
-                id: Some(id),
-            } => Diff::DeleteId { id },
-            Change::Delete { .. } => {
-                return Err("a logged delete needs exactly one of index and id".into())
-            }
-            Change::Update { id, set, index } => Diff::Update { id, set, index },
-        };
+        let d = crate::protocol::diff(c)?;
         rows.apply(&d)?;
     }
     Ok(())

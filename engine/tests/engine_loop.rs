@@ -120,6 +120,9 @@ impl HistorySource for FakeHistory {
                 json!({"__k0": "u1", "__a0_0": 1, "__a1_0": 900, "__a2_0": 900, "__a2_1": 1}),
             )]),
             // top groups by total latency
+            // groupArray: the history's arrays, UInt32 elements
+            "SELECT user_id AS __k0, groupArray(latency_ms) AS __a0_0 FROM default.requests \
+             GROUP BY __k0" => Ok(vec![row(json!({"__k0": "u1", "__a0_0": [900, 300]}))]),
             "SELECT user_id AS __k0, sum(latency_ms) AS __a0_0 FROM default.requests GROUP BY __k0" => {
                 Ok(vec![
                     row(json!({"__k0": "u1", "__a0_0": 900})),
@@ -148,6 +151,12 @@ impl HistorySource for FakeHistory {
                 row(json!({"__key_0": "a", "__ver": 1, "__k0": 5, "__arg_1": 1})),
                 row(json!({"__key_0": "b", "__ver": 1, "__k0": 5, "__arg_1": 1})),
                 row(json!({"__key_0": "c", "__ver": 1, "__k0": 7, "__arg_1": 1})),
+            ]),
+            "SELECT product_id AS __key_0, version AS __ver, price AS __k0, \
+             version AS __arg_0 FROM default.products FINAL WHERE price > 2" => Ok(vec![
+                row(json!({"__key_0": "a", "__ver": 1, "__k0": 5, "__arg_0": 1})),
+                row(json!({"__key_0": "b", "__ver": 1, "__k0": 5, "__arg_0": 1})),
+                row(json!({"__key_0": "c", "__ver": 1, "__k0": 7, "__arg_0": 1})),
             ]),
             "SELECT product_id AS __key_0, version AS __ver, price AS __arg_1, \
              price AS __arg_2, price AS __arg_3 FROM default.products FINAL" => Ok(vec![
@@ -1413,6 +1422,89 @@ async fn aggregates_with_now_read_every_row_in_the_window() {
              WHERE (latency_ms > 1) AND ts > fromUnixTimestamp64Nano(toInt64({B})) \
              - INTERVAL 10 SECOND"
         )
+    );
+}
+
+/// groupArray, natively: events append to the group's array (an `edit`, not the whole array);
+/// with now(), rows leaving take their elements out from the front; with FINAL, a new version
+/// takes its key's element out and appends its own.
+#[tokio::test(start_paused = true)]
+async fn group_arrays_change_by_edits() {
+    let mut source = MemorySource::new();
+    source
+        .push("requests", 0, r#"{"user_id": "u1", "latency_ms": 1}"#) // offset 0: history
+        .push("requests", 0, r#"{"user_id": "u1", "latency_ms": 50}"#)
+        .push("requests", 0, r#"{"user_id": "u2", "latency_ms": 70}"#)
+        .push("requests", 0, r#"{"user_id": "u1", "latency_ms": 60}"#);
+    let lines: Vec<String> = engine(source)
+        .with_max_batch(1)
+        .subscribe("select user_id, groupArray(latency_ms) as xs from requests group by user_id")
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines,
+        [
+            "+ [\"u1\"] {\"user_id\":\"u1\",\"xs\":[900,300]}\nhistory: 1 rows",
+            "requests/0:1 ~ [\"u1\"] {} xs[+[50]]",
+            "requests/0:2 + [\"u2\"] {\"user_id\":\"u2\",\"xs\":[70]}",
+            "requests/0:3 ~ [\"u1\"] {} xs[+[60]]",
+        ]
+    );
+
+    // now(): u1's rows (B - 5 s, B - 1 s; latencies 3, 9), u2's (B - 2 s, 4), and two more
+    let e = clicks_engine(&[click("u1", -500, 4), click("u1", -400, 5)]);
+    assert_eq!(
+        timed_lines(
+            &e,
+            "select user_id, array_agg(latency_ms) as xs from clicks \
+             where ts > now() - interval 10 second group by user_id",
+        )
+        .await,
+        [
+            "0 + [\"u1\"] {\"user_id\":\"u1\",\"xs\":[3,9]}\n\
+             + [\"u2\"] {\"user_id\":\"u2\",\"xs\":[4]}\nhistory: 2 rows",
+            "0 clicks/0:1 ~ [\"u1\"] {} xs[+[4]]",
+            "0 clicks/0:2 ~ [\"u1\"] {} xs[+[5]]",
+            // the oldest go from the front
+            "5000 clock: ~ [\"u1\"] {} xs[-0+1 +[]]",
+            "8000 clock: - @1",
+            "9000 clock: ~ [\"u1\"] {} xs[-0+1 +[]]",
+            // fewer are left than an edit would take: whole
+            "9500 clock: ~ [\"u1\"] {\"xs\":[5]}",
+            "9600 clock: - @0",
+        ]
+    );
+
+    // FINAL: products a, b at 5 and c at 7 (version 1)
+    let p = |id: &str, price: u32, version: u64| {
+        format!(r#"{{"product_id": "{id}", "price": {price}, "version": {version}, "deleted": 0}}"#)
+    };
+    let mut source = MemorySource::new();
+    source
+        .push("products", 0, p("x", 5, 1)) // offset 0: history
+        .push("products", 0, p("a", 5, 2)) // a's element out, in again at the end
+        .push("products", 0, p("d", 5, 1));
+    let lines: Vec<String> = engine(source)
+        .with_max_batch(1)
+        .subscribe(
+            "select price, groupArray(version) as vs from products final where price > 2 \
+             group by price",
+        )
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines,
+        [
+            "+ [5] {\"price\":5,\"vs\":[1,1]}\n+ [7] {\"price\":7,\"vs\":[1]}\nhistory: 2 rows",
+            "products/0:1 ~ [5] {\"vs\":[1,2]}",
+            "products/0:2 ~ [5] {} vs[+[1]]",
+        ]
     );
 }
 

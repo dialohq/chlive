@@ -19,8 +19,66 @@ pub fn change(d: Diff) -> Change {
             index: None,
             id: Some(id),
         },
-        Diff::Update { id, set, index } => Change::Update { id, set, index },
+        Diff::Update {
+            id,
+            set,
+            index,
+            edit,
+        } => Change::Update {
+            id,
+            set,
+            index,
+            edit: edit
+                .into_iter()
+                .map(|(column, e)| {
+                    let e = ArrayEdit {
+                        remove: e.remove.into_iter().map(|(s, c)| [s, c]).collect(),
+                        append: e.append,
+                    };
+                    (column, serde_json::to_value(e).expect("an edit is JSON"))
+                })
+                .collect(),
+        },
     }
+}
+
+/// An engine diff from its wire form (the server's change log, as sent).
+pub fn diff(c: Change) -> Result<Diff, String> {
+    Ok(match c {
+        Change::Insert { row, index, id } => Diff::Insert { row, index, id },
+        Change::Delete {
+            index: Some(index),
+            id: None,
+        } => Diff::Delete { index },
+        Change::Delete {
+            index: None,
+            id: Some(id),
+        } => Diff::DeleteId { id },
+        Change::Delete { .. } => return Err("a delete needs exactly one of index and id".into()),
+        Change::Update {
+            id,
+            set,
+            index,
+            edit,
+        } => Diff::Update {
+            id,
+            set,
+            index,
+            edit: edit
+                .iter()
+                .map(|(column, e)| {
+                    let e = ArrayEdit::from_json(e)?;
+                    Ok((
+                        column.clone(),
+                        chlive_engine::diff::ArrayEdit {
+                            remove: e.remove.into_iter().map(|[s, c]| (s, c)).collect(),
+                            append: e.append,
+                        },
+                    ))
+                })
+                .collect::<Result<_, String>>()?,
+        },
+    })
 }
 
 fn term(column: &str, desc: bool, nulls_first: bool) -> OrderTerm {
@@ -160,11 +218,19 @@ mod tests {
                     id: "[\"PL\"]".into(),
                     set: row.clone(),
                     index: None,
+                    edit: Vec::new(),
                 }),
                 change(Diff::Update {
                     id: "[\"DE\"]".into(),
                     set: Row::new(),
                     index: Some(0),
+                    edit: vec![(
+                        "users".into(),
+                        chlive_engine::diff::ArrayEdit {
+                            remove: vec![(0, 2)],
+                            append: vec![json!("u7")],
+                        },
+                    )],
                 }),
                 change(Diff::Delete { index: 0 }),
                 change(Diff::DeleteId {
@@ -179,11 +245,21 @@ mod tests {
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}},
                 {"op": "insert", "row": {"user_id": "u1", "latency_ms": 10}, "index": 2},
                 {"op": "update", "id": "[\"PL\"]", "set": {"user_id": "u1", "latency_ms": 10}},
-                {"op": "update", "id": "[\"DE\"]", "set": {}, "index": 0},
+                {"op": "update", "id": "[\"DE\"]", "set": {}, "index": 0,
+                 "edit": {"users": {"remove": [[0, 2]], "append": ["u7"]}}},
                 {"op": "delete", "index": 0},
                 {"op": "delete", "id": "[\"PL\"]"}
             ], "at": "c2"})
         );
+        // and back, as the change log reads it
+        let ServerMsg::Diff { changes, .. } = diff.clone() else {
+            unreachable!()
+        };
+        let back: Vec<String> = changes
+            .into_iter()
+            .map(|c| super::diff(c).unwrap().to_string())
+            .collect();
+        assert_eq!(back[3], r#"~ ["DE"] @0 {} users[-0+2 +["u7"]]"#);
         assert_eq!(
             serde_json::to_value(ServerMsg::Progress {
                 id: "s1".into(),

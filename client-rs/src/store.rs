@@ -212,7 +212,12 @@ impl<R: DeserializeOwned> Store<R> {
                     len -= 1;
                     ops.push(Op::Delete { index });
                 }
-                chlive_protocol::Change::Update { id, set, index } => {
+                chlive_protocol::Change::Update {
+                    id,
+                    set,
+                    index,
+                    edit,
+                } => {
                     let from = ids
                         .position(&id)
                         .ok_or_else(|| format!("update of unknown row {id}"))?;
@@ -227,6 +232,13 @@ impl<R: DeserializeOwned> Store<R> {
                     };
                     for (k, v) in set {
                         json.insert(k, v);
+                    }
+                    // array columns changed in place
+                    for (column, e) in &edit {
+                        let value = json
+                            .get_mut(column)
+                            .ok_or_else(|| format!("an edit of {id}'s unknown column {column}"))?;
+                        chlive_protocol::ArrayEdit::from_json(e)?.apply(value)?;
                     }
                     let row = Arc::new(parse(json.clone())?);
                     staged.insert(id.clone(), json);
@@ -399,6 +411,30 @@ mod tests {
                 json!({"op": "update", "id": "[\"DE\"]", "set": {}})
             )])
             .is_err());
+    }
+
+    #[test]
+    fn array_columns_are_edited_in_place() {
+        let mut s = Store::<Row>::default();
+        s.snapshot(
+            vec![row(json!({"u": "PL", "users": ["a", "b", "c"]}))],
+            Some(vec!["[\"PL\"]".into()]),
+        )
+        .unwrap();
+        s.diff(vec![change(
+            json!({"op": "update", "id": "[\"PL\"]", "set": {},
+            "edit": {"users": {"remove": [[0, 2]], "append": ["d", "e"]}}}),
+        )])
+        .unwrap();
+        assert_eq!(s.rows()[0]["users"], json!(["c", "d", "e"]));
+        // a range outside the array: the diff fails, nothing changes
+        assert!(s
+            .diff(vec![change(
+                json!({"op": "update", "id": "[\"PL\"]", "set": {},
+                "edit": {"users": {"remove": [[2, 5]]}}})
+            )])
+            .is_err());
+        assert_eq!(s.rows()[0]["users"], json!(["c", "d", "e"]));
     }
 
     #[derive(Debug, Deserialize, PartialEq)]

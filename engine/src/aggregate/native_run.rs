@@ -47,6 +47,9 @@ struct Kept {
     group: String,
     /// Each aggregate's argument (`Null` for `count()`'s none).
     args: Vec<Value>,
+    /// Its identity in its group's states (in arrival order): which element it added to a
+    /// `groupArray`.
+    seq: u64,
 }
 
 /// What a checkpoint holds: every group's states, the ranking, and the cursor. Shared with the
@@ -59,7 +62,7 @@ struct Shared {
     kept: HashMap<String, Kept>,
     /// The kept rows' deadlines, earliest first.
     expiry: BTreeSet<(i128, String)>,
-    /// The next `#<n>` id.
+    /// The last kept row's `seq` (and without FINAL, its id: `#<seq>`).
     next_row: u64,
 }
 
@@ -84,7 +87,7 @@ impl Shared {
     fn take_out(&mut self, plan: &NativeAggregates, old: Kept, touch: &mut impl FnMut(&String)) {
         let g = self.groups.get_mut(&old.group).expect("a kept row's group");
         for (j, (agg, state)) in plan.aggs.iter().zip(&mut g.states).enumerate() {
-            state.retract(agg.arg.map(|_| &old.args[j]));
+            state.retract_row(agg.arg.map(|_| &old.args[j]), old.seq);
         }
         g.rows -= 1;
         if g.rows == 0 && !plan.keys.is_empty() {
@@ -246,6 +249,7 @@ impl NativeRun {
                         deadline,
                         group: k["group"].as_str().ok_or_else(bad)?.to_string(),
                         args,
+                        seq: k["seq"].as_u64().unwrap_or(0),
                     },
                 ));
             }
@@ -302,6 +306,7 @@ impl NativeRun {
                             // as a string: it doesn't fit JSON's numbers
                             "deadline": k.deadline.map(|d| d.to_string()),
                             "group": k.group,
+                            "seq": k.seq,
                             "args": k.args.iter().map(Value::save).collect::<Vec<_>>(),
                         })
                     })
@@ -380,6 +385,7 @@ impl NativeRun {
             let old = shared.forget(&id).expect("a due row is kept");
             shared.take_out(&self.plan, old, &mut touch);
         }
+        share_arrays(&self.plan, &shared.groups, &mut shared.result, &touched);
         let diffs = shared
             .result
             .changes(changes(&self.plan, &shared.groups, touched));
@@ -440,8 +446,10 @@ impl NativeRun {
                 },
             );
         }
-        let mut shared = self.shared.lock().unwrap();
+        let mut guard = self.shared.lock().unwrap();
+        let shared = &mut *guard;
         shared.groups = groups;
+        share_arrays(&self.plan, &shared.groups, &mut shared.result, &ids);
         let rows = ids
             .into_iter()
             .map(|id| row(&self.plan, &shared.groups, id))
@@ -477,14 +485,13 @@ impl NativeRun {
             ids.push(id);
         }
         for mut row in rows {
+            shared.next_row += 1;
+            let seq = shared.next_row;
             let (id, ver) = match &keyed {
                 Some(keyed) => keyed
                     .history_row(&mut row)
                     .map_err(|e| bad(format!("FINAL row: {e:?}")))?,
-                None => {
-                    shared.next_row += 1;
-                    (format!("#{}", shared.next_row), Value::Null)
-                }
+                None => (format!("#{seq}"), Value::Null),
             };
             // NULL can't be in it (the history's WHERE): it would leave at once
             let deadline = match timed {
@@ -521,7 +528,7 @@ impl NativeRun {
                 );
             }
             let g = shared.groups.get_mut(&group).expect("just made");
-            add(&self.plan, g, &args);
+            add(&self.plan, g, &args, seq);
             shared.keep(
                 id,
                 Kept {
@@ -529,9 +536,11 @@ impl NativeRun {
                     deadline,
                     group,
                     args,
+                    seq,
                 },
             );
         }
+        share_arrays(&self.plan, &shared.groups, &mut shared.result, &ids);
         let rows = ids
             .into_iter()
             .map(|id| row(&self.plan, &shared.groups, id))
@@ -602,12 +611,11 @@ impl NativeRun {
                 },
                 false => None,
             };
+            shared.next_row += 1;
+            let seq = shared.next_row;
             let id = match keyed {
                 Some(_) => id,
-                None => {
-                    shared.next_row += 1;
-                    format!("#{}", shared.next_row)
-                }
+                None => format!("#{seq}"),
             };
             let key: Vec<Json> = self.plan.keys.iter().map(|k| row[k.0].to_json()).collect();
             let args: Vec<Value> = self
@@ -623,7 +631,7 @@ impl NativeRun {
                 states: new_states(),
                 rows: 0,
             });
-            add(&self.plan, g, &args);
+            add(&self.plan, g, &args, seq);
             touch(&group);
             shared.keep(
                 id,
@@ -632,9 +640,11 @@ impl NativeRun {
                     deadline,
                     group,
                     args,
+                    seq,
                 },
             );
         }
+        share_arrays(&self.plan, &shared.groups, &mut shared.result, &touched);
         let diffs = shared
             .result
             .changes(changes(&self.plan, &shared.groups, touched));
@@ -686,6 +696,7 @@ impl NativeRun {
                 touched.push(id);
             }
         }
+        share_arrays(&self.plan, &shared.groups, &mut shared.result, &touched);
         let rows = touched
             .into_iter()
             .map(|id| row(&self.plan, &shared.groups, id))
@@ -717,12 +728,37 @@ fn changes(
         .collect()
 }
 
-/// A row's values into its group.
-fn add(plan: &NativeAggregates, group: &mut Group, args: &[Value]) {
+/// A row's values into its group, by its identity.
+fn add(plan: &NativeAggregates, group: &mut Group, args: &[Value], seq: u64) {
     for (j, (agg, state)) in plan.aggs.iter().zip(&mut group.states).enumerate() {
-        state.update(agg.arg.map(|_| &args[j]));
+        state.update_row(agg.arg.map(|_| &args[j]), seq);
     }
     group.rows += 1;
+}
+
+/// The groups' array columns' element identities, to the result (before their rows).
+fn share_arrays(
+    plan: &NativeAggregates,
+    groups: &HashMap<String, Group>,
+    result: &mut GroupResult,
+    ids: &[String],
+) {
+    for id in ids {
+        let Some(group) = groups.get(id) else {
+            continue;
+        };
+        let arrays: crate::aggregate::result::Arrays = plan
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                NativeItem::Agg(j, name) => {
+                    group.states[*j].identities().map(|ids| (name.clone(), ids))
+                }
+                NativeItem::Key(..) => None,
+            })
+            .collect();
+        result.set_arrays(id, arrays);
+    }
 }
 
 /// The group's row now (hidden ORDER BY columns included).

@@ -1,5 +1,5 @@
 import { type ColumnParser, columnParsers, parseRow, resolveParsers, type ValueParsers } from "./parsers.ts";
-import type { Column, DiffMessage, Row, SnapshotMessage } from "./protocol.ts";
+import { applyArrayEdit, type Column, type DiffMessage, type Row, type SnapshotMessage } from "./protocol.ts";
 
 /** A result as kept in a cache: the rows (as they came over the wire) and the cursor they're
  * complete to. */
@@ -158,8 +158,16 @@ export class ResultStore<R extends Row = Row> {
         case "update": {
           const i = indexOf(change.id);
           if (i === undefined) throw new Error(`update of unknown row ${change.id}`);
-          const wire = { ...raw[i], ...change.set };
-          const row = twin ? ({ ...next[i], ...parse(change.set) } as R) : (wire as R);
+          // array columns edited in place: their new values, as if set
+          let set = change.set;
+          if (change.edit) {
+            set = { ...set };
+            for (const [column, edit] of Object.entries(change.edit)) {
+              set[column] = applyArrayEdit(raw[i][column], edit);
+            }
+          }
+          const wire = { ...raw[i], ...set };
+          const row = twin ? ({ ...next[i], ...parse(set) } as R) : (wire as R);
           if (change.index === undefined || change.index === i) {
             raw[i] = wire;
             if (twin) next[i] = row;

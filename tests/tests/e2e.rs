@@ -193,7 +193,7 @@ async fn rejections_over_websocket() -> Result<()> {
                     "select uniq(price) from products final",
                     "INVALID_QUERY",
                     "FINAL on products (ReplacingMergeTree) with uniq() isn't supported yet \
-                     (on FINAL: count, sum, avg, min, max) at 1:34",
+                     (on FINAL: count, sum, avg, min, max, groupArray) at 1:34",
                 ),
             ];
             for (id, sql, _, _) in &cases {
@@ -1201,6 +1201,125 @@ async fn time_window_aggregates_lose_rows_as_time_passes() -> Result<()> {
                 .fetch(&sql.replace("from events", "from default.events"))
                 .await?;
             assert_eq!(multiset(&live.rows), multiset(&direct));
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// groupArray natively over the server: the client's arrays, built from inserts and in-place
+/// edits (appends), equal ClickHouse's (as sets: the order isn't defined), and most changes
+/// to them were edits, not whole arrays.
+#[tokio::test]
+async fn group_arrays_are_edited_in_place() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let users: Vec<String> = (0..6).map(|k| format!("ga{run}-{k}")).collect();
+    let list = users
+        .iter()
+        .map(|u| format!("'{u}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "select country, groupArray(latency_ms) as ls, array_agg(user_id) as us, count() as n \
+         from events where user_id in ({list}) group by country"
+    );
+    let events = move |round: u64| -> Vec<(String, String)> {
+        users
+            .iter()
+            .enumerate()
+            .map(|(k, u)| {
+                let n = round * 6 + k as u64;
+                (
+                    u.clone(),
+                    format!(
+                        r#"{{"ts":"{}","user_id":"{u}","country":"{}","path":"/","latency_ms":{},"amount":0}}"#,
+                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                        ["PL", "DE"][k % 2],
+                        n * 7 % 100
+                    ),
+                )
+            })
+            .collect()
+    };
+    with_server(config(), |server| {
+        async move {
+            let topic = producer::Producer::new(&config().kafka_brokers, "events")?;
+            let wait = |produced: std::collections::BTreeMap<i32, i64>| async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                loop {
+                    let have = ingested_from("events").await?;
+                    if produced
+                        .iter()
+                        .all(|(p, o)| have.get(p).is_some_and(|h| h >= o))
+                    {
+                        return anyhow::Ok(());
+                    }
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "events not ingested: {have:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            };
+            wait(topic.produce_keyed(&events(0)).await?).await?;
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("g", &sql);
+            conn.wait_ready(&["g"], Duration::from_secs(60)).await?;
+            for round in 1..=8 {
+                wait(topic.produce_keyed(&events(round)).await?).await?;
+            }
+            conn.wait_quiet(Duration::from_millis(1000), Duration::from_secs(60))
+                .await?;
+            let live = conn.result("g").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert!(
+                live.protocol_violations.is_empty(),
+                "{:?}",
+                live.protocol_violations
+            );
+            let direct = clickhouse()
+                .fetch(&sql.replace("from events", "from default.events"))
+                .await?;
+            let sorted = |rows: &[serde_json::Map<String, serde_json::Value>]| {
+                let mut v: Vec<String> = rows
+                    .iter()
+                    .map(|r| {
+                        let mut r = r.clone();
+                        for c in ["ls", "us"] {
+                            let mut items: Vec<String> = r[c]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|x| x.to_string())
+                                .collect();
+                            items.sort();
+                            r.insert(c.into(), serde_json::json!(items));
+                        }
+                        serde_json::Value::Object(r).to_string()
+                    })
+                    .collect();
+                v.sort();
+                v
+            };
+            assert_eq!(sorted(&live.rows), sorted(&direct));
+            eprintln!(
+                "groupArray: {} edits, {} whole arrays, {} updates",
+                live.edits, live.whole_arrays, live.updated
+            );
+            assert!(
+                live.edits > live.whole_arrays,
+                "{} edits, {} whole",
+                live.edits,
+                live.whole_arrays
+            );
             Ok(())
         }
         .boxed()
