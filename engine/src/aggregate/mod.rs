@@ -28,6 +28,15 @@ pub trait AggregateFunction: Send + Sync + 'static {
     ) -> Vec<(String, Type)>;
     /// A new, empty state for one group.
     fn new_state(&self, arg_ty: Option<&Type>, result_ty: &Type) -> Box<dyn AggregateState>;
+    /// A state values can also be taken back out of ([`AggregateState::retract`]): for results
+    /// whose rows are replaced or leave (FINAL).
+    fn new_retractable_state(
+        &self,
+        arg_ty: Option<&Type>,
+        result_ty: &Type,
+    ) -> Box<dyn AggregateState> {
+        self.new_state(arg_ty, result_ty)
+    }
 }
 
 /// One group's state of one aggregate.
@@ -36,6 +45,12 @@ pub trait AggregateState: Send + Sync {
     fn merge_history(&mut self, values: &[Value]);
     /// One event: its argument's value (`Value::Null` for NULL); `None` for `count()`.
     fn update(&mut self, value: Option<&Value>);
+    /// Take back one earlier `update` with this value (only on a state from
+    /// [`AggregateFunction::new_retractable_state`]).
+    fn retract(&mut self, value: Option<&Value>) {
+        let _ = value;
+        unreachable!("this state can't take values back")
+    }
     /// Merge another state of the same function.
     fn merge(&mut self, other: &dyn AggregateState);
     /// The result, as ClickHouse computes it.

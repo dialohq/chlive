@@ -148,6 +148,19 @@ pub struct NativeAggregates {
     pub items: Vec<NativeItem>,
     /// `country AS __k0, count() AS __a0_0, …`
     select: String,
+    /// FINAL: the history is every row, not states (see [`PerRow`]).
+    pub per_row: Option<PerRow>,
+}
+
+/// FINAL's aggregates keep each row's values, to take them back out when a newer version
+/// replaces the row (or deletes it, or it stops matching). The history reads every row: its
+/// key and version (`__key_<i>`, `__ver`, as [`KeyedPlan`] reads them), its group (`__k<i>`)
+/// and each aggregate's argument (`__arg_<j>`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerRow {
+    select: String,
+    /// Each aggregate's argument field in history rows, with its type (`count()`: none).
+    pub args: Vec<Option<(String, Type)>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +196,13 @@ impl AggregatePlan {
     /// snapshot of the table).
     pub fn native_history_sql(&self, from: &str) -> Option<String> {
         let native = self.native.as_ref()?;
+        if let Some(rows) = &native.per_row {
+            return Some(format!(
+                "SELECT {} FROM {from} FINAL{}",
+                rows.select,
+                self.where_clause()
+            ));
+        }
         Some(format!(
             "SELECT {} FROM {from}{}{}",
             native.select,
@@ -345,11 +365,38 @@ fn native_aggregates(agg: &Aggregation, table: &BoundTable) -> Option<NativeAggr
             }
         }
     }
+    let per_row = table.final_key.as_ref().map(|k| {
+        let mut select: Vec<String> = Vec::new();
+        for (i, id) in k.key.iter().enumerate() {
+            select.push(format!("{} AS __key_{i}", col(*id)));
+        }
+        if let Some(v) = k.ver {
+            select.push(format!("{} AS __ver", col(v)));
+        }
+        for (i, id) in agg.keys.iter().enumerate() {
+            select.push(format!("{} AS __k{i}", col(*id)));
+        }
+        let args = aggs
+            .iter()
+            .enumerate()
+            .map(|(j, a)| {
+                a.arg.map(|id| {
+                    select.push(format!("{} AS __arg_{j}", col(id)));
+                    (format!("__arg_{j}"), table.column(id).ty.clone())
+                })
+            })
+            .collect();
+        PerRow {
+            select: select.join(", "),
+            args,
+        }
+    });
     Some(NativeAggregates {
         keys: agg.keys.clone(),
         aggs,
         items,
         select: select.join(", "),
+        per_row,
     })
 }
 
@@ -1132,6 +1179,11 @@ impl std::fmt::Display for Plan {
             )?;
             writeln!(f, "merge:   {}", a.snapshot_sql("<chdb table>"))?;
             match a.native_history_sql("<snapshot>") {
+                Some(sql) if a.native.as_ref().is_some_and(|n| n.per_row.is_some()) => writeln!(
+                    f,
+                    "native:  {sql} (FINAL: every row's values in the engine, taken back out \
+                     when a version replaces it; chDB unused)"
+                )?,
                 Some(sql) => writeln!(f, "native:  {sql} (states in the engine; chDB unused)")?,
                 None => writeln!(
                     f,

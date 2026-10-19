@@ -130,6 +130,9 @@ const SHAPES: &[(&str, &str)] = &[
     ("keyed", "select user_id from requests final offset 4"),
     ("keyed", "select user_id, latency_ms from requests final order by latency_ms desc limit 2 offset 2"),
     ("keyed", "select user_id from requests final order by cost nulls first offset 3"),
+    ("native_final", "select latency_ms, count() as n, sum(cost) as s, avg(cost) as a, min(cost) as lo, max(cost) as hi from requests final group by latency_ms"),
+    ("native_final", "select latency_ms, count() as n from requests final group by latency_ms order by n desc, latency_ms limit 2 offset 1"),
+    ("native_final", "select count(), sum(latency_ms), min(cost) from requests final where latency_ms > 300"),
 ];
 
 #[tokio::test]

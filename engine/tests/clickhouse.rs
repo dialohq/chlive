@@ -18,6 +18,32 @@ use chlive_engine::{Engine, Origin};
 use futures::StreamExt;
 use serde_json::json;
 
+/// Counts the heap's live bytes and their peak, for `final_aggregates_at_scale`.
+struct Counting;
+
+static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            let now = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
+            PEAK.fetch_max(now, Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+        LIVE.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
 fn url() -> String {
     std::env::var("CHLIVE_CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:18123".into())
 }
@@ -1688,6 +1714,264 @@ async fn time_windows_match_clickhouse() {
         }
     }
     for (database, _, _) in &engines {
+        exec(&format!("DROP DATABASE {database}")).await;
+    }
+}
+
+/// Aggregates on FINAL, in every split of history and stream: each new version of a key takes
+/// its old values out of their group and puts its own in (deleted, in and out of the WHERE,
+/// moving between groups, groups coming and going), and the live result equals ClickHouse's
+/// `SELECT … FINAL … GROUP BY` over all the data.
+#[tokio::test]
+async fn final_aggregates_match_clickhouse() {
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    // versions only grow per key, sometimes tie; some versions delete their key
+    let mut seed: u64 = 23;
+    let mut rand = |n: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let mut versions = [0u64; 30];
+    let events: Vec<String> = (0..400)
+        .map(|i| {
+            let k = rand(30) as usize;
+            if rand(6) != 0 {
+                versions[k] += 1 + rand(3);
+            }
+            let discount = match rand(4) {
+                0 => "null".to_string(),
+                d => format!("{}", d as f64 * 0.1 + rand(10) as f64 * 0.01),
+            };
+            format!(
+                r#"{{"product_id":"k{k}","grp":"g{}","name":"n{i}","price":{},"discount":{discount},"version":{},"deleted":{}}}"#,
+                rand(5),
+                rand(100),
+                versions[k],
+                u8::from(rand(7) == 0)
+            )
+        })
+        .collect();
+    // (query, whether it's ordered: compared in order, otherwise as sets)
+    const CASES: &[(&str, bool)] = &[
+        (
+            "select count() as n, sum(price) as s, avg(price) as a, min(price) as lo, \
+             max(price) as hi from products final",
+            false,
+        ),
+        (
+            "select count() as n, sum(discount) as d, min(discount) as md from products final \
+             where price > 90",
+            false,
+        ),
+        (
+            "select grp, count() as n, sum(price) as s, min(name) as first, max(version) as v \
+             from products final group by grp",
+            false,
+        ),
+        (
+            "select grp, count() as n, sum(discount) as d, avg(discount) as ad, \
+             min(discount) as md, max(discount) as xd from products final where price > 30 \
+             group by grp",
+            false,
+        ),
+        // many small groups: they come and go
+        (
+            "select version, count() as n, sum(price) as s from products final group by version",
+            false,
+        ),
+        (
+            "select grp, price, count() as n from products final where price < 20 \
+             group by grp, price",
+            false,
+        ),
+        // ordered, limited, offset (ties broken by the group, so the result is exact)
+        (
+            "select grp, sum(price) as s from products final group by grp \
+             order by s desc, grp limit 2",
+            true,
+        ),
+        (
+            "select grp, count() as n from products final group by grp \
+             order by n, grp limit 2 offset 1",
+            true,
+        ),
+        (
+            "select version, count() as n from products final group by version \
+             order by n desc, version offset 3",
+            true,
+        ),
+    ];
+    let mut engines = Vec::new();
+    for (database, in_clickhouse) in [
+        ("chlive_engine_final_agg_history", events.len()),
+        ("chlive_engine_final_agg_stream", 0),
+        ("chlive_engine_final_agg_split", events.len() / 2),
+    ] {
+        exec(&format!("DROP DATABASE IF EXISTS {database}")).await;
+        exec(&format!("CREATE DATABASE {database}")).await;
+        exec(&format!(
+            "CREATE TABLE {database}.products (product_id String, grp String, name String, \
+             price UInt32, discount Nullable(Float64), version UInt64, deleted UInt8) \
+             ENGINE = ReplacingMergeTree(version, deleted) ORDER BY product_id"
+        ))
+        .await;
+        if in_clickhouse > 0 {
+            let rows: String = events[..in_clickhouse]
+                .iter()
+                .map(|e| format!("{e}\n"))
+                .collect();
+            exec(&format!(
+                "INSERT INTO {database}.products FORMAT JSONEachRow\n{rows}"
+            ))
+            .await;
+        }
+        let mut source = MemorySource::new();
+        for e in &events {
+            source.push("products", 0, e.as_str());
+        }
+        let engine = engine_at(database.into(), source, upto(in_clickhouse)).with_max_batch(7);
+        engines.push((database, engine));
+    }
+    let direct = ClickHouseHttp::new(&url(), "default", "");
+    // floats to 9 significant digits (sums taken back out can differ in the last ones)
+    fn round(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Number(n) if n.is_f64() => {
+                serde_json::json!(format!("{:.9e}", n.as_f64().unwrap()))
+            }
+            serde_json::Value::Object(o) => {
+                serde_json::Value::Object(o.iter().map(|(k, v)| (k.clone(), round(v))).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    let canon = |rows: &[chlive_engine::diff::Row], ordered: bool| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .map(|r| round(&serde_json::Value::Object(r.clone())).to_string())
+            .collect();
+        if !ordered {
+            v.sort();
+        }
+        v
+    };
+    for (sql, ordered) in CASES {
+        use chlive_engine::history::HistorySource;
+        let want = direct
+            .fetch(&sql.replace(
+                "from products",
+                "from chlive_engine_final_agg_history.products",
+            ))
+            .await
+            .unwrap();
+        assert!(!want.is_empty(), "{sql}");
+        for (database, engine) in &engines {
+            let iterations: Vec<_> = engine
+                .subscribe(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .map(|i| i.unwrap_or_else(|e| panic!("{database}: {sql}: {e}")))
+                .collect()
+                .await;
+            let mut list = chlive_engine::diff::ResultList::default();
+            for it in &iterations {
+                for d in &it.diffs {
+                    list.apply(d)
+                        .unwrap_or_else(|e| panic!("{database}: {sql}: {d}: {e}"));
+                }
+            }
+            assert_eq!(
+                canon(&list.rows, *ordered),
+                canon(&want, *ordered),
+                "{database}: {sql}"
+            );
+            eprintln!("{database:>32}: {sql}: {} groups", list.rows.len());
+        }
+    }
+    for (database, _) in &engines {
+        exec(&format!("DROP DATABASE {database}")).await;
+    }
+}
+
+/// How big a FINAL aggregate's state gets, and how fast it runs: for RMTs of growing size, the
+/// history's load time, the heap the state keeps and the peak while loading, then 100k events
+/// replacing rows. Run by hand (`--ignored --nocapture`, release for real numbers); prints a
+/// table for the docs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn final_aggregates_at_scale() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let sql = "select grp, count() as n, sum(price) as s, avg(price) as a, min(price) as lo, \
+               max(price) as hi from products final group by grp";
+    const EVENTS: u64 = 100_000;
+    eprintln!(
+        "| rows | history load | state kept | per row | peak while loading | {EVENTS} events |"
+    );
+    eprintln!("|---|---|---|---|---|---|");
+    for rows in [10_000u64, 100_000, 1_000_000] {
+        let database = "chlive_engine_final_scale";
+        exec(&format!("DROP DATABASE IF EXISTS {database}")).await;
+        exec(&format!("CREATE DATABASE {database}")).await;
+        exec(&format!(
+            "CREATE TABLE {database}.products (product_id String, grp String, price UInt32, \
+             version UInt64, deleted UInt8) \
+             ENGINE = ReplacingMergeTree(version, deleted) ORDER BY product_id"
+        ))
+        .await;
+        exec(&format!(
+            "INSERT INTO {database}.products SELECT concat('k', toString(number)), \
+             concat('g', toString(number % 100)), number % 1000, 1, 0 FROM numbers({rows})"
+        ))
+        .await;
+        // new versions of random keys, moving between groups
+        let mut source = MemorySource::new();
+        for i in 0..EVENTS {
+            let k = i.wrapping_mul(2654435761) % rows;
+            source.push(
+                "products",
+                0,
+                format!(
+                    r#"{{"product_id":"k{k}","grp":"g{}","price":{},"version":2,"deleted":0}}"#,
+                    i % 97,
+                    i % 1000
+                )
+                .as_str(),
+            );
+        }
+        let engine = engine_at(database.into(), source, Watermark([(0, -1)].into()));
+        let before = LIVE.load(Relaxed);
+        PEAK.store(before, Relaxed);
+        let started = std::time::Instant::now();
+        let mut sub = engine.subscribe(sql).await.unwrap();
+        sub.next().await.unwrap().unwrap(); // the history
+        let loaded = started.elapsed();
+        let (after, peak) = (LIVE.load(Relaxed), PEAK.load(Relaxed));
+        let started = std::time::Instant::now();
+        loop {
+            let it = sub.next().await.unwrap().unwrap();
+            if let Origin::Event { offset, .. } = it.origin {
+                if offset as u64 == EVENTS - 1 {
+                    break;
+                }
+            }
+        }
+        let events = started.elapsed();
+        let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "| {rows} | {:.2} s | {:.0} MB | {:.0} B | {:.0} MB | {:.2} s ({:.0}/s) |",
+            loaded.as_secs_f64(),
+            mb(after - before),
+            (after - before) as f64 / rows as f64,
+            mb(peak - before),
+            events.as_secs_f64(),
+            EVENTS as f64 / events.as_secs_f64()
+        );
+        drop(sub);
         exec(&format!("DROP DATABASE {database}")).await;
     }
 }

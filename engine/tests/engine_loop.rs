@@ -131,6 +131,17 @@ impl HistorySource for FakeHistory {
                 row(json!({"__order_0": 500})),
                 row(json!({"__order_0": 500})),
             ]),
+            // FINAL aggregates: every row, its key, version, group and arguments
+            "SELECT product_id AS __key_0, version AS __ver, price AS __k0, \
+             version AS __arg_1 FROM default.products FINAL WHERE price > 2" => Ok(vec![
+                row(json!({"__key_0": "a", "__ver": 1, "__k0": 5, "__arg_1": 1})),
+                row(json!({"__key_0": "b", "__ver": 1, "__k0": 5, "__arg_1": 1})),
+                row(json!({"__key_0": "c", "__ver": 1, "__k0": 7, "__arg_1": 1})),
+            ]),
+            "SELECT product_id AS __key_0, version AS __ver, price AS __arg_1, \
+             price AS __arg_2, price AS __arg_3 FROM default.products FINAL" => Ok(vec![
+                row(json!({"__key_0": "a", "__ver": 1, "__arg_1": 5, "__arg_2": 5, "__arg_3": 5})),
+            ]),
             // FINAL: one row per product, with its key and version under hidden aliases
             "SELECT product_id, price, product_id AS __key_0, version AS __ver \
              FROM default.products FINAL WHERE price > 2" => Ok(vec![row(
@@ -799,6 +810,72 @@ async fn final_replaces_each_keys_row_with_its_latest_version() {
             "products/0:5 - [\"a\"]",
             "products/0:6 - [\"b\"]",
             "products/0:7 + [\"a\"] {\"product_id\":\"a\",\"price\":4}",
+        ]
+    );
+}
+
+/// Aggregates on FINAL: each new version takes its key's old values out of their group and
+/// puts its own in; deleted, non-matching and older versions; a group whose last row leaves.
+#[tokio::test]
+async fn final_aggregates_replace_each_rows_values() {
+    let p = |id: &str, price: u32, version: u64, deleted: u8| {
+        format!(
+            r#"{{"product_id": "{id}", "price": {price}, "version": {version}, "deleted": {deleted}}}"#
+        )
+    };
+    let mut source = MemorySource::new();
+    source
+        .push("products", 0, p("x", 5, 1, 0)) // offset 0: history (a, b at 5; c at 7)
+        .push("products", 0, p("a", 7, 2, 0)) // from 5 to 7
+        .push("products", 0, p("b", 9, 0, 0)) // older than b's row: ignored
+        .push("products", 0, p("b", 5, 2, 1)) // deleted: 5's last row, so 5 is gone
+        .push("products", 0, p("c", 1, 2, 0)) // no longer matches
+        .push("products", 0, p("d", 3, 1, 0)) // new, in a new group
+        .push("products", 0, p("d", 7, 4, 0)); // into 7; 3 is gone
+    let sql = "select price, count() as n, max(version) as v from products final \
+               where price > 2 group by price";
+    let lines: Vec<String> = engine(source)
+        .with_max_batch(1)
+        .subscribe(sql)
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines,
+        [
+            "+ [5] {\"price\":5,\"n\":2,\"v\":1}\n+ [7] {\"price\":7,\"n\":1,\"v\":1}\n\
+             history: 2 rows",
+            "products/0:1 ~ [5] {\"n\":1}\nproducts/0:1 ~ [7] {\"n\":2,\"v\":2}",
+            "",
+            "products/0:3 - @0",
+            "products/0:4 ~ [7] {\"n\":1}",
+            "products/0:5 + [3] {\"price\":3,\"n\":1,\"v\":1}",
+            "products/0:6 - @1\nproducts/0:6 ~ [7] {\"n\":2,\"v\":4}",
+        ]
+    );
+
+    // a global aggregate keeps its row, back to the empty values
+    let mut source = MemorySource::new();
+    source
+        .push("products", 0, p("x", 5, 1, 0))
+        .push("products", 0, p("a", 5, 2, 1));
+    let sql = "select count() as n, sum(price) as s, avg(price) as a, min(price) as m \
+               from products final";
+    let lines: Vec<String> = engine(source)
+        .with_max_batch(1)
+        .subscribe(sql)
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines,
+        [
+            "+ [] {\"n\":1,\"s\":5,\"a\":5,\"m\":5}\nhistory: 1 rows",
+            "products/0:1 ~ [] {\"n\":0,\"s\":0,\"a\":\"nan\",\"m\":0}",
         ]
     );
 }

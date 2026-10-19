@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use super::{AggregateFunction, AggregateState};
 use crate::types::{IntType, Kind, Type, Value};
@@ -44,6 +45,12 @@ impl AggregateState for CountState {
     fn update(&mut self, value: Option<&Value>) {
         if !matches!(value, Some(Value::Null)) {
             self.0 += 1;
+        }
+    }
+
+    fn retract(&mut self, value: Option<&Value>) {
+        if !matches!(value, Some(Value::Null)) {
+            self.0 -= 1;
         }
     }
 
@@ -102,6 +109,18 @@ impl Total {
             (Total::Unsigned(t), Value::Int(n)) => *t = t.wrapping_add(*n as u64),
             (Total::Float(t), Value::Float(f)) => *t += f,
             (Total::Float(t), Value::Int(n)) => *t += *n as f64,
+            _ => {}
+        }
+    }
+
+    /// Take back an `add` of `v`: exact for integers (wrapping back); for floats, a plain
+    /// subtraction (so the last digits can drift from a sum of the values left).
+    fn sub(&mut self, v: &Value) {
+        match (self, v) {
+            (Total::Signed(t), Value::Int(n)) => *t = t.wrapping_sub(*n as i64),
+            (Total::Unsigned(t), Value::Int(n)) => *t = t.wrapping_sub(*n as u64),
+            (Total::Float(t), Value::Float(f)) => *t -= f,
+            (Total::Float(t), Value::Int(n)) => *t -= *n as f64,
             _ => {}
         }
     }
@@ -174,7 +193,8 @@ pub struct Sum;
 #[derive(Clone)]
 struct SumState {
     total: Total,
-    seen: bool,
+    /// How many non-NULL values are in it (NULL-able columns: none is NULL).
+    count: u64,
     nullable: bool,
 }
 
@@ -191,7 +211,7 @@ impl AggregateFunction for Sum {
     fn new_state(&self, _: Option<&Type>, result_ty: &Type) -> Box<dyn AggregateState> {
         Box::new(SumState {
             total: Total::zero(result_ty),
-            seen: false,
+            count: 0,
             nullable: result_ty.nullable,
         })
     }
@@ -203,7 +223,9 @@ impl AggregateState for SumState {
             Some(Value::Null) | None => {}
             Some(v) => {
                 self.total.add(v);
-                self.seen = true;
+                // a group's sum from ClickHouse: some values, how many doesn't matter (it's
+                // never taken back)
+                self.count += 1;
             }
         }
     }
@@ -211,19 +233,26 @@ impl AggregateState for SumState {
     fn update(&mut self, value: Option<&Value>) {
         if let Some(v) = value.filter(|v| **v != Value::Null) {
             self.total.add(v);
-            self.seen = true;
+            self.count += 1;
+        }
+    }
+
+    fn retract(&mut self, value: Option<&Value>) {
+        if let Some(v) = value.filter(|v| **v != Value::Null) {
+            self.total.sub(v);
+            self.count -= 1;
         }
     }
 
     fn merge(&mut self, other: &dyn AggregateState) {
         if let Some(o) = other.as_any().downcast_ref::<Self>() {
             self.total.merge(o.total);
-            self.seen |= o.seen;
+            self.count += o.count;
         }
     }
 
     fn finalize(&self) -> Value {
-        if self.nullable && !self.seen {
+        if self.nullable && self.count == 0 {
             Value::Null
         } else {
             self.total.value()
@@ -231,12 +260,17 @@ impl AggregateState for SumState {
     }
 
     fn save(&self) -> serde_json::Value {
-        serde_json::json!({ "total": self.total.save(), "seen": self.seen })
+        serde_json::json!({ "total": self.total.save(), "count": self.count })
     }
 
     fn load(&mut self, json: &serde_json::Value) -> Result<(), String> {
         self.total = Total::load(&json["total"])?;
-        self.seen = json["seen"].as_bool().ok_or("checkpoint: bad sum")?;
+        // older checkpoints: whether any value was seen
+        self.count = match (json["count"].as_u64(), json["seen"].as_bool()) {
+            (Some(n), _) => n,
+            (None, Some(seen)) => u64::from(seen),
+            _ => return Err("checkpoint: bad sum".into()),
+        };
         Ok(())
     }
 
@@ -302,6 +336,13 @@ impl AggregateState for AvgState {
         if let Some(v) = value.filter(|v| **v != Value::Null) {
             self.total.add(v);
             self.count += 1;
+        }
+    }
+
+    fn retract(&mut self, value: Option<&Value>) {
+        if let Some(v) = value.filter(|v| **v != Value::Null) {
+            self.total.sub(v);
+            self.count -= 1;
         }
     }
 
@@ -373,12 +414,25 @@ impl AggregateFunction for MinMax {
         Box::new(MinMaxState {
             best: None,
             max: self.max,
-            empty: if result_ty.nullable {
-                Value::Null
-            } else {
-                result_ty.default_value()
-            },
+            empty: empty_extreme(result_ty),
         })
+    }
+
+    fn new_retractable_state(&self, _: Option<&Type>, result_ty: &Type) -> Box<dyn AggregateState> {
+        Box::new(MinMaxMultiset {
+            values: BTreeMap::new(),
+            max: self.max,
+            empty: empty_extreme(result_ty),
+        })
+    }
+}
+
+/// `min`/`max` of no values: NULL for a NULL-able column, otherwise the type's zero value.
+fn empty_extreme(result_ty: &Type) -> Value {
+    if result_ty.nullable {
+        Value::Null
+    } else {
+        result_ty.default_value()
     }
 }
 
@@ -440,6 +494,113 @@ impl AggregateState for MinMaxState {
                     .ok_or_else(|| format!("checkpoint: bad min/max {v}"))?,
             ),
         };
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn box_clone(&self) -> Box<dyn AggregateState> {
+        Box::new(self.clone())
+    }
+}
+
+/// A value in ORDER BY's total order (NaN after the numbers), as a map key.
+#[derive(Clone)]
+struct OrdValue(Value);
+
+impl PartialEq for OrdValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for OrdValue {}
+
+impl PartialOrd for OrdValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.sort_cmp(&other.0, false, false)
+    }
+}
+
+/// `min(x)` / `max(x)` that values can be taken back out of: every value with its count, the
+/// extreme at either end.
+#[derive(Clone)]
+struct MinMaxMultiset {
+    values: BTreeMap<OrdValue, u64>,
+    max: bool,
+    empty: Value,
+}
+
+impl AggregateState for MinMaxMultiset {
+    fn merge_history(&mut self, values: &[Value]) {
+        if let [v, Value::Int(n), ..] = values {
+            if *n > 0 && *v != Value::Null {
+                *self.values.entry(OrdValue(v.clone())).or_default() += 1;
+            }
+        }
+    }
+
+    fn update(&mut self, value: Option<&Value>) {
+        if let Some(v) = value.filter(|v| **v != Value::Null) {
+            *self.values.entry(OrdValue(v.clone())).or_default() += 1;
+        }
+    }
+
+    fn retract(&mut self, value: Option<&Value>) {
+        if let Some(v) = value.filter(|v| **v != Value::Null) {
+            let k = OrdValue(v.clone());
+            if let Some(n) = self.values.get_mut(&k) {
+                *n -= 1;
+                if *n == 0 {
+                    self.values.remove(&k);
+                }
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &dyn AggregateState) {
+        if let Some(o) = other.as_any().downcast_ref::<Self>() {
+            for (k, n) in &o.values {
+                *self.values.entry(k.clone()).or_default() += n;
+            }
+        }
+    }
+
+    fn finalize(&self) -> Value {
+        let best = if self.max {
+            self.values.keys().next_back()
+        } else {
+            self.values.keys().next()
+        };
+        best.map_or_else(|| self.empty.clone(), |k| k.0.clone())
+    }
+
+    fn save(&self) -> serde_json::Value {
+        serde_json::json!({
+            "values": self
+                .values
+                .iter()
+                .map(|(k, n)| serde_json::json!([k.0.save(), n]))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn load(&mut self, json: &serde_json::Value) -> Result<(), String> {
+        let bad = || format!("checkpoint: bad min/max {json}");
+        self.values.clear();
+        for e in json["values"].as_array().ok_or_else(bad)? {
+            let v = e.get(0).and_then(Value::load).ok_or_else(bad)?;
+            let n = e.get(1).and_then(|n| n.as_u64()).ok_or_else(bad)?;
+            self.values.insert(OrdValue(v), n);
+        }
         Ok(())
     }
 
@@ -533,6 +694,97 @@ mod tests {
         y.update(Some(&Value::Int(9)));
         x.merge(y.as_ref());
         assert_eq!(x.finalize(), Value::Int(9));
+    }
+
+    fn retractable(func: AggFunc, arg: &str) -> Box<dyn AggregateState> {
+        let arg = Type::parse(arg);
+        let rt = result_type(func, Some(&arg)).unwrap();
+        native(func).unwrap().new_retractable_state(Some(&arg), &rt)
+    }
+
+    /// Values in and out at random: every function's result equals a fresh state's over the
+    /// values left.
+    #[test]
+    fn retracting_gives_the_result_of_the_values_left() {
+        let mut seed: u64 = 7;
+        let mut rand = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for (func, arg) in [
+            (AggFunc::Count, "Nullable(Int32)"),
+            (AggFunc::Sum, "Nullable(Int32)"),
+            (AggFunc::Sum, "UInt8"),
+            (AggFunc::Sum, "Float64"),
+            (AggFunc::Avg, "Nullable(Float64)"),
+            (AggFunc::Avg, "Int64"),
+            (AggFunc::Min, "Nullable(Int32)"),
+            (AggFunc::Max, "Int32"),
+            (AggFunc::Min, "Float64"),
+        ] {
+            let float = arg.contains("Float");
+            let nullable = arg.contains("Nullable");
+            let mut state = retractable(func, arg);
+            let mut live: Vec<Value> = Vec::new();
+            for step in 0..2000 {
+                if live.is_empty() || rand(3) > 0 {
+                    let v = match rand(10) {
+                        0 if nullable => Value::Null,
+                        n if float => Value::Float(n as f64 * 0.1 - 0.3),
+                        n => Value::Int(n as i128 * 7 - 20),
+                    };
+                    state.update(Some(&v));
+                    live.push(v);
+                } else {
+                    let v = live.swap_remove(rand(live.len() as u64) as usize);
+                    state.retract(Some(&v));
+                }
+                let (mut fresh, _) = (retractable(func, arg), ());
+                for v in &live {
+                    fresh.update(Some(v));
+                }
+                let (got, want) = (state.finalize(), fresh.finalize());
+                match (&got, &want) {
+                    (Value::Float(a), Value::Float(b)) if a.is_nan() || b.is_nan() => {
+                        assert!(a.is_nan() && b.is_nan(), "{func:?} {arg} at {step}")
+                    }
+                    (Value::Float(a), Value::Float(b)) => assert!(
+                        (a - b).abs() <= 1e-9 * b.abs().max(1.0),
+                        "{func:?} {arg} at {step}: {a} vs {b}"
+                    ),
+                    _ => assert_eq!(got, want, "{func:?} {arg} at {step}"),
+                }
+            }
+            // and saved and loaded
+            let mut back = retractable(func, arg);
+            back.load(&state.save()).unwrap();
+            assert_eq!(back.save(), state.save());
+        }
+    }
+
+    #[test]
+    fn retracting_back_to_nothing() {
+        let mut s = retractable(AggFunc::Sum, "Nullable(Int32)");
+        s.update(Some(&Value::Int(4)));
+        s.retract(Some(&Value::Int(4)));
+        assert_eq!(s.finalize(), Value::Null, "no values: NULL again");
+        let mut m = retractable(AggFunc::Max, "Int32");
+        for v in [3, 9, 9] {
+            m.update(Some(&Value::Int(v)));
+        }
+        m.retract(Some(&Value::Int(9)));
+        assert_eq!(m.finalize(), Value::Int(9), "the other 9 stays");
+        m.retract(Some(&Value::Int(9)));
+        assert_eq!(m.finalize(), Value::Int(3));
+        m.retract(Some(&Value::Int(3)));
+        assert_eq!(m.finalize(), Value::Int(0), "empty: the zero value");
+        // a sum from an older checkpoint
+        let (mut old, _) = state(AggFunc::Sum, "Nullable(Int32)");
+        old.load(&serde_json::json!({"total": {"i": 5}, "seen": true}))
+            .unwrap();
+        assert_eq!(old.finalize(), Value::Int(5));
     }
 
     #[test]

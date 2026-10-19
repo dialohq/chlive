@@ -190,9 +190,10 @@ async fn rejections_over_websocket() -> Result<()> {
                 ),
                 (
                     "final",
-                    "select count() from products final",
+                    "select uniq(price) from products final",
                     "INVALID_QUERY",
-                    "FINAL on products (ReplacingMergeTree) with aggregates isn't supported yet at 1:30",
+                    "FINAL on products (ReplacingMergeTree) with uniq() isn't supported yet \
+                     (on FINAL: count, sum, avg, min, max) at 1:34",
                 ),
             ];
             for (id, sql, _, _) in &cases {
@@ -1009,6 +1010,136 @@ async fn rows_leave_a_time_window_as_time_passes() -> Result<()> {
                 "window: {} in, {} out (offsets {produced:?})",
                 live.inserted, live.deleted
             );
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// Aggregates on FINAL over the server: products written through Kafka, versions replacing
+/// each other (prices and names change, some deleted) before and after subscribing; the live
+/// groups equal ClickHouse's `SELECT … FINAL … GROUP BY`.
+#[tokio::test]
+async fn final_aggregates_match_clickhouse() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let ids: Vec<String> = (0..8).map(|k| format!("a{run}-{k}")).collect();
+    let list = ids
+        .iter()
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let within = format!("from products final where product_id in ({list})");
+    let queries = [
+        (
+            "global",
+            format!(
+                "select count() as n, sum(price) as s, avg(price) as a, min(price) as lo, \
+                 max(price) as hi {within}"
+            ),
+        ),
+        (
+            "by_name",
+            format!(
+                "select name, count() as n, sum(price) as s, max(version) as v {within} \
+                 group by name"
+            ),
+        ),
+        // many small groups, coming and going
+        (
+            "by_price",
+            format!("select price, count() as n {within} and price > 10 group by price"),
+        ),
+        (
+            "top",
+            format!(
+                "select name, sum(price) as s {within} group by name order by s desc, name limit 2"
+            ),
+        ),
+    ];
+    // each product: versions that only grow, prices and names changing, some deleted
+    let versions = move |round: u64| -> Vec<(String, String)> {
+        ids.iter()
+            .enumerate()
+            .map(|(k, id)| {
+                let n = round * 8 + k as u64;
+                let price = (n * 37) % 50;
+                let deleted = u8::from(n % 5 == 4);
+                (
+                    id.clone(),
+                    format!(
+                        r#"{{"product_id":"{id}","name":"n{}","price":{price},"version":{round},"deleted":{deleted}}}"#,
+                        n % 3
+                    ),
+                )
+            })
+            .collect()
+    };
+    with_server(config(), |server| {
+        async move {
+            let products = producer::Producer::new(&config().kafka_brokers, "products")?;
+            let wait = |produced: std::collections::BTreeMap<i32, i64>| async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                loop {
+                    let have = ingested_from("products").await?;
+                    if produced
+                        .iter()
+                        .all(|(p, o)| have.get(p).is_some_and(|h| h >= o))
+                    {
+                        return anyhow::Ok(());
+                    }
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "products not ingested: {have:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            };
+            for round in 1..=3 {
+                wait(products.produce_keyed(&versions(round)).await?).await?;
+            }
+            let conn = LiveConn::connect(server).await?;
+            for (name, sql) in &queries {
+                conn.subscribe(name, sql);
+            }
+            let names: Vec<&str> = queries.iter().map(|(n, _)| *n).collect();
+            conn.wait_ready(&names, Duration::from_secs(60)).await?;
+            for round in 4..=9 {
+                wait(products.produce_keyed(&versions(round)).await?).await?;
+            }
+            conn.wait_quiet(Duration::from_millis(1000), Duration::from_secs(60))
+                .await?;
+            for (name, sql) in &queries {
+                let live = conn.result(name).unwrap();
+                assert!(live.error.is_none(), "{name}: {:?}", live.error);
+                assert!(
+                    live.protocol_violations.is_empty(),
+                    "{name}: {:?}",
+                    live.protocol_violations
+                );
+                let direct = clickhouse()
+                    .fetch(&sql.replace("from products", "from default.products"))
+                    .await?;
+                eprintln!(
+                    "{name}: {} groups ({} inserts, {} updates, {} deletes)",
+                    live.rows.len(),
+                    live.inserted,
+                    live.updated,
+                    live.deleted
+                );
+                if *name == "top" {
+                    assert_eq!(live.rows, direct, "{name}");
+                } else {
+                    assert_eq!(multiset(&live.rows), multiset(&direct), "{name}");
+                }
+            }
             Ok(())
         }
         .boxed()

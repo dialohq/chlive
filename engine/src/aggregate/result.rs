@@ -134,11 +134,89 @@ impl GroupResult {
 
     /// The groups a batch touched, with their new rows, in the order they were touched.
     pub fn batch(&mut self, groups: Vec<(String, Row)>) -> Vec<Diff> {
+        self.changes(
+            groups
+                .into_iter()
+                .map(|(id, row)| (id, Some(row)))
+                .collect(),
+        )
+    }
+
+    /// Like [`Self::batch`], with groups that are gone (`None`: their last row left).
+    pub fn changes(&mut self, groups: Vec<(String, Option<Row>)>) -> Vec<Diff> {
         let mut diffs = Vec::new();
         for (id, row) in groups {
-            self.touch(id, row, &mut diffs);
+            match row {
+                Some(row) => self.touch(id, row, &mut diffs),
+                None => self.remove(id, &mut diffs),
+            }
         }
         diffs
+    }
+
+    /// A group is gone: out of the result if it was in, and (LIMIT) the next one comes in.
+    fn remove(&mut self, id: String, diffs: &mut Vec<Diff>) {
+        let Some(old) = self.ranking.position(&id) else {
+            self.rows.remove(&id);
+            return;
+        };
+        if self.offset > 0 {
+            // everything after it moves up a place: compare the windows
+            let before = self.window();
+            self.ranking.remove(&id);
+            self.rows.remove(&id);
+            let after = self.window();
+            return self.rewindow(before, after, diffs);
+        }
+        self.ranking.remove(&id);
+        self.rows.remove(&id);
+        if self.sent.remove(&id).is_none() {
+            return;
+        }
+        diffs.push(Diff::Delete { index: old });
+        // the group now last in the LIMIT comes in
+        let n = self.limit;
+        if n == usize::MAX {
+            return;
+        }
+        if let Some(next) = self.ranking.get(n - 1).map(|e| e.id.clone()) {
+            if !self.sent.contains_key(&next) {
+                let row = self.rows[&next].clone();
+                self.sent.insert(next.clone(), row.clone());
+                diffs.push(Diff::Insert {
+                    row,
+                    index: self.ordered().then_some(n - 1),
+                    id: Some(next),
+                });
+            }
+        }
+    }
+
+    /// From the window `before` to `after` (no group in both changed): deletes, then inserts.
+    fn rewindow(&mut self, before: Vec<String>, after: Vec<String>, diffs: &mut Vec<Diff>) {
+        use std::collections::HashSet;
+        let staying: HashSet<&String> = after.iter().collect();
+        let mut present: HashSet<String> = HashSet::new();
+        for (i, x) in before.iter().enumerate().rev() {
+            if staying.contains(x) {
+                present.insert(x.clone());
+            } else {
+                diffs.push(Diff::Delete { index: i });
+                self.sent.remove(x);
+            }
+        }
+        let ordered = self.ordered();
+        for (j, x) in after.iter().enumerate() {
+            if !present.contains(x) {
+                let row = self.rows[x].clone();
+                self.sent.insert(x.clone(), row.clone());
+                diffs.push(Diff::Insert {
+                    row,
+                    index: ordered.then_some(j),
+                    id: Some(x.clone()),
+                });
+            }
+        }
     }
 
     fn touch(&mut self, id: String, row: Row, diffs: &mut Vec<Diff>) {
@@ -442,6 +520,40 @@ mod tests {
     }
 
     #[test]
+    fn groups_that_are_gone_leave_and_the_next_comes_in() {
+        let gone = |g: &str| (format!("[\"{g}\"]"), None);
+        let some = |g: &str, n: i64| {
+            let (id, r) = row(g, n);
+            (id, Some(r))
+        };
+        // unordered: out of its place
+        let mut r = GroupResult::new(vec![], None, None, vec![]);
+        r.history(vec![row("a", 1), row("b", 2), row("c", 3)]);
+        assert_eq!(
+            lines(&r.changes(vec![gone("b"), some("a", 5)])),
+            ["- @1", r#"~ ["a"] {"n":5}"#]
+        );
+        // ordered, LIMIT 2: the next one comes in at the end
+        let mut r = GroupResult::new(vec![term("n", true)], Some(2), None, vec![]);
+        r.history(vec![row("a", 1), row("b", 5), row("c", 3)]);
+        assert_eq!(
+            lines(&r.changes(vec![gone("b")])),
+            ["- @0", r#"+ @1 ["a"] {"g":"a","n":1}"#]
+        );
+        // one past the LIMIT, or never seen: nothing to send
+        assert_eq!(lines(&r.changes(vec![gone("x")])), Vec::<String>::new());
+        r.changes(vec![some("d", 0)]);
+        assert_eq!(lines(&r.changes(vec![gone("d")])), Vec::<String>::new());
+        // OFFSET 1 LIMIT 1: one above the window goes, everything moves up
+        let mut r = GroupResult::new(vec![term("n", true)], Some(1), Some(1), vec![]);
+        r.history(vec![row("a", 1), row("b", 5), row("c", 3)]);
+        assert_eq!(
+            lines(&r.changes(vec![gone("b")])),
+            ["- @0", r#"+ @0 ["a"] {"g":"a","n":1}"#]
+        );
+    }
+
+    #[test]
     fn hidden_order_columns_are_not_sent() {
         let mut r = GroupResult::new(vec![term("__o0", false)], None, None, vec!["__o0".into()]);
         let with = |g: &str, o: i64| {
@@ -553,17 +665,22 @@ mod tests {
                 list.apply(&d).unwrap();
             }
             for _ in 0..300 {
-                let batch: Vec<(String, Row)> = (0..1 + rand(4))
+                let batch: Vec<(String, Option<Row>)> = (0..1 + rand(4))
                     .map(|_| {
                         let g = format!("g{}", rand(8));
                         let n = rand(10) as i64 - 3; // sums can go down
-                        row(&g, n)
+                        let (id, row) = row(&g, n);
+                        // some groups are gone (their last row left)
+                        (id, (rand(5) > 0).then_some(row))
                     })
                     .collect();
                 for (id, row) in &batch {
-                    latest.insert(id.clone(), row["n"].as_i64().unwrap());
+                    match row {
+                        Some(row) => latest.insert(id.clone(), row["n"].as_i64().unwrap()),
+                        None => latest.remove(id),
+                    };
                 }
-                for d in r.batch(batch) {
+                for d in r.changes(batch) {
                     list.apply(&d).unwrap_or_else(|e| panic!("{d}: {e}"));
                 }
                 let mut want: Vec<i64> = latest.values().copied().collect();

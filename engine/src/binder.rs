@@ -497,8 +497,23 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
                 w.span,
             ));
         }
+        // FINAL: native functions only (each replaced row's values are taken back out)
         if let (Some(_), Some(span)) = (&table.final_key, query.from.final_span) {
-            return Err(final_unsupported(&table, "aggregates", span));
+            for item in &aggregation.items {
+                if let AggExpr::Call { func, .. } = &item.expr {
+                    if crate::aggregate::native(*func).is_none() {
+                        return Err(BindError::at(
+                            format!(
+                                "FINAL on {} (ReplacingMergeTree) with {}() isn't supported yet \
+                                 (on FINAL: count, sum, avg, min, max)",
+                                table.name,
+                                func.name()
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
         }
         if let Some(Sub::In(_, _, span) | Sub::Exists(_, span)) = sub {
             return Err(BindError::at(
@@ -1500,9 +1515,7 @@ fn check_final_shape(query: &Query, table: &BoundTable) -> Result<(), BindError>
     let (Some(_), Some(span)) = (&table.final_key, query.from.final_span) else {
         return Ok(());
     };
-    let what = if query.group_by.is_some() {
-        "GROUP BY"
-    } else if query.selection.as_ref().is_some_and(has_subquery) {
+    let what = if query.selection.as_ref().is_some_and(has_subquery) {
         "a sub-query"
     } else {
         return Ok(());
@@ -2073,13 +2086,20 @@ mod tests {
         ] {
             assert!(bind_sql(sql).await.is_ok(), "{sql}");
         }
+        // native aggregates, grouped or not
+        for sql in [
+            "select deleted, count(), sum(version), avg(version), min(version), max(version) \
+             from products final group by deleted",
+            "select count() from products final",
+            "select deleted, count() as n from products final group by deleted \
+             order by n desc limit 3",
+        ] {
+            assert!(bind_sql(sql).await.is_ok(), "{sql}");
+        }
         assert_eq!(
-            err("select product_id, count() from products final group by product_id").await,
-            unsupported("GROUP BY", "1:42")
-        );
-        assert_eq!(
-            err("select count() from products final").await,
-            unsupported("aggregates", "1:30")
+            err("select deleted, uniq(version) from products final group by deleted").await,
+            unsupported("uniq()", "1:45")
+                .replace(" at 1:45", " (on FINAL: count, sum, avg, min, max) at 1:45")
         );
         assert_eq!(
             err("select * from products final where product_id in (select item_id from items)")
