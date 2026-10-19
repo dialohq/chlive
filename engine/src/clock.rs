@@ -51,6 +51,20 @@ impl Clock for TokioClock {
     }
 }
 
+/// Sleep until `earliest + coalescing` on `clock` (now, if that's past); forever without one.
+pub async fn wait_for(clock: &dyn Clock, earliest: Option<i128>, coalescing: i128) {
+    match earliest {
+        Some(d) => {
+            let ns = (d + coalescing - clock.now_ns()).max(0);
+            tokio::time::sleep(std::time::Duration::from_nanos(
+                u64::try_from(ns).unwrap_or(u64::MAX),
+            ))
+            .await
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// When each row of a result leaves, in the client's order: kept in step with the diffs the
 /// result's state sends. Also counted by deadline, for the earliest.
 #[derive(Debug, Clone, Default)]

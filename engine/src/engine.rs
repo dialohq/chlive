@@ -422,7 +422,8 @@ impl Engine {
             checkpoint,
             aggregate.result(),
         )
-        .map_err(EngineError::Checkpoint)?;
+        .map_err(EngineError::Checkpoint)?
+        .with_clock(self.clock.clone(), self.now_coalescing);
         tracing::info!(at = %at.describe(), "restored (aggregate, native)");
         let checkpointer = run.checkpointer();
         let iterations = stream::unfold(run, |mut run| async move {
@@ -744,7 +745,8 @@ impl Engine {
             .ready_chunks(self.max_batch)
             .boxed();
         let (history_sql, iterations, checkpointer) = match (
-            aggregate.native_history_sql(&from),
+            // time windows: at the clock's now
+            aggregate.native_history_sql_at(&from, self.clock.now_ns()),
             aggregate.native.clone(),
         ) {
             (Some(sql), Some(native)) => {
@@ -758,7 +760,8 @@ impl Engine {
                     events,
                     watermark.clone(),
                     aggregate.result(),
-                );
+                )
+                .with_clock(self.clock.clone(), self.now_coalescing);
                 let checkpointer = run.checkpointer();
                 let iterations = stream::unfold(run, |mut run| async move {
                     let next = run.step().await?;
@@ -976,18 +979,7 @@ impl Engine {
                     // wake at the earliest deadline, plus the window for the rows due
                     // close after it; re-armed every turn (an event can bring it forward)
                     let earliest = shared.lock().unwrap().2.earliest();
-                    let wake = async {
-                        match earliest {
-                            Some(d) => {
-                                let ns = (d + coalescing - clock.now_ns()).max(0);
-                                tokio::time::sleep(Duration::from_nanos(
-                                    u64::try_from(ns).unwrap_or(u64::MAX),
-                                ))
-                                .await
-                            }
-                            None => std::future::pending().await,
-                        }
-                    };
+                    let wake = crate::clock::wait_for(clock.as_ref(), earliest, coalescing);
                     // the clock first: it's only ready when due, so events can't starve it
                     let item = if ended {
                         wake.await;

@@ -184,9 +184,9 @@ async fn rejections_over_websocket() -> Result<()> {
                 ),
                 (
                     "now_group",
-                    "select country, count() from events where ts > now() group by country",
+                    "select country, uniq(user_id) from events where ts > now() group by country",
                     "INVALID_QUERY",
-                    "now() with GROUP BY or aggregates isn't supported yet",
+                    "now() with uniq() isn't supported yet",
                 ),
                 (
                     "final",
@@ -1140,6 +1140,67 @@ async fn final_aggregates_match_clickhouse() -> Result<()> {
                     assert_eq!(multiset(&live.rows), multiset(&direct), "{name}");
                 }
             }
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// Aggregates with now() over the server: produced events come into their groups, and leave
+/// them two seconds later with no further events; then the groups equal ClickHouse's (rows
+/// written with a time ahead of the clock stay in both).
+#[tokio::test]
+async fn time_window_aggregates_lose_rows_as_time_passes() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let sql = "select country, count() as n, max(latency_ms) as m from events \
+               where ts > now() - interval 2 second group by country";
+    with_server(config(), |server| {
+        async move {
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("w", sql);
+            conn.wait_ready(&["w"], Duration::from_secs(60)).await?;
+            let count = |name: &str| -> i64 {
+                conn.result(name)
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .map(|r| r["n"].as_i64().unwrap_or(0))
+                    .sum()
+            };
+            let before = count("w");
+            producer()?.produce(50, None).await?;
+            // they come in ...
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while count("w") <= before {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "no rows came in");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // ... and leave, with no further events
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while count("w") > before {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "rows didn't leave: {} of {before} before",
+                    count("w")
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let live = conn.result("w").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert!(
+                live.protocol_violations.is_empty(),
+                "{:?}",
+                live.protocol_violations
+            );
+            let direct = clickhouse()
+                .fetch(&sql.replace("from events", "from default.events"))
+                .await?;
+            assert_eq!(multiset(&live.rows), multiset(&direct));
             Ok(())
         }
         .boxed()

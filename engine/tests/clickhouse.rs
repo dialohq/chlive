@@ -1898,6 +1898,222 @@ async fn final_aggregates_match_clickhouse() {
     }
 }
 
+/// Aggregates with `now()`, against ClickHouse: at a fixed clock time, in every split of
+/// history and stream (MergeTree, and FINAL on an RMT); and as time passes, the groups after
+/// rows left equal ClickHouse's at that later time.
+#[tokio::test]
+async fn time_window_aggregates_match_clickhouse() {
+    use chlive_engine::history::HistorySource;
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    // 2026-10-18 12:00:00 UTC
+    const B: i128 = 1_792_324_800_000_000_000;
+    let ts = |ms: i64| chlive_engine::types::format_datetime((B / 1_000_000) as i64 + ms, 3);
+    // seconds around B: in the last minute, or out of it; none near its edge
+    let offsets: Vec<i64> = (-120..40)
+        .step_by(3)
+        .filter(|s| !(-70 < *s && *s < -50))
+        .collect();
+    let events: Vec<String> = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            format!(
+                r#"{{"ts":"{}","user_id":"u{}","latency_ms":{}}}"#,
+                ts(s * 1000),
+                i % 4,
+                i * 37 % 100
+            )
+        })
+        .collect();
+    // carts: versions of 6 keys moving in and out of the window
+    let carts: Vec<String> = (0..30)
+        .map(|i| {
+            format!(
+                r#"{{"cart_id":"c{}","total":{},"ts":"{}","version":{}}}"#,
+                i % 6,
+                i * 13 % 50,
+                ts(((i * 41) % 150 - 110) * 1000),
+                i
+            )
+        })
+        .collect();
+    const CASES: &[(&str, bool)] = &[
+        (
+            "select count() as n, sum(latency_ms) as s, avg(latency_ms) as a, \
+             min(latency_ms) as lo, max(latency_ms) as hi from events \
+             where ts > now() - interval 1 minute",
+            false,
+        ),
+        (
+            "select user_id, count() as n, max(latency_ms) as m from events \
+             where latency_ms > 20 and ts >= now() - interval 1 minute group by user_id",
+            false,
+        ),
+        (
+            "select user_id, sum(latency_ms) as s from events where ts > now() - interval 1 minute \
+             group by user_id order by s desc, user_id limit 2",
+            true,
+        ),
+        (
+            "select count() as n, sum(total) as s, min(total) as lo from carts final \
+             where ts > now() - interval 1 minute",
+            false,
+        ),
+    ];
+    let mut engines = Vec::new();
+    for (database, split) in [
+        ("chlive_engine_time_agg_history", 1.0),
+        ("chlive_engine_time_agg_stream", 0.0),
+        ("chlive_engine_time_agg_split", 0.5),
+    ] {
+        exec(&format!("DROP DATABASE IF EXISTS {database}")).await;
+        exec(&format!("CREATE DATABASE {database}")).await;
+        exec(&format!(
+            "CREATE TABLE {database}.events (ts DateTime64(3), user_id String, latency_ms UInt32) \
+             ENGINE = MergeTree ORDER BY ts"
+        ))
+        .await;
+        exec(&format!(
+            "CREATE TABLE {database}.carts (cart_id String, total UInt32, ts DateTime64(3), \
+             version UInt64) ENGINE = ReplacingMergeTree(version) ORDER BY cart_id"
+        ))
+        .await;
+        let mut source = MemorySource::new();
+        let mut watermarks = std::collections::HashMap::new();
+        for (table, rows) in [("events", &events), ("carts", &carts)] {
+            let n = (rows.len() as f64 * split) as usize;
+            if n > 0 {
+                let body: String = rows[..n].iter().map(|e| format!("{e}\n")).collect();
+                exec(&format!(
+                    "INSERT INTO {database}.{table} FORMAT JSONEachRow\n{body}"
+                ))
+                .await;
+            }
+            for e in rows {
+                source.push(table, 0, e.as_str());
+            }
+            watermarks.insert(table.to_string(), upto(n));
+        }
+        let engine = engine_with(database.into(), source, upto(0), watermarks)
+            .with_max_batch(7)
+            .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)));
+        engines.push((database, engine));
+    }
+    let direct = ClickHouseHttp::new(&url(), "default", "");
+    let at = |sql: &str, now: i128| {
+        sql.replace("from events", "from chlive_engine_time_agg_history.events")
+            .replace("from carts", "from chlive_engine_time_agg_history.carts")
+            .replace("now()", &format!("fromUnixTimestamp64Nano(toInt64({now}))"))
+    };
+    let canon = |rows: &[chlive_engine::diff::Row], ordered: bool| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .map(|r| serde_json::Value::Object(r.clone()).to_string())
+            .collect();
+        if !ordered {
+            v.sort();
+        }
+        v
+    };
+    for (sql, ordered) in CASES {
+        let want = direct.fetch(&at(sql, B)).await.unwrap();
+        let topic_len = if sql.contains("carts") {
+            carts.len()
+        } else {
+            events.len()
+        };
+        for (database, engine) in &engines {
+            // until the stream has every event (the clock has nothing to say yet)
+            let mut sub = engine
+                .subscribe(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let mut list = chlive_engine::diff::ResultList::default();
+            loop {
+                let it = sub.next().await.unwrap().unwrap();
+                assert_ne!(
+                    it.origin,
+                    Origin::Clock,
+                    "{database}: {sql}: nothing leaves yet"
+                );
+                for d in &it.diffs {
+                    list.apply(d)
+                        .unwrap_or_else(|e| panic!("{database}: {sql}: {e}"));
+                }
+                if it.at.0.get(&0).copied() == Some(topic_len as i64 - 1) {
+                    break;
+                }
+            }
+            assert_eq!(
+                canon(&list.rows, *ordered),
+                canon(&want, *ordered),
+                "{database}: {sql}"
+            );
+            eprintln!("{database:>30}: {sql}: {} groups", list.rows.len());
+        }
+    }
+
+    // as time passes: a 3-second window, in real time from B; rows due at 0.5, 1.5, 2.5,
+    // 3.2 and 4 s, and one (5.5 s) not by the time it's compared, at 4.5 s
+    let database = "chlive_engine_time_agg_history";
+    exec(&format!("TRUNCATE TABLE {database}.events")).await;
+    let rows: Vec<String> = [
+        (-2_500, 0),
+        (-1_500, 1),
+        (-500, 0),
+        (200, 1),
+        (1_000, 0),
+        (2_500, 1),
+    ]
+    .iter()
+    .map(|(ms, u)| {
+        format!(
+            r#"{{"ts":"{}","user_id":"u{u}","latency_ms":{}}}"#,
+            ts(*ms),
+            ms.abs()
+        )
+    })
+    .collect();
+    let body: String = rows.iter().map(|e| format!("{e}\n")).collect();
+    exec(&format!(
+        "INSERT INTO {database}.events FORMAT JSONEachRow\n{body}"
+    ))
+    .await;
+    let mut source = MemorySource::new();
+    for e in &rows {
+        source.push("events", 0, e.as_str());
+    }
+    let engine = engine_at(database.into(), source, upto(rows.len()))
+        .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)));
+    let sql = "select user_id, count() as n, max(latency_ms) as m from events \
+               where ts > now() - interval 3 second group by user_id";
+    let mut sub = engine.subscribe(sql).await.unwrap();
+    let end = tokio::time::Instant::now() + Duration::from_millis(4_500);
+    let mut list = chlive_engine::diff::ResultList::default();
+    let mut clock = 0;
+    while let Ok(Some(it)) = tokio::time::timeout_at(end, sub.next()).await {
+        let it = it.unwrap();
+        clock += usize::from(it.origin == Origin::Clock);
+        for d in &it.diffs {
+            list.apply(d).unwrap();
+        }
+    }
+    let want = direct.fetch(&at(sql, B + 4_500_000_000)).await.unwrap();
+    assert_eq!(
+        canon(&list.rows, false),
+        canon(&want, false),
+        "at B + 4.5 s"
+    );
+    assert_eq!(want.len(), 1, "only u1's last row is left");
+    assert!(clock >= 4, "rows left on the clock: {clock} times");
+    for (database, _) in &engines {
+        exec(&format!("DROP DATABASE {database}")).await;
+    }
+}
+
 /// How big a FINAL aggregate's state gets, and how fast it runs: for RMTs of growing size, the
 /// history's load time, the heap the state keeps and the peak while loading, then 100k events
 /// replacing rows. Run by hand (`--ignored --nocapture`, release for real numbers); prints a

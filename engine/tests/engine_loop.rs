@@ -47,6 +47,12 @@ impl HistorySource for FakeHistory {
                 col("user_id", "String"),
                 col("latency_ms", "UInt32"),
             ]),
+            "default.carts" => Ok(vec![
+                col("cart_id", "String"),
+                col("total", "UInt32"),
+                col("ts", "DateTime64(3)"),
+                col("version", "UInt64"),
+            ]),
             "default.products" => Ok(vec![
                 col("product_id", "String"),
                 col("price", "UInt32"),
@@ -59,6 +65,11 @@ impl HistorySource for FakeHistory {
 
     async fn table_engine(&self, _: &str, table: &str) -> Result<TableEngine, HistoryError> {
         Ok(match table {
+            "carts" => TableEngine::Replacing {
+                ver: Some("version".into()),
+                is_deleted: None,
+                key: Key::from_system("cart_id", ""),
+            },
             "products" => TableEngine::Replacing {
                 ver: Some("version".into()),
                 is_deleted: Some("deleted".into()),
@@ -233,6 +244,23 @@ impl HistorySource for FakeHistory {
             }
             // the calendar test's: nothing in ClickHouse
             s if s.contains("toInt64(1792836000000000000)") => Ok(vec![]),
+            // aggregates with now() - INTERVAL 10 SECOND at B: every row, with each field
+            // any of these queries reads (u1 at B - 5 s and B - 1 s, u2 at B - 2 s)
+            s if s.contains("FROM default.clicks WHERE ts > fromUnixTimestamp64Nano")
+                && s.contains("__time_0") =>
+            {
+                Ok([("u1", -5_000, 3), ("u1", -1_000, 9), ("u2", -2_000, 4)]
+                    .iter()
+                    .map(|(u, ms, lat)| {
+                        row(json!({"__k0": u, "__arg_0": lat, "__arg_1": lat, "__arg_2": lat,
+                                   "__time_0": click_ts(*ms)}))
+                    })
+                    .collect())
+            }
+            // FINAL with now(): c1 (version 1, B - 5 s)
+            s if s.contains("FROM default.carts FINAL") => Ok(vec![row(
+                json!({"__key_0": "c1", "__ver": 1, "__arg_1": 5, "__time_0": click_ts(-5_000)}),
+            )]),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -1260,6 +1288,185 @@ async fn a_day_across_the_clocks_going_back_is_25_hours() {
     }
 }
 
+/// The lines of a subscription until it ends, each with the time it came at (ms after start).
+async fn timed_lines(e: &Engine, sql: &str) -> Vec<String> {
+    let mut sub = e
+        .subscribe(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let start = tokio::time::Instant::now();
+    let mut lines = Vec::new();
+    while let Some(it) = sub.next().await {
+        let it = it.unwrap();
+        lines.push(format!("{} {it}", start.elapsed().as_millis()));
+    }
+    lines
+}
+
+/// Aggregates with now(): every row in the window counts until its deadline, then its values
+/// leave its group; a group whose last row left is gone; an event past its deadline never
+/// counts, and one due earlier than all brings the wakeup forward.
+#[tokio::test(start_paused = true)]
+async fn aggregates_lose_rows_at_their_deadlines() {
+    let e = clicks_engine(&[
+        click("u1", -9_000, 20), // leaves at 1 s
+        click("u3", -20_000, 1), // past its deadline: never counts
+    ]);
+    assert_eq!(
+        timed_lines(
+            &e,
+            "select user_id, count() as n, max(latency_ms) as m from clicks \
+             where ts > now() - interval 10 second group by user_id",
+        )
+        .await,
+        [
+            "0 + [\"u1\"] {\"user_id\":\"u1\",\"n\":2,\"m\":9}\n\
+             + [\"u2\"] {\"user_id\":\"u2\",\"n\":1,\"m\":4}\nhistory: 2 rows",
+            "0 clicks/0:1 ~ [\"u1\"] {\"n\":3,\"m\":20}",
+            "0 ",
+            "1000 clock: ~ [\"u1\"] {\"n\":2,\"m\":9}",
+            // 3 leaves; the max stays 9
+            "5000 clock: ~ [\"u1\"] {\"n\":1}",
+            "8000 clock: - @1",
+            "9000 clock: - @0",
+        ]
+    );
+    // a global aggregate keeps its row, back to no values
+    assert_eq!(
+        timed_lines(
+            &clicks_engine(&[]),
+            "select count() as n, avg(latency_ms) as a from clicks \
+             where ts > now() - interval 10 second",
+        )
+        .await,
+        [
+            "0 + [] {\"n\":3,\"a\":5.333333333333333}\nhistory: 1 rows",
+            "5000 clock: ~ [] {\"n\":2,\"a\":6.5}",
+            "8000 clock: ~ [] {\"n\":1,\"a\":9}",
+            "9000 clock: ~ [] {\"n\":0,\"a\":\"nan\"}",
+        ]
+    );
+    // ORDER BY and LIMIT over the groups: when the first goes, the next comes in
+    assert_eq!(
+        timed_lines(
+            &clicks_engine(&[]),
+            "select user_id, count() as n from clicks where ts > now() - interval 10 second \
+             group by user_id order by n desc, user_id limit 1",
+        )
+        .await,
+        [
+            "0 + [\"u1\"] {\"user_id\":\"u1\",\"n\":2}\nhistory: 1 rows",
+            // u1 and u2 tie at 1: u1 stays first by user_id
+            "5000 clock: ~ [\"u1\"] {\"n\":1}",
+            // u2 goes at 8 s, unseen; u1 at 9 s, and no group is left to come in
+            "9000 clock: - @0",
+        ]
+    );
+    // and with one more u2 row (until 9.5 s): u2 passes u1 as u1's rows leave, then u1 is
+    // back first as u2's do
+    assert_eq!(
+        timed_lines(
+            &clicks_engine(&[click("u2", -500, 1)]),
+            "select user_id, count() as n from clicks where ts > now() - interval 10 second \
+             group by user_id order by n desc, user_id limit 1",
+        )
+        .await,
+        [
+            "0 + [\"u1\"] {\"user_id\":\"u1\",\"n\":2}\nhistory: 1 rows",
+            "0 ",
+            "5000 clock: - @0\nclock: + @0 [\"u2\"] {\"user_id\":\"u2\",\"n\":2}",
+            "8000 clock: - @0\nclock: + @0 [\"u1\"] {\"user_id\":\"u1\",\"n\":1}",
+            "9000 clock: - @0\nclock: + @0 [\"u2\"] {\"user_id\":\"u2\",\"n\":1}",
+            "9500 clock: - @0",
+        ]
+    );
+}
+
+/// The plan of an aggregate with now(): every row with its window's column, `now()` symbolic in
+/// the identity and explain, a literal when fetched (as the fake's history shows).
+#[tokio::test]
+async fn aggregates_with_now_read_every_row_in_the_window() {
+    let plan = clicks_engine(&[])
+        .explain(
+            "select user_id, max(latency_ms) from clicks where latency_ms > 1 \
+             and ts > now() - interval 10 second group by user_id",
+        )
+        .await
+        .unwrap();
+    let text = plan.to_string();
+    assert!(
+        text.contains(
+            "native:  SELECT user_id AS __k0, latency_ms AS __arg_0, ts AS __time_0 \
+             FROM <snapshot> WHERE (latency_ms > 1) AND ts > now64(9) - INTERVAL 10 SECOND"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("window:  ts > now() - INTERVAL 10 SECOND"),
+        "{text}"
+    );
+    let a = plan.aggregate.as_ref().unwrap();
+    assert_eq!(
+        a.native_history_sql_at("s", B).unwrap(),
+        format!(
+            "SELECT user_id AS __k0, latency_ms AS __arg_0, ts AS __time_0 FROM s \
+             WHERE (latency_ms > 1) AND ts > fromUnixTimestamp64Nano(toInt64({B})) \
+             - INTERVAL 10 SECOND"
+        )
+    );
+}
+
+/// The coalescing window: rows due within it of the earliest leave together.
+#[tokio::test(start_paused = true)]
+async fn aggregate_expiries_within_the_window_leave_together() {
+    let e = clicks_engine(&[click("u1", -9_950, 1), click("u2", -9_900, 1)])
+        .with_now_coalescing(std::time::Duration::from_millis(100));
+    let lines = timed_lines(
+        &e,
+        "select count() as n from clicks where ts > now() - interval 10 second",
+    )
+    .await;
+    // the two events (due at 50 and 100 ms) in one wakeup at 150 ms
+    assert_eq!(lines[3], "150 clock: ~ [] {\"n\":3}");
+}
+
+/// FINAL with now(): a key's new version replaces its row's values and its deadline; one
+/// already past its deadline takes the row out.
+#[tokio::test(start_paused = true)]
+async fn final_aggregates_with_now_follow_each_keys_latest_version() {
+    let cart = |id: &str, total: u32, ms: i64, version: u64| {
+        format!(
+            r#"{{"cart_id": "{id}", "total": {total}, "ts": "{}", "version": {version}}}"#,
+            click_ts(ms)
+        )
+    };
+    let mut source = MemorySource::new();
+    source
+        .push("carts", 0, cart("x", 0, 0, 1)) // offset 0: history (c1: 5, B - 5 s)
+        .push("carts", 0, cart("c1", 7, -1_000, 2)) // c1 now leaves at 9 s, not 5 s
+        .push("carts", 0, cart("c2", 3, -8_000, 1)) // leaves at 2 s
+        .push("carts", 0, cart("c2", 3, -20_000, 2)); // past: c2 out now
+    let e = engine(source)
+        .with_max_batch(1)
+        .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)))
+        .with_now_coalescing(std::time::Duration::ZERO);
+    assert_eq!(
+        timed_lines(
+            &e,
+            "select count() as n, sum(total) as s from carts final \
+             where ts > now() - interval 10 second",
+        )
+        .await,
+        [
+            "0 + [] {\"n\":1,\"s\":5}\nhistory: 1 rows",
+            "0 carts/0:1 ~ [] {\"s\":7}",
+            "0 carts/0:2 ~ [] {\"n\":2,\"s\":10}",
+            "0 carts/0:3 ~ [] {\"n\":1,\"s\":7}",
+            "9000 clock: ~ [] {\"n\":0,\"s\":0}",
+        ]
+    );
+}
+
 /// With ORDER BY: rows leave wherever they are; newest first with LIMIT, from the bottom.
 #[tokio::test(start_paused = true)]
 async fn rows_leave_ordered_time_windows_from_their_place() {
@@ -1338,6 +1545,41 @@ async fn a_restored_time_window_lets_overdue_rows_go_first() {
     }
     // rows [h1, h2, e1]: e1 and h1 at once (from the bottom), then h2 half a second later
     assert_eq!(lines, ["clock: - @2\nclock: - @0", "clock: - @0"]);
+}
+
+/// A restored aggregate with now(): the rows that went overdue while it was stored leave on
+/// the first wake, together; the others at their deadlines.
+#[tokio::test(start_paused = true)]
+async fn a_restored_aggregate_lets_overdue_rows_go_first() {
+    let sql = "select user_id, count() as n from clicks where ts > now() - interval 10 second \
+               group by user_id";
+    let e = clicks_engine(&[click("u2", -3_000, 1)]); // u2 at B - 3 s: leaves at 7 s
+    let mut sub = e.subscribe(sql).await.unwrap();
+    sub.next().await.unwrap().unwrap(); // history: u1 (5 s, 9 s), u2 (8 s)
+    sub.next().await.unwrap().unwrap(); // the event
+    let checkpoint = sub.checkpoint().unwrap();
+    assert_eq!(checkpoint.shape(), "native_rows");
+    let checkpoint = chlive_engine::Checkpoint::from_json(&checkpoint.to_json()).unwrap();
+    drop(sub);
+    // stored for 8.5 s: u1's first row and both of u2's are overdue
+    tokio::time::sleep(std::time::Duration::from_millis(8_500)).await;
+    let params = chlive_engine::Params::new();
+    let mut sub = e.restore(sql, &params, &checkpoint).await.unwrap();
+    let start = tokio::time::Instant::now();
+    let mut lines = Vec::new();
+    while let Some(it) = sub.next().await {
+        let it = it.unwrap();
+        if !it.diffs.is_empty() {
+            lines.push(format!("{} {it}", start.elapsed().as_millis()));
+        }
+    }
+    assert_eq!(
+        lines,
+        [
+            "0 clock: ~ [\"u1\"] {\"n\":1}\nclock: - @1",
+            "500 clock: - @0",
+        ]
+    );
 }
 
 #[tokio::test]

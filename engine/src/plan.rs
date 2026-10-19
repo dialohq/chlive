@@ -135,6 +135,9 @@ pub struct AggregatePlan {
     pub hidden: Vec<String>,
     /// When every aggregate has a native implementation: how to run without chDB.
     pub native: Option<NativeAggregates>,
+    /// Time windows (`ts > now() - INTERVAL …`): in the history's WHERE, at the clock's now
+    /// when fetched (always native, per row).
+    pub windows: Vec<HistoryWindow>,
 }
 
 /// GROUP BY with native aggregates: their states come from main ClickHouse as plain SQL values
@@ -159,6 +162,8 @@ pub struct NativeAggregates {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerRow {
     select: String,
+    /// Read with FINAL (a ReplacingMergeTree's latest versions), or every row (time windows).
+    pub final_: bool,
     /// Each aggregate's argument field in history rows, with its type (`count()`: none).
     pub args: Vec<Option<(String, Type)>>,
 }
@@ -193,14 +198,26 @@ impl AggregatePlan {
     }
 
     /// Native: the history's per-group states from main ClickHouse, read from `from` (a
-    /// snapshot of the table).
+    /// snapshot of the table); `now()` as itself (for the identity and explain).
     pub fn native_history_sql(&self, from: &str) -> Option<String> {
+        self.native_history(from, None)
+    }
+
+    /// [`Self::native_history_sql`] at `now` (nanoseconds since the epoch): what's fetched.
+    pub fn native_history_sql_at(&self, from: &str, now: i128) -> Option<String> {
+        self.native_history(from, Some(now))
+    }
+
+    fn native_history(&self, from: &str, now: Option<i128>) -> Option<String> {
         let native = self.native.as_ref()?;
         if let Some(rows) = &native.per_row {
+            let where_ = where_with(self.filter.as_deref(), &self.windows, now)
+                .map(|w| format!(" WHERE {w}"))
+                .unwrap_or_default();
             return Some(format!(
-                "SELECT {} FROM {from} FINAL{}",
+                "SELECT {} FROM {from}{}{where_}",
                 rows.select,
-                self.where_clause()
+                if rows.final_ { " FINAL" } else { "" },
             ));
         }
         Some(format!(
@@ -320,7 +337,11 @@ fn backquote(name: &str) -> String {
 }
 
 /// The native plan, if every aggregate has a native implementation.
-fn native_aggregates(agg: &Aggregation, table: &BoundTable) -> Option<NativeAggregates> {
+fn native_aggregates(
+    agg: &Aggregation,
+    table: &BoundTable,
+    windows: &[crate::binder::TimeWindow],
+) -> Option<NativeAggregates> {
     let col = |id: ColumnId| quote_ident(&table.column(id).clickhouse);
     let mut select: Vec<String> = agg
         .keys
@@ -365,13 +386,16 @@ fn native_aggregates(agg: &Aggregation, table: &BoundTable) -> Option<NativeAggr
             }
         }
     }
-    let per_row = table.final_key.as_ref().map(|k| {
+    // FINAL or time windows: every row's values are kept, to take them back out
+    let per_row = (table.final_key.is_some() || !windows.is_empty()).then(|| {
         let mut select: Vec<String> = Vec::new();
-        for (i, id) in k.key.iter().enumerate() {
-            select.push(format!("{} AS __key_{i}", col(*id)));
-        }
-        if let Some(v) = k.ver {
-            select.push(format!("{} AS __ver", col(v)));
+        if let Some(k) = &table.final_key {
+            for (i, id) in k.key.iter().enumerate() {
+                select.push(format!("{} AS __key_{i}", col(*id)));
+            }
+            if let Some(v) = k.ver {
+                select.push(format!("{} AS __ver", col(v)));
+            }
         }
         for (i, id) in agg.keys.iter().enumerate() {
             select.push(format!("{} AS __k{i}", col(*id)));
@@ -386,8 +410,13 @@ fn native_aggregates(agg: &Aggregation, table: &BoundTable) -> Option<NativeAggr
                 })
             })
             .collect();
+        // each window's column, for the row's deadline (as `WindowPlan::history_field`)
+        for (i, w) in windows.iter().enumerate() {
+            select.push(format!("{} AS __time_{i}", col(w.column)));
+        }
         PerRow {
             select: select.join(", "),
+            final_: table.final_key.is_some(),
             args,
         }
     });
@@ -400,7 +429,12 @@ fn native_aggregates(agg: &Aggregation, table: &BoundTable) -> Option<NativeAggr
     })
 }
 
-fn aggregate_plan(agg: &Aggregation, table: &BoundTable, filter: Option<String>) -> AggregatePlan {
+fn aggregate_plan(
+    agg: &Aggregation,
+    table: &BoundTable,
+    filter: Option<String>,
+    windows: &[crate::binder::TimeWindow],
+) -> AggregatePlan {
     let col = |id: ColumnId| quote_ident(&table.column(id).clickhouse);
     let mut state = Vec::new();
     let mut merge = Vec::new();
@@ -448,9 +482,18 @@ fn aggregate_plan(agg: &Aggregation, table: &BoundTable, filter: Option<String>)
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let native = native_aggregates(agg, table);
+    let native = native_aggregates(agg, table, windows);
     AggregatePlan {
         native,
+        windows: windows
+            .iter()
+            .map(|w| HistoryWindow {
+                column: quote_ident(&table.column(w.column).clickhouse),
+                inclusive: w.inclusive,
+                tz: w.tz,
+                intervals: w.intervals.clone(),
+            })
+            .collect(),
         columns: agg
             .items
             .iter()
@@ -512,6 +555,22 @@ pub struct HistoryPlan {
     pub final_: bool,
     /// `col > now() - INTERVAL …`: AND conditions with the server's clock in them.
     pub windows: Vec<HistoryWindow>,
+}
+
+/// A WHERE of a condition and time windows (at `now`, or symbolically).
+fn where_with(
+    filter: Option<&str>,
+    windows: &[HistoryWindow],
+    now: Option<i128>,
+) -> Option<String> {
+    let mut parts: Vec<String> = filter.iter().map(|f| format!("({f})")).collect();
+    parts.extend(windows.iter().map(|w| w.sql(now)));
+    match parts.len() {
+        0 => None,
+        // a lone condition as it is
+        1 if windows.is_empty() => filter.map(str::to_string),
+        _ => Some(parts.join(" AND ")),
+    }
 }
 
 /// A time window in the history query: `column op now(['tz']) ± INTERVAL …`.
@@ -580,14 +639,7 @@ impl HistoryPlan {
 
     /// The WHERE: the condition and the time windows (at `now`, or symbolically).
     fn where_sql(&self, now: Option<i128>) -> Option<String> {
-        let mut parts: Vec<String> = self.filter.iter().map(|f| format!("({f})")).collect();
-        parts.extend(self.windows.iter().map(|w| w.sql(now)));
-        match parts.len() {
-            0 => None,
-            // a lone condition as it is
-            1 if self.windows.is_empty() => self.filter.clone(),
-            _ => Some(parts.join(" AND ")),
-        }
+        where_with(self.filter.as_deref(), &self.windows, now)
     }
 
     /// The query with one more condition (a semi-join's, or a back-fill's keys).
@@ -1181,8 +1233,8 @@ impl std::fmt::Display for Plan {
             match a.native_history_sql("<snapshot>") {
                 Some(sql) if a.native.as_ref().is_some_and(|n| n.per_row.is_some()) => writeln!(
                     f,
-                    "native:  {sql} (FINAL: every row's values in the engine, taken back out \
-                     when a version replaces it; chDB unused)"
+                    "native:  {sql} (every row's values in the engine, taken back out when \
+                     a version replaces the row or it passes its deadline; chDB unused)"
                 )?,
                 Some(sql) => writeln!(f, "native:  {sql} (states in the engine; chDB unused)")?,
                 None => writeln!(
@@ -1523,6 +1575,7 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             a,
             table,
             bound.filter.as_ref().map(|f| to_clickhouse(f, table)),
+            &bound.windows,
         )
     });
     if let Some(a) = &aggregate {

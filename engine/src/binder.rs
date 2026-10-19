@@ -491,11 +491,22 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
         }
     }
     if let Some(mut aggregation) = bind_aggregation(query, &table)? {
+        // now(): native functions only (each row's values are taken back out at its deadline)
         if let Some(w) = windows.first() {
-            return Err(BindError::at(
-                "now() with GROUP BY or aggregates isn't supported yet",
-                w.span,
-            ));
+            for item in &aggregation.items {
+                if let AggExpr::Call { func, .. } = &item.expr {
+                    if crate::aggregate::native(*func).is_none() {
+                        return Err(BindError::at(
+                            format!(
+                                "now() with {}() isn't supported yet \
+                                 (with now(): count, sum, avg, min, max)",
+                                func.name()
+                            ),
+                            w.span,
+                        ));
+                    }
+                }
+            }
         }
         // FINAL: native functions only (each replaced row's values are taken back out)
         if let (Some(_), Some(span)) = (&table.final_key, query.from.final_span) {
@@ -535,7 +546,7 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
             offset: None,
             aggregation: Some(aggregation),
             semi_join: None,
-            windows: Vec::new(),
+            windows,
         });
     }
     let projection = bind_select(query, &table)?;
@@ -2176,6 +2187,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn now_binds_with_native_aggregates() {
+        for sql in [
+            "select count() from events where ts > now() - interval 1 minute",
+            "select user_id, count() as n, avg(latency_ms) from events \
+             where ts > now() - interval 1 minute group by user_id order by n desc limit 3 offset 1",
+        ] {
+            let q = bind_sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(q.windows.len(), 1, "{sql}");
+            assert!(q.aggregation.is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn now_is_refused_where_time_windows_dont_reach_yet() {
         let cases = [
             (
@@ -2191,8 +2215,8 @@ mod tests {
                 "now() is compared with DateTime or DateTime64 columns; user_id is String at 1:29",
             ),
             (
-                "select count() from events where ts > now()",
-                "now() with GROUP BY or aggregates isn't supported yet at 1:39",
+                "select uniq(user_id) from events where ts > now()",
+                "now() with uniq() isn't supported yet (with now(): count, sum, avg, min, max) at 1:45",
             ),
             (
                 "select ts from events where ts > now() limit 3 offset 1",
