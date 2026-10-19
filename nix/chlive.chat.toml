@@ -1,0 +1,15 @@
+# chlive-server's config for the chat demo's stack (nix/chat.nix): addresses
+# come as flags from the dnvr `chat-server` process; this is the rest.
+[clickhouse]
+password = "chlive_ro"
+snapshot_password = "chlive_snap"
+snapshot_database = "chlive_snapshots"
+
+[cache]
+dir = ".dnvr/chat-chlive-cache"
+
+[log]
+level = "info,chlive_server::hub=debug"
+
+[tables.messages]
+[tables.users]

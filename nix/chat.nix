@@ -1,0 +1,100 @@
+# The chat demo's dnvr shell (`nix develop .#chat`, then `dnvr up`): its own stack
+# (nix/stack.nix, every name prefixed `chat-`), its schema and seed, the app, and scripts.
+# Runs instead of the main stack, not next to it.
+{
+  pkgs,
+  presets,
+  dnvrState,
+  continuous-backup,
+  clickhouse,
+  libchdb,
+}:
+let
+  stack =
+    import ./stack.nix
+      {
+        inherit
+          pkgs
+          presets
+          dnvrState
+          continuous-backup
+          clickhouse
+          ;
+      }
+      {
+        prefix = "chat-";
+        topics = [
+          "messages"
+          "users"
+        ];
+        schemaFile = "scripts/chat/schema.sql";
+        serverConfig = "nix/chlive.chat.toml";
+        cacheDir = ".dnvr/chat-chlive-cache";
+      };
+  inherit (stack) chClient name ref;
+
+  toolchain = import ./toolchain.nix { inherit pkgs dnvrState libchdb; };
+in
+{ ... }:
+{
+  description = "chlive chat demo: its own Redpanda, ClickHouse, sink, pause server and chlive-server, and the chat app";
+
+  packages = toolchain.packages ++ [ clickhouse ];
+  inherit (toolchain) env;
+  inherit (stack) prerun;
+
+  processes = stack.processes // {
+    # Users and an hour of messages (scripts/chat/seed), produced to
+    # Kafka like everything else, into an empty ClickHouse; then wait until they're in.
+    ${name "seed"} = {
+      env = {
+        CONNECTORS_READY = ref "connectors" "ready";
+        CH_TCP_PORT = ref "clickhouse" "tcpPort";
+        PROXY_URL = ref "redpanda" "proxyUrl";
+      };
+      command = ''
+        cd "$DNVR_ROOT/scripts/chat"
+        count() { ${chClient ''"$CH_TCP_PORT"''} --query "SELECT count() FROM default.$1"; }
+        if [ "$(count users)" -eq 0 ]; then
+          ${stack.produce} users < seed/users.jsonl >/dev/null
+          clickhouse local --queries-file seed/messages.sql | ${stack.produce} messages >/dev/null
+          until [ "$(count users)" -ge 4 ] && [ "$(count messages)" -ge 60 ]; do sleep 1; done
+          echo "[seed] seeded $(count users) users, $(count messages) messages"
+        else
+          echo "[seed] already seeded ($(count messages) messages)"
+        fi
+        dnvr-state set seeded 1
+        exec tail -f /dev/null
+      '';
+    };
+
+    # The app (Vite): /live proxied to the server, /kafka to Redpanda's HTTP proxy.
+    ${name "app"} = {
+      env = {
+        CHLIVE_URL = ref "server" "url";
+        PROXY_URL = ref "redpanda" "proxyUrl";
+      };
+      command = ''
+        cd "$DNVR_ROOT"
+        [ -d node_modules/react ] || bun install
+        port=$(dnvr-state pick-port)
+        dnvr-state set url "http://localhost:$port"
+        exec bun --bun run --cwd examples/chat dev --port "$port" --strictPort
+      '';
+    };
+  };
+
+  scripts = stack.scripts // {
+    chat-smoke = {
+      description = "Check the running chat stack end to end: a message, through chlive";
+      runtimeInputs = [ dnvrState ];
+      text = ''
+        CHLIVE_URL="''${CHLIVE_URL:-$(dnvr-state get ${name "server"}.url)}"
+        PROXY_URL="''${PROXY_URL:-$(dnvr-state get ${name "redpanda"}.proxyUrl)}"
+        export CHLIVE_URL PROXY_URL
+        cd "$DNVR_ROOT"
+        exec bun scripts/chat/smoke.ts "$@"
+      '';
+    };
+  };
+}

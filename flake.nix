@@ -59,6 +59,17 @@
               ;
             inherit (inputs) continuous-backup;
           };
+          # the chat demo (examples/chat): `nix develop .#chat`
+          dnvr.shells.chat = import ./nix/chat.nix {
+            inherit
+              pkgs
+              presets
+              dnvrState
+              clickhouse
+              libchdb
+              ;
+            inherit (inputs) continuous-backup;
+          };
         };
     };
 }

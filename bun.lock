@@ -22,6 +22,19 @@
         "react",
       ],
     },
+    "examples/chat": {
+      "name": "chlive-chat",
+      "dependencies": {
+        "@chlive/client": "*",
+        "@sqlite.org/sqlite-wasm": "^3.53.4-build2",
+        "react": "^19.1.0",
+        "react-dom": "^19.1.0",
+      },
+      "devDependencies": {
+        "@vitejs/plugin-react": "^5.0.0",
+        "vite": "^7.1.0",
+      },
+    },
     "examples/playground": {
       "name": "chlive-playground",
       "dependencies": {
@@ -214,6 +227,8 @@
     "browserslist": ["browserslist@4.29.3", "", { "dependencies": { "baseline-browser-mapping": "^2.11.26", "caniuse-lite": "^1.0.30001813", "electron-to-chromium": "^1.5.439", "node-releases": "^2.0.57", "update-browserslist-db": "^1.3.3" }, "bin": { "browserslist": "cli.js" } }, "sha512-1R4kiYKXGViqEN0CnoDrXc1StD9niAwu+j2dukWzrD4bJgsD4lDmEp0CRbc6E/vYJIfTHwPmwyaKtVSudICdPA=="],
 
     "caniuse-lite": ["caniuse-lite@1.0.30001814", "", {}, "sha512-/Uaf1lAzr59XcMpW0o96WoEfr+VXK2OX4U9AgFoiSHsVJ4HppnIFUjtYzsyDH2+tgANaQb2/oxYGwCPapN1FpA=="],
+
+    "chlive-chat": ["chlive-chat@workspace:examples/chat"],
 
     "chlive-playground": ["chlive-playground@workspace:examples/playground"],
 

@@ -52,6 +52,8 @@ Writes go **straight to Kafka** through Redpanda's HTTP proxy (proxied as `/kafk
 
 It reconnects on its own when the server restarts (the fresh snapshots replace its rows). To see an alert, produce a request slower than the current top 5, e.g. on freshly seeded data `produce events '{"user_id": "u7", "country": "PL", "path": "/checkout", "latency_ms": 99999}'`, and watch the process's log (`dnvr logs rust-alerts`).
 
+`examples/chat` is a group-chat demo, two users side by side, with its own stack and schema, in its own dev shell: `nix develop .#chat`, then `dnvr up`. It's where permissions will be built; see [examples/chat/README.md](examples/chat/README.md).
+
 ## How it works
 
 Ingestion is Kafka Connect's ClickHouse sink, exactly once, which keeps no Kafka offsets in the rows. The **engine** (`engine/`, see [Engine](#engine-custom-dialect)) parses and binds the query against ClickHouse's schema, runs the history query on a **snapshot** of the table, and consumes the table's Kafka topic from right after the snapshot's offsets, decoding, filtering and projecting each event itself. Every event is in exactly one of history and stream.
@@ -83,7 +85,7 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `server/` | `chlive-server` (Rust; binary `chlive`): the WebSocket protocol over the engine, and its config (`chlive.example.toml`: every key and default) |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
 | `client-rs/` | `chlive-client` (Rust): the client for services; `examples/watch.rs` prints any query's updates |
-| `examples/` | example apps: `playground`, the query playground (React); `rust-alerts`, an event-driven service on `chlive-client` |
+| `examples/` | example apps: `playground`, the query playground (React); `rust-alerts`, an event-driven service on `chlive-client`; `chat`, the permissions demo (its own dev shell) |
 | `tui/` | `chlive-tui` (Rust; binary `clc`): a terminal UI on `chlive-client`; type a query, watch its result as a table updated on every diff |
 | `tests/` | end-to-end tests (`chlive-e2e`): the server over the full stack, with a small Kafka producer |
 | `bench/` | `queries.ts`: a ladder of queries, simple to most complex, benchmarked through `@chlive/client` against the stack; results in `docs/bench/` |
