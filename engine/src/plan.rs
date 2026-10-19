@@ -9,6 +9,7 @@ use crate::binder::{
     AggExpr, AggFunc, Aggregation, BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId,
     OrderKey,
 };
+use crate::calendar::Interval;
 use crate::diff::Row;
 use crate::order::{KeyOrder, SortKey};
 use crate::rules::{quote_ident, TopicId};
@@ -466,32 +467,50 @@ pub struct HistoryPlan {
     pub windows: Vec<HistoryWindow>,
 }
 
-/// A time window in the history query: `column op now() + shift`.
+/// A time window in the history query: `column op now(['tz']) ± INTERVAL …`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryWindow {
     /// The column, quoted.
     pub column: String,
     pub inclusive: bool,
-    pub shift_ns: i128,
+    pub tz: Option<chrono_tz::Tz>,
+    pub intervals: Vec<Interval>,
 }
 
 impl HistoryWindow {
     /// At `now` (nanoseconds since the epoch) a literal; otherwise `now()` itself (for the
-    /// plan's identity and explain, which mustn't change as time passes).
+    /// plan's identity and explain, which mustn't change as time passes). The intervals stay
+    /// as written, so ClickHouse adds DAY and WEEK by the calendar in the timezone.
     fn sql(&self, now: Option<i128>) -> String {
         let op = if self.inclusive { ">=" } else { ">" };
-        match now {
-            Some(now) => format!(
-                "{} {op} fromUnixTimestamp64Nano(toInt64({}))",
-                self.column,
-                now + self.shift_ns
-            ),
-            None => format!(
-                "{} {op} now64(9) + toIntervalNanosecond({})",
-                self.column, self.shift_ns
-            ),
-        }
+        let tz = self.tz.map(|tz| quote_string(tz.name()));
+        let now = match (now, tz) {
+            (Some(n), Some(tz)) => format!("fromUnixTimestamp64Nano(toInt64({n}), {tz})"),
+            (Some(n), None) => format!("fromUnixTimestamp64Nano(toInt64({n}))"),
+            (None, Some(tz)) => format!("now64(9, {tz})"),
+            (None, None) => "now64(9)".into(),
+        };
+        format!(
+            "{} {op} {now}{}",
+            self.column,
+            intervals_sql(&self.intervals)
+        )
     }
+}
+
+/// ` - INTERVAL 1 DAY + INTERVAL 2 HOUR`, as written.
+fn intervals_sql(intervals: &[Interval]) -> String {
+    intervals
+        .iter()
+        .map(|i| {
+            format!(
+                " {} INTERVAL {} {}",
+                if i.amount < 0 { '-' } else { '+' },
+                i.amount.unsigned_abs(),
+                i.unit.name()
+            )
+        })
+        .collect()
 }
 
 impl HistoryPlan {
@@ -622,8 +641,8 @@ pub struct StreamPlan {
     pub windows: Vec<WindowPlan>,
 }
 
-/// A time window for the stream: `column > now() + shift` (or `>=`). A row holds until the
-/// server's clock reaches its deadline, `column − shift` (`>=`: a nanosecond later).
+/// A time window for the stream: `column > now(['tz']) ± INTERVAL …` (or `>=`). A row holds
+/// until the server's clock reaches its deadline (see [`crate::calendar::deadline`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowPlan {
     pub column: ColumnId,
@@ -633,7 +652,11 @@ pub struct WindowPlan {
     pub history_field: String,
     pub hidden: bool,
     pub inclusive: bool,
-    pub shift_ns: i128,
+    pub intervals: Vec<Interval>,
+    /// The query's timezone (`now('…')`), and the one DAY and WEEK go by: the query's, or the
+    /// server's (set by the engine; UTC until then).
+    pub tz: Option<chrono_tz::Tz>,
+    pub zone: chrono_tz::Tz,
     /// The condition in dialect syntax, for `explain`.
     pub text: String,
 }
@@ -646,31 +669,19 @@ impl WindowPlan {
             return None;
         };
         let ns = i128::from(dt.ticks) * 10i128.pow(9 - u32::from(dt.precision.min(9)));
-        Some(ns - self.shift_ns + i128::from(self.inclusive))
+        Some(crate::calendar::deadline(
+            ns,
+            &self.intervals,
+            self.zone,
+            self.inclusive,
+        ))
     }
 }
 
-/// `now() ± INTERVAL …` in dialect syntax: the shift in its largest whole unit.
-fn now_text(shift_ns: i128) -> String {
-    if shift_ns == 0 {
-        return "now()".into();
-    }
-    let units: [(i128, &str); 6] = [
-        (7 * 86_400 * 1_000_000_000, "WEEK"),
-        (86_400 * 1_000_000_000, "DAY"),
-        (3_600 * 1_000_000_000, "HOUR"),
-        (60 * 1_000_000_000, "MINUTE"),
-        (1_000_000_000, "SECOND"),
-        (1_000_000, "MILLISECOND"),
-    ];
-    let abs = shift_ns.abs();
-    let (per, unit) = units
-        .iter()
-        .find(|(per, _)| abs % per == 0)
-        .copied()
-        .unwrap_or((1, "NANOSECOND"));
-    let sign = if shift_ns < 0 { '-' } else { '+' };
-    format!("now() {sign} INTERVAL {} {unit}", abs / per)
+/// `now(['tz']) ± INTERVAL …` in dialect syntax, as written.
+fn now_text(tz: Option<chrono_tz::Tz>, intervals: &[Interval]) -> String {
+    let tz = tz.map(|tz| quote_string(tz.name())).unwrap_or_default();
+    format!("now({tz}){}", intervals_sql(intervals))
 }
 
 /// FINAL for the stream: what identifies a row, which version it is, and whether it's deleted;
@@ -1385,12 +1396,14 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
                 history_field,
                 hidden,
                 inclusive: w.inclusive,
-                shift_ns: w.shift_ns,
+                intervals: w.intervals.clone(),
+                tz: w.tz,
+                zone: w.tz.unwrap_or(chrono_tz::Tz::UTC),
                 text: format!(
                     "{} {} {}",
                     c.name,
                     if w.inclusive { ">=" } else { ">" },
-                    now_text(w.shift_ns)
+                    now_text(w.tz, &w.intervals)
                 ),
             }
         })
@@ -1432,7 +1445,8 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
             .map(|w| HistoryWindow {
                 column: quote_ident(&table.column(w.column).clickhouse),
                 inclusive: w.inclusive,
-                shift_ns: w.shift_ns,
+                tz: w.tz,
+                intervals: w.intervals.clone(),
             })
             .collect(),
     };
@@ -1868,26 +1882,25 @@ mod tests {
         b.windows = vec![crate::binder::TimeWindow {
             column: ColumnId(0),
             inclusive: false,
-            shift_ns: -H,
+            tz: None,
+            intervals: vec![crate::calendar::Interval {
+                amount: -1,
+                unit: crate::calendar::Unit::Hour,
+            }],
             span: crate::error::Span::new(0, 0),
         }];
         let p = plan(&b);
         // ts isn't selected: fetched under a hidden alias, for the rows' deadlines
         assert_eq!(
             p.history.sql("db.snap"),
-            format!(
-                "SELECT user_id, ts AS __time_0 FROM db.snap WHERE ts > now64(9) + \
-                 toIntervalNanosecond({})",
-                -H
-            )
+            "SELECT user_id, ts AS __time_0 FROM db.snap WHERE ts > now64(9) - INTERVAL 1 HOUR"
         );
         let now: i128 = 1_800_000_000_000_000_000;
         assert_eq!(
             p.history.sql_at("db.snap", now),
             format!(
                 "SELECT user_id, ts AS __time_0 FROM db.snap WHERE ts > \
-                 fromUnixTimestamp64Nano(toInt64({}))",
-                now - H
+                 fromUnixTimestamp64Nano(toInt64({now})) - INTERVAL 1 HOUR"
             )
         );
         assert!(p.stream.required_keys().contains(&"ts".to_string()));
@@ -1917,10 +1930,49 @@ mod tests {
         let mut b2 = bound(&[0], Some(f));
         b2.windows = b.windows.clone();
         b2.windows[0].inclusive = true;
-        assert!(plan(&b2).history.sql("x").ends_with(&format!(
-            "WHERE (latency_ms > 5) AND ts >= now64(9) + toIntervalNanosecond({})",
-            -H
+        assert!(plan(&b2)
+            .history
+            .sql("x")
+            .ends_with("WHERE (latency_ms > 5) AND ts >= now64(9) - INTERVAL 1 HOUR"));
+        // a timezone: in the query (so in its identity), and ClickHouse adds DAYs by it
+        let mut b3 = bound(&[1], None);
+        b3.windows = b.windows.clone();
+        b3.windows[0].tz = Some(chrono_tz::Europe::Warsaw);
+        b3.windows[0].intervals = vec![
+            crate::calendar::Interval {
+                amount: -1,
+                unit: crate::calendar::Unit::Day,
+            },
+            crate::calendar::Interval {
+                amount: 2,
+                unit: crate::calendar::Unit::Hour,
+            },
+        ];
+        let p3 = plan(&b3);
+        assert!(p3
+            .history
+            .sql("x")
+            .ends_with("WHERE ts > now64(9, 'Europe/Warsaw') - INTERVAL 1 DAY + INTERVAL 2 HOUR"));
+        assert!(p3.history.sql_at("x", now).ends_with(&format!(
+            "WHERE ts > fromUnixTimestamp64Nano(toInt64({now}), 'Europe/Warsaw') \
+             - INTERVAL 1 DAY + INTERVAL 2 HOUR"
         )));
+        assert!(p3
+            .to_string()
+            .contains("window:  ts > now('Europe/Warsaw') - INTERVAL 1 DAY + INTERVAL 2 HOUR"));
+        assert_ne!(p3.history.sql("x"), {
+            let mut b4 = b3.clone();
+            b4.windows[0].tz = Some(chrono_tz::Europe::London);
+            plan(&b4).history.sql("x")
+        });
+        // its deadlines by the Warsaw calendar: the day before the clocks go back is 25 h
+        let mut row = json!({"user_id": "u", "__time_0": "2026-10-24 10:00:00.000"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let d = p3.stream.history_deadline(&mut row).unwrap().unwrap();
+        let ts = crate::types::parse_datetime("2026-10-24 10:00:00.000", 3).unwrap();
+        assert_eq!(d, i128::from(ts) * 1_000_000 + 25 * H - 2 * H);
     }
 
     #[test]

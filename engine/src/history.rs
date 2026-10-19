@@ -34,6 +34,10 @@ pub trait HistorySource: Send + Sync {
         Ok(TableEngine::MergeTree)
     }
     async fn fetch(&self, sql: &str) -> Result<Vec<Row>, HistoryError>;
+    /// The server's timezone, which `now()` without one goes by (fakes: UTC).
+    async fn timezone(&self) -> Result<String, HistoryError> {
+        Ok("UTC".into())
+    }
 }
 
 pub struct ClickHouseHttp {
@@ -107,6 +111,18 @@ impl HistorySource for ClickHouseHttp {
             }
             other => other,
         }
+    }
+
+    async fn timezone(&self) -> Result<String, HistoryError> {
+        #[derive(Deserialize)]
+        struct Tz {
+            tz: String,
+        }
+        let rows: Vec<Tz> = self.json_each_row("SELECT timezone() AS tz").await?;
+        rows.into_iter()
+            .next()
+            .map(|r| r.tz)
+            .ok_or_else(|| HistoryError::ClickHouse("timezone(): no row".into()))
     }
 
     async fn table_engine(&self, database: &str, table: &str) -> Result<TableEngine, HistoryError> {

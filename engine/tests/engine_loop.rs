@@ -220,6 +220,8 @@ impl HistorySource for FakeHistory {
                 let f = &["user_id", "__order_0", "__time_0"];
                 Ok(vec![click_row(f, "h2", -1_000, 1), click_row(f, "h1", -5_000, 3)])
             }
+            // the calendar test's: nothing in ClickHouse
+            s if s.contains("toInt64(1792836000000000000)") => Ok(vec![]),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -231,8 +233,8 @@ const B: i128 = 1_792_324_800_000_000_000;
 /// The history query of `clicks` with `ts > now() - INTERVAL 10 SECOND` at B.
 fn clicks_sql(select: &str, order: &str, limit: &str) -> String {
     format!(
-        "{select} FROM default.clicks WHERE ts > fromUnixTimestamp64Nano(toInt64({})){order}{limit}",
-        B - 10_000_000_000
+        "{select} FROM default.clicks WHERE ts > fromUnixTimestamp64Nano(toInt64({B})) \
+         - INTERVAL 10 SECOND{order}{limit}"
     )
 }
 
@@ -1138,6 +1140,45 @@ async fn a_late_old_event_brings_the_wakeup_forward() {
             assert_eq!(it.to_string(), "clock: - @2");
             assert_eq!(start.elapsed().as_millis(), 1_000);
             break;
+        }
+    }
+}
+
+/// `now('Europe/Warsaw') - INTERVAL 1 DAY` goes by the calendar: a row from noon the day before
+/// the clocks go back leaves at noon the next day, 25 hours later (in UTC, 24).
+#[tokio::test(start_paused = true)]
+async fn a_day_across_the_clocks_going_back_is_25_hours() {
+    // 2026-10-24 12:00 in Warsaw (10:00 UTC)
+    const NOON: i128 = 1_792_836_000_000_000_000;
+    for (tz, hours) in [("Europe/Warsaw", 25), ("UTC", 24)] {
+        let mut source = MemorySource::new();
+        source.push("clicks", 0, click("h", 0, 1)); // in the (empty) history
+        source.push(
+            "clicks",
+            0,
+            format!(
+                r#"{{"ts": "{}", "user_id": "noon", "latency_ms": 1}}"#,
+                chlive_engine::types::format_datetime((NOON / 1_000_000) as i64, 3)
+            )
+            .as_str(),
+        );
+        let e = engine(source)
+            .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(NOON)))
+            .with_now_coalescing(std::time::Duration::ZERO);
+        let mut sub = e
+            .subscribe(&format!(
+                "select user_id from clicks where ts > now('{tz}') - interval 1 day"
+            ))
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        loop {
+            let it = sub.next().await.unwrap().unwrap();
+            if it.origin == Origin::Clock {
+                assert_eq!(it.to_string(), "clock: - @0");
+                assert_eq!(start.elapsed().as_secs(), hours * 3600, "{tz}");
+                break;
+            }
         }
     }
 }

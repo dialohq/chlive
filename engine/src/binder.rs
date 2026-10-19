@@ -9,6 +9,7 @@ use crate::ast::{
     CallArg, CmpOp, ColumnRef, Direction, Expr, Literal, NullsOrder, Order, Projection, Query,
     SelectExpr,
 };
+use crate::calendar::Interval;
 use crate::error::{render_at, Span};
 use crate::history::{DescribedColumn, HistoryError, HistorySource};
 use crate::rules::{NamingRules, TopicId};
@@ -126,14 +127,16 @@ pub struct BoundQuery {
     pub windows: Vec<TimeWindow>,
 }
 
-/// `column > now() + shift` (or `>=`): a row holds while the server's clock is before its
-/// column's value minus `shift`.
+/// `column > now(['tz']) ± INTERVAL …` (or `>=`): a row holds while the column's value is after
+/// the server's clock with the intervals applied (DAY and WEEK by the calendar in `tz`, the
+/// server's timezone if `None`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeWindow {
     pub column: ColumnId,
     /// `>=` rather than `>`.
     pub inclusive: bool,
-    pub shift_ns: i128,
+    pub tz: Option<chrono_tz::Tz>,
+    pub intervals: Vec<Interval>,
     /// The `now`'s, for errors.
     pub span: Span,
 }
@@ -656,7 +659,12 @@ fn split_windows(
                 continue;
             }
         };
-        let Expr::Now { shift_ns, span } = now else {
+        let Expr::Now {
+            tz,
+            intervals,
+            span,
+        } = now
+        else {
             unreachable!("matched above")
         };
         let inclusive = match op {
@@ -686,7 +694,14 @@ fn split_windows(
         windows.push(TimeWindow {
             column: c.id,
             inclusive,
-            shift_ns: *shift_ns,
+            tz: match tz {
+                None => None,
+                Some(name) => Some(
+                    name.parse::<chrono_tz::Tz>()
+                        .map_err(|_| BindError::at(format!("unknown timezone '{name}'"), *span))?,
+                ),
+            },
+            intervals: intervals.clone(),
             span: *span,
         });
     }
@@ -2079,6 +2094,30 @@ mod tests {
         assert!(bind_sql("select * from lowered").await.is_ok());
     }
 
+    /// The intervals' total, a day as 24 hours.
+    fn shift_of(intervals: &[Interval]) -> i128 {
+        crate::calendar::shift(0, intervals, chrono_tz::Tz::UTC)
+    }
+
+    #[tokio::test]
+    async fn now_takes_a_timezone() {
+        let q = bind_sql("select ts from events where ts > now('Europe/Warsaw') - interval 1 day")
+            .await
+            .unwrap();
+        assert_eq!(q.windows[0].tz, Some(chrono_tz::Europe::Warsaw));
+        assert_eq!(shift_of(&q.windows[0].intervals), -86_400_000_000_000);
+        let q = bind_sql("select ts from events where ts > now()")
+            .await
+            .unwrap();
+        assert_eq!(q.windows[0].tz, None, "the server's");
+        assert_eq!(
+            bind_sql("select ts from events where ts > now('Europe/Warsw')")
+                .await
+                .unwrap_err(),
+            "unknown timezone 'Europe/Warsw' at 1:34"
+        );
+    }
+
     #[tokio::test]
     async fn time_windows_bind_apart_from_the_filter() {
         const H: i128 = 3_600_000_000_000;
@@ -2092,7 +2131,7 @@ mod tests {
         assert_eq!(
             q.windows
                 .iter()
-                .map(|w| (w.column, w.inclusive, w.shift_ns))
+                .map(|w| (w.column, w.inclusive, shift_of(&w.intervals)))
                 .collect::<Vec<_>>(),
             [(ts, false, -H), (ts, true, -2 * H)]
         );

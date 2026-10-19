@@ -204,10 +204,11 @@ pub enum Expr {
         negated: bool,
         span: Span,
     },
-    /// `now() [± INTERVAL n unit]…`: the server's clock, shifted by `shift_ns`; `span` is the
-    /// `now`'s.
+    /// `now(['timezone']) [± INTERVAL n unit]…`: the server's clock, with the intervals as
+    /// written (DAY and WEEK go by the calendar in the timezone); `span` is the `now`'s.
     Now {
-        shift_ns: i128,
+        tz: Option<String>,
+        intervals: Vec<crate::calendar::Interval>,
         span: Span,
     },
     /// `expr [NOT] IN (SELECT …)`; `span` is the `IN`'s.

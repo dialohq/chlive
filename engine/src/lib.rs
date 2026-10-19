@@ -29,6 +29,7 @@
 pub mod aggregate;
 pub mod ast;
 pub mod binder;
+pub mod calendar;
 pub mod chdb;
 pub mod checkpoint;
 pub mod clock;

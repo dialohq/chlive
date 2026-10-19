@@ -976,6 +976,8 @@ async fn rows_leave_a_time_window_as_time_passes() -> Result<()> {
             let conn = LiveConn::connect(server).await?;
             conn.subscribe("w", sql);
             conn.wait_ready(&["w"], Duration::from_secs(60)).await?;
+            // what's already in the window (rows written with a time ahead of the clock stay)
+            let held = conn.result("w").unwrap().rows.len();
             let produced = producer()?.produce(50, None).await?;
             // they come in ...
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -985,10 +987,12 @@ async fn rows_leave_a_time_window_as_time_passes() -> Result<()> {
             }
             // ... and leave, with no further events
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !conn.result("w").unwrap().rows.is_empty() {
+            while conn.result("w").unwrap().rows.len() > held
+                || conn.result("w").unwrap().deleted < conn.result("w").unwrap().inserted
+            {
                 anyhow::ensure!(
                     std::time::Instant::now() < deadline,
-                    "rows didn't leave: {:?}",
+                    "rows didn't leave: {} of {held} before",
                     conn.result("w").unwrap().rows.len()
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;

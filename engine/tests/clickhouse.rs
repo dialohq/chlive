@@ -1692,6 +1692,155 @@ async fn time_windows_match_clickhouse() {
     }
 }
 
+/// `now('Europe/Warsaw') ± INTERVAL n DAY|WEEK` goes by the calendar as in ClickHouse: the
+/// arithmetic around both 2026 DST changes (into the skipped and the repeated hour too), and a
+/// window just after the clocks went back, where a day is 25 hours, in every split.
+#[tokio::test]
+async fn calendar_windows_match_clickhouse() {
+    use chlive_engine::calendar::{shift, Interval, Unit};
+    use chlive_engine::history::HistorySource;
+    if std::env::var_os("CHLIVE_E2E").is_none() {
+        eprintln!("skipping: set CHLIVE_E2E=1 (requires `dnvr up`)");
+        return;
+    }
+    const H: i128 = 3_600_000_000_000;
+    let warsaw = chrono_tz::Europe::Warsaw;
+    let direct = ClickHouseHttp::new(&url(), "default", "");
+    let server: chrono_tz::Tz = direct.timezone().await.unwrap().parse().unwrap();
+    eprintln!("ClickHouse's timezone: {server}");
+
+    // around 2026-03-29 01:00 UTC and 2026-10-25 01:00 UTC, every 30 minutes for two days,
+    // plus a nanosecond either side of the changes
+    let changes: [i128; 2] = [1_774_746_000_000_000_000, 1_792_890_000_000_000_000];
+    let mut instants: Vec<i128> = changes
+        .iter()
+        .flat_map(|c| (-52..=52).map(move |k| c + k * H / 2))
+        .collect();
+    instants.extend(changes.iter().flat_map(|c| [c - 1, *c, c + 1]));
+    for (sign, amount, unit, name) in [
+        ('+', 1, Unit::Day, "DAY"),
+        ('-', 1, Unit::Day, "DAY"),
+        ('+', 1, Unit::Week, "WEEK"),
+        ('-', 1, Unit::Week, "WEEK"),
+    ] {
+        let list = instants
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let rows = direct
+            .fetch(&format!(
+                "SELECT toString(n) AS n, toString(toUnixTimestamp64Nano(\
+                 fromUnixTimestamp64Nano(toInt64(n), 'Europe/Warsaw') {sign} INTERVAL {amount} {name})) AS s \
+                 FROM (SELECT arrayJoin([{list}]) AS n)"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), instants.len());
+        let interval = [Interval {
+            amount: if sign == '-' { -amount } else { amount },
+            unit,
+        }];
+        for r in rows {
+            let n: i128 = r["n"].as_str().unwrap().parse().unwrap();
+            let want: i128 = r["s"].as_str().unwrap().parse().unwrap();
+            assert_eq!(
+                shift(n, &interval, warsaw),
+                want,
+                "{n} {sign} INTERVAL {amount} {name}"
+            );
+        }
+    }
+
+    // the clock at 2026-10-25 12:00 Warsaw (11:00 UTC), the day the clocks went back: a day
+    // ago is 25 hours ago, so rows up to 25 h old are in
+    const B: i128 = 1_792_926_000_000_000_000;
+    let ts = |m: i64| chlive_engine::types::format_datetime((B / 1_000_000) as i64 + m * 60_000, 3);
+    // minutes before B: within a 24 h day, between 24 and 25 h (in only by the calendar), and
+    // out; none within 10 minutes of the edge
+    let ages: Vec<i64> = [10, 600, 1400, 1450, 1470, 1490, 1510, 1530, 1600, 2000].into();
+    let events: Vec<String> = ages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| format!(r#"{{"ts":"{}","user_id":"u{i}","latency_ms":{i}}}"#, ts(-m)))
+        .collect();
+    let sql = "select user_id, ts from events where ts > now('Europe/Warsaw') - interval 1 day";
+    let mut engines = Vec::new();
+    for (database, in_clickhouse) in [
+        ("chlive_engine_calendar_history", events.len()),
+        ("chlive_engine_calendar_stream", 0),
+        ("chlive_engine_calendar_split", events.len() / 2),
+    ] {
+        exec(&format!("DROP DATABASE IF EXISTS {database}")).await;
+        exec(&format!("CREATE DATABASE {database}")).await;
+        exec(&format!(
+            "CREATE TABLE {database}.events (ts DateTime64(3), user_id String, latency_ms UInt32) \
+             ENGINE = MergeTree ORDER BY ts"
+        ))
+        .await;
+        if in_clickhouse > 0 {
+            let rows: String = events[..in_clickhouse]
+                .iter()
+                .map(|e| format!("{e}\n"))
+                .collect();
+            exec(&format!(
+                "INSERT INTO {database}.events FORMAT JSONEachRow\n{rows}"
+            ))
+            .await;
+        }
+        let mut source = MemorySource::new();
+        for e in &events {
+            source.push("events", 0, e.as_str());
+        }
+        let engine = engine_at(database.into(), source, upto(in_clickhouse))
+            .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)));
+        engines.push((database, engine, in_clickhouse));
+    }
+    let at_b = sql
+        .replace("from events", "from chlive_engine_calendar_history.events")
+        .replace(
+            "now('Europe/Warsaw')",
+            &format!("fromUnixTimestamp64Nano(toInt64({B}), 'Europe/Warsaw')"),
+        );
+    let mut want: Vec<String> = direct
+        .fetch(&at_b)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r["user_id"].as_str().unwrap().to_string())
+        .collect();
+    want.sort();
+    // 25 h: the ones up to 1490 minutes old (a 24 h day would stop at 1400)
+    assert_eq!(want, ["u0", "u1", "u2", "u3", "u4", "u5"]);
+    for (database, engine, in_clickhouse) in &engines {
+        let n = 1 + events.len() - in_clickhouse;
+        let iterations: Vec<_> = engine
+            .subscribe(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .take(n)
+            .map(|i| i.unwrap_or_else(|e| panic!("{database}: {e}")))
+            .collect()
+            .await;
+        let mut rows = Vec::new();
+        for it in &iterations {
+            assert_ne!(it.origin, Origin::Clock, "{database}: nothing leaves yet");
+            for d in &it.diffs {
+                d.apply(&mut rows).unwrap();
+            }
+        }
+        let mut got: Vec<String> = rows
+            .iter()
+            .map(|r| r["user_id"].as_str().unwrap().to_string())
+            .collect();
+        got.sort();
+        assert_eq!(got, want, "{database}");
+    }
+    for (database, _, _) in &engines {
+        exec(&format!("DROP DATABASE {database}")).await;
+    }
+}
+
 /// `IN (SELECT …)` over two tables, in every split of history and stream for both: the live
 /// result (history, then events, then users entering S with back-fills) equals ClickHouse's
 /// answer over all the data.

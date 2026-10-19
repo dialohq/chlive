@@ -122,6 +122,8 @@ pub struct Engine {
     /// rows due in between.
     clock: Arc<dyn Clock>,
     now_coalescing: Duration,
+    /// ClickHouse's timezone, for `now()` without one: read on the first time window.
+    server_tz: tokio::sync::OnceCell<chrono_tz::Tz>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +204,7 @@ impl Engine {
             final_buffer: crate::keyed::BUFFER,
             clock: Arc::new(SystemClock),
             now_coalescing: NOW_COALESCING,
+            server_tz: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -261,7 +264,31 @@ impl Engine {
             BindError::Source(e) => EngineError::Source(e),
             e => EngineError::Bind(e.render(sql)),
         })?;
-        Ok(plan_with(&bound, self.final_buffer))
+        let mut plan = plan_with(&bound, self.final_buffer);
+        if plan.stream.windows.iter().any(|w| w.tz.is_none()) {
+            let zone = self.server_tz().await?;
+            for w in &mut plan.stream.windows {
+                if w.tz.is_none() {
+                    w.zone = zone;
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// ClickHouse's timezone (read once); one chrono-tz doesn't know is UTC.
+    async fn server_tz(&self) -> Result<chrono_tz::Tz, EngineError> {
+        self.server_tz
+            .get_or_try_init(|| async {
+                let name = self.history.timezone().await?;
+                Ok(name.parse().unwrap_or_else(|_| {
+                    tracing::warn!(timezone = %name, "ClickHouse's timezone is unknown here; now() uses UTC");
+                    chrono_tz::Tz::UTC
+                }))
+            })
+            .await
+            .copied()
+            .map_err(EngineError::History)
     }
 
     /// Plan a query and start it: the history first, then one iteration per event of the

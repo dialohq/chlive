@@ -228,10 +228,10 @@ Functions (except `now()`, see [Time](#time)), arithmetic, `LIKE` and `BETWEEN` 
 ### Time
 
 `now()` is the server's clock, so a live query with it changes with no event: `WHERE ts > now() - INTERVAL 1 HOUR` keeps the last hour's rows, and rows leave as the clock passes them.
-- **`now()` takes no arguments** (ClickHouse's `now(timezone)` isn't supported).
+- **`now(['timezone'])`** as in ClickHouse: `now('Europe/Warsaw')`. The timezone doesn't change the instant. It only matters for `DAY` and `WEEK`, which go by the calendar in that timezone: across a DST change, `INTERVAL 1 DAY` is 23 or 25 hours, as in ClickHouse. `now()` without one uses ClickHouse's server timezone (read once).
 - **`INTERVAL n unit`** can be added or subtracted, any number of times: `now() - INTERVAL 1 HOUR - INTERVAL 30 MINUTE`. Units: `MILLISECOND`, `SECOND`, `MINUTE`, `HOUR`, `DAY`, `WEEK` (calendar units, `MONTH`/`QUARTER`/`YEAR`, aren't supported yet).
-- **The supported form** is a sliding window: a `DateTime`/`DateTime64` column `>` or `>=` `now() ± INTERVAL …` (or the same with the sides swapped), as top-level AND conditions of the WHERE, any number of them. A row holds until the clock reaches its deadline: the column's value minus the shift (measured from the row's own time, not from when its event arrived, so a late event with an old `ts` leaves sooner).
-- **History** reads the window with the clock's value inlined (`ts > fromUnixTimestamp64Nano(…)`), so history and stream agree; an event already past its deadline never comes in. The plan's identity keeps `now()` symbolic (and the refresh), so a result is shared and stored like any other.
+- **The supported form** is a sliding window: a `DateTime`/`DateTime64` column `>` or `>=` `now() ± INTERVAL …` (or the same with the sides swapped), as top-level AND conditions of the WHERE, any number of them. A row holds until the clock reaches its deadline: the first instant at which `now() ± INTERVAL …` catches up with the column's value (measured from the row's own time, not from when its event arrived, so a late event with an old `ts` leaves sooner).
+- **History** reads the window with the clock's value inlined and the intervals as written (`ts > fromUnixTimestamp64Nano(…, 'Europe/Warsaw') - INTERVAL 1 DAY`), so ClickHouse does the calendar itself, and history and stream agree; an event already past its deadline never comes in. The plan's identity keeps `now()` symbolic (with its timezone), so a result is shared and stored like any other.
 - **Leaving:** the engine wakes at the earliest deadline and deletes the rows whose deadline the clock passed (`delete @i`, highest first), as one diff with no event behind it. `server.now_coalescing` (default 100 ms) is how long after the earliest it waits, so rows due within it leave together: never early, at most that late (`0s`: each at its own deadline). A result with nothing due doesn't wake. The shared result's change log keeps them, so a client resumes through them; a result restored from disk lets everything that went overdue meanwhile go at once. A `since` cursor gets a fresh snapshot.
 - **Shapes:** plain results, ORDER BY (rows leave wherever they are), and LIMIT only with ORDER BY the window's column DESC first ("the latest n in the last hour"), where rows leave from the bottom and nothing has to come in.
 - **Not yet:** rows that come in as time passes (`ts <= now()`, `<`, `=`), `now()` inside OR/NOT/IN or compared with a value, other LIMITs, OFFSET, GROUP BY and aggregates (next), FINAL, and sub-queries.
@@ -514,7 +514,7 @@ condition   := condition OR condition | condition AND condition | NOT condition 
              | EXISTS (SELECT … FROM table [[AS] alias] [WHERE inner.col = outer.col] [AND condition …])
              | operand
 operand     := column | literal
-             | now() [{+ | -} INTERVAL n unit …]                -- see Time
+             | now(['timezone']) [{+ | -} INTERVAL n unit …]    -- see Time
 literal     := number | -number | 'string' | TRUE | FALSE | NULL
 column      := [table_or_alias.]name
 name, table, alias := identifier | "identifier" | `identifier`

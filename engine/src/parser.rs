@@ -4,6 +4,7 @@
 
 use crate::ast::{CallArg, Direction, Limit, NullsOrder, Order, OrderItem, SelectExpr, SelectItem};
 use crate::ast::{CmpOp, ColumnRef, Expr, Literal, Projection, Query, TableRef};
+use crate::calendar::{Interval, Unit};
 use crate::error::{Span, SyntaxError};
 use crate::lexer::{tokenize, Token, TokenKind};
 
@@ -577,14 +578,24 @@ impl Parser {
     fn now_expr(&mut self) -> Result<Expr, SyntaxError> {
         let span = self.next().span;
         self.next(); // `(`
+        let tz = match self.peek().kind.clone() {
+            TokenKind::RParen => None,
+            TokenKind::String(tz) => {
+                self.next();
+                Some(tz)
+            }
+            _ => {
+                return Err(SyntaxError::new(
+                    "now()'s argument is a timezone, e.g. now('Europe/Warsaw')",
+                    self.peek().span,
+                ))
+            }
+        };
         if self.peek().kind != TokenKind::RParen {
-            return Err(SyntaxError::new(
-                "now() takes no arguments",
-                self.peek().span,
-            ));
+            return Err(self.expected("`)`"));
         }
         self.next();
-        let mut shift_ns: i128 = 0;
+        let mut intervals = Vec::new();
         loop {
             let sign = match self.peek().kind {
                 TokenKind::Plus => 1,
@@ -607,20 +618,20 @@ impl Parser {
                 return Err(self.expected("a number of units after INTERVAL"));
             };
             let at = self.next().span;
-            let n: i128 = n
+            let n: i64 = n
                 .parse()
                 .map_err(|_| SyntaxError::new("an INTERVAL is a whole number of units", at))?;
             let unit = self.peek().clone();
             let TokenKind::Ident(u) = &unit.kind else {
                 return Err(self.expected("a unit (SECOND, MINUTE, HOUR, DAY, …)"));
             };
-            let per: i128 = match u.to_ascii_uppercase().as_str() {
-                "MILLISECOND" => 1_000_000,
-                "SECOND" => 1_000_000_000,
-                "MINUTE" => 60 * 1_000_000_000,
-                "HOUR" => 3_600 * 1_000_000_000,
-                "DAY" => 86_400 * 1_000_000_000,
-                "WEEK" => 7 * 86_400 * 1_000_000_000,
+            let unit_of = match u.to_ascii_uppercase().as_str() {
+                "MILLISECOND" => Unit::Millisecond,
+                "SECOND" => Unit::Second,
+                "MINUTE" => Unit::Minute,
+                "HOUR" => Unit::Hour,
+                "DAY" => Unit::Day,
+                "WEEK" => Unit::Week,
                 "MONTH" | "QUARTER" | "YEAR" => {
                     return Err(SyntaxError::new(
                         "calendar intervals (MONTH, QUARTER, YEAR) aren't supported yet",
@@ -635,9 +646,16 @@ impl Parser {
                 }
             };
             self.next();
-            shift_ns += sign * n * per;
+            intervals.push(Interval {
+                amount: sign * n,
+                unit: unit_of,
+            });
         }
-        Ok(Expr::Now { shift_ns, span })
+        Ok(Expr::Now {
+            tz,
+            intervals,
+            span,
+        })
     }
 
     fn projection(&mut self) -> Result<Projection, SyntaxError> {
@@ -915,7 +933,14 @@ mod tests {
                 Expr::And(l, r) => format!("({} AND {})", show(l), show(r)),
                 Expr::Or(l, r) => format!("({} OR {})", show(l), show(r)),
                 Expr::Not { expr, .. } => format!("(NOT {})", show(expr)),
-                Expr::Now { shift_ns, .. } => format!("now({shift_ns:+})"),
+                Expr::Now { tz, intervals, .. } => format!(
+                    "now({}{})",
+                    tz.as_deref().unwrap_or(""),
+                    intervals
+                        .iter()
+                        .map(|i| format!(" {:+} {}", i.amount, i.unit.name()))
+                        .collect::<String>()
+                ),
                 Expr::IsNull { expr, negated, .. } => format!(
                     "({} IS{} NULL)",
                     show(expr),
@@ -1002,24 +1027,31 @@ mod tests {
 
     #[test]
     fn now_and_intervals() {
-        const H: i128 = 3_600_000_000_000;
-        assert_eq!(
-            where_of("select * from t where ts > now()"),
-            "(ts > now(+0))"
-        );
+        assert_eq!(where_of("select * from t where ts > now()"), "(ts > now())");
         assert_eq!(
             where_of("select * from t where ts > NOW() - interval 1 hour"),
-            format!("(ts > now({}))", -H)
+            "(ts > now( -1 HOUR))"
         );
         assert_eq!(
             where_of(
                 "select * from t where now() - INTERVAL 1 HOUR - INTERVAL 30 MINUTE + INTERVAL 2 SECOND < ts"
             ),
-            format!("(now({}) < ts)", -H - H / 2 + 2_000_000_000)
+            "(now( -1 HOUR -30 MINUTE +2 SECOND) < ts)"
         );
         assert_eq!(
             where_of("select * from t where ts >= now() + interval 1 week and x = 1"),
-            format!("((ts >= now(+{})) AND (x = Number(\"1\")))", 168 * H)
+            "((ts >= now( +1 WEEK)) AND (x = Number(\"1\")))"
+        );
+        // a timezone, as in ClickHouse; the intervals in order
+        assert_eq!(
+            where_of("select * from t where ts > now('UTC')"),
+            "(ts > now(UTC))"
+        );
+        assert_eq!(
+            where_of(
+                "select * from t where ts > now('Europe/Warsaw') - interval 1 day + interval 2 hour"
+            ),
+            "(ts > now(Europe/Warsaw -1 DAY +2 HOUR))"
         );
         for (src, want) in [
             (
@@ -1027,12 +1059,16 @@ mod tests {
                 "calendar intervals (MONTH, QUARTER, YEAR) aren't supported yet at 1:47",
             ),
             (
-                "select * from t where ts > now('UTC')",
-                "now() takes no arguments at 1:32",
+                "select * from t where ts > now(500)",
+                "now()'s argument is a timezone, e.g. now('Europe/Warsaw') at 1:32",
             ),
             (
-                "select * from t where ts > now(500)",
-                "now() takes no arguments at 1:32",
+                "select * from t where ts > now(x)",
+                "now()'s argument is a timezone, e.g. now('Europe/Warsaw') at 1:32",
+            ),
+            (
+                "select * from t where ts > now('UTC', 1)",
+                "expected `)`, found `,` at 1:37",
             ),
             (
                 "select * from t where ts > now() - 5",
