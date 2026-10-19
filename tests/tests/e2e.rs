@@ -961,8 +961,8 @@ async fn final_results_match_clickhouse() -> Result<()> {
     .await
 }
 
-/// `ts > now(200) - INTERVAL 2 SECOND`: rows produced now come in, and with no further events
-/// they leave as the server's clock passes them, within the refresh of their deadline.
+/// `ts > now() - INTERVAL 2 SECOND`: rows produced now come in, and with no further events they
+/// leave as the server's clock passes their deadlines.
 #[tokio::test]
 async fn rows_leave_a_time_window_as_time_passes() -> Result<()> {
     if !enabled() {
@@ -970,7 +970,7 @@ async fn rows_leave_a_time_window_as_time_passes() -> Result<()> {
     }
     let _guard = exclusive().await;
     init_tracing();
-    let sql = "select user_id, ts from events where ts > now(200) - interval 2 second";
+    let sql = "select user_id, ts from events where ts > now() - interval 2 second";
     with_server(config(), |server| {
         async move {
             let conn = LiveConn::connect(server).await?;

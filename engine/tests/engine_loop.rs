@@ -258,7 +258,8 @@ fn click(user: &str, ms: i64, latency: u32) -> String {
     )
 }
 
-/// Clicks (offset 0: the history) then events, under the test clock at B.
+/// Clicks (offset 0: the history) then events, under the test clock at B; rows leave exactly
+/// at their deadlines.
 fn clicks_engine(events: &[String]) -> Engine {
     let mut source = MemorySource::new();
     source.push("clicks", 0, click("h", 0, 1));
@@ -268,6 +269,7 @@ fn clicks_engine(events: &[String]) -> Engine {
     engine(source)
         .with_max_batch(1)
         .with_clock(Arc::new(chlive_engine::clock::TokioClock::at(B)))
+        .with_now_coalescing(std::time::Duration::ZERO)
 }
 
 fn row(v: serde_json::Value) -> Row {
@@ -1079,30 +1081,64 @@ async fn rows_leave_a_time_window_as_the_clock_passes() {
     assert_eq!(at[4..], [5, 8, 9, 13]);
 }
 
-/// `now(200)`: the clock re-read every 200 ms, so a row leaves within 200 ms of its deadline.
+/// Rows due within the server's coalescing window of the earliest leave together, at most the
+/// window late; with no window, each at its own deadline.
 #[tokio::test(start_paused = true)]
-async fn now_takes_its_refresh() {
-    for (sql, expect_ms) in [
+async fn expiries_within_the_window_leave_together() {
+    let sql = "select user_id from clicks where ts > now() - interval 10 second";
+    // after h1 and h2: a, b and c leave at 0.50, 0.55 and 0.80 s
+    let events = [
+        click("a", -9_500, 1),
+        click("b", -9_450, 1),
+        click("c", -9_200, 1),
+    ];
+    for (window_ms, want) in [
         (
-            "select user_id from clicks where ts > now(200) - interval 10 second",
-            600,
+            100,
+            vec![(600, "clock: - @3\nclock: - @2"), (900, "clock: - @2")],
         ),
         (
-            "select user_id from clicks where ts > now() - interval 10 second",
-            1_000,
+            0,
+            vec![
+                (500, "clock: - @2"),
+                (550, "clock: - @2"),
+                (800, "clock: - @2"),
+            ],
         ),
     ] {
-        // each with its own clock at B: e leaves at B + 0.5 s
-        let e = clicks_engine(&[click("e", -9_500, 1)]);
+        let e =
+            clicks_engine(&events).with_now_coalescing(std::time::Duration::from_millis(window_ms));
         let mut sub = e.subscribe(sql).await.unwrap();
         let start = tokio::time::Instant::now();
-        loop {
+        let mut got = Vec::new();
+        while got.len() < want.len() {
             let it = sub.next().await.unwrap().unwrap();
-            if it.origin == Origin::Clock && it.to_string() == "clock: - @2" {
-                break;
+            if it.origin == Origin::Clock {
+                got.push((start.elapsed().as_millis() as u64, it.to_string()));
             }
         }
-        assert_eq!(start.elapsed().as_millis(), expect_ms, "{sql}");
+        let want: Vec<(u64, String)> = want.into_iter().map(|(t, l)| (t, l.into())).collect();
+        assert_eq!(got, want, "window {window_ms} ms");
+    }
+}
+
+/// An event with an old `ts` (late to arrive) can be due before every row there: the clock
+/// wakes for it, not for the earliest before it.
+#[tokio::test(start_paused = true)]
+async fn a_late_old_event_brings_the_wakeup_forward() {
+    let e = clicks_engine(&[click("late", -9_000, 1)]); // leaves at 1 s (h1 at 5 s)
+    let mut sub = e
+        .subscribe("select user_id from clicks where ts > now() - interval 10 second")
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    loop {
+        let it = sub.next().await.unwrap().unwrap();
+        if it.origin == Origin::Clock {
+            assert_eq!(it.to_string(), "clock: - @2");
+            assert_eq!(start.elapsed().as_millis(), 1_000);
+            break;
+        }
     }
 }
 

@@ -634,8 +634,6 @@ pub struct WindowPlan {
     pub hidden: bool,
     pub inclusive: bool,
     pub shift_ns: i128,
-    /// `now(ms)`'s refresh, if given.
-    pub refresh_ms: Option<u64>,
     /// The condition in dialect syntax, for `explain`.
     pub text: String,
 }
@@ -892,16 +890,6 @@ impl StreamPlan {
             row.shift_remove(&w.history_field);
         }
         Ok(deadline)
-    }
-
-    /// How often the server's clock is re-read: the smallest `now(ms)` (`None`: the
-    /// server's default).
-    pub fn refresh(&self) -> Option<std::time::Duration> {
-        self.windows
-            .iter()
-            .filter_map(|w| w.refresh_ms)
-            .min()
-            .map(std::time::Duration::from_millis)
     }
 
     /// The result row, rendered the way ClickHouse renders it.
@@ -1225,13 +1213,10 @@ impl std::fmt::Display for Plan {
             Filter::Where { text, .. } => write!(f, "filter:  {text}")?,
         }
         for w in &self.stream.windows {
-            let every = match self.stream.refresh() {
-                Some(d) => format!("{} ms", d.as_millis()),
-                None => "the server's now_refresh".into(),
-            };
             write!(
                 f,
-                "\nwindow:  {} (rows leave as time passes; the clock re-read every {every})",
+                "\nwindow:  {} (rows leave as time passes, at their deadlines, within the \
+                 server's now_coalescing)",
                 w.text
             )?;
         }
@@ -1401,7 +1386,6 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
                 hidden,
                 inclusive: w.inclusive,
                 shift_ns: w.shift_ns,
-                refresh_ms: w.refresh_ms,
                 text: format!(
                     "{} {} {}",
                     c.name,
@@ -1885,7 +1869,6 @@ mod tests {
             column: ColumnId(0),
             inclusive: false,
             shift_ns: -H,
-            refresh_ms: Some(500),
             span: crate::error::Span::new(0, 0),
         }];
         let p = plan(&b);
@@ -1907,14 +1890,10 @@ mod tests {
                 now - H
             )
         );
-        assert_eq!(
-            p.stream.refresh(),
-            Some(std::time::Duration::from_millis(500))
-        );
         assert!(p.stream.required_keys().contains(&"ts".to_string()));
         assert!(p.to_string().contains(
-            "window:  ts > now() - INTERVAL 1 HOUR (rows leave as time passes; the clock re-read \
-             every 500 ms)"
+            "window:  ts > now() - INTERVAL 1 HOUR (rows leave as time passes, at their \
+             deadlines, within the server's now_coalescing)"
         ));
         // a row's deadline: when the clock gets to ts + 1 hour
         let mut row = json!({"user_id": "u", "__time_0": "2026-10-18 12:00:00.000"})
@@ -1942,12 +1921,6 @@ mod tests {
             "WHERE (latency_ms > 5) AND ts >= now64(9) + toIntervalNanosecond({})",
             -H
         )));
-        // the refresh is part of the identity
-        b2.windows[0].refresh_ms = None;
-        let fp = |b: &BoundQuery| crate::cursor::fingerprint(&plan(b));
-        let default = fp(&b2);
-        b2.windows[0].refresh_ms = Some(500);
-        assert_ne!(fp(&b2), default);
     }
 
     #[test]

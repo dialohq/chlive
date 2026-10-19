@@ -204,10 +204,9 @@ pub enum Expr {
         negated: bool,
         span: Span,
     },
-    /// `now([refresh ms]) [± INTERVAL n unit]…`: the server's clock, re-read every `refresh_ms`
-    /// (the server's default if `None`), shifted by `shift_ns`; `span` is the `now`'s.
+    /// `now() [± INTERVAL n unit]…`: the server's clock, shifted by `shift_ns`; `span` is the
+    /// `now`'s.
     Now {
-        refresh_ms: Option<u64>,
         shift_ns: i128,
         span: Span,
     },

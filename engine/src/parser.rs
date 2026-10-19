@@ -573,31 +573,15 @@ impl Parser {
         }
     }
 
-    /// `now([refresh ms])`, then `+`/`- INTERVAL n unit` any number of times, at `now`.
+    /// `now()`, then `+`/`- INTERVAL n unit` any number of times, at `now`.
     fn now_expr(&mut self) -> Result<Expr, SyntaxError> {
         let span = self.next().span;
         self.next(); // `(`
-        let refresh_ms = match self.peek().kind.clone() {
-            TokenKind::RParen => None,
-            TokenKind::Number(n) => {
-                let at = self.next().span;
-                match n.parse::<u64>() {
-                    Ok(ms) if ms >= 1 => Some(ms),
-                    _ => return Err(SyntaxError::new(
-                        "now()'s argument is its refresh in milliseconds, a whole number from 1",
-                        at,
-                    )),
-                }
-            }
-            _ => {
-                return Err(SyntaxError::new(
-                    "now()'s argument is its refresh in milliseconds",
-                    self.peek().span,
-                ))
-            }
-        };
         if self.peek().kind != TokenKind::RParen {
-            return Err(self.expected("`)`"));
+            return Err(SyntaxError::new(
+                "now() takes no arguments",
+                self.peek().span,
+            ));
         }
         self.next();
         let mut shift_ns: i128 = 0;
@@ -653,11 +637,7 @@ impl Parser {
             self.next();
             shift_ns += sign * n * per;
         }
-        Ok(Expr::Now {
-            refresh_ms,
-            shift_ns,
-            span,
-        })
+        Ok(Expr::Now { shift_ns, span })
     }
 
     fn projection(&mut self) -> Result<Projection, SyntaxError> {
@@ -935,11 +915,7 @@ mod tests {
                 Expr::And(l, r) => format!("({} AND {})", show(l), show(r)),
                 Expr::Or(l, r) => format!("({} OR {})", show(l), show(r)),
                 Expr::Not { expr, .. } => format!("(NOT {})", show(expr)),
-                Expr::Now {
-                    refresh_ms,
-                    shift_ns,
-                    ..
-                } => format!("now({refresh_ms:?}{shift_ns:+})"),
+                Expr::Now { shift_ns, .. } => format!("now({shift_ns:+})"),
                 Expr::IsNull { expr, negated, .. } => format!(
                     "({} IS{} NULL)",
                     show(expr),
@@ -1025,25 +1001,25 @@ mod tests {
     }
 
     #[test]
-    fn now_with_its_refresh_and_intervals() {
+    fn now_and_intervals() {
         const H: i128 = 3_600_000_000_000;
         assert_eq!(
             where_of("select * from t where ts > now()"),
-            "(ts > now(None+0))"
+            "(ts > now(+0))"
         );
         assert_eq!(
-            where_of("select * from t where ts > NOW(500) - interval 1 hour"),
-            format!("(ts > now(Some(500)-{H}))")
+            where_of("select * from t where ts > NOW() - interval 1 hour"),
+            format!("(ts > now({}))", -H)
         );
         assert_eq!(
             where_of(
                 "select * from t where now() - INTERVAL 1 HOUR - INTERVAL 30 MINUTE + INTERVAL 2 SECOND < ts"
             ),
-            format!("(now(None{}) < ts)", -H - H / 2 + 2_000_000_000)
+            format!("(now({}) < ts)", -H - H / 2 + 2_000_000_000)
         );
         assert_eq!(
             where_of("select * from t where ts >= now() + interval 1 week and x = 1"),
-            format!("((ts >= now(None+{})) AND (x = Number(\"1\")))", 168 * H)
+            format!("((ts >= now(+{})) AND (x = Number(\"1\")))", 168 * H)
         );
         for (src, want) in [
             (
@@ -1052,11 +1028,11 @@ mod tests {
             ),
             (
                 "select * from t where ts > now('UTC')",
-                "now()'s argument is its refresh in milliseconds at 1:32",
+                "now() takes no arguments at 1:32",
             ),
             (
-                "select * from t where ts > now(0)",
-                "now()'s argument is its refresh in milliseconds, a whole number from 1 at 1:32",
+                "select * from t where ts > now(500)",
+                "now() takes no arguments at 1:32",
             ),
             (
                 "select * from t where ts > now() - 5",

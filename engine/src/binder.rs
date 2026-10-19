@@ -127,14 +127,13 @@ pub struct BoundQuery {
 }
 
 /// `column > now() + shift` (or `>=`): a row holds while the server's clock is before its
-/// column's value minus `shift`, re-read every `refresh_ms` (the server's default if `None`).
+/// column's value minus `shift`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeWindow {
     pub column: ColumnId,
     /// `>=` rather than `>`.
     pub inclusive: bool,
     pub shift_ns: i128,
-    pub refresh_ms: Option<u64>,
     /// The `now`'s, for errors.
     pub span: Span,
 }
@@ -657,12 +656,7 @@ fn split_windows(
                 continue;
             }
         };
-        let Expr::Now {
-            refresh_ms,
-            shift_ns,
-            span,
-        } = now
-        else {
+        let Expr::Now { shift_ns, span } = now else {
             unreachable!("matched above")
         };
         let inclusive = match op {
@@ -693,7 +687,6 @@ fn split_windows(
             column: c.id,
             inclusive,
             shift_ns: *shift_ns,
-            refresh_ms: *refresh_ms,
             span: *span,
         });
     }
@@ -2091,7 +2084,7 @@ mod tests {
         const H: i128 = 3_600_000_000_000;
         let q = bind_sql(
             "select user_id from events where latency_ms > 5 \
-             and now(500) - interval 1 hour < ts and ts >= now() - interval 2 hour",
+             and now() - interval 1 hour < ts and ts >= now() - interval 2 hour",
         )
         .await
         .unwrap();
@@ -2099,9 +2092,9 @@ mod tests {
         assert_eq!(
             q.windows
                 .iter()
-                .map(|w| (w.column, w.inclusive, w.shift_ns, w.refresh_ms))
+                .map(|w| (w.column, w.inclusive, w.shift_ns))
                 .collect::<Vec<_>>(),
-            [(ts, false, -H, Some(500)), (ts, true, -2 * H, None)]
+            [(ts, false, -H), (ts, true, -2 * H)]
         );
         // the rest is the filter
         assert!(matches!(q.filter, Some(BoundExpr::Compare { .. })));

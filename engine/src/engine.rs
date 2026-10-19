@@ -83,8 +83,8 @@ pub struct Config {
     pub snapshot_user: String,
     pub snapshot_password: String,
     pub snapshots: SnapshotConfig,
-    /// How often `now()` is re-read when a query doesn't say (`now(ms)`).
-    pub now_refresh: Duration,
+    /// `now()`: rows due within this long of each other leave together (at most this late).
+    pub now_coalescing: Duration,
 }
 
 impl Default for Config {
@@ -101,7 +101,7 @@ impl Default for Config {
             snapshot_user: "default".into(),
             snapshot_password: String::new(),
             snapshots: SnapshotConfig::default(),
-            now_refresh: NOW_REFRESH,
+            now_coalescing: NOW_COALESCING,
         }
     }
 }
@@ -118,9 +118,10 @@ pub struct Engine {
     semi_refresh: Duration,
     /// FINAL with LIMIT: how many rows past the window are kept to replace departures.
     final_buffer: u64,
-    /// `now()`'s clock, and how often it's re-read when a query doesn't say (`now(ms)`).
+    /// `now()`'s clock, and how long after a row's deadline it may leave, together with the
+    /// rows due in between.
     clock: Arc<dyn Clock>,
-    now_refresh: Duration,
+    now_coalescing: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +137,7 @@ impl Engine {
     pub fn connect(config: Config) -> Result<Self, ConfigError> {
         let rules = ConfiguredRules::new(config.tables)?;
         let semi_refresh = config.snapshots.refresh;
-        let now_refresh = config.now_refresh;
+        let now_coalescing = config.now_coalescing;
         let snapshots = SnapshotManager::start(
             Arc::new(PauseServer::new(&config.pause_server_url)),
             Arc::new(ClickHouseCloner::new(
@@ -157,7 +158,7 @@ impl Engine {
             snapshots,
         )
         .with_semi_refresh(semi_refresh)
-        .with_now_refresh(now_refresh)
+        .with_now_coalescing(now_coalescing)
         .with_clickhouse(&config.clickhouse_url, &config.user, &config.password))
     }
 
@@ -200,13 +201,14 @@ impl Engine {
             semi_refresh: Duration::from_secs(10),
             final_buffer: crate::keyed::BUFFER,
             clock: Arc::new(SystemClock),
-            now_refresh: NOW_REFRESH,
+            now_coalescing: NOW_COALESCING,
         }
     }
 
-    /// How often `now()` is re-read when a query doesn't say (`now(ms)`; default 1 s).
-    pub fn with_now_refresh(mut self, every: Duration) -> Self {
-        self.now_refresh = every.max(Duration::from_millis(1));
+    /// `now()`: a row leaves at most this long after its deadline, together with the rows due
+    /// in between (default 100 ms; 0: each at its own).
+    pub fn with_now_coalescing(mut self, window: Duration) -> Self {
+        self.now_coalescing = window;
         self
     }
 
@@ -939,75 +941,86 @@ impl Engine {
             })
         };
         let clock = self.clock.clone();
-        let mut ticker = tokio::time::interval(plan.stream.refresh().unwrap_or(self.now_refresh));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let iterations = stream::unfold(
-            (items, ticker, false),
-            move |(mut items, mut ticker, mut ended)| {
-                let (shared, plan, clock) = (shared.clone(), stream_plan.clone(), clock.clone());
-                async move {
-                    loop {
-                        // the clock first: it's only ready when due, so events can't starve it
-                        let item = if ended {
-                            ticker.tick().await;
-                            None
-                        } else {
-                            tokio::select! {
-                                biased;
-                                _ = ticker.tick() => None,
-                                item = items.next() => match item {
-                                    Some(item) => Some(item),
-                                    None => {
-                                        ended = true;
-                                        continue;
-                                    }
-                                },
+        let coalescing = self.now_coalescing.as_nanos() as i128;
+        let iterations = stream::unfold((items, false), move |(mut items, mut ended)| {
+            let (shared, plan, clock) = (shared.clone(), stream_plan.clone(), clock.clone());
+            async move {
+                loop {
+                    // wake at the earliest deadline, plus the window for the rows due
+                    // close after it; re-armed every turn (an event can bring it forward)
+                    let earliest = shared.lock().unwrap().2.earliest();
+                    let wake = async {
+                        match earliest {
+                            Some(d) => {
+                                let ns = (d + coalescing - clock.now_ns()).max(0);
+                                tokio::time::sleep(Duration::from_nanos(
+                                    u64::try_from(ns).unwrap_or(u64::MAX),
+                                ))
+                                .await
                             }
-                        };
-                        let mut guard = shared.lock().unwrap();
-                        let (state, at, deadlines) = &mut *guard;
-                        let now = clock.now_ns();
-                        let it = match item {
-                            Some(Item::History(rows)) => {
-                                timed_history_iteration(&plan, state, at, rows, deadlines)
-                            }
-                            Some(Item::Event(event)) => Ok(timed_event_iteration(
-                                &plan, state, at, event, now, deadlines,
-                            )),
-                            Some(Item::Restored) => Ok(Iteration {
-                                origin: Origin::CatchUp,
-                                diffs: Vec::new(),
-                                at: at.clone(),
-                            }),
-                            Some(Item::CatchUp(..)) => {
-                                unreachable!("queries with now() don't resume from a cursor")
-                            }
-                            Some(Item::Failed(e)) => Err(e),
-                            None => {
-                                // rows whose deadline the clock passed leave, from the bottom
-                                let diffs: Vec<Diff> = deadlines
-                                    .expire(now)
-                                    .into_iter()
-                                    .map(|index| {
-                                        state.remove_at(index);
-                                        Diff::Delete { index }
-                                    })
-                                    .collect();
-                                if diffs.is_empty() {
+                            None => std::future::pending().await,
+                        }
+                    };
+                    // the clock first: it's only ready when due, so events can't starve it
+                    let item = if ended {
+                        wake.await;
+                        None
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = wake => None,
+                            item = items.next() => match item {
+                                Some(item) => Some(item),
+                                None => {
+                                    ended = true;
                                     continue;
                                 }
-                                Ok(Iteration {
-                                    origin: Origin::Clock,
-                                    diffs,
-                                    at: at.clone(),
+                            },
+                        }
+                    };
+                    let mut guard = shared.lock().unwrap();
+                    let (state, at, deadlines) = &mut *guard;
+                    let now = clock.now_ns();
+                    let it = match item {
+                        Some(Item::History(rows)) => {
+                            timed_history_iteration(&plan, state, at, rows, deadlines)
+                        }
+                        Some(Item::Event(event)) => Ok(timed_event_iteration(
+                            &plan, state, at, event, now, deadlines,
+                        )),
+                        Some(Item::Restored) => Ok(Iteration {
+                            origin: Origin::CatchUp,
+                            diffs: Vec::new(),
+                            at: at.clone(),
+                        }),
+                        Some(Item::CatchUp(..)) => {
+                            unreachable!("queries with now() don't resume from a cursor")
+                        }
+                        Some(Item::Failed(e)) => Err(e),
+                        None => {
+                            // rows whose deadline the clock passed leave, from the bottom
+                            let diffs: Vec<Diff> = deadlines
+                                .expire(now)
+                                .into_iter()
+                                .map(|index| {
+                                    state.remove_at(index);
+                                    Diff::Delete { index }
                                 })
+                                .collect();
+                            if diffs.is_empty() {
+                                continue;
                             }
-                        };
-                        return Some((it, (items, ticker, ended)));
-                    }
+                            Ok(Iteration {
+                                origin: Origin::Clock,
+                                diffs,
+                                at: at.clone(),
+                            })
+                        }
+                    };
+                    return Some((it, (items, ended)));
                 }
-            },
-        )
+            }
+        })
         .boxed();
         (iterations, checkpointer)
     }
@@ -1141,8 +1154,8 @@ impl Engine {
     }
 }
 
-/// How often `now()` is re-read when neither the query (`now(ms)`) nor the server says.
-pub const NOW_REFRESH: Duration = Duration::from_secs(1);
+/// `now()`: how long after its deadline a row may leave, with the rows due in between.
+pub const NOW_COALESCING: Duration = Duration::from_millis(100);
 
 /// What a subscription's stream is made of, before it becomes iterations.
 enum Item {

@@ -52,9 +52,9 @@ pub struct Server {
     pub max_subscriptions_per_connection: usize,
     #[serde(with = "humantime_serde")]
     pub progress_interval: Duration,
-    /// How often `now()` is re-read when a query doesn't say (`now(500)`: every 500 ms).
+    /// `now()`: rows due within this long of each other leave together (at most this late).
     #[serde(with = "humantime_serde")]
-    pub now_refresh: Duration,
+    pub now_coalescing: Duration,
 }
 
 impl Default for Server {
@@ -67,7 +67,7 @@ impl Default for Server {
             max_connections: s.max_connections,
             max_subscriptions_per_connection: s.max_subscriptions_per_connection,
             progress_interval: s.progress_interval,
-            now_refresh: chlive_engine::engine::NOW_REFRESH,
+            now_coalescing: chlive_engine::engine::NOW_COALESCING,
         }
     }
 }
@@ -434,7 +434,6 @@ impl Config {
             Ok(())
         };
         positive("server.progress_interval", self.server.progress_interval)?;
-        positive("server.now_refresh", self.server.now_refresh)?;
         positive("kafka.metadata_refresh", self.kafka.metadata_refresh)?;
         positive("snapshots.refresh", self.snapshots.refresh)?;
         positive("snapshots.idle", self.snapshots.idle)?;
@@ -487,7 +486,7 @@ impl Config {
                 sweep: true,
                 database: self.clickhouse.snapshot_database.clone(),
             },
-            now_refresh: self.server.now_refresh,
+            now_coalescing: self.server.now_coalescing,
         })
     }
 
@@ -629,7 +628,7 @@ mod tests {
                 max_connections: 10_000,
                 max_subscriptions_per_connection: 100,
                 progress_interval: Duration::from_secs(1),
-                now_refresh: Duration::from_secs(1),
+                now_coalescing: Duration::from_millis(100),
             }
         );
         assert_eq!(
@@ -773,7 +772,7 @@ mod tests {
                 max_connections = 7
                 max_subscriptions_per_connection = 3
                 progress_interval = "250ms"
-                now_refresh = "100ms"
+                now_coalescing = "0s"
 
                 [cache]
                 keep_alive = "5s"
@@ -838,7 +837,7 @@ mod tests {
                     max_connections: 7,
                     max_subscriptions_per_connection: 3,
                     progress_interval: Duration::from_millis(250),
-                    now_refresh: Duration::from_millis(100),
+                    now_coalescing: Duration::ZERO,
                 }
             );
             assert_eq!(c.clickhouse.url, "http://ch:8123");
