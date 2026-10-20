@@ -34,16 +34,52 @@ let
   inherit (stack) chClient name ref;
 
   toolchain = import ./toolchain.nix { inherit pkgs dnvrState libchdb; };
+
+  # The permissions source's Postgres: a fixed port (dnvr's preset doesn't pick one), and the
+  # `chat` database.
+  pgPort = 54329;
+  psql = ''${pkgs.postgresql}/bin/psql -h 127.0.0.1 -p ${toString pgPort} -U postgres -d chat'';
 in
 { ... }:
 {
-  description = "chlive chat demo: its own Redpanda, ClickHouse, sink, pause server and chlive-server, and the chat app";
+  description = "chlive chat demo: its own Redpanda, ClickHouse, sink, pause server and chlive-server, Postgres (the permissions source), and the chat app";
 
-  packages = toolchain.packages ++ [ clickhouse ];
+  packages = toolchain.packages ++ [
+    clickhouse
+    pkgs.postgresql
+  ];
   inherit (toolchain) env;
   inherit (stack) prerun;
 
   processes = stack.processes // {
+    # Postgres, where the permissions live (the source chlive will follow with logical
+    # replication, CDC). dnvr's preset: data under .dnvr/chat-postgres, `database` published
+    # once the database exists.
+    ${name "postgres"} = {
+      imports = [ presets.postgres ];
+      package = pkgs.postgresql;
+      database = "chat";
+      port = pgPort;
+      settings = {
+        wal_level = "logical";
+        max_replication_slots = 10;
+        max_wal_senders = 10;
+      };
+    };
+
+    # The permissions table and its publication (scripts/chat/postgres.sql). Idempotent; reruns
+    # on every start and then idles so its `ready` key stays live.
+    ${name "postgres-schema"} = {
+      env.PG_DATABASE = ref "postgres" "database";
+      command = ''
+        cd "$DNVR_ROOT"
+        ${psql} -v ON_ERROR_STOP=1 -q -f scripts/chat/postgres.sql
+        dnvr-state set ready 1
+        echo "[postgres-schema] applied scripts/chat/postgres.sql (wal_level: $(${psql} -tAc 'show wal_level'))"
+        exec tail -f /dev/null
+      '';
+    };
+
     # Users and an hour of messages (scripts/chat/seed), produced to
     # Kafka like everything else, into an empty ClickHouse; then wait until they're in.
     ${name "seed"} = {
@@ -85,6 +121,18 @@ in
   };
 
   scripts = stack.scripts // {
+    pg = {
+      description = "psql connected to the chat stack's Postgres (the `chat` database)";
+      text = ''exec ${psql} "$@"'';
+    };
+    reset-data = {
+      inherit (stack.scripts.reset-data) description;
+      text = ''
+        ${stack.scripts.reset-data.text}
+        rm -rf "''${DNVR_ROOT:?}/.dnvr/${name "postgres"}"
+        echo "removed Postgres data too"
+      '';
+    };
     chat-smoke = {
       description = "Check the running chat stack end to end: a message, through chlive";
       runtimeInputs = [ dnvrState ];
