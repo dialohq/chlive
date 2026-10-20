@@ -174,7 +174,10 @@ async fn restored_subscriptions_continue_exactly_like_uninterrupted_ones() {
             let checkpoint = Checkpoint::from_json(&checkpoint.to_json()).unwrap();
 
             // a new engine (another day) restores it and goes on
-            let restored = engine().restore(sql, &params, &checkpoint).await.unwrap();
+            let restored = engine()
+                .restore(sql, &params, &Default::default(), &checkpoint)
+                .await
+                .unwrap();
             let rest: Vec<Iteration> = restored.map(|i| i.unwrap()).collect().await;
             assert!(
                 rest[0].diffs.is_empty(),
@@ -216,7 +219,7 @@ async fn a_checkpoint_only_restores_its_own_kind_of_query() {
         "select user_id, count() from requests group by user_id",
     ] {
         let e = engine()
-            .restore(other, &params, &ordered)
+            .restore(other, &params, &Default::default(), &ordered)
             .await
             .err()
             .unwrap();
@@ -228,6 +231,7 @@ async fn a_checkpoint_only_restores_its_own_kind_of_query() {
         .restore(
             "select user_id from requests order by latency_ms",
             &params,
+            &Default::default(),
             &broken,
         )
         .await

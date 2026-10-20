@@ -11,6 +11,7 @@ use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Sna
 use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
 use chlive_engine::watermark::Watermark;
 use chlive_engine::Engine;
+use chlive_server::security::{Default as SecurityDefault, MemoryProvider, Security};
 use chlive_server::{CacheSettings, ServerSettings};
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::SinkExt;
@@ -1760,4 +1761,151 @@ async fn an_entry_that_fails_tells_every_subscriber_and_goes() {
     // the same id can subscribe again: a new attempt
     a.subscribe("a", sql).await;
     assert_eq!(a.expect().await["code"], "HISTORY_FAILED");
+}
+
+/// `requests` secured by user_id, its grants in `provider` (grant 0); nothing else readable.
+fn secured(provider: std::sync::Arc<MemoryProvider>) -> ServerSettings {
+    ServerSettings {
+        security: std::sync::Arc::new(Security::with_provider(
+            SecurityDefault::Deny,
+            &[],
+            provider,
+            &[("requests", "user_id")],
+        )),
+        ..ServerSettings::default()
+    }
+}
+
+async fn hello(c: &mut Client, user: &str) {
+    c.send(json!({"type": "hello", "user": user})).await;
+}
+
+#[tokio::test]
+async fn secured_tables_show_each_user_their_rows() {
+    let p = MemoryProvider::loaded();
+    p.set(0, "alice", &["slow", "fast"]);
+    p.set(0, "bob", &["slower"]);
+    let server = server_with(secured(p)).await;
+
+    // anonymous, or another table: denied
+    let mut anon = Client::connect(&server).await;
+    anon.subscribe("s", "select user_id from requests").await;
+    let m = anon.expect().await;
+    assert_eq!(
+        (&m["code"], &m["id"]),
+        (&json!("PERMISSION_DENIED"), &json!("s")),
+        "{m}"
+    );
+    let mut a = Client::connect(&server).await;
+    hello(&mut a, "alice").await;
+    a.subscribe(
+        "x",
+        "select * from requests where user_id in (select user_id from other)",
+    )
+    .await;
+    let m = a.expect().await;
+    assert_eq!(m["code"], "PERMISSION_DENIED", "{m}");
+    assert!(
+        m["message"].as_str().unwrap().contains("table other"),
+        "{m}"
+    );
+
+    // each user: their rows (the fake history ignores the WHERE)
+    a.subscribe("s", "select user_id from requests").await;
+    assert_eq!(a.expect().await["type"], "snapshot");
+    assert_eq!(
+        a.inserts("s", 2).await,
+        [json!({"user_id": "fast"}), json!({"user_id": "slow"})]
+    );
+    assert_eq!(a.next().await, None);
+    let mut b = Client::connect(&server).await;
+    hello(&mut b, "bob").await;
+    b.subscribe("s", "select user_id from requests").await;
+    assert_eq!(b.expect().await["type"], "snapshot");
+    assert_eq!(b.inserts("s", 1).await, [json!({"user_id": "slower"})]);
+    assert_eq!(b.next().await, None);
+    // the filter is in the plan: two entries
+    assert_eq!(debug(&server).await.as_array().unwrap().len(), 2);
+
+    // hello only comes first
+    hello(&mut a, "bob").await;
+    let m = a.expect().await;
+    assert_eq!(
+        (&m["code"], &m["id"]),
+        (&json!("PERMISSION_DENIED"), &Value::Null),
+        "{m}"
+    );
+}
+
+#[tokio::test]
+async fn a_permission_change_replaces_the_result() {
+    let p = MemoryProvider::loaded();
+    p.set(0, "alice", &["fast"]);
+    let server = server_with(secured(p.clone())).await;
+    let mut a = Client::connect(&server).await;
+    hello(&mut a, "alice").await;
+    a.subscribe("s", "select user_id from requests").await;
+    assert_eq!(a.expect().await["type"], "snapshot");
+    assert_eq!(a.inserts("s", 1).await, [json!({"user_id": "fast"})]);
+    assert_eq!(a.next().await, None);
+
+    // granted more: a new snapshot for the same id, then what matches now
+    p.set(0, "alice", &["fast", "slower"]);
+    let m = a.expect().await;
+    assert_eq!(
+        (&m["type"], &m["id"]),
+        (&json!("snapshot"), &json!("s")),
+        "{m}"
+    );
+    assert_eq!(
+        a.inserts("s", 2).await,
+        [json!({"user_id": "fast"}), json!({"user_id": "slower"})]
+    );
+    assert_eq!(a.next().await, None);
+    // the same values again: nothing
+    p.set(0, "alice", &["slower", "fast"]);
+    assert_eq!(a.next().await, None);
+    // nothing left: a snapshot of no stream rows (the fake history still has h1)
+    p.set(0, "alice", &[]);
+    let m = a.expect().await;
+    assert_eq!(m["type"], "snapshot", "{m}");
+    while let Some(m) = a.next().await {
+        assert_eq!(m["type"], "progress", "no rows: {m}");
+    }
+    // the old entries go (no subscribers), the current one stays
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let subscribed: Vec<Value> = debug(&server)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| !e["subscribers"].as_array().unwrap().is_empty())
+        .cloned()
+        .collect();
+    assert_eq!(subscribed.len(), 1, "{subscribed:?}");
+}
+
+#[tokio::test]
+async fn users_with_the_same_permissions_share_an_entry() {
+    let p = MemoryProvider::loaded();
+    p.set(0, "alice", &["slow"]);
+    p.set(0, "bob", &["slow"]);
+    p.set(0, "carol", &["fast"]);
+    let server = server_with(secured(p)).await;
+    for user in ["alice", "bob", "carol"] {
+        let mut c = Client::connect(&server).await;
+        hello(&mut c, user).await;
+        c.subscribe("s", "select user_id from requests").await;
+        assert_eq!(c.expect().await["type"], "snapshot");
+        std::mem::forget(c);
+    }
+    let entries = debug(&server).await;
+    let mut sizes: Vec<usize> = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["subscribers"].as_array().unwrap().len())
+        .collect();
+    sizes.sort();
+    assert_eq!(sizes, [1, 2]);
 }

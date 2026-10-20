@@ -606,3 +606,36 @@ test("the cache's most recent results are warmed into memory; subscribing resume
   assert.deepEqual(calls.filter((c) => c.startsWith("load")), []);
   client.close();
 });
+
+test("a user says hello first on every connection, and caches results as theirs", async () => {
+  FakeSocket.all = [];
+  const { cache, data } = memoryCache({
+    // another user's cached result, and one without a user: neither is alice's
+    [`bob\u0001${SQL}`]: { rows: [{ user_id: "b" }], at: "cb", savedAt: 1 },
+    [SQL]: { rows: [{ user_id: "x" }], at: "cx", savedAt: 1 },
+  });
+  const client = new LiveClient({ url: "ws://x/live", user: "alice", minBackoffMs: 5, WebSocket: FakeSocket as any, cache, saveDelayMs: 1 });
+  const states: LiveState[] = [];
+  client.subscribe(SQL, (s) => states.push(s));
+  FakeSocket.all[0].open();
+  await tick(1);
+  assert.deepEqual(FakeSocket.all[0].sent, [
+    { type: "hello", user: "alice" },
+    { type: "subscribe", id: "s1", sql: SQL },
+  ]);
+  // permissions changed: a second snapshot replaces the rows
+  FakeSocket.all[0].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "a" }], at: "c1" });
+  FakeSocket.all[0].deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "a" }, { user_id: "c" }], at: "c2" });
+  assert.deepEqual(states.at(-1)!.rows, [{ user_id: "a" }, { user_id: "c" }]);
+  await tick(10);
+  assert.equal(data.get(`alice\u0001${SQL}`)!.at, "c2");
+  // reconnecting: hello again, before resubscribing
+  FakeSocket.all[0].close();
+  await tick(20);
+  FakeSocket.all[1].open();
+  assert.deepEqual(FakeSocket.all[1].sent, [
+    { type: "hello", user: "alice" },
+    { type: "subscribe", id: "s1", sql: SQL, since: "c2" },
+  ]);
+  client.close();
+});

@@ -52,7 +52,7 @@ Writes go **straight to Kafka** through Redpanda's HTTP proxy (proxied as `/kafk
 
 It reconnects on its own when the server restarts (the fresh snapshots replace its rows). To see an alert, produce a request slower than the current top 5, e.g. on freshly seeded data `produce events '{"user_id": "u7", "country": "PL", "path": "/checkout", "latency_ms": 99999}'`, and watch the process's log (`dnvr logs rust-alerts`).
 
-`examples/chat` is a group-chat demo, two users side by side, with its own stack and schema, in its own dev shell: `nix develop .#chat`, then `dnvr up`. It's where permissions will be built; see [examples/chat/README.md](examples/chat/README.md).
+`examples/chat` is a group-chat demo, two users side by side, with its own stack and schema, in its own dev shell: `nix develop .#chat`, then `dnvr up`. Each user sees the messages they're permitted to see, by row-level permissions followed live from Postgres; see [examples/chat/README.md](examples/chat/README.md).
 
 ## How it works
 

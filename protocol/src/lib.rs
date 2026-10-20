@@ -2,9 +2,12 @@
 //! `client/src/protocol.ts`;
 //! used by `chlive-server` and the Rust client, `chlive-client`.
 //!
-//! The client subscribes with an id of its choosing (scoped to the connection) and a dialect
-//! query. The server answers with one `snapshot` (the history), then `diff`s as events arrive,
-//! or an `error`, after which that subscription is over.
+//! The client may first say who it is (`hello`); the tables a server secures show each user
+//! only the rows they may see. It subscribes with an id of its choosing (scoped to the
+//! connection) and a dialect query. The server answers with a `snapshot` (the history), then
+//! `diff`s as events arrive, or an `error`, after which that subscription is over. When the
+//! rows the user may see change (their permissions), the subscription gets a new `snapshot`
+//! that replaces its result, and the diffs continue from it.
 //!
 //! With ORDER BY, the snapshot is in order and says so (`order`), and every insert carries the
 //! `index` the row takes: the row at that index and all after it move one down. Without ORDER BY
@@ -47,6 +50,12 @@ pub type Params = std::collections::BTreeMap<String, serde_json::Value>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ClientMsg {
+    /// Who the client is: before any `subscribe`, at most once per connection. Without one,
+    /// the connection is anonymous.
+    Hello {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+    },
     Subscribe {
         id: String,
         sql: String,
@@ -65,7 +74,8 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerMsg {
-    /// The result as of subscribing; always first and exactly once per subscription.
+    /// The result as of subscribing; always first. Another one later replaces the result (the
+    /// user's permissions changed).
     Snapshot {
         id: String,
         columns: Vec<Column>,
@@ -243,6 +253,8 @@ pub const STREAM_FAILED: &str = "STREAM_FAILED";
 pub const AGGREGATE_FAILED: &str = "AGGREGATE_FAILED";
 /// The snapshots (the pause server, or cloning).
 pub const SNAPSHOT_FAILED: &str = "SNAPSHOT_FAILED";
+/// A table the query reads isn't one this connection's user may read (or a misplaced `hello`).
+pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
 /// Never sent: a client's code for a message it couldn't apply.
 pub const CLIENT_ERROR: &str = "CLIENT_ERROR";
 

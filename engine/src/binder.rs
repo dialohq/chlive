@@ -13,6 +13,7 @@ use crate::calendar::Interval;
 use crate::error::{render_at, Span};
 use crate::history::{DescribedColumn, HistoryError, HistorySource};
 use crate::rules::{NamingRules, TopicId};
+use crate::security::{RowFilter, RowFilters};
 use crate::source::{EventSource, SourceError};
 use crate::table_engine::{Key, TableEngine};
 use crate::types::{Kind, LiteralError, Type, Value};
@@ -24,6 +25,8 @@ pub struct Catalog<'a> {
     pub source: &'a dyn EventSource,
     /// The values of the query's parameters (`{name:Type}`), by name.
     pub params: &'a Params,
+    /// The rows of each table the subscriber may see, ANDed into every reference to it.
+    pub filters: &'a RowFilters,
 }
 
 /// Query parameter values by name, as JSON; each is read by its placeholder's declared type,
@@ -488,7 +491,7 @@ fn visit_literals(
 }
 
 async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuery, BindError> {
-    let table = bind_from(query, catalog).await?;
+    let (table, row_filter) = bind_from(query, catalog).await?;
     check_final_shape(query, &table)?;
     let (selection, sub) = match &query.selection {
         Some(expr) => split_subquery(expr)?,
@@ -499,6 +502,7 @@ async fn bind_resolved(query: &Query, catalog: &Catalog<'_>) -> Result<BoundQuer
         Some(expr) => Some(bind_cond(expr, &table, &mut windows, true)?),
         None => None,
     };
+    let filter = and(filter, row_filter);
     let semi_join = match sub {
         Some(Sub::In(key, sub, span)) => {
             Some(bind_semi_join(key, sub, span, &table, catalog).await?)
@@ -852,7 +856,7 @@ async fn bind_semi_join(
             ))
         }
     };
-    let inner = bind_from(sub, catalog).await?;
+    let (inner, row_filter) = bind_from(sub, catalog).await?;
     check_inner_final(sub, &inner)?;
     let inner_key = resolve_column(&inner, column)?;
     check_key_types(
@@ -876,6 +880,7 @@ async fn bind_semi_join(
         }
         None => None,
     };
+    let inner_filter = and(inner_filter, row_filter);
     Ok(SemiJoin {
         keys: Some((outer_key, inner_key)),
         inner,
@@ -954,7 +959,7 @@ async fn bind_exists(
     catalog: &Catalog<'_>,
 ) -> Result<SemiJoin, BindError> {
     check_subquery_clauses(sub, "an EXISTS sub-query")?;
-    let inner = bind_from(sub, catalog).await?;
+    let (inner, row_filter) = bind_from(sub, catalog).await?;
     check_inner_final(sub, &inner)?;
     let mut conjuncts = Vec::new();
     if let Some(e) = &sub.selection {
@@ -1018,6 +1023,7 @@ async fn bind_exists(
         Some(e) => Some(bind_where(e, &inner)?),
         None => None,
     };
+    let inner_filter = and(inner_filter, row_filter);
     Ok(SemiJoin {
         keys,
         inner,
@@ -1395,7 +1401,19 @@ fn check_qualifier(table: &BoundTable, c: &ColumnRef) -> Result<(), BindError> {
 
 /// FROM: the table must exist in ClickHouse, have an event stream (a Kafka topic), and record
 /// each row's Kafka partition and offset (so history and stream can be lined up).
-async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, BindError> {
+/// `a AND b`, either possibly absent.
+fn and(a: Option<BoundExpr>, b: Option<BoundExpr>) -> Option<BoundExpr> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(BoundExpr::And(Box::new(a), Box::new(b))),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The FROM table, and the condition its row filter puts on it (none: every row).
+async fn bind_from(
+    query: &Query,
+    catalog: &Catalog<'_>,
+) -> Result<(BoundTable, Option<BoundExpr>), BindError> {
     let from = &query.from;
     if from.name.starts_with(crate::snapshot::CLONE_PREFIX) {
         return Err(BindError::at(
@@ -1520,6 +1538,61 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
         }
         _ => None,
     };
+    // the row filter's column, hidden or not
+    let row_filter = match catalog.filters.get(&from.name) {
+        None | Some(RowFilter::All) => None,
+        Some(RowFilter::None) => Some(BoundExpr::Literal(Value::Bool(false))),
+        Some(RowFilter::In { column, values }) => {
+            let c = match columns
+                .iter()
+                .chain(&internal)
+                .find(|c| c.clickhouse == *column)
+            {
+                Some(c) => c.clone(),
+                None => {
+                    let c = described
+                        .iter()
+                        .find(|c| c.name == *column)
+                        .ok_or_else(|| {
+                            BindError::at(
+                                format!(
+                                "table {}: its row filter's column {column} isn't in ClickHouse",
+                                from.name
+                            ),
+                                from.span,
+                            )
+                        })?;
+                    internal.push(bound(columns.len() + internal.len(), c));
+                    internal.last().unwrap().clone()
+                }
+            };
+            let decode = c.ty.kind.column_type();
+            let list = values
+                .iter()
+                .map(|v| {
+                    decode
+                        .decode(&serde_json::Value::String(v.clone()))
+                        .ok_or_else(|| {
+                            BindError::at(
+                                format!(
+                                    "table {}: its row filter's value {v:?} isn't a {}",
+                                    from.name, c.ty
+                                ),
+                                from.span,
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(match list.is_empty() {
+                true => BoundExpr::Literal(Value::Bool(false)),
+                false => BoundExpr::InList {
+                    expr: Box::new(BoundExpr::Column(c.id)),
+                    list,
+                    negated: false,
+                },
+            })
+        }
+    };
     // a rename can land on another column's name
     let mut names = std::collections::BTreeSet::new();
     if let Some(dup) = columns.iter().find(|c| !names.insert(c.name.as_str())) {
@@ -1531,7 +1604,7 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
             from.span,
         ));
     }
-    Ok(BoundTable {
+    let table = BoundTable {
         name: from.name.clone(),
         alias: from.alias.clone(),
         clickhouse_table,
@@ -1542,7 +1615,8 @@ async fn bind_from(query: &Query, catalog: &Catalog<'_>) -> Result<BoundTable, B
         engine,
         internal,
         final_key,
-    })
+    };
+    Ok((table, row_filter))
 }
 
 /// FINAL on a sub-query's ReplacingMergeTree.
@@ -2033,12 +2107,22 @@ mod tests {
         sql: &str,
         params: serde_json::Value,
     ) -> Result<BoundQuery, String> {
+        bind_filtered(rules, sql, params, &RowFilters::new()).await
+    }
+
+    async fn bind_filtered(
+        rules: ConfiguredRules,
+        sql: &str,
+        params: serde_json::Value,
+        filters: &RowFilters,
+    ) -> Result<BoundQuery, String> {
         let params: Params = serde_json::from_value(params).unwrap();
         let catalog = Catalog {
             rules: &rules,
             history: &FakeHistory,
             source: &topics(),
             params: &params,
+            filters,
         };
         let q = parse(sql).map_err(|e| e.render(sql))?;
         bind(&q, &catalog).await.map_err(|e| e.render(sql))
@@ -2483,6 +2567,128 @@ mod tests {
             crate::cursor::fingerprint(&a),
             crate::cursor::fingerprint(&b)
         );
+    }
+
+    fn only(table: &str, column: &str, values: &[&str]) -> RowFilters {
+        RowFilters::from([(
+            table.to_string(),
+            RowFilter::In {
+                column: column.into(),
+                values: values.iter().map(|v| v.to_string()).collect(),
+            },
+        )])
+    }
+
+    async fn history_of(rules: ConfiguredRules, sql: &str, filters: &RowFilters) -> String {
+        let b = bind_filtered(rules, sql, serde_json::json!({}), filters)
+            .await
+            .unwrap();
+        crate::plan::plan(&b).history.sql(&b.table.clickhouse_table)
+    }
+
+    #[tokio::test]
+    async fn row_filters_are_anded_into_the_table() {
+        let f = only("events", "user_id", &["u1", "u2"]);
+        assert_eq!(
+            history_of(
+                ConfiguredRules::default(),
+                "select ts from events where latency_ms > 5",
+                &f
+            )
+            .await,
+            "SELECT ts FROM default.events WHERE (latency_ms > 5) AND (user_id IN ('u1', 'u2'))"
+        );
+        // no rows: an empty list, or none at all
+        for f in [
+            only("events", "user_id", &[]),
+            RowFilters::from([("events".to_string(), RowFilter::None)]),
+        ] {
+            assert_eq!(
+                history_of(ConfiguredRules::default(), "select ts from events", &f).await,
+                "SELECT ts FROM default.events WHERE false"
+            );
+        }
+        // every row, or another table's filter: nothing added
+        for f in [
+            RowFilters::from([("events".to_string(), RowFilter::All)]),
+            only("orders", "order_id", &["o1"]),
+        ] {
+            assert_eq!(
+                history_of(ConfiguredRules::default(), "select ts from events", &f).await,
+                "SELECT ts FROM default.events"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn row_filters_reach_hidden_columns_and_sub_queries() {
+        // a hidden column: read for the filter, still not selectable
+        let rules =
+            || configured(serde_json::json!({ "events": { "hidden_columns": ["user_id"] } }));
+        let f = only("events", "user_id", &["u1"]);
+        assert_eq!(
+            history_of(rules(), "select ts from events", &f).await,
+            "SELECT ts FROM default.events WHERE user_id IN ('u1')"
+        );
+        assert!(bind_filtered(
+            rules(),
+            "select user_id from events",
+            serde_json::json!({}),
+            &f
+        )
+        .await
+        .is_err());
+        // the sub-query's table too, in IN and in EXISTS
+        let f = only("sessions", "user_id", &["u1"]);
+        for sql in [
+            "select ts from events where user_id in (select user_id from sessions)",
+            "select ts from events e where exists (select 1 from sessions l where l.user_id = e.user_id)",
+        ] {
+            let b = bind_filtered(ConfiguredRules::default(), sql, serde_json::json!({}), &f)
+                .await
+                .unwrap();
+            let semi = b.semi_join.expect("a semi-join");
+            assert!(
+                matches!(semi.inner_filter, Some(BoundExpr::InList { ref list, .. }) if list.len() == 1),
+                "{sql}: {:?}",
+                semi.inner_filter
+            );
+            assert_eq!(b.filter, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn row_filters_tell_plans_apart_and_check_their_column() {
+        let id = |f: RowFilters| async move {
+            let b = bind_filtered(
+                ConfiguredRules::default(),
+                "select ts from events",
+                serde_json::json!({}),
+                &f,
+            )
+            .await
+            .unwrap();
+            crate::cursor::identity(&crate::plan::plan(&b))
+        };
+        let a = id(only("events", "user_id", &["u1"])).await;
+        assert_ne!(a, id(only("events", "user_id", &["u2"])).await);
+        assert_eq!(a, id(only("events", "user_id", &["u1"])).await);
+        let err = |f: RowFilters| async move {
+            bind_filtered(
+                ConfiguredRules::default(),
+                "select ts from events",
+                serde_json::json!({}),
+                &f,
+            )
+            .await
+            .unwrap_err()
+        };
+        assert!(err(only("events", "nope", &["x"]))
+            .await
+            .contains("column nope isn't in ClickHouse"));
+        assert!(err(only("events", "latency_ms", &["x"]))
+            .await
+            .contains("isn't a UInt32"));
     }
 
     #[tokio::test]

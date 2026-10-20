@@ -14,11 +14,12 @@ use figment::value::{Dict, Map};
 use figment::{Figment, Metadata, Profile, Provider};
 use serde::{Deserialize, Serialize};
 
+use crate::security::{Security, SecurityConfig};
 use crate::ServerSettings;
 
 /// The sections, in order; env vars are read only for these (`CHLIVE_URL` and the like aren't
 /// config).
-pub const SECTIONS: [&str; 8] = [
+pub const SECTIONS: [&str; 9] = [
     "server",
     "cache",
     "clickhouse",
@@ -27,6 +28,7 @@ pub const SECTIONS: [&str; 8] = [
     "snapshots",
     "log",
     "tables",
+    "security",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -40,6 +42,8 @@ pub struct Config {
     pub snapshots: Snapshots,
     pub log: Log,
     pub tables: TablesConfig,
+    /// Who may read which rows (see [`crate::security`]).
+    pub security: SecurityConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -463,6 +467,7 @@ impl Config {
         tracing_subscriber::EnvFilter::try_new(&self.log.level)
             .map_err(|e| anyhow::anyhow!("log.level: {:?}: {e}", self.log.level))?;
         ConfiguredRules::new(self.tables.clone())?;
+        Security::check(&self.security, &self.tables)?;
         Ok(())
     }
 
@@ -490,8 +495,10 @@ impl Config {
         })
     }
 
+    /// The server's settings; its security is open until [`Security::start`] replaces it.
     pub fn server_settings(&self) -> ServerSettings {
         ServerSettings {
+            security: std::sync::Arc::new(Security::open()),
             path: self.server.path.clone(),
             allowed_origins: self.server.allowed_origins.clone(),
             max_connections: self.server.max_connections,
@@ -872,6 +879,7 @@ mod tests {
                         }
                     )]
                     .into(),
+                    security: None,
                 }
             );
 

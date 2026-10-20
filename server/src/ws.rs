@@ -17,15 +17,21 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use chlive_engine::Engine;
+use chlive_engine::{Engine, Params, RowFilter, RowFilters};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use crate::hub::{CacheSettings, Hub, Joined, Outgoing};
 use crate::protocol::{
-    engine_error, ClientMsg, ServerMsg, BAD_MESSAGE, DUPLICATE_ID, TOO_MANY_SUBSCRIPTIONS,
+    engine_error, ClientMsg, ServerMsg, BAD_MESSAGE, DUPLICATE_ID, PERMISSION_DENIED,
+    TOO_MANY_SUBSCRIPTIONS,
 };
+use crate::security::{Access, Security};
+
+/// How long a subscribe waits for a permission provider that's still loading.
+const PERMISSIONS_WAIT: Duration = Duration::from_secs(10);
 
 /// Messages buffered per connection; a subscription whose messages don't fit falls behind.
 const OUTBOX: usize = 256;
@@ -47,6 +53,8 @@ pub struct ServerSettings {
     pub progress_interval: Duration,
     /// Shared results: how long they're kept, and their change logs (the `[cache]` section).
     pub cache: CacheSettings,
+    /// Who may read which rows (the `[security]` section, its providers started).
+    pub security: Arc<Security>,
 }
 
 impl Default for ServerSettings {
@@ -58,6 +66,7 @@ impl Default for ServerSettings {
             max_subscriptions_per_connection: 100,
             progress_interval: Duration::from_secs(1),
             cache: CacheSettings::default(),
+            security: Arc::new(Security::open()),
         }
     }
 }
@@ -80,6 +89,8 @@ struct ConnInfo {
     connected_at: u64,
     /// Weak: the writer ends when the connection drops its sender.
     outbox: mpsc::WeakSender<Outgoing>,
+    /// Its user (`hello`).
+    user: Option<String>,
     /// Its subscriptions: id, and the entry's key (as listed).
     subscriptions: Vec<(String, String)>,
 }
@@ -135,6 +146,7 @@ async fn debug_state(State(s): State<AppState>) -> impl IntoResponse {
             serde_json::json!({
                 "conn": conn,
                 "origin": c.origin,
+                "user": c.user,
                 "connectedAt": c.connected_at,
                 "outbox": c.outbox.upgrade().map(|tx| OUTBOX - tx.capacity()),
                 "subscriptions": c.subscriptions.iter()
@@ -205,21 +217,25 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
             origin,
             connected_at: crate::store::now_ms() as u64,
             outbox: tx.downgrade(),
+            user: None,
             subscriptions: Vec::new(),
         },
     );
-    let listed = |subscriptions: &HashMap<String, Joined>| {
+    let listed = |subscriptions: &HashMap<String, Live>| {
         if let Some(c) = s.conns.lock().unwrap().get_mut(&conn) {
             c.subscriptions = subscriptions
                 .iter()
-                .map(|(id, j)| (id.clone(), crate::store::short(&j.key)))
+                .map(|(id, l)| (id.clone(), crate::store::short(&l.joined.key)))
                 .collect();
             c.subscriptions.sort();
         }
     };
     let writer = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
-            if sink.send(Message::Text(out.render().into())).await.is_err() {
+            let Some(text) = out.render() else {
+                continue;
+            };
+            if sink.send(Message::Text(text.into())).await.is_err() {
                 break;
             }
         }
@@ -231,8 +247,24 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
         }
     };
 
-    let mut subscriptions: HashMap<String, Joined> = HashMap::new();
-    while let Some(Ok(msg)) = incoming.next().await {
+    let mut subscriptions: HashMap<String, Live> = HashMap::new();
+    let mut user: Option<String> = None;
+    // `hello` only comes first
+    let mut greeted = false;
+    // a subscription whose permissions changed, by id
+    let (changed_tx, mut changed_rx) = mpsc::unbounded_channel::<String>();
+    loop {
+        let msg = tokio::select! {
+            msg = incoming.next() => msg,
+            Some(id) = changed_rx.recv() => {
+                refilter(&s, conn, &id, &mut subscriptions, &tx).await;
+                listed(&subscriptions);
+                continue;
+            }
+        };
+        let Some(Ok(msg)) = msg else {
+            break;
+        };
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
@@ -251,14 +283,32 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
             }
         };
         match msg {
+            ClientMsg::Hello { user: who } => {
+                if greeted {
+                    send(ServerMsg::error(
+                        None,
+                        PERMISSION_DENIED,
+                        "hello comes first, once",
+                    ))
+                    .await;
+                    continue;
+                }
+                greeted = true;
+                debug!(conn, user = who, "hello");
+                if let Some(c) = s.conns.lock().unwrap().get_mut(&conn) {
+                    c.user = who.clone();
+                }
+                user = who;
+            }
             ClientMsg::Subscribe {
                 id,
                 sql,
                 since,
                 params,
             } => {
+                greeted = true;
                 // a subscription whose entry failed is over: its id can be used again
-                subscriptions.retain(|_, j| j.alive.load(Ordering::Relaxed));
+                subscriptions.retain(|_, l| l.joined.alive.load(Ordering::Relaxed));
                 if subscriptions.contains_key(&id) {
                     send(ServerMsg::error(
                         Some(&id),
@@ -281,7 +331,38 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                     continue;
                 }
                 debug!(conn, id, sql, "subscribe");
-                let plan = match s.hub.engine().explain_with(&sql, &params).await {
+                let mut access = match permitted(&s.settings.security, user.as_deref(), &sql) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        debug!(conn, id, error = %e, "subscribe denied");
+                        send(ServerMsg::error(Some(&id), PERMISSION_DENIED, e)).await;
+                        continue;
+                    }
+                };
+                let mut filters = RowFilters::new();
+                let mut loading = None;
+                for (table, a) in &mut access {
+                    match tokio::time::timeout(PERMISSIONS_WAIT, a.filter()).await {
+                        Ok(RowFilter::All) => {}
+                        Ok(f) => {
+                            filters.insert(table.clone(), f);
+                        }
+                        Err(_) => {
+                            loading = Some(table.clone());
+                            break;
+                        }
+                    }
+                }
+                if let Some(table) = loading {
+                    send(ServerMsg::error(
+                        Some(&id),
+                        PERMISSION_DENIED,
+                        format!("the permissions for {table} aren't loaded yet; try again"),
+                    ))
+                    .await;
+                    continue;
+                }
+                let plan = match s.hub.engine().explain_with(&sql, &params, &filters).await {
                     Ok(plan) => plan,
                     Err(e) => {
                         debug!(conn, id, error = %e, "subscribe failed");
@@ -289,16 +370,44 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                         continue;
                     }
                 };
-                let joined = s
-                    .hub
-                    .join(&plan, &sql, &params, conn, &id, tx.clone(), since);
-                subscriptions.insert(id, joined);
+                let joined =
+                    s.hub
+                        .join(&plan, &sql, &params, &filters, conn, &id, tx.clone(), since);
+                let watchers = access
+                    .iter()
+                    .filter_map(|(_, a)| match a {
+                        Access::All => None,
+                        Access::Rows { granted, .. } => Some(granted.clone()),
+                    })
+                    .map(|mut granted| {
+                        let (changed, id) = (changed_tx.clone(), id.clone());
+                        tokio::spawn(async move {
+                            while granted.changed().await.is_ok() {
+                                if changed.send(id.clone()).is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                        .abort_handle()
+                    })
+                    .collect();
+                subscriptions.insert(
+                    id,
+                    Live {
+                        joined,
+                        sql,
+                        params,
+                        access,
+                        filters,
+                        watchers,
+                    },
+                );
                 listed(&subscriptions);
             }
             ClientMsg::Unsubscribe { id } => {
                 debug!(conn, id, "unsubscribe");
-                if let Some(j) = subscriptions.remove(&id) {
-                    s.hub.leave(&j.key, j.sub);
+                if let Some(l) = subscriptions.remove(&id) {
+                    s.hub.leave(&l.joined.key, l.joined.sub);
                 }
                 listed(&subscriptions);
             }
@@ -306,10 +415,104 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
     }
 
     s.conns.lock().unwrap().remove(&conn);
-    for j in subscriptions.into_values() {
-        s.hub.leave(&j.key, j.sub);
+    for l in subscriptions.into_values() {
+        s.hub.leave(&l.joined.key, l.joined.sub);
     }
     drop(tx);
     let _ = writer.await;
     info!(conn, "disconnected");
+}
+
+/// A running subscription: its entry, and what it's allowed to read.
+struct Live {
+    joined: Joined,
+    sql: String,
+    params: Params,
+    /// Per table it reads, its access (watched while it changes).
+    access: Vec<(String, Access)>,
+    /// The row filters its entry was planned with.
+    filters: RowFilters,
+    /// The tasks telling the connection that a table's permissions changed.
+    watchers: Vec<AbortHandle>,
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        for w in &self.watchers {
+            w.abort();
+        }
+    }
+}
+
+/// What `user` may read of each table the query reads; an error names one it may not. A query
+/// that doesn't parse reads nothing here (planning reports it).
+fn permitted(
+    security: &Security,
+    user: Option<&str>,
+    sql: &str,
+) -> Result<Vec<(String, Access)>, String> {
+    let tables: Vec<String> = match chlive_engine::parser::parse(sql) {
+        Ok(q) => q.tables().into_iter().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    };
+    tables
+        .into_iter()
+        .map(|t| security.access(user, &t).map(|a| (t, a)))
+        .collect()
+}
+
+/// A subscription's permissions changed: when its row filters did, it moves to the entry of
+/// its query with the new ones (a new snapshot replaces its result); nothing more comes from
+/// the old one.
+async fn refilter(
+    s: &AppState,
+    conn: u64,
+    id: &str,
+    subscriptions: &mut HashMap<String, Live>,
+    tx: &mpsc::Sender<Outgoing>,
+) {
+    let Some(live) = subscriptions.get_mut(id) else {
+        return;
+    };
+    let mut filters = RowFilters::new();
+    for (table, a) in &live.access {
+        match a.current() {
+            Some(RowFilter::All) => {}
+            Some(f) => {
+                filters.insert(table.clone(), f);
+            }
+            // reloading: it says again once loaded
+            None => return,
+        }
+    }
+    if filters == live.filters {
+        return;
+    }
+    debug!(conn, id, "permissions changed: new snapshot");
+    let plan = s
+        .hub
+        .engine()
+        .explain_with(&live.sql, &live.params, &filters)
+        .await;
+    live.joined.close();
+    s.hub.leave(&live.joined.key, live.joined.sub);
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(e) => {
+            let _ = tx.send(Outgoing::Msg(engine_error(id, &e))).await;
+            subscriptions.remove(id);
+            return;
+        }
+    };
+    live.joined = s.hub.join(
+        &plan,
+        &live.sql,
+        &live.params,
+        &filters,
+        conn,
+        id,
+        tx.clone(),
+        None,
+    );
+    live.filters = filters;
 }

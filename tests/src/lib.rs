@@ -134,7 +134,8 @@ pub struct LiveResult {
     pub resumed: bool,
     /// The last cursor received.
     pub at: Option<String>,
-    /// Anything after an error, or a second snapshot.
+    /// Anything after an error, or a second snapshot (only a change of permissions sends one,
+    /// and these servers have none).
     pub protocol_violations: Vec<String>,
 }
 

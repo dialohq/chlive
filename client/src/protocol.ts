@@ -1,9 +1,11 @@
 /**
  * The chlive WebSocket protocol (v1), mirroring `protocol/src/lib.rs` (the `chlive-protocol` crate).
  *
- * The client subscribes with an id of its choosing (scoped to the connection) and a query in the
- * chlive dialect. The server answers with one `snapshot` (the result as of subscribing), then
- * `diff`s as events arrive — or an `error`, after which that subscription is over.
+ * The client may first say who it is (`hello`); tables the server secures show each user only
+ * the rows they may see. It subscribes with an id of its choosing (scoped to the connection) and
+ * a query in the chlive dialect. The server answers with a `snapshot` (the result as of
+ * subscribing), then `diff`s as events arrive — or an `error`, after which that subscription is
+ * over. When the user's permissions change, a new `snapshot` replaces the result.
  */
 
 /** A result row: exactly the selected columns, rendered the way ClickHouse renders JSON. */
@@ -20,6 +22,8 @@ export interface Column {
 export type Params = Record<string, unknown>;
 
 export type ClientMessage =
+  /** Who the client is: before any `subscribe`, at most once per connection. */
+  | { type: "hello"; user?: string }
   /** `since`: the `at` of a result the client already holds (e.g. cached), to resume from it.
    * `params`: values for the query's parameters. */
   | { type: "subscribe"; id: string; sql: string; since?: string; params?: Params }

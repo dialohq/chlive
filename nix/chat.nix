@@ -52,7 +52,14 @@ in
   inherit (stack) prerun;
 
   processes = stack.processes // {
-    # Postgres, where the permissions live (the source chlive will follow with logical
+    # the server reads its permissions from Postgres: once its schema is in
+    ${name "server"} = stack.processes.${name "server"} // {
+      env = stack.processes.${name "server"}.env // {
+        PG_READY = ref "postgres-schema" "ready";
+      };
+    };
+
+    # Postgres, where the permissions live (the source chlive follows with logical
     # replication, CDC). dnvr's preset: data under .dnvr/chat-postgres, `database` published
     # once the database exists.
     ${name "postgres"} = {
@@ -134,12 +141,16 @@ in
       '';
     };
     chat-smoke = {
-      description = "Check the running chat stack end to end: a message, through chlive";
-      runtimeInputs = [ dnvrState ];
+      description = "Check the running chat stack end to end: messages through chlive, per user's Postgres permissions";
+      runtimeInputs = [
+        dnvrState
+        pkgs.postgresql
+      ];
       text = ''
         CHLIVE_URL="''${CHLIVE_URL:-$(dnvr-state get ${name "server"}.url)}"
         PROXY_URL="''${PROXY_URL:-$(dnvr-state get ${name "redpanda"}.proxyUrl)}"
-        export CHLIVE_URL PROXY_URL
+        PG_URL="''${PG_URL:-postgres://postgres@127.0.0.1:${toString pgPort}/chat}"
+        export CHLIVE_URL PROXY_URL PG_URL
         cd "$DNVR_ROOT"
         exec bun scripts/chat/smoke.ts "$@"
       '';

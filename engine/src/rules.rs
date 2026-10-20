@@ -119,6 +119,9 @@ pub struct TableConfig {
     /// Renamed columns, by dialect name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub columns: BTreeMap<String, ColumnConfig>,
+    /// Who may read which rows (the server's row-level security).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<crate::security::TableSecurity>,
 }
 
 /// A column's ClickHouse name (default: its dialect name) and JSON key (default: its ClickHouse

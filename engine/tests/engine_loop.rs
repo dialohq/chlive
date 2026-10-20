@@ -1713,7 +1713,10 @@ async fn a_restored_result_lets_pending_rows_come_in() {
     drop(sub);
     tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
     let params = chlive_engine::Params::new();
-    let mut sub = e.restore(sql, &params, &checkpoint).await.unwrap();
+    let mut sub = e
+        .restore(sql, &params, &Default::default(), &checkpoint)
+        .await
+        .unwrap();
     let start = tokio::time::Instant::now();
     let mut lines = Vec::new();
     while let Some(it) = sub.next().await {
@@ -1847,7 +1850,10 @@ async fn a_restored_time_window_lets_overdue_rows_go_first() {
     // stored for 8.5 s: h1 (5 s) and e1 (8 s) are overdue, h2 (9 s) isn't
     tokio::time::sleep(std::time::Duration::from_millis(8_500)).await;
     let params = chlive_engine::Params::new();
-    let mut sub = e.restore(sql, &params, &checkpoint).await.unwrap();
+    let mut sub = e
+        .restore(sql, &params, &Default::default(), &checkpoint)
+        .await
+        .unwrap();
     let mut lines = Vec::new();
     while lines.len() < 2 {
         let it = sub.next().await.unwrap().unwrap();
@@ -1876,7 +1882,10 @@ async fn a_restored_aggregate_lets_overdue_rows_go_first() {
     // stored for 8.5 s: u1's first row and both of u2's are overdue
     tokio::time::sleep(std::time::Duration::from_millis(8_500)).await;
     let params = chlive_engine::Params::new();
-    let mut sub = e.restore(sql, &params, &checkpoint).await.unwrap();
+    let mut sub = e
+        .restore(sql, &params, &Default::default(), &checkpoint)
+        .await
+        .unwrap();
     let start = tokio::time::Instant::now();
     let mut lines = Vec::new();
     while let Some(it) = sub.next().await {

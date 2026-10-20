@@ -237,3 +237,45 @@ impl Expr {
         }
     }
 }
+
+impl Query {
+    /// The tables it reads: its FROM, then its sub-query's (IN or EXISTS), each once.
+    pub fn tables(&self) -> Vec<&str> {
+        fn visit<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
+            match e {
+                Expr::And(l, r)
+                | Expr::Or(l, r)
+                | Expr::Compare {
+                    left: l, right: r, ..
+                } => {
+                    visit(l, out);
+                    visit(r, out);
+                }
+                Expr::Not { expr, .. } | Expr::IsNull { expr, .. } | Expr::InList { expr, .. } => {
+                    visit(expr, out)
+                }
+                Expr::Exists { query, .. } => {
+                    for t in query.tables() {
+                        if !out.contains(&t) {
+                            out.push(t);
+                        }
+                    }
+                }
+                Expr::InSubquery { expr, query, .. } => {
+                    visit(expr, out);
+                    for t in query.tables() {
+                        if !out.contains(&t) {
+                            out.push(t);
+                        }
+                    }
+                }
+                Expr::Column(_) | Expr::Literal { .. } | Expr::Now { .. } => {}
+            }
+        }
+        let mut out = vec![self.from.name.as_str()];
+        if let Some(e) = &self.selection {
+            visit(e, &mut out);
+        }
+        out
+    }
+}

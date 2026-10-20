@@ -143,6 +143,11 @@ export interface SubscribeOptions {
 export interface LiveClientOptions {
   /** e.g. `ws://localhost:8080/live` */
   url: string;
+  /**
+   * Who the client is, said to the server (`hello`) on every connection: tables it secures show
+   * each user only the rows they may see. Results are cached per user.
+   */
+  user?: string;
   /** Initial reconnect delay; doubles up to `maxBackoffMs`. */
   minBackoffMs?: number;
   maxBackoffMs?: number;
@@ -223,8 +228,8 @@ const DEFAULT_WARM_ROWS = 10_000;
  * snapshot if it can't resume). Results are saved back as they change.
  */
 export class LiveClient {
-  private readonly opts: Required<Omit<LiveClientOptions, "WebSocket" | "cache" | "parsers">> &
-    Pick<LiveClientOptions, "WebSocket" | "parsers">;
+  private readonly opts: Required<Omit<LiveClientOptions, "WebSocket" | "cache" | "parsers" | "user">> &
+    Pick<LiveClientOptions, "WebSocket" | "parsers" | "user">;
   /** Resolves to the cache once it's set up and memory is warmed from it (`undefined` without
    * one); reads wait for it. */
   private readonly cacheReady: Promise<ResultCache | undefined> | undefined;
@@ -304,7 +309,7 @@ export class LiveClient {
   subscribe<R extends Row = Row>(sql: string, listener: Listener<R>, opts: SubscribeOptions = {}): Subscription {
     if (this.closed) throw new Error("LiveClient is closed");
     const params = serializeParams(opts.params);
-    const key = cacheKey(sql, params);
+    const key = this.keyOf(sql, params);
     let r = this.results.get(key);
     // a failed query is tried again once nobody is looking at the error
     if (r && r.state.status === "error" && r.listeners.size === 0) {
@@ -332,7 +337,21 @@ export class LiveClient {
   /** The query's current state if the client holds it (synchronously), else `undefined`. The
    * same object until it changes, so it can be a `useSyncExternalStore` snapshot. */
   peek<R extends Row = Row>(sql: string, opts: SubscribeOptions = {}): LiveState<R> | undefined {
-    return this.results.get(cacheKey(sql, serializeParams(opts.params)))?.state;
+    return this.results.get(this.keyOf(sql, serializeParams(opts.params)))?.state;
+  }
+
+  /** What a query's result is kept under: its `cacheKey`, after the user's name if there's one
+   * (a user's cached results are theirs). */
+  private keyOf(sql: string, params: Params | undefined): string {
+    const key = cacheKey(sql, params);
+    return this.opts.user === undefined ? key : `${this.opts.user}\u0001${key}`;
+  }
+
+  /** A key's `cacheKey`, if it's this client's user's (or, without a user, nobody's). */
+  private ownKey(key: string): string | undefined {
+    const i = key.indexOf("\u0001");
+    const user = i < 0 ? undefined : key.slice(0, i);
+    return user === this.opts.user ? key.slice(i + 1) : undefined;
   }
 
   /**
@@ -470,7 +489,9 @@ export class LiveClient {
     const now = Date.now();
     recent.forEach(({ key, result }, i) => {
       if (this.closed || this.results.has(key)) return;
-      const [sql, json] = splitKey(key);
+      const own = this.ownKey(key);
+      if (own === undefined) return;
+      const [sql, json] = splitKey(own);
       const r = this.create(sql, json === undefined ? undefined : (JSON.parse(json) as Params), key, result);
       r.store.applyCached(result);
       r.saved = true;
@@ -579,6 +600,7 @@ export class LiveClient {
     this.ws = ws;
     ws.onopen = () => {
       this.backoff = this.opts.minBackoffMs;
+      if (this.opts.user !== undefined) this.send({ type: "hello", user: this.opts.user });
       for (const r of this.byWire.values()) this.sendSubscribe(r);
     };
     ws.onmessage = (ev: MessageEvent) => {

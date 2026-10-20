@@ -39,7 +39,9 @@ use chlive_engine::cursor::{self, Cursor};
 use chlive_engine::diff::{Diff, ResultList};
 use chlive_engine::plan::Plan;
 use chlive_engine::watermark::Watermark;
-use chlive_engine::{Checkpoint, Engine, EngineError, Iteration, Origin, Params, Subscription};
+use chlive_engine::{
+    Checkpoint, Engine, EngineError, Iteration, Origin, Params, RowFilters, Subscription,
+};
 use futures::stream::ReadyChunks;
 use futures::StreamExt;
 use serde::Serialize;
@@ -99,22 +101,37 @@ impl Default for CacheSettings {
 /// subscriber, with the subscriber's id put in when written.
 pub enum Outgoing {
     Msg(ServerMsg),
-    Shared { id: String, body: Arc<str> },
+    Shared {
+        id: String,
+        body: Arc<str>,
+    },
+    /// From an entry to one subscription, sent only while its gate is open: a subscription
+    /// moved to another entry (its row filters changed) gets nothing more from the old one,
+    /// even what's already queued.
+    Gated {
+        open: Arc<AtomicBool>,
+        msg: Box<Outgoing>,
+    },
 }
 
 /// The id a shared body is serialized with; replaced by each subscriber's own.
 const PLACEHOLDER: &str = "\u{1}chlive-subscription\u{1}";
 
 impl Outgoing {
-    pub fn render(&self) -> String {
-        match self {
+    /// The message's text; none when its gate has closed.
+    pub fn render(&self) -> Option<String> {
+        Some(match self {
             Outgoing::Msg(m) => serde_json::to_string(m).expect("server messages serialize"),
             Outgoing::Shared { id, body } => {
                 let placeholder = serde_json::to_string(PLACEHOLDER).expect("a string");
                 let id = serde_json::to_string(id).expect("a string");
                 body.replacen(&placeholder, &id, 1)
             }
-        }
+            Outgoing::Gated { open, msg } => match open.load(Ordering::SeqCst) {
+                true => return msg.render(),
+                false => return None,
+            },
+        })
     }
 }
 
@@ -257,6 +274,7 @@ enum Cmd {
         out: mpsc::Sender<Outgoing>,
         since: Option<String>,
         alive: Arc<AtomicBool>,
+        gate: Arc<AtomicBool>,
     },
     Leave {
         sub: u64,
@@ -281,6 +299,16 @@ pub struct Joined {
     pub key: String,
     pub sub: u64,
     pub alive: Arc<AtomicBool>,
+    /// Open while the connection takes this entry's messages for it (see [`Outgoing::Gated`]).
+    pub gate: Arc<AtomicBool>,
+}
+
+impl Joined {
+    /// Take nothing more from this entry, queued or not (before joining another under the
+    /// same id).
+    pub fn close(&self) {
+        self.gate.store(false, Ordering::SeqCst);
+    }
 }
 
 pub struct Hub {
@@ -339,6 +367,7 @@ impl Hub {
         plan: &Plan,
         sql: &str,
         params: &Params,
+        filters: &RowFilters,
         conn: u64,
         client_id: &str,
         out: mpsc::Sender<Outgoing>,
@@ -347,6 +376,7 @@ impl Hub {
         let key = cursor::identity(plan);
         let sub = self.next.fetch_add(1, Ordering::Relaxed);
         let alive = Arc::new(AtomicBool::new(true));
+        let gate = Arc::new(AtomicBool::new(true));
         let join = Cmd::Join {
             sub,
             conn,
@@ -354,13 +384,21 @@ impl Hub {
             out,
             since,
             alive: alive.clone(),
+            gate: gate.clone(),
         };
         // joins are sent under the lock, so an entry deciding to go (also under it) never
         // misses one
         let mut entries = self.entries.lock().unwrap();
         let join = match entries.get(&key) {
             Some(h) => match h.tx.send(join) {
-                Ok(()) => return Joined { key, sub, alive },
+                Ok(()) => {
+                    return Joined {
+                        key,
+                        sub,
+                        alive,
+                        gate,
+                    }
+                }
                 // its task ended without removing itself (a panic): replace it
                 Err(mpsc::error::SendError(join)) => join,
             },
@@ -391,10 +429,16 @@ impl Hub {
             lineage,
             sql.to_string(),
             params.clone(),
+            filters.clone(),
             info,
         );
         tokio::spawn(entry.run(rx));
-        Joined { key, sub, alive }
+        Joined {
+            key,
+            sub,
+            alive,
+            gate,
+        }
     }
 
     pub fn leave(&self, key: &str, sub: u64) {
@@ -720,6 +764,7 @@ struct Sub {
     client_id: String,
     out: mpsc::Sender<Outgoing>,
     alive: Arc<AtomicBool>,
+    gate: Arc<AtomicBool>,
     /// The cursor of the last message it got.
     delivered: Option<Watermark>,
     /// Joined before the result was ready: decided when it is (with its cursor).
@@ -787,6 +832,8 @@ struct Entry {
     born_at: i64,
     sql: String,
     params: Params,
+    /// The subscribers' row filters: part of the plan, so every subscriber has the same.
+    filters: RowFilters,
     info: Arc<Mutex<Info>>,
     sub: Option<ReadyChunks<Subscription>>,
     form: Option<Form>,
@@ -835,6 +882,7 @@ impl Entry {
         lineage: String,
         sql: String,
         params: Params,
+        filters: RowFilters,
         info: Arc<Mutex<Info>>,
     ) -> Self {
         let progress_interval = hub.progress_interval;
@@ -848,6 +896,7 @@ impl Entry {
             born_at: store::now_ms(),
             sql,
             params,
+            filters,
             info,
             sub: None,
             form: None,
@@ -888,6 +937,7 @@ impl Entry {
             self.fp.clone(),
             self.sql.clone(),
             self.params.clone(),
+            self.filters.clone(),
         ));
         let mut subscribed = false;
         let mut tick = tokio::time::interval(Duration::from_millis(200));
@@ -1350,9 +1400,12 @@ impl Entry {
         let Some(s) = self.subs.get_mut(&sub) else {
             return Sent::Closed;
         };
-        let msg = Outgoing::Shared {
-            id: s.client_id.clone(),
-            body,
+        let msg = Outgoing::Gated {
+            open: s.gate.clone(),
+            msg: Box::new(Outgoing::Shared {
+                id: s.client_id.clone(),
+                body,
+            }),
         };
         match s.out.try_send(msg) {
             Ok(()) => {
@@ -1378,7 +1431,11 @@ impl Entry {
         let Some(s) = self.subs.get_mut(&sub) else {
             return Sent::Closed;
         };
-        match s.out.try_send(Outgoing::Msg(msg)) {
+        let msg = Outgoing::Gated {
+            open: s.gate.clone(),
+            msg: Box::new(Outgoing::Msg(msg)),
+        };
+        match s.out.try_send(msg) {
             Ok(()) => Sent::Ok,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 s.lagging = true;
@@ -1438,6 +1495,7 @@ impl Entry {
                 out,
                 since,
                 alive,
+                gate,
             } => {
                 let mut source = Source::Memory;
                 if self.stage != Stage::Live {
@@ -1463,6 +1521,7 @@ impl Entry {
                         client_id: client_id.clone(),
                         out,
                         alive,
+                        gate,
                         delivered: None,
                         waiting: None,
                         lagging: false,
@@ -1824,6 +1883,7 @@ async fn start(
     fp: String,
     sql: String,
     params: Params,
+    filters: RowFilters,
 ) -> Result<Start, EngineError> {
     let mut rejected = None;
     if let Some(store) = hub.store.clone() {
@@ -1834,24 +1894,26 @@ async fn start(
             tokio::task::spawn_blocking(move || store.load(&k)).await
         };
         match loaded {
-            Ok(Ok(Some(stored))) => match restorable(&hub, &store, &stored, &sql, &params).await {
-                Ok((sub, rows, log, checkpoint, lag)) => {
-                    return Ok(Start::Restored {
-                        sub,
-                        stored: Box::new(stored),
-                        rows: Box::new(rows),
-                        log,
-                        checkpoint,
-                        lag,
-                        ms: started.elapsed().as_millis() as u64,
-                    })
+            Ok(Ok(Some(stored))) => {
+                match restorable(&hub, &store, &stored, &sql, &params, &filters).await {
+                    Ok((sub, rows, log, checkpoint, lag)) => {
+                        return Ok(Start::Restored {
+                            sub,
+                            stored: Box::new(stored),
+                            rows: Box::new(rows),
+                            log,
+                            checkpoint,
+                            lag,
+                            ms: started.elapsed().as_millis() as u64,
+                        })
+                    }
+                    Err(reason) => {
+                        info!(key = %fp, lineage = %stored.meta.lineage, reason, "the stored result can't be used: starting from ClickHouse");
+                        store.delete(&key, &reason);
+                        rejected = Some(reason);
+                    }
                 }
-                Err(reason) => {
-                    info!(key = %fp, lineage = %stored.meta.lineage, reason, "the stored result can't be used: starting from ClickHouse");
-                    store.delete(&key, &reason);
-                    rejected = Some(reason);
-                }
-            },
+            }
             Ok(Ok(None)) => {}
             other => {
                 warn!(key = %fp, result = ?other.map(|r| r.map(|s| s.is_some())), "reading the cache store failed")
@@ -1859,7 +1921,7 @@ async fn start(
         }
     }
     hub.engine
-        .subscribe_with(&sql, &params, None)
+        .subscribe_with(&sql, &params, &filters, None)
         .await
         .map(|sub| Start::Fresh { sub, rejected })
 }
@@ -1881,6 +1943,7 @@ async fn restorable(
     stored: &Stored,
     sql: &str,
     params: &Params,
+    filters: &RowFilters,
 ) -> Result<Restorable, String> {
     let cache = &hub.cache;
     let state = stored.state.as_ref().ok_or("no checkpoint")?;
@@ -1895,7 +1958,7 @@ async fn restorable(
     let checkpoint = Checkpoint::from_json(state)?;
     let plan = hub
         .engine
-        .explain_with(sql, params)
+        .explain_with(sql, params, filters)
         .await
         .map_err(|e| format!("the query doesn't plan anymore: {e}"))?;
     if cursor::identity(&plan) != stored.meta.key {
@@ -1919,7 +1982,7 @@ async fn restorable(
     }
     let sub = hub
         .engine
-        .restore(sql, params, &checkpoint)
+        .restore(sql, params, filters, &checkpoint)
         .await
         .map_err(|e| format!("restoring: {e}"))?;
     Ok((sub, rows, log, checkpoint, lag))
@@ -2034,6 +2097,7 @@ mod tests {
                 body: body.clone(),
             }
             .render()
+            .unwrap()
         };
         assert_eq!(out("s1"), r#"{"type":"progress","id":"s1","at":"c"}"#);
         // ids are JSON-escaped
@@ -2047,7 +2111,8 @@ mod tests {
             id: "x".into(),
             body,
         }
-        .render();
+        .render()
+        .unwrap();
         assert!(s.starts_with(r#"{"type":"progress","id":"x""#), "{s}");
     }
 

@@ -29,6 +29,11 @@ humantime-serde = "1"
 # the shared results' disk store (src/store.rs)
 rusqlite = { version = "0.40", features = ["bundled"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# row-level security's Postgres provider (src/security/postgres.rs): its tables, then logical
+# replication (pgoutput, decoded in src/security/pgoutput.rs)
+tokio-postgres = "0.7"
+pgwire-replication = { version = "0.4.1", default-features = false, features = ["scram"] }
+bytes = "1"
 # binary only
 clap = { version = "4", features = ["derive", "env"] }
 

@@ -114,12 +114,15 @@ async fn main() -> Result<()> {
         warn!("no tables listed in [tables]: nothing can be queried");
     }
     let engine = std::sync::Arc::new(Engine::connect(config.engine()?)?);
-    let mut server = chlive_server::start_with(
-        &config.server.listen,
-        config.server_settings(),
-        engine.clone(),
-    )
-    .await?;
+    let mut settings = config.server_settings();
+    if config.security != Default::default() {
+        settings.security = std::sync::Arc::new(chlive_server::security::Security::start(
+            &config.security,
+            &config.tables,
+        )?);
+    }
+    let mut server =
+        chlive_server::start_with(&config.server.listen, settings, engine.clone()).await?;
     info!(addr = %server.addr, path = %config.server.path, "listening");
     tokio::select! {
         r = server.wait() => r?,

@@ -6,6 +6,7 @@ pub mod config;
 pub mod hub;
 pub mod log;
 pub mod protocol;
+pub mod security;
 pub mod store;
 pub mod ws;
 
