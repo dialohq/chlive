@@ -2,12 +2,13 @@
 //! `client/src/protocol.ts`;
 //! used by `chlive-server` and the Rust client, `chlive-client`.
 //!
-//! The client may first say who it is (`hello`); the tables a server secures show each user
-//! only the rows they may see. It subscribes with an id of its choosing (scoped to the
+//! The client may first say who it is (`hello`); a server that secures its tables shows each
+//! user only the tables, rows and columns they may see (`*` is the columns they may see). It subscribes with an id of its choosing (scoped to the
 //! connection) and a dialect query. The server answers with a `snapshot` (the history), then
-//! `diff`s as events arrive, or an `error`, after which that subscription is over. When the
-//! rows the user may see change (their permissions), the subscription gets a new `snapshot`
-//! that replaces its result, and the diffs continue from it.
+//! `diff`s as events arrive, or an `error`, after which that subscription is over. When what
+//! the user may see changes (their permissions), the subscription gets a new `snapshot` that
+//! replaces its result, and the diffs continue from it; when they lose a table it reads, or a
+//! column it names, it gets `PERMISSION_DENIED` instead, and is over.
 //!
 //! With ORDER BY, the snapshot is in order and says so (`order`), and every insert carries the
 //! `index` the row takes: the row at that index and all after it move one down. Without ORDER BY
@@ -253,7 +254,8 @@ pub const STREAM_FAILED: &str = "STREAM_FAILED";
 pub const AGGREGATE_FAILED: &str = "AGGREGATE_FAILED";
 /// The snapshots (the pause server, or cloning).
 pub const SNAPSHOT_FAILED: &str = "SNAPSHOT_FAILED";
-/// A table the query reads isn't one this connection's user may read (or a misplaced `hello`).
+/// A table the query reads, or a column it names, isn't one this connection's user may read
+/// (anymore: a live subscription that loses it ends with this); or a misplaced `hello`.
 pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
 /// Never sent: a client's code for a message it couldn't apply.
 pub const CLIENT_ERROR: &str = "CLIENT_ERROR";

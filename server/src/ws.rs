@@ -17,7 +17,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use chlive_engine::{Engine, Params, RowFilter, RowFilters};
+use chlive_engine::{Engine, Filters, Params};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -28,7 +28,7 @@ use crate::protocol::{
     engine_error, ClientMsg, ServerMsg, BAD_MESSAGE, DUPLICATE_ID, PERMISSION_DENIED,
     TOO_MANY_SUBSCRIPTIONS,
 };
-use crate::security::{Access, Security};
+use crate::security::{Decision, Security, TableAccess};
 
 /// How long a subscribe waits for a permission provider that's still loading.
 const PERMISSIONS_WAIT: Duration = Duration::from_secs(10);
@@ -339,27 +339,30 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                         continue;
                     }
                 };
-                let mut filters = RowFilters::new();
-                let mut loading = None;
+                let mut filters = Filters::new();
+                let mut denied = None;
                 for (table, a) in &mut access {
-                    match tokio::time::timeout(PERMISSIONS_WAIT, a.filter()).await {
-                        Ok(RowFilter::All) => {}
-                        Ok(f) => {
-                            filters.insert(table.clone(), f);
+                    match tokio::time::timeout(PERMISSIONS_WAIT, a.decide()).await {
+                        Ok(Decision::Filter(f)) => {
+                            if !f.is_open() {
+                                filters.insert(table.clone(), f);
+                            }
                         }
-                        Err(_) => {
-                            loading = Some(table.clone());
+                        Ok(Decision::Denied(e)) => {
+                            denied = Some(e);
+                            break;
+                        }
+                        Ok(Decision::Loading) | Err(_) => {
+                            denied = Some(format!(
+                                "the permissions for {table} aren't loaded yet; try again"
+                            ));
                             break;
                         }
                     }
                 }
-                if let Some(table) = loading {
-                    send(ServerMsg::error(
-                        Some(&id),
-                        PERMISSION_DENIED,
-                        format!("the permissions for {table} aren't loaded yet; try again"),
-                    ))
-                    .await;
+                if let Some(e) = denied {
+                    debug!(conn, id, error = %e, "subscribe denied");
+                    send(ServerMsg::error(Some(&id), PERMISSION_DENIED, e)).await;
                     continue;
                 }
                 let plan = match s.hub.engine().explain_with(&sql, &params, &filters).await {
@@ -375,10 +378,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                         .join(&plan, &sql, &params, &filters, conn, &id, tx.clone(), since);
                 let watchers = access
                     .iter()
-                    .filter_map(|(_, a)| match a {
-                        Access::All => None,
-                        Access::Rows { granted, .. } => Some(granted.clone()),
-                    })
+                    .flat_map(|(_, a)| a.watches())
                     .map(|mut granted| {
                         let (changed, id) = (changed_tx.clone(), id.clone());
                         tokio::spawn(async move {
@@ -429,9 +429,9 @@ struct Live {
     sql: String,
     params: Params,
     /// Per table it reads, its access (watched while it changes).
-    access: Vec<(String, Access)>,
-    /// The row filters its entry was planned with.
-    filters: RowFilters,
+    access: Vec<(String, TableAccess)>,
+    /// The filters its entry was planned with.
+    filters: Filters,
     /// The tasks telling the connection that a table's permissions changed.
     watchers: Vec<AbortHandle>,
 }
@@ -450,7 +450,7 @@ fn permitted(
     security: &Security,
     user: Option<&str>,
     sql: &str,
-) -> Result<Vec<(String, Access)>, String> {
+) -> Result<Vec<(String, TableAccess)>, String> {
     let tables: Vec<String> = match chlive_engine::parser::parse(sql) {
         Ok(q) => q.tables().into_iter().map(str::to_string).collect(),
         Err(_) => Vec::new(),
@@ -461,9 +461,10 @@ fn permitted(
         .collect()
 }
 
-/// A subscription's permissions changed: when its row filters did, it moves to the entry of
-/// its query with the new ones (a new snapshot replaces its result); nothing more comes from
-/// the old one.
+/// A subscription's permissions changed: when its filters did, it moves to the entry of its
+/// query with the new ones (a new snapshot replaces its result), or ends with
+/// `PERMISSION_DENIED` when it lost a table, or a column it names; nothing more comes from the
+/// old entry either way.
 async fn refilter(
     s: &AppState,
     conn: u64,
@@ -474,36 +475,47 @@ async fn refilter(
     let Some(live) = subscriptions.get_mut(id) else {
         return;
     };
-    let mut filters = RowFilters::new();
+    let mut filters = Filters::new();
+    let mut denied = None;
     for (table, a) in &live.access {
         match a.current() {
-            Some(RowFilter::All) => {}
-            Some(f) => {
-                filters.insert(table.clone(), f);
+            Decision::Filter(f) => {
+                if !f.is_open() {
+                    filters.insert(table.clone(), f);
+                }
+            }
+            Decision::Denied(e) => {
+                denied = Some(e);
+                break;
             }
             // reloading: it says again once loaded
-            None => return,
+            Decision::Loading => return,
         }
     }
-    if filters == live.filters {
+    if denied.is_none() && filters == live.filters {
         return;
     }
-    debug!(conn, id, "permissions changed: new snapshot");
-    let plan = s
-        .hub
-        .engine()
-        .explain_with(&live.sql, &live.params, &filters)
-        .await;
+    let plan = match denied {
+        Some(e) => Err(ServerMsg::error(Some(id), PERMISSION_DENIED, e)),
+        None => s
+            .hub
+            .engine()
+            .explain_with(&live.sql, &live.params, &filters)
+            .await
+            .map_err(|e| engine_error(id, &e)),
+    };
     live.joined.close();
     s.hub.leave(&live.joined.key, live.joined.sub);
     let plan = match plan {
         Ok(plan) => plan,
-        Err(e) => {
-            let _ = tx.send(Outgoing::Msg(engine_error(id, &e))).await;
+        Err(msg) => {
+            debug!(conn, id, "permissions changed: the subscription ends");
+            let _ = tx.send(Outgoing::Msg(msg)).await;
             subscriptions.remove(id);
             return;
         }
     };
+    debug!(conn, id, "permissions changed: new snapshot");
     live.joined = s.hub.join(
         &plan,
         &live.sql,

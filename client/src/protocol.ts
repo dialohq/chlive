@@ -5,7 +5,8 @@
  * the rows they may see. It subscribes with an id of its choosing (scoped to the connection) and
  * a query in the chlive dialect. The server answers with a `snapshot` (the result as of
  * subscribing), then `diff`s as events arrive — or an `error`, after which that subscription is
- * over. When the user's permissions change, a new `snapshot` replaces the result.
+ * over. When the user's permissions change, a new `snapshot` replaces the result; when they lose a
+ * table the query reads, or a column it names, a `PERMISSION_DENIED` error ends it.
  */
 
 /** A result row: exactly the selected columns, rendered the way ClickHouse renders JSON. */

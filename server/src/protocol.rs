@@ -128,6 +128,7 @@ pub fn error_code(e: &EngineError) -> &'static str {
     match e {
         EngineError::Syntax(_) => SYNTAX_ERROR,
         EngineError::Bind(_) => INVALID_QUERY,
+        EngineError::Denied(_) => PERMISSION_DENIED,
         EngineError::History(_) => HISTORY_FAILED,
         EngineError::Source(_) => STREAM_FAILED,
         EngineError::Aggregate(_) => AGGREGATE_FAILED,

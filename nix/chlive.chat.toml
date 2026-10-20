@@ -11,11 +11,12 @@ dir = ".dnvr/chat-chlive-cache"
 [log]
 level = "info,chlive_server::hub=debug"
 
-# Row-level security: each user sees the messages of the authors they're permitted to see,
-# per the `permissions` table in the chat stack's Postgres (scripts/chat/postgres.sql),
-# followed by logical replication.
+# Security: per tables in the chat stack's Postgres (scripts/chat/postgres.sql), followed by
+# logical replication: which tables each user may read, whose messages, and which columns of the
+# users.
 [security]
 default = "deny"
+tables = { provider = "pg", grants = "SELECT table_name FROM table_permissions WHERE user_id = {subject:String}" }
 
 [security.providers.pg]
 kind = "postgres"
@@ -30,3 +31,4 @@ grants = "SELECT author_id FROM permissions WHERE viewer_id = {subject:String}"
 
 [tables.users.security]
 public = true
+columns = { provider = "pg", grants = "SELECT column_name FROM column_permissions WHERE user_id = {subject:String} AND table_name = 'users'" }

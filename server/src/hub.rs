@@ -40,7 +40,7 @@ use chlive_engine::diff::{Diff, ResultList};
 use chlive_engine::plan::Plan;
 use chlive_engine::watermark::Watermark;
 use chlive_engine::{
-    Checkpoint, Engine, EngineError, Iteration, Origin, Params, RowFilters, Subscription,
+    Checkpoint, Engine, EngineError, Filters, Iteration, Origin, Params, Subscription,
 };
 use futures::stream::ReadyChunks;
 use futures::StreamExt;
@@ -367,7 +367,7 @@ impl Hub {
         plan: &Plan,
         sql: &str,
         params: &Params,
-        filters: &RowFilters,
+        filters: &Filters,
         conn: u64,
         client_id: &str,
         out: mpsc::Sender<Outgoing>,
@@ -833,7 +833,7 @@ struct Entry {
     sql: String,
     params: Params,
     /// The subscribers' row filters: part of the plan, so every subscriber has the same.
-    filters: RowFilters,
+    filters: Filters,
     info: Arc<Mutex<Info>>,
     sub: Option<ReadyChunks<Subscription>>,
     form: Option<Form>,
@@ -882,7 +882,7 @@ impl Entry {
         lineage: String,
         sql: String,
         params: Params,
-        filters: RowFilters,
+        filters: Filters,
         info: Arc<Mutex<Info>>,
     ) -> Self {
         let progress_interval = hub.progress_interval;
@@ -1883,7 +1883,7 @@ async fn start(
     fp: String,
     sql: String,
     params: Params,
-    filters: RowFilters,
+    filters: Filters,
 ) -> Result<Start, EngineError> {
     let mut rejected = None;
     if let Some(store) = hub.store.clone() {
@@ -1943,7 +1943,7 @@ async fn restorable(
     stored: &Stored,
     sql: &str,
     params: &Params,
-    filters: &RowFilters,
+    filters: &Filters,
 ) -> Result<Restorable, String> {
     let cache = &hub.cache;
     let state = stored.state.as_ref().ok_or("no checkpoint")?;

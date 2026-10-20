@@ -57,4 +57,4 @@ pub use binder::{BoundColumn, BoundExpr, BoundQuery, Params};
 pub use checkpoint::Checkpoint;
 pub use engine::{Config, Engine, EngineError, Iteration, Origin, Subscription};
 pub use plan::Plan;
-pub use security::{RowFilter, RowFilters};
+pub use security::{Filters, RowFilter, TableFilter};

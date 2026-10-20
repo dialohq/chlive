@@ -13,7 +13,7 @@ use crate::calendar::Interval;
 use crate::error::{render_at, Span};
 use crate::history::{DescribedColumn, HistoryError, HistorySource};
 use crate::rules::{NamingRules, TopicId};
-use crate::security::{RowFilter, RowFilters};
+use crate::security::{Filters, RowFilter};
 use crate::source::{EventSource, SourceError};
 use crate::table_engine::{Key, TableEngine};
 use crate::types::{Kind, LiteralError, Type, Value};
@@ -25,8 +25,8 @@ pub struct Catalog<'a> {
     pub source: &'a dyn EventSource,
     /// The values of the query's parameters (`{name:Type}`), by name.
     pub params: &'a Params,
-    /// The rows of each table the subscriber may see, ANDed into every reference to it.
-    pub filters: &'a RowFilters,
+    /// The rows and columns of each table the subscriber may see.
+    pub filters: &'a Filters,
 }
 
 /// Query parameter values by name, as JSON; each is read by its placeholder's declared type,
@@ -71,6 +71,9 @@ pub struct BoundTable {
     pub internal: Vec<BoundColumn>,
     /// `FROM t FINAL` on a ReplacingMergeTree: what its rows are replaced by.
     pub final_key: Option<FinalKey>,
+    /// Columns the subscriber may not see (left out of `columns`): naming one is
+    /// [`BindError::Denied`].
+    pub denied: Vec<String>,
 }
 
 /// A ReplacingMergeTree read with FINAL: one row per key, its latest version (the highest
@@ -342,6 +345,8 @@ pub enum BindError {
     Source(SourceError),
     /// A problem with the query's parameters as a whole (one given that the query doesn't use).
     Params(String),
+    /// The query names a column the subscriber may not see.
+    Denied { message: String, span: Span },
 }
 
 impl BindError {
@@ -355,7 +360,9 @@ impl BindError {
     /// With line and column for query errors.
     pub fn render(&self, src: &str) -> String {
         match self {
-            BindError::At { message, span } => render_at(src, *span, message),
+            BindError::At { message, span } | BindError::Denied { message, span } => {
+                render_at(src, *span, message)
+            }
             BindError::History(e) => e.to_string(),
             BindError::Source(e) => e.to_string(),
             BindError::Params(message) => message.clone(),
@@ -366,7 +373,9 @@ impl BindError {
 impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BindError::At { message, span } => write!(f, "{message} at byte {}", span.start),
+            BindError::At { message, span } | BindError::Denied { message, span } => {
+                write!(f, "{message} at byte {}", span.start)
+            }
             BindError::History(e) => write!(f, "{e}"),
             BindError::Source(e) => write!(f, "{e}"),
             BindError::Params(message) => write!(f, "{message}"),
@@ -920,7 +929,10 @@ enum Side {
 }
 
 fn side(c: &ColumnRef, inner: &BoundTable, outer: &BoundTable) -> Option<Side> {
-    let has = |t: &BoundTable| t.columns.iter().any(|col| col.name == c.name);
+    // a column it may not see is still its own (and fails as such)
+    let has = |t: &BoundTable| {
+        t.columns.iter().any(|col| col.name == c.name) || t.denied.contains(&c.name)
+    };
     match &c.qualifier {
         Some(q) if inner.names(q) => Some(Side::Inner),
         Some(q) if outer.names(q) => Some(Side::Outer),
@@ -1375,6 +1387,10 @@ fn resolve_column(table: &BoundTable, c: &ColumnRef) -> Result<ColumnId, BindErr
     let (name, span) = (&c.name, c.span);
     match table.columns.iter().find(|c| &c.name == name) {
         Some(c) => Ok(c.id),
+        None if table.denied.contains(name) => Err(BindError::Denied {
+            message: format!("column {name} of {} isn't readable here", table.name),
+            span,
+        }),
         None => {
             let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
             Err(BindError::at(
@@ -1495,9 +1511,21 @@ async fn bind_from(
             ty: Type::parse(&c.ty),
         }
     };
+    // the columns it may see: not hidden, and allowed by its filter
+    let filter = catalog.filters.get(&from.name);
+    let allowed = filter.and_then(|f| f.columns.as_ref());
+    let mut denied = Vec::new();
     let columns: Vec<BoundColumn> = described
         .iter()
         .filter(|c| !catalog.rules.is_hidden(&from.name, &c.name))
+        .filter(|c| {
+            let name = catalog.rules.column(&from.name, &c.name).name;
+            let ok = allowed.is_none_or(|a| a.contains(&name));
+            if !ok {
+                denied.push(name);
+            }
+            ok
+        })
         .enumerate()
         .map(|(i, c)| bound(i, c))
         .collect();
@@ -1539,7 +1567,7 @@ async fn bind_from(
         _ => None,
     };
     // the row filter's column, hidden or not
-    let row_filter = match catalog.filters.get(&from.name) {
+    let row_filter = match filter.map(|f| &f.rows) {
         None | Some(RowFilter::All) => None,
         Some(RowFilter::None) => Some(BoundExpr::Literal(Value::Bool(false))),
         Some(RowFilter::In { column, values }) => {
@@ -1615,6 +1643,7 @@ async fn bind_from(
         engine,
         internal,
         final_key,
+        denied,
     };
     Ok((table, row_filter))
 }
@@ -2007,6 +2036,7 @@ mod tests {
     use crate::history::DescribedColumn;
     use crate::parser::parse;
     use crate::rules::ConfiguredRules;
+    use crate::security::TableFilter;
     use crate::source::MemorySource;
     use crate::types::{parse_datetime, DateTime};
     use async_trait::async_trait;
@@ -2107,15 +2137,27 @@ mod tests {
         sql: &str,
         params: serde_json::Value,
     ) -> Result<BoundQuery, String> {
-        bind_filtered(rules, sql, params, &RowFilters::new()).await
+        bind_filtered(rules, sql, params, &Filters::new()).await
     }
 
     async fn bind_filtered(
         rules: ConfiguredRules,
         sql: &str,
         params: serde_json::Value,
-        filters: &RowFilters,
+        filters: &Filters,
     ) -> Result<BoundQuery, String> {
+        parse(sql).map_err(|e| e.render(sql))?;
+        bind_raw(rules, sql, params, filters)
+            .await
+            .map_err(|e| e.render(sql))
+    }
+
+    async fn bind_raw(
+        rules: ConfiguredRules,
+        sql: &str,
+        params: serde_json::Value,
+        filters: &Filters,
+    ) -> Result<BoundQuery, BindError> {
         let params: Params = serde_json::from_value(params).unwrap();
         let catalog = Catalog {
             rules: &rules,
@@ -2124,8 +2166,8 @@ mod tests {
             params: &params,
             filters,
         };
-        let q = parse(sql).map_err(|e| e.render(sql))?;
-        bind(&q, &catalog).await.map_err(|e| e.render(sql))
+        let q = parse(sql).expect("parses");
+        bind(&q, &catalog).await
     }
 
     fn configured(tables: serde_json::Value) -> ConfiguredRules {
@@ -2569,17 +2611,27 @@ mod tests {
         );
     }
 
-    fn only(table: &str, column: &str, values: &[&str]) -> RowFilters {
-        RowFilters::from([(
+    fn rows(table: &str, rows: RowFilter) -> Filters {
+        Filters::from([(
             table.to_string(),
-            RowFilter::In {
-                column: column.into(),
-                values: values.iter().map(|v| v.to_string()).collect(),
+            TableFilter {
+                rows,
+                columns: None,
             },
         )])
     }
 
-    async fn history_of(rules: ConfiguredRules, sql: &str, filters: &RowFilters) -> String {
+    fn only(table: &str, column: &str, values: &[&str]) -> Filters {
+        rows(
+            table,
+            RowFilter::In {
+                column: column.into(),
+                values: values.iter().map(|v| v.to_string()).collect(),
+            },
+        )
+    }
+
+    async fn history_of(rules: ConfiguredRules, sql: &str, filters: &Filters) -> String {
         let b = bind_filtered(rules, sql, serde_json::json!({}), filters)
             .await
             .unwrap();
@@ -2601,7 +2653,7 @@ mod tests {
         // no rows: an empty list, or none at all
         for f in [
             only("events", "user_id", &[]),
-            RowFilters::from([("events".to_string(), RowFilter::None)]),
+            rows("events", RowFilter::None),
         ] {
             assert_eq!(
                 history_of(ConfiguredRules::default(), "select ts from events", &f).await,
@@ -2610,7 +2662,7 @@ mod tests {
         }
         // every row, or another table's filter: nothing added
         for f in [
-            RowFilters::from([("events".to_string(), RowFilter::All)]),
+            rows("events", RowFilter::All),
             only("orders", "order_id", &["o1"]),
         ] {
             assert_eq!(
@@ -2659,7 +2711,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_filters_tell_plans_apart_and_check_their_column() {
-        let id = |f: RowFilters| async move {
+        let id = |f: Filters| async move {
             let b = bind_filtered(
                 ConfiguredRules::default(),
                 "select ts from events",
@@ -2673,7 +2725,7 @@ mod tests {
         let a = id(only("events", "user_id", &["u1"])).await;
         assert_ne!(a, id(only("events", "user_id", &["u2"])).await);
         assert_eq!(a, id(only("events", "user_id", &["u1"])).await);
-        let err = |f: RowFilters| async move {
+        let err = |f: Filters| async move {
             bind_filtered(
                 ConfiguredRules::default(),
                 "select ts from events",
@@ -2689,6 +2741,111 @@ mod tests {
         assert!(err(only("events", "latency_ms", &["x"]))
             .await
             .contains("isn't a UInt32"));
+    }
+
+    fn columns(table: &str, allowed: &[&str]) -> Filters {
+        Filters::from([(
+            table.to_string(),
+            TableFilter {
+                rows: RowFilter::All,
+                columns: Some(allowed.iter().map(|c| c.to_string()).collect()),
+            },
+        )])
+    }
+
+    #[tokio::test]
+    async fn denied_columns_cant_be_named_and_star_skips_them() {
+        let f = columns("events", &["ts", "user_id"]);
+        let star = bind_filtered(
+            ConfiguredRules::default(),
+            "select * from events",
+            serde_json::json!({}),
+            &f,
+        )
+        .await
+        .unwrap();
+        assert_eq!(names(&star), ["ts", "user_id"]);
+        // anywhere: the select list, WHERE, ORDER BY, GROUP BY, an aggregate, sub-query keys
+        for (sql, f) in [
+            ("select latency_ms from events", &f),
+            ("select ts from events where latency_ms > 5", &f),
+            ("select ts from events order by latency_ms", &f),
+            ("select latency_ms, count() from events group by latency_ms", &f),
+            ("select sum(latency_ms) from events", &f),
+            ("select id from sessions where user_id in (select coupon from events)", &f),
+            (
+                "select id from sessions s where exists (select 1 from events e where e.coupon = s.user_id)",
+                &f,
+            ),
+            (
+                "select ts from events where user_id in (select user_id from sessions where parent is null)",
+                &columns("sessions", &["id", "user_id"]),
+            ),
+        ] {
+            match bind_raw(ConfiguredRules::default(), sql, serde_json::json!({}), f).await {
+                Err(e @ BindError::Denied { .. }) => {
+                    assert!(e.render(sql).contains("isn't readable here at 1:"), "{sql}")
+                }
+                other => panic!("{sql}: {other:?}"),
+            }
+        }
+        // an unknown column is still unknown
+        let e = bind_filtered(
+            ConfiguredRules::default(),
+            "select nope from events",
+            serde_json::json!({}),
+            &f,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.starts_with("unknown column nope"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn denied_columns_still_serve_row_filters_and_final() {
+        // the row filter's column, not visible
+        let mut f = columns("events", &["ts"]);
+        f.get_mut("events").unwrap().rows = RowFilter::In {
+            column: "user_id".into(),
+            values: vec!["u1".into()],
+        };
+        assert_eq!(
+            history_of(ConfiguredRules::default(), "select * from events", &f).await,
+            "SELECT ts FROM default.events WHERE user_id IN ('u1')"
+        );
+        // FINAL's key, version and deleted columns, not visible
+        let b = bind_filtered(
+            ConfiguredRules::default(),
+            "select * from products final",
+            serde_json::json!({}),
+            &columns("products", &["product_id"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(names(&b), ["product_id"]);
+        assert!(b.table.final_key.is_some());
+    }
+
+    #[tokio::test]
+    async fn column_sets_tell_star_plans_apart_only() {
+        let id = |sql: &'static str, f: Filters| async move {
+            let b = bind_filtered(ConfiguredRules::default(), sql, serde_json::json!({}), &f)
+                .await
+                .unwrap();
+            crate::cursor::identity(&crate::plan::plan(&b))
+        };
+        let (a, b) = (
+            columns("events", &["ts", "user_id"]),
+            columns("events", &["ts", "user_id", "paid"]),
+        );
+        assert_ne!(
+            id("select * from events", a.clone()).await,
+            id("select * from events", b.clone()).await
+        );
+        assert_eq!(
+            id("select ts from events", a).await,
+            id("select ts from events", b).await
+        );
     }
 
     #[tokio::test]

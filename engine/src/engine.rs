@@ -27,7 +27,7 @@ use crate::order::{HeldWindow, OffsetState, OrderedState, SortKey, WindowState};
 use crate::parser::parse;
 use crate::plan::{plan_with, AggregatePlan, DecodedRow, Plan, StreamPlan};
 use crate::rules::{ConfigError, ConfiguredRules, NamingRules, TablesConfig, TopicId};
-use crate::security::RowFilters;
+use crate::security::Filters;
 use crate::snapshot::{
     ClickHouseCloner, InUse, Lease, PauseServer, SnapshotConfig, SnapshotError, SnapshotManager,
     Snapshots,
@@ -44,6 +44,9 @@ pub enum EngineError {
     /// The query doesn't fit the catalog (unknown table/column, …); rendered with position.
     #[error("{0}")]
     Bind(String),
+    /// The query names a column the subscriber may not see; rendered with position.
+    #[error("{0}")]
+    Denied(String),
     #[error(transparent)]
     History(#[from] HistoryError),
     #[error(transparent)]
@@ -249,7 +252,7 @@ impl Engine {
 
     /// Parse, bind and plan a query without running it.
     pub async fn explain(&self, sql: &str) -> Result<Plan, EngineError> {
-        self.explain_with(sql, &Params::new(), &RowFilters::new())
+        self.explain_with(sql, &Params::new(), &Filters::new())
             .await
     }
 
@@ -259,7 +262,7 @@ impl Engine {
         &self,
         sql: &str,
         params: &Params,
-        filters: &RowFilters,
+        filters: &Filters,
     ) -> Result<Plan, EngineError> {
         let query = parse(sql).map_err(|e| EngineError::Syntax(e.render(sql)))?;
         let catalog = Catalog {
@@ -272,6 +275,7 @@ impl Engine {
         let bound = bind(&query, &catalog).await.map_err(|e| match e {
             BindError::History(e) => EngineError::History(e),
             BindError::Source(e) => EngineError::Source(e),
+            e @ BindError::Denied { .. } => EngineError::Denied(e.render(sql)),
             e => EngineError::Bind(e.render(sql)),
         })?;
         let mut plan = plan_with(&bound, self.final_buffer);
@@ -308,7 +312,7 @@ impl Engine {
     /// every offset up to its [`Watermark`], and each partition is consumed from right after
     /// it. So every event is in exactly one of them, wherever ClickHouse's ingestion is at.
     pub async fn subscribe(&self, sql: &str) -> Result<Subscription, EngineError> {
-        self.subscribe_with(sql, &Params::new(), &RowFilters::new(), None)
+        self.subscribe_with(sql, &Params::new(), &Filters::new(), None)
             .await
     }
 
@@ -330,7 +334,7 @@ impl Engine {
         sql: &str,
         since: Option<&str>,
     ) -> Result<Subscription, EngineError> {
-        self.subscribe_with(sql, &Params::new(), &RowFilters::new(), since)
+        self.subscribe_with(sql, &Params::new(), &Filters::new(), since)
             .await
     }
 
@@ -341,7 +345,7 @@ impl Engine {
         &self,
         sql: &str,
         params: &Params,
-        filters: &RowFilters,
+        filters: &Filters,
         since: Option<&str>,
     ) -> Result<Subscription, EngineError> {
         let plan = self.explain_with(sql, params, filters).await?;
@@ -363,7 +367,7 @@ impl Engine {
         &self,
         sql: &str,
         params: &Params,
-        filters: &RowFilters,
+        filters: &Filters,
         checkpoint: &Checkpoint,
     ) -> Result<Subscription, EngineError> {
         let plan = self.explain_with(sql, params, filters).await?;

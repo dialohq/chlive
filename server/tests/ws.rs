@@ -11,7 +11,7 @@ use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Sna
 use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
 use chlive_engine::watermark::Watermark;
 use chlive_engine::Engine;
-use chlive_server::security::{Default as SecurityDefault, MemoryProvider, Security};
+use chlive_server::security::{Default as SecurityDefault, MemoryProvider, Security, Source};
 use chlive_server::{CacheSettings, ServerSettings};
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::SinkExt;
@@ -1766,11 +1766,10 @@ async fn an_entry_that_fails_tells_every_subscriber_and_goes() {
 /// `requests` secured by user_id, its grants in `provider` (grant 0); nothing else readable.
 fn secured(provider: std::sync::Arc<MemoryProvider>) -> ServerSettings {
     ServerSettings {
-        security: std::sync::Arc::new(Security::with_provider(
-            SecurityDefault::Deny,
-            &[],
-            provider,
-            &[("requests", "user_id")],
+        security: std::sync::Arc::new(Security::secured(SecurityDefault::Deny).rows(
+            "requests",
+            "user_id",
+            Source { provider, grant: 0 },
         )),
         ..ServerSettings::default()
     }
@@ -1908,4 +1907,141 @@ async fn users_with_the_same_permissions_share_an_entry() {
         .collect();
     sizes.sort();
     assert_eq!(sizes, [1, 2]);
+}
+
+/// `requests` with all rows; grant 1 says which tables a user may read, grant 2 which columns
+/// of `requests`.
+fn tables_and_columns(provider: std::sync::Arc<MemoryProvider>) -> ServerSettings {
+    let source = |grant| Source {
+        provider: provider.clone(),
+        grant,
+    };
+    ServerSettings {
+        security: std::sync::Arc::new(
+            Security::secured(SecurityDefault::Deny)
+                .public("requests")
+                .tables(source(1))
+                .columns("requests", source(2)),
+        ),
+        ..ServerSettings::default()
+    }
+}
+
+/// Every message until a quiet while, by subscription id.
+async fn drain(c: &mut Client) -> std::collections::BTreeMap<String, Vec<Value>> {
+    let mut by_id = std::collections::BTreeMap::<String, Vec<Value>>::new();
+    while let Some(m) = c.next().await {
+        let id = m["id"].as_str().unwrap_or_default().to_string();
+        by_id.entry(id).or_default().push(m);
+    }
+    by_id
+}
+
+fn columns_of(snapshot: &Value) -> Vec<String> {
+    snapshot["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn tables_must_be_granted_and_a_revoke_ends_the_subscription() {
+    let p = MemoryProvider::loaded();
+    for user in ["alice", "bob"] {
+        p.set(2, user, &["user_id", "latency_ms"]);
+    }
+    p.set(1, "alice", &["requests"]);
+    let server = server_with(tables_and_columns(p.clone())).await;
+
+    let mut b = Client::connect(&server).await;
+    hello(&mut b, "bob").await;
+    b.subscribe("s", "select user_id from requests").await;
+    let m = b.expect().await;
+    assert_eq!(
+        (&m["code"], &m["id"]),
+        (&json!("PERMISSION_DENIED"), &json!("s")),
+        "{m}"
+    );
+    assert!(
+        m["message"].as_str().unwrap().contains("table requests"),
+        "{m}"
+    );
+
+    let mut a = Client::connect(&server).await;
+    hello(&mut a, "alice").await;
+    a.subscribe("s", "select user_id from requests").await;
+    assert_eq!(a.expect().await["type"], "snapshot");
+    assert_eq!(a.inserts("s", 3).await.len(), 3);
+    // revoked: the subscription ends
+    p.set(1, "alice", &[]);
+    let m = a.expect().await;
+    assert_eq!(
+        (&m["type"], &m["code"], &m["id"]),
+        (&json!("error"), &json!("PERMISSION_DENIED"), &json!("s")),
+        "{m}"
+    );
+    assert_eq!(a.next().await, None);
+    // and is over: granted again, nothing comes until it subscribes again
+    p.set(1, "alice", &["requests"]);
+    assert_eq!(a.next().await, None);
+    a.subscribe("s", "select user_id from requests").await;
+    assert_eq!(a.expect().await["type"], "snapshot");
+}
+
+#[tokio::test]
+async fn columns_must_be_granted_and_star_follows_them() {
+    let p = MemoryProvider::loaded();
+    for user in ["alice", "bob"] {
+        p.set(1, user, &["requests"]);
+    }
+    p.set(2, "alice", &["user_id", "latency_ms"]);
+    p.set(2, "bob", &["user_id"]);
+    let server = server_with(tables_and_columns(p.clone())).await;
+
+    // Bob: `*` is the columns he may read; naming another is denied, anywhere
+    let mut b = Client::connect(&server).await;
+    hello(&mut b, "bob").await;
+    b.subscribe("s", "select * from requests").await;
+    let m = b.expect().await;
+    assert_eq!(columns_of(&m), ["user_id"], "{m}");
+    drain(&mut b).await;
+    b.subscribe("t", "select user_id from requests where latency_ms > 5")
+        .await;
+    let m = b.expect().await;
+    assert_eq!(
+        (&m["code"], &m["id"]),
+        (&json!("PERMISSION_DENIED"), &json!("t")),
+        "{m}"
+    );
+    assert!(
+        m["message"]
+            .as_str()
+            .unwrap()
+            .contains("column latency_ms of requests isn't readable here"),
+        "{m}"
+    );
+
+    // Alice: both columns; her `*` isn't Bob's
+    let mut a = Client::connect(&server).await;
+    hello(&mut a, "alice").await;
+    a.subscribe("star", "select * from requests").await;
+    a.subscribe("named", "select user_id, latency_ms from requests")
+        .await;
+    let first = drain(&mut a).await;
+    assert_eq!(columns_of(&first["star"][0]), ["user_id", "latency_ms"]);
+    assert_eq!(first["named"][0]["type"], "snapshot");
+    // her `*` is exactly her named query (one entry), Bob's `*` another
+    assert_eq!(debug(&server).await.as_array().unwrap().len(), 2);
+
+    // latency_ms revoked: the query naming it ends, `*` gets a snapshot without it
+    p.set(2, "alice", &["user_id"]);
+    let after = drain(&mut a).await;
+    let named = &after["named"];
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert_eq!(named[0]["code"], "PERMISSION_DENIED", "{named:?}");
+    let star = &after["star"];
+    assert_eq!(star[0]["type"], "snapshot", "{star:?}");
+    assert_eq!(columns_of(&star[0]), ["user_id"]);
 }

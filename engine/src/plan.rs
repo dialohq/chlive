@@ -1951,6 +1951,7 @@ mod tests {
             engine: TableEngine::MergeTree,
             internal: Vec::new(),
             final_key: None,
+            denied: Vec::new(),
             columns: vec![
                 col(0, "ts", "DateTime64(3)"),
                 col(1, "user_id", "String"),

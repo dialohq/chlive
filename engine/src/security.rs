@@ -1,9 +1,10 @@
-//! Row-level security, as the engine sees it: per table, which rows a subscriber may see
-//! ([`RowFilter`]). Where the filters come from (permission providers, who's asking) is the
-//! server's business; the binder ANDs each table's filter into every reference to that table,
-//! so it's part of the plan, its history SQL and its identity.
+//! Security, as the engine sees it: per table, which rows and which columns a subscriber may
+//! see ([`TableFilter`]). Where they come from (permission providers, who's asking) is the
+//! server's business. The binder ANDs each table's row filter into every reference to that
+//! table, and leaves the columns it may not see out of the table (they can't be named, and `*`
+//! skips them); both are part of the plan and its identity.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The rows of one table a subscriber may see.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -17,8 +18,32 @@ pub enum RowFilter {
     In { column: String, values: Vec<String> },
 }
 
-/// Row filters by table (dialect name); a table without one is read whole.
-pub type RowFilters = BTreeMap<String, RowFilter>;
+/// What a subscriber may see of one table.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableFilter {
+    pub rows: RowFilter,
+    /// The columns (dialect names) it may see; none: every one.
+    pub columns: Option<BTreeSet<String>>,
+}
+
+impl Default for TableFilter {
+    fn default() -> Self {
+        Self {
+            rows: RowFilter::All,
+            columns: None,
+        }
+    }
+}
+
+impl TableFilter {
+    /// Every row and column: as if there were no filter.
+    pub fn is_open(&self) -> bool {
+        self.rows == RowFilter::All && self.columns.is_none()
+    }
+}
+
+/// Filters by table (dialect name); a table without one is read whole.
+pub type Filters = BTreeMap<String, TableFilter>;
 
 /// `[tables.<name>.security]`: how the server secures a table. The engine only carries it; the
 /// server reads it (its permission providers are the server's).
@@ -38,4 +63,17 @@ pub struct TableSecurity {
     /// query over a permissions table).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grants: Option<String>,
+    /// Which of its columns (dialect names) a subject may see; without it, every one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<GrantSource>,
+}
+
+/// A provider's grant: which strings (table names, column names, …) a subject is granted.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantSource {
+    /// The permission provider (in `[security.providers]`).
+    pub provider: String,
+    /// As the provider takes it (for Postgres, a query over a permissions table).
+    pub grants: String,
 }

@@ -1,35 +1,39 @@
-//! Row-level security: which rows of each table a connection's user may see.
+//! Security: which tables, rows and columns a connection's user may read.
 //!
-//! A table is public, or secured by a permission provider: a source of permissions (Postgres
-//! over CDC, …) that, for each of its grants and each subject, keeps the values of the table's
-//! column the subject may see, and tells when they change ([`PermissionProvider::watch`]). The
-//! server ANDs them into every reference to the table ([`chlive_engine::RowFilter`]); when they
-//! change, the subscription moves to the plan with the new filter and gets a new snapshot.
+//! A permission provider (Postgres over CDC, …) answers, for each of its grants and each
+//! subject, a set of strings, and tells when it changes ([`PermissionProvider::watch`]). What
+//! the strings mean is the configuration's: the tables a user may read (`[security.tables]`),
+//! the values of a table's column whose rows they may read (`[tables.<t>.security]`), or the
+//! columns of a table they may read (`[tables.<t>.security.columns]`). The server turns them
+//! into each table's [`TableFilter`]; when they change, the subscription moves to the plan
+//! with the new filter (a new snapshot), or ends with `PERMISSION_DENIED` if it lost a table or
+//! a column it names.
 //!
-//! Without a `[security]` section, every table is open, to anyone.
+//! Without a `[security]` section, everything is open, to anyone.
 
 pub mod grants;
 pub mod index;
 pub mod pgoutput;
 pub mod postgres;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use chlive_engine::rules::TablesConfig;
-use chlive_engine::RowFilter;
+use chlive_engine::security::GrantSource;
+use chlive_engine::{RowFilter, TableFilter};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use self::grants::Grant;
 
-/// The values a subject may see; none until the provider has loaded its permissions.
+/// The values a subject is granted; none until the provider has loaded its permissions.
 pub type Granted = Option<Arc<Vec<String>>>;
 
 /// A source of permissions. Each grant (by index, as given when it was made) tells, per
-/// subject, the values of a table's column the subject may see.
+/// subject, a set of strings: what they mean is up to whoever asks.
 pub trait PermissionProvider: Send + Sync {
     /// What `subject` is granted by `grant`, now and as it changes.
     fn watch(&self, grant: usize, subject: &str) -> watch::Receiver<Granted>;
@@ -43,6 +47,9 @@ pub struct SecurityConfig {
     /// Without this section, every table is allowed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<Default>,
+    /// Which tables (dialect names) a subject may read; with it, every table needs a grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tables: Option<GrantSource>,
     /// The permission providers, by name.
     pub providers: BTreeMap<String, ProviderConfig>,
 }
@@ -61,61 +68,116 @@ pub enum ProviderConfig {
     Postgres(postgres::PostgresConfig),
 }
 
-/// How a table is read.
-enum Rule {
-    /// Whole, by anyone.
-    Public,
-    /// Not at all.
-    Denied,
-    /// The rows whose `column` is one of what the subject is granted by the provider's grant.
-    Granted {
-        provider: Arc<dyn PermissionProvider>,
-        grant: usize,
-        column: String,
-    },
+/// One grant of a running provider.
+#[derive(Clone)]
+pub struct Source {
+    pub provider: Arc<dyn PermissionProvider>,
+    pub grant: usize,
 }
 
-/// What a connection may read of a table.
-pub enum Access {
+/// Which rows of a table are read.
+enum Rows {
+    /// All of them.
     All,
-    /// The rows whose ClickHouse `column` is one of the granted values, as they change.
-    Rows {
-        column: String,
-        granted: watch::Receiver<Granted>,
-    },
+    /// None: the table isn't readable.
+    Denied,
+    /// The rows whose `column` is one of what the subject is granted.
+    Granted { source: Source, column: String },
 }
 
-impl Access {
-    /// The row filter now, once the provider has loaded.
-    pub async fn filter(&mut self) -> RowFilter {
-        match self {
-            Access::All => RowFilter::All,
-            Access::Rows { column, granted } => {
-                let values = match granted.wait_for(Option::is_some).await {
-                    Ok(v) => v.clone().unwrap_or_default(),
-                    // the provider is gone: nothing
-                    Err(_) => return RowFilter::None,
-                };
-                RowFilter::In {
-                    column: column.clone(),
-                    values: values.as_ref().clone(),
-                }
-            }
+/// A table's rule: its rows, and its columns (none: every one).
+struct Rule {
+    rows: Rows,
+    columns: Option<Source>,
+}
+
+/// What a connection may read of a table, as it changes.
+#[derive(Debug)]
+pub struct TableAccess {
+    table: String,
+    /// Its name must be among these (`[security.tables]`).
+    tables: Option<watch::Receiver<Granted>>,
+    /// Its rows: the ClickHouse column, and the values (none: all rows).
+    rows: Option<(String, watch::Receiver<Granted>)>,
+    /// Its columns (none: every one).
+    columns: Option<watch::Receiver<Granted>>,
+}
+
+/// What a [`TableAccess`] allows now.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Decision {
+    /// A provider is still loading.
+    Loading,
+    /// The table isn't readable (anymore).
+    Denied(String),
+    Filter(TableFilter),
+}
+
+impl TableAccess {
+    /// Everything.
+    fn open(table: &str) -> Self {
+        Self {
+            table: table.to_string(),
+            tables: None,
+            rows: None,
+            columns: None,
         }
     }
 
-    /// The filter as it is, not waiting (`None` while loading).
-    pub fn current(&self) -> Option<RowFilter> {
-        match self {
-            Access::All => Some(RowFilter::All),
-            Access::Rows { column, granted } => {
-                let values = granted.borrow().clone()?;
-                Some(RowFilter::In {
-                    column: column.clone(),
-                    values: values.as_ref().clone(),
-                })
+    fn receivers(&self) -> impl Iterator<Item = &watch::Receiver<Granted>> {
+        self.tables
+            .iter()
+            .chain(self.rows.iter().map(|(_, r)| r))
+            .chain(self.columns.iter())
+    }
+
+    /// Receivers to be told by when anything here changes.
+    pub fn watches(&self) -> Vec<watch::Receiver<Granted>> {
+        self.receivers().cloned().collect()
+    }
+
+    /// What it allows now.
+    pub fn current(&self) -> Decision {
+        let get = |r: &watch::Receiver<Granted>| r.borrow().clone();
+        let mut filter = TableFilter::default();
+        if let Some(r) = &self.tables {
+            let Some(tables) = get(r) else {
+                return Decision::Loading;
+            };
+            if !tables.contains(&self.table) {
+                return Decision::Denied(format!("table {} isn't readable here", self.table));
             }
         }
+        if let Some((column, r)) = &self.rows {
+            let Some(values) = get(r) else {
+                return Decision::Loading;
+            };
+            filter.rows = RowFilter::In {
+                column: column.clone(),
+                values: values.as_ref().clone(),
+            };
+        }
+        if let Some(r) = &self.columns {
+            let Some(columns) = get(r) else {
+                return Decision::Loading;
+            };
+            filter.columns = Some(columns.iter().cloned().collect::<BTreeSet<_>>());
+        }
+        Decision::Filter(filter)
+    }
+
+    /// What it allows, once its providers have loaded.
+    pub async fn decide(&mut self) -> Decision {
+        let mut receivers: Vec<_> = self.watches();
+        for r in &mut receivers {
+            if r.wait_for(Option::is_some).await.is_err() {
+                return Decision::Denied(format!(
+                    "the permissions for {} are unavailable",
+                    self.table
+                ));
+            }
+        }
+        self.current()
     }
 }
 
@@ -123,6 +185,8 @@ impl Access {
 pub struct Security {
     /// For tables without a rule; `None`: no security at all.
     default: Option<Default>,
+    /// Which tables a subject may read (`[security.tables]`).
+    tables_grant: Option<Source>,
     tables: BTreeMap<String, Rule>,
 }
 
@@ -147,13 +211,56 @@ impl Security {
     pub fn open() -> Self {
         Self {
             default: None,
+            tables_grant: None,
             tables: BTreeMap::new(),
         }
     }
 
-    /// Whether any table is secured (connections then say who they are).
+    /// Whether nothing is secured.
     pub fn is_open(&self) -> bool {
         self.default.is_none()
+    }
+
+    /// Secured, with no rules yet: tables without one are read whole (`Allow`) or not at all.
+    pub fn secured(default: Default) -> Self {
+        Self {
+            default: Some(default),
+            ..Self::open()
+        }
+    }
+
+    /// `table`'s rows, all of them.
+    pub fn public(mut self, table: &str) -> Self {
+        self.rule(table).rows = Rows::All;
+        self
+    }
+
+    /// `table`'s rows whose `column` is one of what `source` grants the subject.
+    pub fn rows(mut self, table: &str, column: &str, source: Source) -> Self {
+        self.rule(table).rows = Rows::Granted {
+            source,
+            column: column.to_string(),
+        };
+        self
+    }
+
+    /// `table`'s columns: those `source` grants the subject.
+    pub fn columns(mut self, table: &str, source: Source) -> Self {
+        self.rule(table).columns = Some(source);
+        self
+    }
+
+    /// The tables a subject may read: those `source` grants them.
+    pub fn tables(mut self, source: Source) -> Self {
+        self.tables_grant = Some(source);
+        self
+    }
+
+    fn rule(&mut self, table: &str) -> &mut Rule {
+        self.tables.entry(table.to_string()).or_insert(Rule {
+            rows: Rows::All,
+            columns: None,
+        })
     }
 
     /// Check the config without starting anything: each table's rule, its provider, its grants.
@@ -164,111 +271,123 @@ impl Security {
     /// Start the providers (in the background) and serve their tables. Must run in a Tokio
     /// runtime.
     pub fn start(security: &SecurityConfig, tables: &TablesConfig) -> Result<Self> {
-        let (rules, grants) = plan(security, tables)?;
+        let planned = plan(security, tables)?;
         let mut providers: HashMap<String, Arc<dyn PermissionProvider>> = HashMap::new();
-        for (name, grants) in grants {
+        for (name, grants) in planned.grants {
             let provider: Arc<dyn PermissionProvider> = match &security.providers[&name] {
                 ProviderConfig::Postgres(c) => postgres::PostgresProvider::start(&name, c, grants)?,
             };
             providers.insert(name, provider);
         }
-        let tables = rules
-            .into_iter()
-            .map(|(table, rule)| {
-                let rule = match rule {
-                    Planned::Public => Rule::Public,
-                    Planned::Denied => Rule::Denied,
-                    Planned::Granted {
-                        provider,
-                        grant,
-                        column,
-                    } => Rule::Granted {
-                        provider: providers[&provider].clone(),
-                        grant,
-                        column,
-                    },
-                };
-                (table, rule)
-            })
-            .collect();
-        Ok(Self {
-            default: Some(security.default.unwrap_or(Default::Allow)),
-            tables,
-        })
-    }
-
-    /// Tables served by `provider`'s grants, by index (tests, other providers).
-    pub fn with_provider(
-        default: Default,
-        public: &[&str],
-        provider: Arc<dyn PermissionProvider>,
-        granted: &[(&str, &str)],
-    ) -> Self {
-        let mut tables: BTreeMap<String, Rule> = public
-            .iter()
-            .map(|t| (t.to_string(), Rule::Public))
-            .collect();
-        for (grant, (table, column)) in granted.iter().enumerate() {
-            tables.insert(
-                table.to_string(),
-                Rule::Granted {
-                    provider: provider.clone(),
-                    grant,
-                    column: column.to_string(),
+        let source = |(provider, grant): (String, usize)| Source {
+            provider: providers[&provider].clone(),
+            grant,
+        };
+        let mut out = Self::secured(security.default.unwrap_or(Default::Allow));
+        out.tables_grant = planned.tables.map(source);
+        for (table, rule) in planned.rules {
+            let rows = match rule.rows {
+                PlannedRows::All => Rows::All,
+                PlannedRows::Denied => Rows::Denied,
+                PlannedRows::Granted { source: s, column } => Rows::Granted {
+                    source: source(s),
+                    column,
+                },
+            };
+            out.tables.insert(
+                table,
+                Rule {
+                    rows,
+                    columns: rule.columns.map(source),
                 },
             );
         }
-        Self {
-            default: Some(default),
-            tables,
-        }
+        Ok(out)
     }
 
     /// What `user` (none: anonymous) may read of `table`; an error says why not at all.
-    pub fn access(&self, user: Option<&str>, table: &str) -> Result<Access, String> {
+    pub fn access(&self, user: Option<&str>, table: &str) -> Result<TableAccess, String> {
         let Some(default) = self.default else {
-            return Ok(Access::All);
+            return Ok(TableAccess::open(table));
         };
-        match self.tables.get(table) {
-            None if default == Default::Allow => Ok(Access::All),
-            None | Some(Rule::Denied) => Err(format!("table {table} isn't readable here")),
-            Some(Rule::Public) => Ok(Access::All),
-            Some(Rule::Granted {
-                provider,
-                grant,
-                column,
-            }) => match user {
-                None => Err(format!(
-                    "table {table} needs a user (send `hello` before subscribing)"
-                )),
-                Some(user) => Ok(Access::Rows {
-                    column: column.clone(),
-                    granted: provider.watch(*grant, user),
-                }),
-            },
+        let needs_user = || format!("table {table} needs a user (send `hello` before subscribing)");
+        let watch = |s: &Source| -> Result<watch::Receiver<Granted>, String> {
+            let user = user.ok_or_else(needs_user)?;
+            Ok(s.provider.watch(s.grant, user))
+        };
+        let mut access = TableAccess::open(table);
+        if let Some(s) = &self.tables_grant {
+            access.tables = Some(watch(s)?);
         }
+        match self.tables.get(table) {
+            None if default == Default::Allow => {}
+            None => return Err(format!("table {table} isn't readable here")),
+            Some(rule) => {
+                match &rule.rows {
+                    Rows::All => {}
+                    Rows::Denied => return Err(format!("table {table} isn't readable here")),
+                    Rows::Granted { source, column } => {
+                        access.rows = Some((column.clone(), watch(source)?));
+                    }
+                }
+                if let Some(s) = &rule.columns {
+                    access.columns = Some(watch(s)?);
+                }
+            }
+        }
+        Ok(access)
     }
 }
 
-/// A table's rule, before its provider is started.
-enum Planned {
-    Public,
+/// The rules, before the providers are started: grants as (provider, index).
+struct Planned {
+    tables: Option<(String, usize)>,
+    rules: BTreeMap<String, PlannedRule>,
+    /// Per provider, its grants (in the order of their indexes).
+    grants: BTreeMap<String, Vec<Grant>>,
+}
+
+struct PlannedRule {
+    rows: PlannedRows,
+    columns: Option<(String, usize)>,
+}
+
+enum PlannedRows {
+    All,
     Denied,
     Granted {
-        provider: String,
-        grant: usize,
+        source: (String, usize),
         column: String,
     },
 }
 
-/// Each secured table's rule, and per provider its grants (in the order of their indexes).
-#[allow(clippy::type_complexity)]
-fn plan(
-    security: &SecurityConfig,
-    tables: &TablesConfig,
-) -> Result<(BTreeMap<String, Planned>, BTreeMap<String, Vec<Grant>>)> {
-    let mut rules = BTreeMap::new();
+/// Every rule checked, and every grant given its provider and index.
+fn plan(security: &SecurityConfig, tables: &TablesConfig) -> Result<Planned> {
     let mut grants: BTreeMap<String, Vec<Grant>> = BTreeMap::new();
+    let mut register = |at: &str, provider: &str, text: &str| -> Result<(String, usize)> {
+        let kind = security
+            .providers
+            .get(provider)
+            .with_context(|| format!("{at}: no provider {provider} in [security.providers]"))?;
+        let grant = match kind {
+            ProviderConfig::Postgres(_) => {
+                Grant::parse(text).map_err(|e| anyhow::anyhow!("{at}.grants: {e}"))?
+            }
+        };
+        let list = grants.entry(provider.to_string()).or_default();
+        list.push(grant);
+        Ok((provider.to_string(), list.len() - 1))
+    };
+    let tables_grant = match &security.tables {
+        Some(g) => {
+            if security.default.is_none() {
+                bail!("security.tables: needs `default` in [security]");
+            }
+            Some(register("security.tables", &g.provider, &g.grants)?)
+        }
+        None => None,
+    };
+    let mut rules = BTreeMap::new();
     for (table, config) in &tables.tables {
         let Some(s) = &config.security else {
             continue;
@@ -277,47 +396,42 @@ fn plan(
         if security.default.is_none() {
             bail!("{at}: secured tables need a [security] section (with `default`)");
         }
-        let rule = match (s.public, &s.provider) {
+        let rows = match (s.public, &s.provider) {
             (true, Some(_)) => bail!("{at}: `public` or a `provider`, not both"),
             (true, None) => {
                 if s.column.is_some() || s.grants.is_some() {
                     bail!("{at}: a public table has no `column` or `grants`");
                 }
-                Planned::Public
+                PlannedRows::All
             }
             (false, None) => {
                 if s.column.is_some() || s.grants.is_some() {
                     bail!("{at}: `column` and `grants` need a `provider`");
                 }
-                Planned::Denied
+                if s.columns.is_some() {
+                    bail!("{at}: with `columns`, say which rows: `public = true`, or a `provider`");
+                }
+                PlannedRows::Denied
             }
             (false, Some(provider)) => {
-                let kind = security.providers.get(provider).with_context(|| {
-                    format!("{at}: no provider {provider} in [security.providers]")
-                })?;
                 let column = s
                     .column
                     .clone()
                     .with_context(|| format!("{at}: `column` (the ClickHouse column to filter)"))?;
-                match kind {
-                    ProviderConfig::Postgres(_) => {
-                        let sql = s.grants.as_deref().with_context(|| {
-                            format!("{at}: `grants` (which values of {column} a subject may see)")
-                        })?;
-                        let grant =
-                            Grant::parse(sql).map_err(|e| anyhow::anyhow!("{at}.grants: {e}"))?;
-                        let list = grants.entry(provider.clone()).or_default();
-                        list.push(grant);
-                        Planned::Granted {
-                            provider: provider.clone(),
-                            grant: list.len() - 1,
-                            column,
-                        }
-                    }
+                let text = s.grants.as_deref().with_context(|| {
+                    format!("{at}: `grants` (which values of {column} a subject may see)")
+                })?;
+                PlannedRows::Granted {
+                    source: register(&at, provider, text)?,
+                    column,
                 }
             }
         };
-        rules.insert(table.clone(), rule);
+        let columns = match &s.columns {
+            Some(g) => Some(register(&format!("{at}.columns"), &g.provider, &g.grants)?),
+            None => None,
+        };
+        rules.insert(table.clone(), PlannedRule { rows, columns });
     }
     for (name, provider) in &security.providers {
         match provider {
@@ -326,7 +440,11 @@ fn plan(
                 .with_context(|| format!("security.providers.{name}"))?,
         }
     }
-    Ok((rules, grants))
+    Ok(Planned {
+        tables: tables_grant,
+        rules,
+        grants,
+    })
 }
 
 /// The watched (grant, subject) pairs of a provider, each with what it's been told.
@@ -423,5 +541,114 @@ impl PermissionProvider for MemoryProvider {
         let mut s = self.state.lock().unwrap();
         let current = s.granted(grant, subject);
         s.watchers.watch(grant, subject, || current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(toml: &str) -> (SecurityConfig, TablesConfig) {
+        #[derive(Deserialize)]
+        struct Both {
+            security: SecurityConfig,
+            tables: TablesConfig,
+        }
+        let both: Both = toml::from_str(toml).unwrap();
+        (both.security, both.tables)
+    }
+
+    const PROVIDER: &str = r#"
+        [security]
+        default = "deny"
+        tables = { provider = "pg", grants = "SELECT table_name FROM t WHERE u = {subject:String}" }
+        [security.providers.pg]
+        kind = "postgres"
+        url = "postgres://postgres@127.0.0.1:5432/db"
+        publication = "p"
+        slot = "s"
+    "#;
+
+    #[test]
+    fn every_grant_gets_its_provider_and_index() {
+        let (security, tables) = config(&format!(
+            r#"{PROVIDER}
+            [tables.messages.security]
+            provider = "pg"
+            column = "user_id"
+            grants = "SELECT a FROM r WHERE v = {{subject:String}}"
+            [tables.users.security]
+            public = true
+            columns = {{ provider = "pg", grants = "SELECT c FROM cols WHERE u = {{subject:String}}" }}
+            "#
+        ));
+        let p = plan(&security, &tables).unwrap();
+        let pg = |i| Some(("pg".to_string(), i));
+        assert_eq!(p.tables, pg(0));
+        let tables: Vec<_> = p.grants["pg"].iter().map(|g| g.table.as_str()).collect();
+        assert_eq!(tables, ["t", "r", "cols"]);
+        assert!(
+            matches!(&p.rules["messages"].rows, PlannedRows::Granted { source, .. } if Some(source.clone()) == pg(1))
+        );
+        assert!(matches!(p.rules["users"].rows, PlannedRows::All));
+        assert_eq!(p.rules["users"].columns, pg(2));
+    }
+
+    #[test]
+    fn rules_that_dont_add_up_are_errors() {
+        for (table, error) in [
+            ("columns = { provider = \"pg\", grants = \"SELECT c FROM x WHERE u = {subject:String}\" }", "say which rows"),
+            ("public = true\ncolumns = { provider = \"nope\", grants = \"x\" }", "no provider nope"),
+            ("public = true\ncolumns = { provider = \"pg\", grants = \"SELECT c FROM x\" }", "users.security.columns.grants"),
+            ("public = true\nprovider = \"pg\"", "not both"),
+        ] {
+            let (security, tables) = config(&format!("{PROVIDER}\n[tables.users.security]\n{table}\n"));
+            let e = format!("{:#}", plan(&security, &tables).err().expect(table));
+            assert!(e.contains(error), "{table}: {e}");
+        }
+    }
+
+    #[test]
+    fn access_needs_a_user_for_any_grant() {
+        let p = MemoryProvider::loaded();
+        let source = |grant| Source {
+            provider: p.clone(),
+            grant,
+        };
+        let open = Security::secured(Default::Allow).public("users");
+        assert!(open.access(None, "users").is_ok());
+        assert!(open.access(None, "other").is_ok());
+        let deny = Security::secured(Default::Deny).public("users");
+        assert!(deny.access(None, "other").is_err());
+        let tables = Security::secured(Default::Allow).tables(source(0));
+        assert!(tables
+            .access(None, "users")
+            .unwrap_err()
+            .contains("needs a user"));
+        let columns = Security::secured(Default::Deny)
+            .public("users")
+            .columns("users", source(1));
+        assert!(columns
+            .access(None, "users")
+            .unwrap_err()
+            .contains("needs a user"));
+
+        // what it decides, as the grants say
+        p.set(0, "alice", &["users"]);
+        p.set(1, "alice", &["name", "user_id"]);
+        let both = Security::secured(Default::Deny)
+            .tables(source(0))
+            .public("users")
+            .columns("users", source(1));
+        let a = both.access(Some("alice"), "users").unwrap();
+        assert_eq!(
+            a.current(),
+            Decision::Filter(TableFilter {
+                rows: RowFilter::All,
+                columns: Some(["name".to_string(), "user_id".to_string()].into()),
+            })
+        );
+        p.set(0, "alice", &[]);
+        assert!(matches!(a.current(), Decision::Denied(e) if e.contains("table users")));
     }
 }
