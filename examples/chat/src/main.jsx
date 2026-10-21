@@ -1,7 +1,7 @@
 // The chat demo: one group chat, two users side by side, every list live through chlive. Each
-// pane is its own connection, as its user: chlive shows it what that user may read, per tables
-// in Postgres followed live (which tables, whose messages, which columns of the users). Messages
-// go straight to Kafka through Redpanda's HTTP proxy.
+// pane is its own connection, as its user: chlive shows it what that user may read, per WorkOS
+// (polled) or Postgres (followed live): whether they may read the messages, whose, and (Postgres
+// only) which columns of the users. Messages go straight to Kafka through Redpanda's HTTP proxy.
 import { StrictMode, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { LiveClient, defaultUrl } from "@chlive/client";
@@ -141,9 +141,9 @@ function App() {
       <header>
         <h1>chlive chat</h1>
         <p>
-          Every list is a live query, as the pane's user. Postgres says what each user may read (change it with{" "}
-          <code>pg</code>): which tables (<code>table_permissions</code>), whose messages (<code>permissions</code>),
-          and which columns of the users (<code>column_permissions</code>: only some see colours).
+          Every list is a live query, as the pane's user. WorkOS says what each user may read: the messages if their
+          role in the organization has <code>messages:read</code>, and those of the feeds they hold{" "}
+          <code>feed:read</code> on (with <code>CHAT_SECURITY=postgres</code>, Postgres tables say it instead).
         </p>
       </header>
       <main className="panes">

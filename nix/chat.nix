@@ -28,7 +28,8 @@ let
           "users"
         ];
         schemaFile = "scripts/chat/schema.sql";
-        serverConfig = "nix/chlive.chat.toml";
+        # permissions from WorkOS, or Postgres with CHAT_SECURITY=postgres (a shell expression)
+        serverConfig = ''"nix/chlive.chat''${CHAT_SECURITY:+.$CHAT_SECURITY}.toml"'';
         cacheDir = ".dnvr/chat-chlive-cache";
       };
   inherit (stack) chClient name ref;
@@ -42,7 +43,7 @@ let
 in
 { ... }:
 {
-  description = "chlive chat demo: its own Redpanda, ClickHouse, sink, pause server and chlive-server, Postgres (the permissions source), and the chat app";
+  description = "chlive chat demo: its own Redpanda, ClickHouse, sink, pause server and chlive-server, Postgres (a permissions source; WorkOS is the default), and the chat app";
 
   packages = toolchain.packages ++ [
     clickhouse
@@ -52,16 +53,17 @@ in
   inherit (stack) prerun;
 
   processes = stack.processes // {
-    # the server reads its permissions from Postgres: once its schema is in
+    # with CHAT_SECURITY=postgres the server reads its permissions from Postgres: once its
+    # schema is in (WorkOS: WORKOS_API_KEY, from the shell)
     ${name "server"} = stack.processes.${name "server"} // {
       env = stack.processes.${name "server"}.env // {
         PG_READY = ref "postgres-schema" "ready";
       };
     };
 
-    # Postgres, where the permissions live (the source chlive follows with logical
-    # replication, CDC). dnvr's preset: data under .dnvr/chat-postgres, `database` published
-    # once the database exists.
+    # Postgres, where the permissions live with CHAT_SECURITY=postgres (the source chlive
+    # follows with logical replication, CDC). dnvr's preset: data under .dnvr/chat-postgres,
+    # `database` published once the database exists.
     ${name "postgres"} = {
       imports = [ presets.postgres ];
       package = pkgs.postgresql;
@@ -140,8 +142,15 @@ in
         echo "removed Postgres data too"
       '';
     };
+    workos-setup = {
+      description = "Set up the chat's permissions in WorkOS (WORKOS_API_KEY): users, roles, feeds; adds only what's missing";
+      text = ''
+        cd "$DNVR_ROOT"
+        exec bun scripts/chat/workos.ts "$@"
+      '';
+    };
     chat-smoke = {
-      description = "Check the running chat stack end to end: messages through chlive, per user's Postgres permissions";
+      description = "Check the running chat stack end to end: messages through chlive, per user's WorkOS (or, with CHAT_SECURITY=postgres, Postgres) permissions";
       runtimeInputs = [
         dnvrState
         pkgs.postgresql
@@ -152,7 +161,10 @@ in
         PG_URL="''${PG_URL:-postgres://postgres@127.0.0.1:${toString pgPort}/chat}"
         export CHLIVE_URL PROXY_URL PG_URL
         cd "$DNVR_ROOT"
-        exec bun scripts/chat/smoke.ts "$@"
+        if [ "''${CHAT_SECURITY:-}" = postgres ]; then
+          exec bun scripts/chat/smoke.ts "$@"
+        fi
+        exec bun scripts/chat/smoke-workos.ts "$@"
       '';
     };
   };

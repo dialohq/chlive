@@ -1,0 +1,35 @@
+# chlive-server's config for the chat demo's stack (nix/chat.nix), with its permissions in
+# Postgres (`CHAT_SECURITY=postgres dnvr up`; WorkOS is nix/chlive.chat.toml): addresses come
+# as flags from the dnvr `chat-server` process; this is the rest.
+[clickhouse]
+password = "chlive_ro"
+snapshot_password = "chlive_snap"
+snapshot_database = "chlive_snapshots"
+
+[cache]
+dir = ".dnvr/chat-chlive-cache"
+
+[log]
+level = "info,chlive_server::hub=debug"
+
+# Security: per tables in the chat stack's Postgres (scripts/chat/postgres.sql), followed by
+# logical replication: which tables each user may read, whose messages, and which columns of the
+# users.
+[security]
+default = "deny"
+tables = { provider = "pg", grants = "SELECT table_name FROM table_permissions WHERE user_id = {subject:String}" }
+
+[security.providers.pg]
+kind = "postgres"
+url = "postgres://postgres@127.0.0.1:54329/chat"
+publication = "chlive_permissions"
+slot = "chlive_chat"
+
+[tables.messages.security]
+provider = "pg"
+column = "user_id"
+grants = "SELECT author_id FROM permissions WHERE viewer_id = {subject:String}"
+
+[tables.users.security]
+public = true
+columns = { provider = "pg", grants = "SELECT column_name FROM column_permissions WHERE user_id = {subject:String} AND table_name = 'users'" }

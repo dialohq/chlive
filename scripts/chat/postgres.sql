@@ -1,7 +1,7 @@
 -- The chat demo's Postgres schema: the permissions source, applied by the dnvr
 -- `chat-postgres-schema` process on every start (idempotent). chlive reads the permissions
 -- through logical replication (CDC): the server runs with wal_level = logical, and the tables
--- are in a publication (see [security] in nix/chlive.chat.toml).
+-- are in a publication (see [security] in nix/chlive.chat.postgres.toml).
 
 -- User-to-user permissions: `viewer_id` may see `author_id`'s messages.
 CREATE TABLE IF NOT EXISTS permissions (

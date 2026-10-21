@@ -1,5 +1,6 @@
-# chlive-server's config for the chat demo's stack (nix/chat.nix): addresses
-# come as flags from the dnvr `chat-server` process; this is the rest.
+# chlive-server's config for the chat demo's stack (nix/chat.nix), with its permissions in
+# WorkOS (Postgres instead: nix/chlive.chat.postgres.toml, `CHAT_SECURITY=postgres dnvr up`):
+# addresses come as flags from the dnvr `chat-server` process; this is the rest.
 [clickhouse]
 password = "chlive_ro"
 snapshot_password = "chlive_snap"
@@ -11,24 +12,23 @@ dir = ".dnvr/chat-chlive-cache"
 [log]
 level = "info,chlive_server::hub=debug"
 
-# Security: per tables in the chat stack's Postgres (scripts/chat/postgres.sql), followed by
-# logical replication: which tables each user may read, whose messages, and which columns of the
-# users.
+# Security: per WorkOS (scripts/chat/workos.ts sets it up), asked again every `poll`: who may
+# read the messages (their role in the organization has `messages:read`), and whose (the feeds
+# they hold `feed:read` on: a feed's external_id is its user's id). The API key comes from
+# WORKOS_API_KEY.
 [security]
 default = "deny"
-tables = { provider = "pg", grants = "SELECT table_name FROM table_permissions WHERE user_id = {subject:String}" }
 
-[security.providers.pg]
-kind = "postgres"
-url = "postgres://postgres@127.0.0.1:54329/chat"
-publication = "chlive_permissions"
-slot = "chlive_chat"
+[security.providers.workos]
+kind = "workos"
+organization = "chlive-chat"
+poll = "2s"
 
 [tables.messages.security]
-provider = "pg"
+table = { provider = "workos", grants = "messages:read" }
+provider = "workos"
 column = "user_id"
-grants = "SELECT author_id FROM permissions WHERE viewer_id = {subject:String}"
+grants = "feed:read"
 
 [tables.users.security]
 public = true
-columns = { provider = "pg", grants = "SELECT column_name FROM column_permissions WHERE user_id = {subject:String} AND table_name = 'users'" }
