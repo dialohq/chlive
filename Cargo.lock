@@ -689,6 +689,7 @@ dependencies = [
  "futures",
  "humantime-serde",
  "pgwire-replication",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",

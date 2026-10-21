@@ -1991,6 +1991,42 @@ async fn tables_must_be_granted_and_a_revoke_ends_the_subscription() {
 }
 
 #[tokio::test]
+async fn a_table_grant_allows_while_it_answers_anything() {
+    let p = MemoryProvider::loaded();
+    p.set(0, "alice", &["requests:read"]);
+    let settings = ServerSettings {
+        security: std::sync::Arc::new(Security::secured(SecurityDefault::Deny).table(
+            "requests",
+            Source {
+                provider: p.clone(),
+                grant: 0,
+            },
+        )),
+        ..ServerSettings::default()
+    };
+    let server = server_with(settings).await;
+
+    let mut b = Client::connect(&server).await;
+    hello(&mut b, "bob").await;
+    b.subscribe("s", "select user_id from requests").await;
+    assert_eq!(b.expect().await["code"], "PERMISSION_DENIED");
+
+    let mut a = Client::connect(&server).await;
+    hello(&mut a, "alice").await;
+    a.subscribe("s", "select user_id from requests").await;
+    assert_eq!(a.expect().await["type"], "snapshot");
+    assert_eq!(a.inserts("s", 3).await.len(), 3);
+    // revoked: the subscription ends
+    p.set(0, "alice", &[]);
+    let m = a.expect().await;
+    assert_eq!(
+        (&m["type"], &m["code"], &m["id"]),
+        (&json!("error"), &json!("PERMISSION_DENIED"), &json!("s")),
+        "{m}"
+    );
+}
+
+#[tokio::test]
 async fn columns_must_be_granted_and_star_follows_them() {
     let p = MemoryProvider::loaded();
     for user in ["alice", "bob"] {

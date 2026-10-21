@@ -1,10 +1,11 @@
 //! Security: which tables, rows and columns a connection's user may read.
 //!
-//! A permission provider (Postgres over CDC, …) answers, for each of its grants and each
-//! subject, a set of strings, and tells when it changes ([`PermissionProvider::watch`]). What
-//! the strings mean is the configuration's: the tables a user may read (`[security.tables]`),
-//! the values of a table's column whose rows they may read (`[tables.<t>.security]`), or the
-//! columns of a table they may read (`[tables.<t>.security.columns]`). The server turns them
+//! A permission provider (Postgres over CDC, WorkOS by polling) answers, for each of its grants
+//! and each subject, a set of strings, and tells when it changes ([`PermissionProvider::watch`]).
+//! What the strings mean is the configuration's: the tables a user may read
+//! (`[security.tables]`), whether they may read a table at all (`[tables.<t>.security.table]`:
+//! anything), the values of a table's column whose rows they may read (`[tables.<t>.security]`),
+//! or the columns of a table they may read (`[tables.<t>.security.columns]`). The server turns them
 //! into each table's [`TableFilter`]; when they change, the subscription moves to the plan
 //! with the new filter (a new snapshot), or ends with `PERMISSION_DENIED` if it lost a table or
 //! a column it names.
@@ -15,6 +16,7 @@ pub mod grants;
 pub mod index;
 pub mod pgoutput;
 pub mod postgres;
+pub mod workos;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -66,6 +68,22 @@ pub enum Default {
 pub enum ProviderConfig {
     /// Permissions in Postgres tables, followed by logical replication.
     Postgres(postgres::PostgresConfig),
+    /// Permissions in WorkOS (FGA), polled.
+    WorkOs(workos::WorkOsConfig),
+}
+
+/// What a grant is asked: a set of values (tables, rows, columns), or yes/no (a table's
+/// `table`: yes is any value). A provider that can answer both alike (Postgres) ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantKind {
+    Values,
+    Check,
+}
+
+/// A provider's grants, as its kind takes them (in the order of their indexes).
+enum ProviderGrants {
+    Postgres(Vec<Grant>),
+    WorkOs(Vec<workos::Grant>),
 }
 
 /// One grant of a running provider.
@@ -85,8 +103,10 @@ enum Rows {
     Granted { source: Source, column: String },
 }
 
-/// A table's rule: its rows, and its columns (none: every one).
+/// A table's rule: whether it's readable at all (none: yes), its rows, and its columns (none:
+/// every one).
 struct Rule {
+    table: Option<Source>,
     rows: Rows,
     columns: Option<Source>,
 }
@@ -97,6 +117,8 @@ pub struct TableAccess {
     table: String,
     /// Its name must be among these (`[security.tables]`).
     tables: Option<watch::Receiver<Granted>>,
+    /// Readable while this grants anything (its `table`).
+    allowed: Option<watch::Receiver<Granted>>,
     /// Its rows: the ClickHouse column, and the values (none: all rows).
     rows: Option<(String, watch::Receiver<Granted>)>,
     /// Its columns (none: every one).
@@ -119,6 +141,7 @@ impl TableAccess {
         Self {
             table: table.to_string(),
             tables: None,
+            allowed: None,
             rows: None,
             columns: None,
         }
@@ -127,6 +150,7 @@ impl TableAccess {
     fn receivers(&self) -> impl Iterator<Item = &watch::Receiver<Granted>> {
         self.tables
             .iter()
+            .chain(self.allowed.iter())
             .chain(self.rows.iter().map(|(_, r)| r))
             .chain(self.columns.iter())
     }
@@ -145,6 +169,14 @@ impl TableAccess {
                 return Decision::Loading;
             };
             if !tables.contains(&self.table) {
+                return Decision::Denied(format!("table {} isn't readable here", self.table));
+            }
+        }
+        if let Some(r) = &self.allowed {
+            let Some(allowed) = get(r) else {
+                return Decision::Loading;
+            };
+            if allowed.is_empty() {
                 return Decision::Denied(format!("table {} isn't readable here", self.table));
             }
         }
@@ -250,6 +282,12 @@ impl Security {
         self
     }
 
+    /// `table` is readable only while `source` grants the subject anything.
+    pub fn table(mut self, table: &str, source: Source) -> Self {
+        self.rule(table).table = Some(source);
+        self
+    }
+
     /// The tables a subject may read: those `source` grants them.
     pub fn tables(mut self, source: Source) -> Self {
         self.tables_grant = Some(source);
@@ -258,6 +296,7 @@ impl Security {
 
     fn rule(&mut self, table: &str) -> &mut Rule {
         self.tables.entry(table.to_string()).or_insert(Rule {
+            table: None,
             rows: Rows::All,
             columns: None,
         })
@@ -274,8 +313,14 @@ impl Security {
         let planned = plan(security, tables)?;
         let mut providers: HashMap<String, Arc<dyn PermissionProvider>> = HashMap::new();
         for (name, grants) in planned.grants {
-            let provider: Arc<dyn PermissionProvider> = match &security.providers[&name] {
-                ProviderConfig::Postgres(c) => postgres::PostgresProvider::start(&name, c, grants)?,
+            let provider: Arc<dyn PermissionProvider> = match (&security.providers[&name], grants) {
+                (ProviderConfig::Postgres(c), ProviderGrants::Postgres(g)) => {
+                    postgres::PostgresProvider::start(&name, c, g)?
+                }
+                (ProviderConfig::WorkOs(c), ProviderGrants::WorkOs(g)) => {
+                    workos::WorkOsProvider::start(&name, c, g)?
+                }
+                _ => unreachable!("grants are planned per their provider's kind"),
             };
             providers.insert(name, provider);
         }
@@ -297,6 +342,7 @@ impl Security {
             out.tables.insert(
                 table,
                 Rule {
+                    table: rule.table.map(source),
                     rows,
                     columns: rule.columns.map(source),
                 },
@@ -323,6 +369,9 @@ impl Security {
             None if default == Default::Allow => {}
             None => return Err(format!("table {table} isn't readable here")),
             Some(rule) => {
+                if let Some(s) = &rule.table {
+                    access.allowed = Some(watch(s)?);
+                }
                 match &rule.rows {
                     Rows::All => {}
                     Rows::Denied => return Err(format!("table {table} isn't readable here")),
@@ -343,11 +392,12 @@ impl Security {
 struct Planned {
     tables: Option<(String, usize)>,
     rules: BTreeMap<String, PlannedRule>,
-    /// Per provider, its grants (in the order of their indexes).
-    grants: BTreeMap<String, Vec<Grant>>,
+    /// Per provider, its grants.
+    grants: BTreeMap<String, ProviderGrants>,
 }
 
 struct PlannedRule {
+    table: Option<(String, usize)>,
     rows: PlannedRows,
     columns: Option<(String, usize)>,
 }
@@ -363,27 +413,39 @@ enum PlannedRows {
 
 /// Every rule checked, and every grant given its provider and index.
 fn plan(security: &SecurityConfig, tables: &TablesConfig) -> Result<Planned> {
-    let mut grants: BTreeMap<String, Vec<Grant>> = BTreeMap::new();
-    let mut register = |at: &str, provider: &str, text: &str| -> Result<(String, usize)> {
-        let kind = security
+    let mut grants: BTreeMap<String, ProviderGrants> = BTreeMap::new();
+    let mut register = |at: &str, provider: &str, text: &str, kind: GrantKind| {
+        let config = security
             .providers
             .get(provider)
             .with_context(|| format!("{at}: no provider {provider} in [security.providers]"))?;
-        let grant = match kind {
-            ProviderConfig::Postgres(_) => {
-                Grant::parse(text).map_err(|e| anyhow::anyhow!("{at}.grants: {e}"))?
+        let list = grants.entry(provider.to_string()).or_insert(match config {
+            ProviderConfig::Postgres(_) => ProviderGrants::Postgres(Vec::new()),
+            ProviderConfig::WorkOs(_) => ProviderGrants::WorkOs(Vec::new()),
+        });
+        let index = match list {
+            ProviderGrants::Postgres(list) => {
+                list.push(Grant::parse(text).map_err(|e| anyhow::anyhow!("{at}.grants: {e}"))?);
+                list.len() - 1
+            }
+            ProviderGrants::WorkOs(list) => {
+                list.push(workos::Grant::new(text, kind).with_context(|| format!("{at}.grants"))?);
+                list.len() - 1
             }
         };
-        let list = grants.entry(provider.to_string()).or_default();
-        list.push(grant);
-        Ok((provider.to_string(), list.len() - 1))
+        anyhow::Ok((provider.to_string(), index))
     };
     let tables_grant = match &security.tables {
         Some(g) => {
             if security.default.is_none() {
                 bail!("security.tables: needs `default` in [security]");
             }
-            Some(register("security.tables", &g.provider, &g.grants)?)
+            Some(register(
+                "security.tables",
+                &g.provider,
+                &g.grants,
+                GrantKind::Values,
+            )?)
         }
         None => None,
     };
@@ -396,6 +458,15 @@ fn plan(security: &SecurityConfig, tables: &TablesConfig) -> Result<Planned> {
         if security.default.is_none() {
             bail!("{at}: secured tables need a [security] section (with `default`)");
         }
+        let table_grant = match &s.table {
+            Some(g) => Some(register(
+                &format!("{at}.table"),
+                &g.provider,
+                &g.grants,
+                GrantKind::Check,
+            )?),
+            None => None,
+        };
         let rows = match (s.public, &s.provider) {
             (true, Some(_)) => bail!("{at}: `public` or a `provider`, not both"),
             (true, None) => {
@@ -411,7 +482,12 @@ fn plan(security: &SecurityConfig, tables: &TablesConfig) -> Result<Planned> {
                 if s.columns.is_some() {
                     bail!("{at}: with `columns`, say which rows: `public = true`, or a `provider`");
                 }
-                PlannedRows::Denied
+                // with only a `table` grant: all rows, while it allows the table
+                if table_grant.is_some() {
+                    PlannedRows::All
+                } else {
+                    PlannedRows::Denied
+                }
             }
             (false, Some(provider)) => {
                 let column = s
@@ -422,23 +498,35 @@ fn plan(security: &SecurityConfig, tables: &TablesConfig) -> Result<Planned> {
                     format!("{at}: `grants` (which values of {column} a subject may see)")
                 })?;
                 PlannedRows::Granted {
-                    source: register(&at, provider, text)?,
+                    source: register(&at, provider, text, GrantKind::Values)?,
                     column,
                 }
             }
         };
         let columns = match &s.columns {
-            Some(g) => Some(register(&format!("{at}.columns"), &g.provider, &g.grants)?),
+            Some(g) => Some(register(
+                &format!("{at}.columns"),
+                &g.provider,
+                &g.grants,
+                GrantKind::Values,
+            )?),
             None => None,
         };
-        rules.insert(table.clone(), PlannedRule { rows, columns });
+        rules.insert(
+            table.clone(),
+            PlannedRule {
+                table: table_grant,
+                rows,
+                columns,
+            },
+        );
     }
     for (name, provider) in &security.providers {
-        match provider {
-            ProviderConfig::Postgres(c) => c
-                .check()
-                .with_context(|| format!("security.providers.{name}"))?,
-        }
+        let checked = match provider {
+            ProviderConfig::Postgres(c) => c.check(),
+            ProviderConfig::WorkOs(c) => c.check(),
+        };
+        checked.with_context(|| format!("security.providers.{name}"))?;
     }
     Ok(Planned {
         tables: tables_grant,
@@ -483,6 +571,11 @@ impl Watchers {
             *now = granted;
             changed
         });
+    }
+
+    /// Pairs nobody watches anymore go.
+    pub fn prune(&mut self) {
+        self.senders.retain(|_, tx| tx.receiver_count() > 0);
     }
 
     /// The watched pairs.
@@ -585,7 +678,10 @@ mod tests {
         let p = plan(&security, &tables).unwrap();
         let pg = |i| Some(("pg".to_string(), i));
         assert_eq!(p.tables, pg(0));
-        let tables: Vec<_> = p.grants["pg"].iter().map(|g| g.table.as_str()).collect();
+        let ProviderGrants::Postgres(grants) = &p.grants["pg"] else {
+            panic!("postgres grants");
+        };
+        let tables: Vec<_> = grants.iter().map(|g| g.table.as_str()).collect();
         assert_eq!(tables, ["t", "r", "cols"]);
         assert!(
             matches!(&p.rules["messages"].rows, PlannedRows::Granted { source, .. } if Some(source.clone()) == pg(1))
@@ -606,6 +702,69 @@ mod tests {
             let e = format!("{:#}", plan(&security, &tables).err().expect(table));
             assert!(e.contains(error), "{table}: {e}");
         }
+    }
+
+    #[test]
+    fn workos_grants_are_permissions_asked_as_their_use_needs() {
+        let (security, tables) = config(
+            r#"
+            [security]
+            default = "deny"
+            [security.providers.workos]
+            kind = "workos"
+            organization = "acme"
+            poll = "2s"
+            [tables.messages.security]
+            table = { provider = "workos", grants = "messages:read" }
+            provider = "workos"
+            column = "user_id"
+            grants = "feed:read"
+            [tables.users.security]
+            table = { provider = "workos", grants = "users:read" }
+            "#,
+        );
+        let p = plan(&security, &tables).unwrap();
+        let ProviderGrants::WorkOs(grants) = &p.grants["workos"] else {
+            panic!("workos grants");
+        };
+        let asked: Vec<_> = grants
+            .iter()
+            .map(|g| (g.permission.as_str(), g.kind))
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                ("messages:read", GrantKind::Check),
+                ("feed:read", GrantKind::Values),
+                ("users:read", GrantKind::Check),
+            ]
+        );
+        assert_eq!(p.rules["messages"].table, Some(("workos".to_string(), 0)));
+        // only a `table` grant: every row, while it allows the table
+        assert!(matches!(p.rules["users"].rows, PlannedRows::All));
+        assert_eq!(p.rules["users"].table, Some(("workos".to_string(), 2)));
+    }
+
+    #[test]
+    fn a_table_grant_allows_while_it_answers_anything() {
+        let p = MemoryProvider::loaded();
+        let security = Security::secured(Default::Deny).table(
+            "messages",
+            Source {
+                provider: p.clone(),
+                grant: 0,
+            },
+        );
+        assert!(security
+            .access(None, "messages")
+            .unwrap_err()
+            .contains("needs a user"));
+        let a = security.access(Some("dave"), "messages").unwrap();
+        assert!(matches!(a.current(), Decision::Denied(e) if e.contains("table messages")));
+        p.set(0, "dave", &["messages:read"]);
+        assert_eq!(a.current(), Decision::Filter(TableFilter::default()));
+        p.set(0, "dave", &[]);
+        assert!(matches!(a.current(), Decision::Denied(_)));
     }
 
     #[test]

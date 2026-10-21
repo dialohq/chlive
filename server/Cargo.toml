@@ -34,6 +34,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio-postgres = "0.7"
 pgwire-replication = { version = "0.4.1", default-features = false, features = ["scram"] }
 bytes = "1"
+# the WorkOS provider (src/security/workos.rs): its API, polled
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # binary only
 clap = { version = "4", features = ["derive", "env"] }
 

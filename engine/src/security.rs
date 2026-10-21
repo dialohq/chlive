@@ -60,12 +60,16 @@ pub struct TableSecurity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column: Option<String>,
     /// Which values of `column` a subject may see, as the provider takes it (for Postgres, a
-    /// query over a permissions table).
+    /// query over a permissions table; for WorkOS, a permission slug).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grants: Option<String>,
     /// Which of its columns (dialect names) a subject may see; without it, every one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub columns: Option<GrantSource>,
+    /// Whether a subject may read it at all: while this grant answers anything (for WorkOS, a
+    /// permission check).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<GrantSource>,
 }
 
 /// A provider's grant: which strings (table names, column names, …) a subject is granted.
@@ -74,6 +78,7 @@ pub struct TableSecurity {
 pub struct GrantSource {
     /// The permission provider (in `[security.providers]`).
     pub provider: String,
-    /// As the provider takes it (for Postgres, a query over a permissions table).
+    /// As the provider takes it (for Postgres, a query over a permissions table; for WorkOS, a
+    /// permission slug).
     pub grants: String,
 }
