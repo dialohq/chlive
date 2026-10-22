@@ -3,17 +3,18 @@
     "continuous-backup": {
       "flake": false,
       "locked": {
-        "lastModified": 1791393942,
-        "narHash": "sha256-2oZI9zQg2j3SJBlF3NZ9R7cuYjW3h74CRvcJzInQPP0=",
-        "ref": "refs/heads/main",
-        "rev": "9c16ca5ee8a7c50efadb8a6c8722555bce063a1b",
-        "revCount": 66,
-        "type": "git",
-        "url": "file:///Users/adam/continuous-backup"
+        "lastModified": 1792668058,
+        "narHash": "sha256-i5m2/PP/pmntv3boIXGk9Opom4EO3jaC+eWl3pdaIPs=",
+        "owner": "dialohq",
+        "repo": "clickhouse-continuous-backup",
+        "rev": "4bfe2915182a3ad9b1411480419451dc7a760bf1",
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:///Users/adam/continuous-backup"
+        "owner": "dialohq",
+        "ref": "pause-server",
+        "repo": "clickhouse-continuous-backup",
+        "type": "github"
       }
     },
     "dnvr": {

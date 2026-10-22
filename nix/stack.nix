@@ -102,11 +102,11 @@ let
     connector.client.config.override.policy=All
     offset.flush.interval.ms=1000
   '';
-  # `listen`, `connectUrl` and `clickhouseUrl` are added at runtime.
+  # `listen`, `connectUrl`, `clickhouseUrl` and `keeperAddress` (ClickHouse's embedded Keeper,
+  # where it elects itself leader and keeps its tokens) are added at runtime.
   pauseServerConfig = pkgs.writeText "chlive-${prefix}pause-server.json" (
     builtins.toJSON {
-      # relative to DNVR_ROOT, where the process runs
-      pausesFile = "${dir "pause-server"}/pauses.json";
+      keeperPath = "/chlive-pause-server";
       pauseTimeoutSeconds = 30;
       pipelines = map (
         topic:
@@ -211,8 +211,8 @@ in
     stackEnv
     ;
 
-  # The ports of ClickHouse's embedded Keeper, which only ClickHouse itself uses (its config
-  # reads them with `from_env`).
+  # The ports of ClickHouse's embedded Keeper: ClickHouse's config reads them with `from_env`,
+  # and the pause server connects to it.
   prerun = ''
     CHLIVE_KEEPER_PORT=$(dnvr-state pick-port)
     CHLIVE_KEEPER_RAFT_PORT=$(dnvr-state pick-port)
@@ -347,13 +347,16 @@ in
         conf=${dir "pause-server"}/config.json
         ${pkgs.jq}/bin/jq --arg listen "127.0.0.1:$port" \
           --arg connect "$CONNECT_URL" --arg clickhouse "$CLICKHOUSE_URL" \
-          '. + {listen: $listen, connectUrl: $connect, clickhouseUrl: $clickhouse}' \
+          --arg keeper "127.0.0.1:''${CHLIVE_KEEPER_PORT:?}" \
+          '. + {listen: $listen, connectUrl: $connect, clickhouseUrl: $clickhouse, keeperAddress: $keeper}' \
           ${pauseServerConfig} > "$conf"
         export CLICKHOUSE_USERNAME=default CLICKHOUSE_PASSWORD=
         ${supervise {
           name = "Pause server";
           start = ''${backup}/bin/durable-clickhouse-backup pause-server "$conf"'';
-          readyWhen = ''${pkgs.curl}/bin/curl -fs "http://127.0.0.1:$port/health" >/dev/null'';
+          # leading, not just up: a standby answers /health too, but refuses the rest with 503,
+          # where the leader gives an unknown token 404
+          readyWhen = ''[ "$(${pkgs.curl}/bin/curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d '{"token":"00000000-0000-0000-0000-000000000000"}' "http://127.0.0.1:$port/renew")" = 404 ]'';
           onReady = ''
             dnvr-state set url "http://127.0.0.1:$port"
             echo "[pause-server] ready"

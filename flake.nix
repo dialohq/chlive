@@ -6,9 +6,10 @@
     dnvr.url = "github:dialohq/dnvr";
     dnvr.inputs.nixpkgs.follows = "nixpkgs";
     # The production ingestion (Kafka Connect's ClickHouse sink, exactly once) and its pause
-    # server, which chlive's snapshots go through. A local checkout for now.
+    # server, which chlive's snapshots go through. Its `pause-server` branch (the pause server's
+    # Keeper storage and leader election) until that's merged into main.
     continuous-backup = {
-      url = "git+file:///Users/adam/continuous-backup";
+      url = "github:dialohq/clickhouse-continuous-backup/pause-server";
       flake = false;
     };
   };

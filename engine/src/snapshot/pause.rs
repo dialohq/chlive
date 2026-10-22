@@ -5,6 +5,8 @@
 //! in-flight batch is in ClickHouse) and answers with a token, its TTL and, per pipeline, the
 //! next offset to ingest of each partition, read from the sink's exactly-once state. The pause
 //! lasts until `POST /resume {"token"}`, or until the TTL passes without a `POST /renew`.
+//!
+//! Its replicas elect a leader; the others answer `503`, as does every replica while none leads.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -33,6 +35,11 @@ pub trait Pauser: Send + Sync {
     async fn renew(&self, token: &str) -> Result<(), SnapshotError>;
 }
 
+/// How long a request is retried while no pause server leads or can be reached: a standby takes
+/// over once the leader's Keeper session times out (about 10 s).
+const FAILOVER_RETRY: Duration = Duration::from_secs(30);
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// The pause server over HTTP.
 pub struct PauseServer {
     client: reqwest::Client,
@@ -52,14 +59,26 @@ impl PauseServer {
         }
     }
 
+    /// Retried through a failover. That's safe even if a lost request did something: whatever it
+    /// paused is held by a token nobody renews, so it expires.
     async fn post(&self, path: &str, body: serde_json::Value) -> Result<String, SnapshotError> {
-        let resp = self
-            .client
-            .post(format!("{}/{path}", self.url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| SnapshotError(format!("pause server /{path}: {e}")))?;
+        let deadline = tokio::time::Instant::now() + FAILOVER_RETRY;
+        let resp = loop {
+            let result = self
+                .client
+                .post(format!("{}/{path}", self.url))
+                .json(&body)
+                .send()
+                .await;
+            let retry = match &result {
+                Ok(resp) => resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                Err(e) => e.is_connect(),
+            };
+            if !retry || tokio::time::Instant::now() + RETRY_DELAY > deadline {
+                break result.map_err(|e| SnapshotError(format!("pause server /{path}: {e}")))?;
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
+        };
         let status = resp.status();
         let text = resp
             .text()
