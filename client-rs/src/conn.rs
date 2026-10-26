@@ -1,6 +1,7 @@
 //! The connection: one task owning the WebSocket. It opens when there's a subscription,
-//! (re)subscribes every active one on each open, hands each subscription the messages for it,
-//! and reconnects with exponential backoff when the socket drops.
+//! (re)subscribes every active one on each open, from the cursor of the last message it handed
+//! it (so the server can resume rather than snapshot), hands each subscription the messages for
+//! it, and reconnects with exponential backoff when the socket drops.
 //!
 //! Messages are only read here; applying them is the subscriptions' work, when their streams
 //! are polled. Each subscription's queue is bounded: a full one makes this task wait, which
@@ -46,6 +47,9 @@ struct Sub {
     sql: String,
     params: Params,
     events: mpsc::Sender<Event>,
+    /// The `at` of the last message handed to it: everything handed over is applied in order,
+    /// so it's where the subscription's rows will be.
+    at: Option<String>,
 }
 
 pub(crate) fn spawn(opts: ClientOptions) -> mpsc::UnboundedSender<Cmd> {
@@ -76,6 +80,7 @@ fn offline(cmd: Option<Cmd>, subs: &mut BTreeMap<String, Sub>) -> Flow {
                     sql,
                     params,
                     events,
+                    at: None,
                 },
             );
             Flow::Go
@@ -95,12 +100,12 @@ fn text(msg: &ClientMsg) -> Message {
     Message::text(serde_json::to_string(msg).expect("client messages serialize"))
 }
 
-fn subscribe(id: &str, sql: &str, params: &Params) -> Message {
+fn subscribe(id: &str, sub: &Sub) -> Message {
     text(&ClientMsg::Subscribe {
         id: id.to_string(),
-        sql: sql.to_string(),
-        since: None,
-        params: params.clone(),
+        sql: sub.sql.clone(),
+        since: sub.at.clone(),
+        params: sub.params.clone(),
     })
 }
 
@@ -166,11 +171,7 @@ async fn connected(
 ) -> Flow {
     let (mut sink, mut stream) = ws.split();
     for (id, sub) in subs.iter() {
-        if sink
-            .send(subscribe(id, &sub.sql, &sub.params))
-            .await
-            .is_err()
-        {
+        if sink.send(subscribe(id, sub)).await.is_err() {
             return Flow::Go;
         }
         let _ = sub.events.send(Event::Subscribed).await;
@@ -194,18 +195,17 @@ async fn connected(
                     params,
                     events,
                 }) => {
-                    let sent = sink.send(subscribe(&id, &sql, &params)).await.is_ok();
+                    let sub = Sub {
+                        sql,
+                        params,
+                        events,
+                        at: None,
+                    };
+                    let sent = sink.send(subscribe(&id, &sub)).await.is_ok();
                     if sent {
-                        let _ = events.send(Event::Subscribed).await;
+                        let _ = sub.events.send(Event::Subscribed).await;
                     }
-                    subs.insert(
-                        id,
-                        Sub {
-                            sql,
-                            params,
-                            events,
-                        },
-                    );
+                    subs.insert(id, sub);
                     if !sent {
                         return Flow::Go;
                     }
@@ -232,7 +232,7 @@ async fn connected(
 }
 
 /// Hand a message to its subscription. One that doesn't parse fails only that subscription.
-async fn dispatch(subs: &BTreeMap<String, Sub>, text: &str) {
+async fn dispatch(subs: &mut BTreeMap<String, Sub>, text: &str) {
     let bytes = text.len();
     let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -246,9 +246,17 @@ async fn dispatch(subs: &BTreeMap<String, Sub>, text: &str) {
         return;
     };
     // messages for subscriptions that are gone are ignored
-    let Some(sub) = subs.get(id) else { return };
+    let Some(sub) = subs.get_mut(id) else { return };
     let event = match serde_json::from_value::<ServerMsg>(value.clone()) {
-        Ok(msg) => Event::Message { msg, bytes },
+        Ok(msg) => {
+            if let ServerMsg::Snapshot { at, .. }
+            | ServerMsg::Diff { at, .. }
+            | ServerMsg::Progress { at, .. } = &msg
+            {
+                sub.at = Some(at.clone());
+            }
+            Event::Message { msg, bytes }
+        }
         Err(e) => Event::Unreadable {
             error: format!("unsupported message ({e}): {value}"),
             bytes,

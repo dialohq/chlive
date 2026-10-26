@@ -19,6 +19,7 @@ async fn main() {
                 }
                 println!("snapshot: {} rows", u.rows.len());
             }
+            Kind::Resumed => println!("resumed"),
             Kind::Diff => {
                 for c in &u.changes {
                     match c {

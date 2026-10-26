@@ -1,9 +1,10 @@
 //! The client against a fake server: a WebSocket listener the test drives by hand.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chlive_client::{
-    Change, ClientOptions, Kind, LiveClient, Params, Row, Status, Subscription, Update,
+    Change, ClientOptions, Kind, LiveClient, LiveError, Params, Row, Status, Subscription, Update,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -129,7 +130,8 @@ async fn subscribes_applies_messages_and_resubscribes_after_reconnect() {
     assert_eq!(u.changes.len(), 2);
     assert_eq!(u.at.as_deref(), Some("c2"));
 
-    // the connection drops: rows are kept, then a fresh snapshot (no resume) replaces them
+    // the connection drops: rows are kept, it subscribes again from its cursor, and a snapshot
+    // (the server couldn't resume) replaces them
     ws.close().await;
     let u = next(&mut sub).await;
     assert_eq!((u.kind, &u.status), (Kind::Disconnected, &Status::Loading));
@@ -137,7 +139,7 @@ async fn subscribes_applies_messages_and_resubscribes_after_reconnect() {
     let mut ws = server.next().await;
     assert_eq!(
         ws.recv().await,
-        json!({"type": "subscribe", "id": "s1", "sql": SQL})
+        json!({"type": "subscribe", "id": "s1", "sql": SQL, "since": "c2"})
     );
     ws.send(snapshot(
         "s1",
@@ -387,4 +389,380 @@ async fn a_snapshot_bigger_than_16_mib_arrives() {
     let u = next(&mut sub).await;
     assert_eq!(u.kind, Kind::Snapshot);
     assert_eq!(u.rows.len(), 100_000);
+}
+
+fn diff(id: &str, at: &str, changes: Value) -> Value {
+    json!({"type": "diff", "id": id, "changes": changes, "at": at})
+}
+
+fn insert(user: &str) -> Value {
+    json!({"op": "insert", "row": {"user_id": user}})
+}
+
+#[derive(Debug, serde::Deserialize, PartialEq)]
+struct User {
+    user_id: String,
+}
+
+fn user(u: &str) -> User {
+    User { user_id: u.into() }
+}
+
+/// A connection with the subscription `id`'s `subscribe` read.
+async fn subscribed(server: &mut FakeServer) -> FakeConn {
+    let mut ws = server.next().await;
+    ws.recv().await;
+    ws
+}
+
+#[tokio::test]
+async fn a_reconnect_resumes_from_the_cursor_and_keeps_the_rows() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let mut sub = client.subscribe::<Row>(SQL);
+    next(&mut sub).await;
+    let mut ws = subscribed(&mut server).await;
+    ws.send(snapshot("s1", json!([{"user_id": "a"}]))).await;
+    next(&mut sub).await;
+    ws.send(diff("s1", "c1", json!([insert("b")]))).await;
+    // progress moves the cursor too
+    ws.send(json!({"type": "progress", "id": "s1", "at": "c2"}))
+        .await;
+    next(&mut sub).await;
+    ws.close().await;
+    assert_eq!(next(&mut sub).await.kind, Kind::Disconnected);
+
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await["since"], "c2");
+    ws.send(
+        json!({"type": "resume", "id": "s1", "columns": [{"name": "user_id", "type": "String"}]}),
+    )
+    .await;
+    let u = next(&mut sub).await;
+    assert_eq!((u.kind, &u.status), (Kind::Resumed, &Status::Live));
+    assert_eq!(users(&u), ["a", "b"]);
+    ws.send(diff("s1", "c3", json!([insert("c")]))).await;
+    assert_eq!(users(&next(&mut sub).await), ["a", "b", "c"]);
+}
+
+#[tokio::test]
+async fn rows_are_every_state_and_end_with_an_error() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let mut rows = client.query(SQL).rows::<User>();
+    let mut ws = subscribed(&mut server).await;
+    ws.send(snapshot("s1", json!([{"user_id": "a"}]))).await;
+    let r = within(rows.next()).await.unwrap().unwrap();
+    assert_eq!(r.len(), 1);
+    ws.send(diff("s1", "c1", json!([insert("b")]))).await;
+    let r = within(rows.next()).await.unwrap().unwrap();
+    assert_eq!(*r[1], user("b"));
+    ws.send(json!({"type": "error", "id": "s1", "code": "STREAM_FAILED", "message": "boom"}))
+        .await;
+    let e = within(rows.next()).await.unwrap().unwrap_err();
+    assert_eq!(e.code, "STREAM_FAILED");
+    assert!(within(rows.next()).await.is_none());
+}
+
+#[tokio::test]
+async fn first_and_last_rows_are_kept_current() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let q = client.query(SQL);
+    let mut first = q.clone().first::<User>();
+    let mut last = q.last::<User>();
+    let mut ws = server.next().await;
+    ws.recv().await;
+    ws.recv().await;
+    assert_eq!(first.get(), None);
+    assert_eq!(first.status(), Status::Loading);
+
+    ws.send(snapshot("s1", json!([]))).await;
+    ws.send(snapshot("s2", json!([]))).await;
+    assert_eq!(within(first.current()).await.unwrap(), None);
+    assert_eq!(within(last.current()).await.unwrap(), None);
+
+    ws.send(diff("s1", "c1", json!([insert("a")]))).await;
+    ws.send(diff("s2", "c1", json!([insert("a")]))).await;
+    assert_eq!(
+        within(first.changed()).await.unwrap().as_deref(),
+        Some(&user("a"))
+    );
+    assert_eq!(
+        within(last.changed()).await.unwrap().as_deref(),
+        Some(&user("a"))
+    );
+
+    // a row at the end changes the last, not the first
+    ws.send(diff("s1", "c2", json!([insert("b")]))).await;
+    ws.send(diff("s2", "c2", json!([insert("b")]))).await;
+    assert_eq!(
+        within(last.changed()).await.unwrap().as_deref(),
+        Some(&user("b"))
+    );
+    // the same rows again (a snapshot after a reconnect): nothing changed
+    ws.send(snapshot("s1", json!([{"user_id": "a"}, {"user_id": "b"}])))
+        .await;
+    ws.send(diff(
+        "s1",
+        "c3",
+        json!([{"op": "insert", "row": {"user_id": "z"}, "index": 0}]),
+    ))
+    .await;
+    assert_eq!(
+        within(first.changed()).await.unwrap().as_deref(),
+        Some(&user("z"))
+    );
+    assert_eq!(first.status(), Status::Live);
+}
+
+#[tokio::test]
+async fn a_slow_reader_gets_only_the_latest_value() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let mut last = client.query(SQL).last::<User>();
+    let mut ws = subscribed(&mut server).await;
+    ws.send(snapshot("s1", json!([]))).await;
+    for (i, u) in ["a", "b", "c", "d"].into_iter().enumerate() {
+        ws.send(diff("s1", &format!("c{i}"), json!([insert(u)])))
+            .await;
+    }
+    // once "d" is in, the values before it are gone
+    let latest = within(last.wait_for(|r| r.as_deref() == Some(&user("d"))))
+        .await
+        .unwrap();
+    assert_eq!(latest.as_deref(), Some(&user("d")));
+    ws.send(diff("s1", "c9", json!([insert("e")]))).await;
+    assert_eq!(
+        within(last.changed()).await.unwrap().as_deref(),
+        Some(&user("e"))
+    );
+}
+
+#[tokio::test]
+async fn a_cell_is_the_first_column_of_the_first_row() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let mut count = client.query("select count() from events").cell::<u64>();
+    let mut flag = client.query("select paid from orders").cell::<bool>();
+    let mut ws = server.next().await;
+    ws.recv().await;
+    ws.recv().await;
+    let cols = json!([{"name": "count()", "type": "UInt64"}]);
+    ws.send(json!({"type": "snapshot", "id": "s1", "columns": cols, "rows": [], "at": "c0"}))
+        .await;
+    assert_eq!(within(count.current()).await.unwrap(), None);
+    // ClickHouse may quote a UInt64
+    ws.send(json!({"type": "snapshot", "id": "s1", "columns": cols, "rows": [{"count()": "41"}], "at": "c1"}))
+        .await;
+    assert_eq!(within(count.changed()).await.unwrap(), Some(41));
+    ws.send(json!({"type": "snapshot", "id": "s1", "columns": cols, "rows": [{"count()": 42}], "at": "c2"}))
+        .await;
+    assert_eq!(within(count.changed()).await.unwrap(), Some(42));
+
+    ws.send(
+        json!({"type": "snapshot", "id": "s2", "columns": [{"name": "paid", "type": "Bool"}],
+                   "rows": [{"paid": false}, {"paid": true}], "at": "c0"}),
+    )
+    .await;
+    let mut flags = flag.clone().into_stream();
+    assert_eq!(within(flag.current()).await.unwrap(), Some(false));
+    // the stream starts from what its own handle hasn't returned
+    assert_eq!(within(flags.next()).await.unwrap().unwrap(), Some(false));
+}
+
+#[tokio::test]
+async fn a_value_that_does_not_fit_fails_the_view() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let mut n = client.query(SQL).cell::<u64>();
+    let mut ws = subscribed(&mut server).await;
+    ws.send(snapshot("s1", json!([{"user_id": "not a number"}])))
+        .await;
+    let e = within(n.current()).await.unwrap_err();
+    assert_eq!(e.code, "CLIENT_ERROR");
+    assert!(matches!(n.status(), Status::Error(_)));
+    // and it unsubscribed
+    assert_eq!(ws.recv().await, json!({"type": "unsubscribe", "id": "s1"}));
+}
+
+#[tokio::test]
+async fn exists_resolves_once_there_is_a_row_and_unsubscribes() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let waiting = tokio::spawn(client.query(SQL).exists());
+    let mut ws = subscribed(&mut server).await;
+    ws.send(snapshot("s1", json!([]))).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished());
+    ws.send(diff("s1", "c1", json!([insert("a")]))).await;
+    within(waiting).await.unwrap().unwrap();
+    assert_eq!(ws.recv().await, json!({"type": "unsubscribe", "id": "s1"}));
+
+    let failing = tokio::spawn(client.query(SQL).exists());
+    ws.recv().await;
+    ws.send(json!({"type": "error", "id": "s2", "code": "INVALID_QUERY", "message": "no"}))
+        .await;
+    let e: LiveError = within(failing).await.unwrap().unwrap_err();
+    assert_eq!(e.code, "INVALID_QUERY");
+}
+
+#[tokio::test]
+async fn inserts_and_deletes_are_each_row_once_after_the_snapshot() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let q = client.query(SQL);
+    let mut inserts = q.clone().inserts::<User>();
+    let mut deletes = q.deletes::<User>();
+    let mut ws = server.next().await;
+    ws.recv().await;
+    ws.recv().await;
+    for id in ["s1", "s2"] {
+        let mut snap = snapshot(id, json!([{"user_id": "a"}, {"user_id": "b"}]));
+        snap["limit"] = json!(2);
+        ws.send(snap).await;
+        ws.send(diff(
+            id,
+            "c1",
+            json!([
+                {"op": "insert", "row": {"user_id": "c"}, "index": 0}, {"op": "delete", "index": 2},
+                {"op": "insert", "row": {"user_id": "d"}, "index": 0}, {"op": "delete", "index": 2},
+            ]),
+        ))
+        .await;
+    }
+    // the snapshot's rows aren't inserts
+    assert_eq!(*within(inserts.next()).await.unwrap().unwrap(), user("c"));
+    assert_eq!(*within(inserts.next()).await.unwrap().unwrap(), user("d"));
+    assert_eq!(*within(deletes.next()).await.unwrap().unwrap(), user("b"));
+    assert_eq!(*within(deletes.next()).await.unwrap().unwrap(), user("a"));
+
+    // resumed: nothing again, only what's new
+    ws.close().await;
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await["since"], "c1");
+    assert_eq!(ws.recv().await["since"], "c1");
+    for id in ["s1", "s2"] {
+        ws.send(
+            json!({"type": "resume", "id": id, "columns": [{"name": "user_id", "type": "String"}]}),
+        )
+        .await;
+        ws.send(diff(
+            id,
+            "c2",
+            json!([
+                {"op": "insert", "row": {"user_id": "e"}, "index": 0}, {"op": "delete", "index": 2},
+            ]),
+        ))
+        .await;
+    }
+    assert_eq!(*within(inserts.next()).await.unwrap().unwrap(), user("e"));
+    assert_eq!(*within(deletes.next()).await.unwrap().unwrap(), user("c"));
+}
+
+#[tokio::test]
+async fn a_snapshot_after_a_reconnect_tells_only_what_changed_meanwhile() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let mut inserts = client.query(SQL).inserts::<User>();
+    let mut ws = subscribed(&mut server).await;
+    // two equal rows: counted, not merged
+    ws.send(snapshot(
+        "s1",
+        json!([{"user_id": "a"}, {"user_id": "a"}, {"user_id": "b"}]),
+    ))
+    .await;
+    ws.close().await;
+    let mut ws = subscribed(&mut server).await;
+    ws.send(snapshot(
+        "s1",
+        json!([{"user_id": "a"}, {"user_id": "a"}, {"user_id": "a"}, {"user_id": "b"}, {"user_id": "c"}]),
+    ))
+    .await;
+    ws.send(diff("s1", "c1", json!([insert("d")]))).await;
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        got.push(
+            within(inserts.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .user_id
+                .clone(),
+        );
+    }
+    assert_eq!(got, ["a", "c", "d"]);
+}
+
+#[tokio::test]
+async fn fetch_takes_the_snapshot_and_unsubscribes() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let fetching = tokio::spawn(client.query(SQL).fetch::<User>());
+    let mut ws = subscribed(&mut server).await;
+    ws.send(snapshot("s1", json!([{"user_id": "a"}, {"user_id": "b"}])))
+        .await;
+    let rows = within(fetching).await.unwrap().unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.user_id.as_str()).collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(ws.recv().await, json!({"type": "unsubscribe", "id": "s1"}));
+
+    let one = tokio::spawn(client.query(SQL).fetch_one::<User>());
+    ws.recv().await;
+    ws.send(snapshot("s2", json!([{"user_id": "x"}]))).await;
+    assert_eq!(
+        within(one).await.unwrap().unwrap().as_deref(),
+        Some(&user("x"))
+    );
+    ws.recv().await;
+
+    let cell = tokio::spawn(
+        client
+            .query("select count() from events")
+            .fetch_cell::<u64>(),
+    );
+    ws.recv().await;
+    ws.send(
+        json!({"type": "snapshot", "id": "s3", "columns": [{"name": "n", "type": "UInt64"}],
+                   "rows": [{"n": "7"}], "at": "c0"}),
+    )
+    .await;
+    assert_eq!(within(cell).await.unwrap().unwrap(), Some(7));
+    ws.recv().await;
+
+    let failing = tokio::spawn(client.query(SQL).fetch::<User>());
+    ws.recv().await;
+    ws.send(json!({"type": "error", "id": "s4", "code": "SYNTAX_ERROR", "message": "1:1"}))
+        .await;
+    assert_eq!(
+        within(failing).await.unwrap().unwrap_err().code,
+        "SYNTAX_ERROR"
+    );
+}
+
+#[tokio::test]
+async fn history_then_each_new_row_with_none_in_both() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let started = tokio::spawn(client.query(SQL).history::<User>());
+    let mut ws = subscribed(&mut server).await;
+    ws.send(snapshot("s1", json!([{"user_id": "a"}, {"user_id": "b"}])))
+        .await;
+    ws.send(diff("s1", "c1", json!([insert("c")]))).await;
+    let (history, mut new) = within(started).await.unwrap().unwrap();
+    assert_eq!(*history, [Arc::new(user("a")), Arc::new(user("b"))]);
+    assert_eq!(*within(new.next()).await.unwrap().unwrap(), user("c"));
+
+    // a reconnect the server can't resume: the history isn't new again, what came meanwhile is
+    ws.close().await;
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await["since"], "c1");
+    ws.send(snapshot(
+        "s1",
+        json!([{"user_id": "a"}, {"user_id": "b"}, {"user_id": "c"}, {"user_id": "d"}]),
+    ))
+    .await;
+    assert_eq!(*within(new.next()).await.unwrap().unwrap(), user("d"));
 }

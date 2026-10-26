@@ -121,7 +121,7 @@ impl<R> Default for Store<R> {
     }
 }
 
-fn parse<R: DeserializeOwned>(row: Row) -> Result<R, String> {
+pub(crate) fn parse<R: DeserializeOwned>(row: Row) -> Result<R, String> {
     serde_json::from_value(Value::Object(row)).map_err(|e| format!("a row doesn't fit: {e}"))
 }
 

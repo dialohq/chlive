@@ -1,41 +1,62 @@
 //! A Rust client for chlive: live ClickHouse queries over WebSocket, for services.
 //!
-//! One [`LiveClient`] is one WebSocket shared by any number of subscriptions. Each
-//! [`Subscription`] is a [`Stream`] of [`Update`]s: the server's snapshot of the result, then
-//! every diff applied to it, with the rows after it and the changes it made. When the connection
-//! drops, the client reconnects with exponential backoff and subscribes again; the new snapshot
-//! replaces the rows.
+//! One [`LiveClient`] is one WebSocket shared by any number of live queries. A [`Query`] is
+//! subscribed to through the view that fits what the service wants to know:
+//!
+//! | View | What it gives |
+//! | --- | --- |
+//! | [`raw`](Query::raw) | every [`Update`]: the snapshot, each diff with the rows after it and what changed |
+//! | [`rows`](Query::rows) | the whole result after every change |
+//! | [`first`](Query::first) / [`last`](Query::last) | one row, kept current ([`Live`]) |
+//! | [`cell`](Query::cell) | the first column of the first row, kept current ([`Live`]) |
+//! | [`exists`](Query::exists) | resolves once the result has a row |
+//! | [`inserts`](Query::inserts) / [`deletes`](Query::deletes) | each row entering or leaving the result ([`Events`]) |
+//! | [`history`](Query::history) | the result now, and each row inserted after it |
+//! | [`fetch`](Query::fetch), [`fetch_one`](Query::fetch_one), [`fetch_cell`](Query::fetch_cell) | the result now, once |
 //!
 //! ```no_run
-//! # async fn run() {
-//! use chlive_client::{Change, ClientOptions, LiveClient, Status};
+//! # async fn run() -> Result<(), chlive_client::LiveError> {
+//! use chlive_client::{ClientOptions, LiveClient};
 //! use futures::StreamExt;
 //!
 //! #[derive(serde::Deserialize)]
-//! struct Slow { user_id: String, latency_ms: u32 }
+//! struct Event { ts: String, kind: String }
 //!
 //! let client = LiveClient::new(ClientOptions::new("ws://127.0.0.1:8080/live"));
-//! let mut slowest = client.subscribe::<Slow>(
-//!     "select user_id, latency_ms from events order by latency_ms desc limit 5",
-//! );
-//! while let Some(update) = slowest.next().await {
-//!     if let Status::Error(e) = &update.status {
-//!         eprintln!("{}: {}", e.code, e.message);
-//!         break;
-//!     }
-//!     for change in &update.changes {
-//!         if let Change::Insert { row, index, .. } = change {
-//!             println!("{} is #{} ({} ms)", row.user_id, index.unwrap_or(0) + 1, row.latency_ms);
-//!         }
-//!     }
-//! }
-//! # }
+//! let session = "4a7c…";
+//! let events = client
+//!     .query("select ts, kind from events where session = {id:String} order by ts")
+//!     .param("id", session);
+//!
+//! // the latest event, whenever it changes (a slow reader skips the ones in between)
+//! let mut latest = events.clone().last::<Event>();
+//! // how many there are
+//! let mut count = client.query("select count() from events").cell::<u64>();
+//! count.wait_for(|n| n.is_some_and(|n| n >= 1000)).await?;
+//!
+//! // what happened so far, then every new event, each exactly once
+//! let (history, mut new) = events.history::<Event>().await?;
+//! for e in history.iter() { println!("was: {}", e.kind); }
+//! while let Some(e) = new.next().await { println!("new: {}", e?.kind); }
+//! # let _ = latest.changed().await;
+//! # Ok(()) }
 //! ```
+//!
+//! [`Live`] values run on a task of their own, so a slow reader only misses values in between.
+//! [`raw`](Query::raw), [`rows`](Query::rows) and [`Events`] are read as they're polled: one
+//! that isn't read holds up the connection it shares (a [`LiveClient`] of its own avoids that).
+//!
+//! When the connection drops, the client reconnects with exponential backoff and subscribes
+//! again from each result's cursor: the server resumes it with the diffs since, or, when it
+//! can't, sends a new snapshot.
 //!
 //! Rows are deserialized into `R` with serde; [`Row`] (a JSON object) takes them as they are.
 //! The protocol itself is `chlive-protocol`.
 
 mod conn;
+mod events;
+mod live;
+mod query;
 mod store;
 
 use std::pin::Pin;
@@ -48,6 +69,9 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
 pub use chlive_protocol::{Column, Params, Row, ServerMsg, CLIENT_ERROR};
+pub use events::Events;
+pub use live::Live;
+pub use query::Query;
 pub use store::Rows;
 
 use conn::{Cmd, Event};
@@ -179,8 +203,12 @@ impl std::error::Error for LiveError {}
 pub enum Kind {
     /// The first update: subscribed, nothing yet.
     Subscribed,
-    /// The whole result: first, and again after every reconnect (it replaces the rows).
+    /// The whole result: first, and again after a reconnect the server couldn't resume (it
+    /// replaces the rows).
     Snapshot,
+    /// Reconnected and resumed from the cursor: the rows are still valid, and the diffs that
+    /// follow bring them up to date.
+    Resumed,
     /// Changes to the result.
     Diff,
     /// The connection dropped; the rows are kept until the snapshot after reconnecting.
@@ -377,9 +405,10 @@ impl<R: DeserializeOwned> Subscription<R> {
                     ServerMsg::Error { code, message, .. } => {
                         return Some(self.fail(&code, message));
                     }
-                    // never asked for: this client doesn't resume
-                    ServerMsg::Resume { .. } => {
-                        return Some(self.fail(CLIENT_ERROR, "unexpected resume".into()));
+                    ServerMsg::Resume { columns, .. } => {
+                        self.columns = columns.into();
+                        self.status = Status::Live;
+                        Some(Kind::Resumed)
                     }
                 };
                 self.stats.last_apply = Some(started.elapsed());

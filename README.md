@@ -46,11 +46,12 @@ Writes go **straight to Kafka** through Redpanda's HTTP proxy (proxied as `/kafk
 
 ### Example: an event-driven Rust service
 
-`examples/rust-alerts` (`chlive-example-rust-alerts`, run by the `rust-alerts` process; `cargo run -p chlive-example-rust-alerts` on its own) reacts to what changes in two live queries over one `chlive-client` connection, with typed rows:
-- **the 5 slowest requests:** `ALERT: <user> entered the top 5 slowest at #<rank>` for each insert, and which request was pushed out (the client hands back the row that left);
-- **requests per country, top 3:** each country's new count and average latency as its group updates, and its new rank when it moves.
+`examples/rust-alerts` (`chlive-example-rust-alerts`, run by the `rust-alerts` process; `cargo run -p chlive-example-rust-alerts` on its own) reacts to what changes in three live queries over one `chlive-client` connection, with typed rows, each through the client's view that fits:
+- **the 5 slowest requests** (`inserts`, each row entering the result): `ALERT: <user> entered the top 5 slowest` for each;
+- **how many requests there are** (`cell`, one value kept current): the count as it changes;
+- **requests per country, top 3** (`raw`, every update): each country's new count and average latency as its group updates, and its new rank when it moves.
 
-It reconnects on its own when the server restarts (the fresh snapshots replace its rows). To see an alert, produce a request slower than the current top 5, e.g. on freshly seeded data `produce events '{"user_id": "u7", "country": "PL", "path": "/checkout", "latency_ms": 99999}'`, and watch the process's log (`dnvr logs rust-alerts`).
+The client's other views are `rows`, `first` / `last`, `exists`, `deletes`, `history` (the result now, then each row inserted after it) and the one-off `fetch`. It reconnects on its own when the server restarts, resuming each query from its cursor (or taking a fresh snapshot when the server can't). To see an alert, produce a request slower than the current top 5, e.g. on freshly seeded data `produce events '{"user_id": "u7", "country": "PL", "path": "/checkout", "latency_ms": 99999}'`, and watch the process's log (`dnvr logs rust-alerts`).
 
 `examples/chat` is a group-chat demo, two users side by side, with its own stack and schema, in its own dev shell: `nix develop .#chat`, then `dnvr up`. Each user sees the messages they're permitted to see, by row-level permissions followed live from Postgres; see [examples/chat/README.md](examples/chat/README.md).
 
@@ -84,7 +85,7 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `protocol/` | `chlive-protocol` (Rust): the WebSocket protocol's messages, shared by the server and the Rust client |
 | `server/` | `chlive-server` (Rust; binary `chlive`): the WebSocket protocol over the engine, and its config (`chlive.example.toml`: every key and default) |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
-| `client-rs/` | `chlive-client` (Rust): the client for services; `examples/watch.rs` prints any query's updates |
+| `client-rs/` | `chlive-client` (Rust): the client for services, with views of a query (raw updates, a row or cell kept current, each insert or delete, history then new rows, one-off fetches); `examples/watch.rs` prints any query's updates |
 | `examples/` | example apps: `playground`, the query playground (React); `rust-alerts`, an event-driven service on `chlive-client`; `chat`, the permissions demo (its own dev shell) |
 | `tui/` | `chlive-tui` (Rust; binary `clc`): a terminal UI on `chlive-client`; type a query, watch its result as a table updated on every diff |
 | `tests/` | end-to-end tests (`chlive-e2e`): the server over the full stack, with a small Kafka producer |

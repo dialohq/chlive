@@ -1,8 +1,11 @@
-//! An event-driven service on `chlive-client`: it reacts to what changes in two live queries.
+//! An event-driven service on `chlive-client`: it reacts to what changes in three live queries,
+//! each through the view that fits.
 //!
-//! - The 5 slowest requests: an alert when one enters, a note when one is pushed out.
-//! - Requests per country (the top 3): each country's new count and average latency, and its
-//!   rank when it moves.
+//! - The 5 slowest requests (`inserts`): an alert when one enters.
+//! - How many requests there are (`cell`): the count as it changes, skipping counts in between
+//!   when it's busy.
+//! - Requests per country, the top 3 (`raw`): each country's new count and average latency,
+//!   and its rank when it moves.
 //!
 //! `cargo run -p chlive-example-rust-alerts` (against `CHLIVE_URL`, e.g. `dnvr-state get server.url`),
 //! then e.g. `produce events '{"user_id": "u7", "path": "/checkout", "latency_ms": 99999}'`.
@@ -30,20 +33,40 @@ struct CountryStats {
 async fn main() {
     let url = std::env::var("CHLIVE_URL").unwrap_or_else(|_| "ws://127.0.0.1:8080/live".into());
     let client = LiveClient::new(ClientOptions::new(url));
-    let mut slowest = client.subscribe::<Slow>(
-        "select ts, user_id, path, latency_ms from events order by latency_ms desc limit 5",
-    );
-    let mut countries = client.subscribe::<CountryStats>(
-        "select country, count() as n, avg(latency_ms) as avg_latency from events \
-         group by country order by n desc limit 3",
-    );
+    let mut slow = client
+        .query("select ts, user_id, path, latency_ms from events order by latency_ms desc limit 5")
+        .inserts::<Slow>();
+    let mut total = client
+        .query("select count() from events")
+        .cell::<u64>()
+        .into_stream();
+    let mut countries = client
+        .query(
+            "select country, count() as n, avg(latency_ms) as avg_latency from events \
+             group by country order by n desc limit 3",
+        )
+        .raw::<CountryStats>();
 
     loop {
-        // read both: they share one connection
+        // read them all: `inserts` and `raw` share the connection (the `cell` has a task of its own)
         tokio::select! {
-            Some(u) = slowest.next() => {
-                if !on_slowest(u) { break; }
-            }
+            Some(r) = slow.next() => match r {
+                Ok(s) => println!(
+                    "ALERT: {} entered the top 5 slowest: {} took {} ms (at {})",
+                    s.user_id, s.path, s.latency_ms, s.ts
+                ),
+                Err(e) => {
+                    eprintln!("[slowest] failed: {e}");
+                    break;
+                }
+            },
+            Some(n) = total.next() => match n {
+                Ok(n) => println!("{} requests", n.unwrap_or(0)),
+                Err(e) => {
+                    eprintln!("[total] failed: {e}");
+                    break;
+                }
+            },
             Some(u) = countries.next() => {
                 if !on_countries(u) { break; }
             }
@@ -55,68 +78,27 @@ async fn main() {
 }
 
 /// Whether to go on.
-fn status<R>(what: &str, u: &Update<R>) -> bool {
+fn on_countries(u: Update<CountryStats>) -> bool {
     match (&u.kind, &u.status) {
-        (Kind::Snapshot, _) => println!("[{what}] live: {} rows", u.rows.len()),
-        (Kind::Disconnected, _) => println!("[{what}] disconnected; reconnecting"),
+        (Kind::Snapshot, _) => {
+            println!("[countries] live: {} rows", u.rows.len());
+            for (i, r) in u.rows.iter().enumerate() {
+                println!(
+                    "  #{} {}: {} requests, {:.1} ms on average",
+                    i + 1,
+                    r.country,
+                    r.n,
+                    r.avg_latency
+                );
+            }
+        }
+        (Kind::Disconnected, _) => println!("[countries] disconnected; reconnecting"),
+        (Kind::Resumed, _) => println!("[countries] resumed"),
         (_, Status::Error(e)) => {
-            eprintln!("[{what}] failed: {e}");
+            eprintln!("[countries] failed: {e}");
             return false;
         }
         _ => {}
-    }
-    true
-}
-
-fn on_slowest(u: Update<Slow>) -> bool {
-    if !status("slowest", &u) {
-        return false;
-    }
-    if u.kind == Kind::Snapshot {
-        for (i, r) in u.rows.iter().enumerate() {
-            println!(
-                "  #{} {} {} ({} ms at {})",
-                i + 1,
-                r.user_id,
-                r.path,
-                r.latency_ms,
-                r.ts
-            );
-        }
-    }
-    for change in &u.changes {
-        match change {
-            Change::Insert { row, index, .. } => println!(
-                "ALERT: {} entered the top 5 slowest at #{}: {} took {} ms",
-                row.user_id,
-                index.unwrap_or(0) + 1,
-                row.path,
-                row.latency_ms
-            ),
-            Change::Delete { row, .. } => println!(
-                "  {} ({} ms) dropped out of the top 5",
-                row.user_id, row.latency_ms
-            ),
-            Change::Update { .. } => {}
-        }
-    }
-    true
-}
-
-fn on_countries(u: Update<CountryStats>) -> bool {
-    if !status("countries", &u) {
-        return false;
-    }
-    if u.kind == Kind::Snapshot {
-        for (i, r) in u.rows.iter().enumerate() {
-            println!(
-                "  #{} {}: {} requests, {:.1} ms on average",
-                i + 1,
-                r.country,
-                r.n,
-                r.avg_latency
-            );
-        }
     }
     for change in &u.changes {
         match change {
