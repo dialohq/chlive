@@ -568,12 +568,14 @@ async fn resume_from_a_cursor_sends_only_what_is_missing() {
     assert_eq!(c.expect().await["type"], "resume");
     assert_eq!(c.next().await, None);
 
-    // a cursor for another query: a snapshot (a new entry: the history, then the events)
+    // a cursor for another query (of the same stream): a snapshot of a new entry, once it's
+    // caught up to the cursor (never older than what the client holds)
     let other = "select user_id, latency_ms from requests";
     c.send(json!({"type": "subscribe", "id": "o1", "sql": other, "since": last_at}))
         .await;
-    assert_eq!(c.expect().await["type"], "snapshot");
-    let _ = c.inserts("o1", 3).await;
+    let m = c.expect().await;
+    assert_eq!(m["type"], "snapshot");
+    assert_eq!(m["rows"].as_array().unwrap().len(), 4, "{m}");
     // garbage: a snapshot of that (now shared) entry as it is, events included
     c.send(json!({"type": "subscribe", "id": "o2", "sql": other, "since": "garbage"}))
         .await;
@@ -1507,6 +1509,39 @@ async fn a_restarted_server_restores_from_disk_when_subscribed() {
 }
 
 #[tokio::test]
+async fn a_restored_result_is_snapshotted_only_once_it_has_caught_up() {
+    let live = Live::new();
+    let dir = TempDir::new();
+    let settings = dir.cache(CacheSettings::default());
+    let sql = "select user_id from requests";
+    let server = live_server(&live, settings.clone()).await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", sql).await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    live.push("u1", 1);
+    c.expect().await;
+    drop(c);
+    server.shutdown().await;
+    drop(server);
+
+    // pushed while the server was down: the restored result is behind Kafka
+    live.push("u2", 1);
+    live.push("u3", 1);
+    let server = live_server(&live, settings).await;
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", sql).await;
+    let snap = c.expect().await;
+    assert_eq!(snap["type"], "snapshot", "{snap}");
+    assert_eq!(
+        snap["rows"],
+        json!([{"user_id": "h1"}, {"user_id": "u1"}, {"user_id": "u2"}, {"user_id": "u3"}]),
+        "what was in Kafka when it was subscribed, not the checkpoint"
+    );
+    assert_eq!(c.next().await, None);
+    assert_eq!(debug(&server).await[0]["restored"], true);
+}
+
+#[tokio::test]
 async fn stored_results_that_cant_continue_start_from_clickhouse() {
     let sql = "select user_id from requests";
     // each case: a stored result (left by a server that stopped), then a server with `c`
@@ -1665,6 +1700,51 @@ async fn a_cursor_the_log_no_longer_covers_gets_a_snapshot() {
             .await;
         assert_eq!(c.expect().await["type"], "snapshot");
     }
+}
+
+#[tokio::test]
+async fn a_cursor_ahead_of_the_result_waits_for_it_to_catch_up() {
+    let live = Live::new();
+    let server = live_server(&live, ServerSettings::default()).await;
+    let sql = "select user_id from requests";
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", sql).await;
+    let at = c.expect().await["at"].as_str().unwrap().to_string();
+    // a client holding a newer result (e.g. from before a restart, restored from an older
+    // checkpoint): one event further on every partition
+    let mut ahead: Value = serde_json::from_str(&at).unwrap();
+    for offset in ahead["o"].as_object_mut().unwrap().values_mut() {
+        *offset = json!(offset.as_i64().unwrap() + 1);
+    }
+    let ahead = ahead.to_string();
+    let mut d = Client::connect(&server).await;
+    d.send(json!({"type": "subscribe", "id": "d", "sql": sql, "since": ahead}))
+        .await;
+    // not an older snapshot meanwhile
+    assert_eq!(d.next().await, None);
+    // caught up: the cursor is this result's, so it resumes (with nothing to send)
+    live.push("u1", 1);
+    assert_eq!(d.expect().await["type"], "resume");
+    assert_eq!(d.next().await, None);
+    // and a cursor of an older lineage (another entry, e.g. before a restart) gets the snapshot
+    // once the result covers it
+    let mut other: Value = serde_json::from_str(&ahead).unwrap();
+    other["l"] = json!("an-older-lineage");
+    for offset in other["o"].as_object_mut().unwrap().values_mut() {
+        *offset = json!(offset.as_i64().unwrap() + 1);
+    }
+    let mut e = Client::connect(&server).await;
+    e.send(json!({"type": "subscribe", "id": "e", "sql": sql, "since": other.to_string()}))
+        .await;
+    assert_eq!(e.next().await, None);
+    live.push("u2", 1);
+    let snap = e.expect().await;
+    assert_eq!(snap["type"], "snapshot", "{snap}");
+    assert_eq!(
+        snap["rows"],
+        json!([{"user_id": "h1"}, {"user_id": "u1"}, {"user_id": "u2"}]),
+        "as new as the cursor"
+    );
 }
 
 #[tokio::test]

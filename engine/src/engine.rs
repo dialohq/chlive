@@ -485,6 +485,22 @@ impl Engine {
         Ok(Some(total))
     }
 
+    /// The last offset of each partition of the plan's topics now: where a result is once it's
+    /// caught up.
+    pub async fn latest(&self, plan: &Plan) -> Result<Watermark, EngineError> {
+        let mut latest = BTreeMap::new();
+        for topic in &plan.stream.topics {
+            let Some(bounds) = self.source.offset_bounds(topic).await? else {
+                continue;
+            };
+            for (p, (_, high)) in bounds {
+                let last = latest.entry(p).or_insert(-1);
+                *last = (*last).max(high - 1);
+            }
+        }
+        Ok(Watermark(latest))
+    }
+
     async fn subscribe_plan(
         &self,
         plan: Plan,

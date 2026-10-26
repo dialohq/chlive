@@ -36,7 +36,9 @@
 //! result is complete. A client that kept a result (e.g. in an offline cache) subscribes with
 //! `since: <at>` and, if the server can resume from it, gets `resume` instead of a snapshot: its
 //! rows are still valid, and the diffs that follow bring them up to date. Otherwise it gets a
-//! normal `snapshot` that replaces them.
+//! normal `snapshot` that replaces them, never older than the cursor: when the server's result
+//! is behind it (e.g. restored from an older checkpoint after a restart), the snapshot waits
+//! for the result to catch up (at most 10 seconds).
 
 use serde::{Deserialize, Serialize};
 

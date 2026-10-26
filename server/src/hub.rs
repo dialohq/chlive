@@ -214,6 +214,10 @@ pub struct Served {
 /// Joins kept for `/debug/state`.
 const RECENT_JOINS: usize = 200;
 
+/// How long a subscriber waits for the result to catch up (to its cursor, or a restored result
+/// to Kafka) before it gets the snapshot anyway (a cursor from data since reset never would).
+const CATCH_UP_WAIT: Duration = Duration::from_secs(10);
+
 /// How a subscriber starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -815,6 +819,8 @@ enum Start {
         log: Vec<store::LogItem>,
         checkpoint: Checkpoint,
         lag: u64,
+        /// Where Kafka was when it was restored: what it catches up to.
+        target: Watermark,
         ms: u64,
     },
 }
@@ -862,6 +868,8 @@ struct Entry {
     /// Bytes logged to disk since the last compaction.
     disk_log_bytes: u64,
     restored: bool,
+    /// Restored, and not caught up to where Kafka was then: new subscribers wait for it.
+    catching_up: Option<Watermark>,
     /// How it started (once its result is ready): what waiting subscribers are told.
     source: Option<Source>,
     /// A fresh start's snapshot and why a stored result wasn't used, until the history is in.
@@ -919,6 +927,7 @@ impl Entry {
             last_checkpoint: Instant::now(),
             disk_log_bytes: 0,
             restored: false,
+            catching_up: None,
             source: None,
             fresh: None,
             started_at: SystemTime::now(),
@@ -965,9 +974,10 @@ impl Entry {
                             self.fresh = Some((s.snapshot.clone(), rejected));
                             self.sub = Some(s.ready_chunks(MAX_ITERATIONS_PER_MESSAGE));
                         }
-                        Ok(Start::Restored { sub, stored, rows, log, checkpoint, lag, ms }) => {
+                        Ok(Start::Restored { sub, stored, rows, log, checkpoint, lag, target, ms }) => {
                             self.subscribed(&sub);
                             self.restore(*stored, *rows, log, checkpoint, lag, ms);
+                            self.catching_up = Some(target);
                             self.sub = Some(sub.ready_chunks(MAX_ITERATIONS_PER_MESSAGE));
                             // subscribers that joined while it was being restored: their
                             // cursors may resume through the fork
@@ -981,12 +991,20 @@ impl Entry {
                     }
                 }
                 batch = next_batch(&mut self.sub) => match batch {
-                    Some(batch) => if !self.batch(batch, started) { return },
+                    Some(batch) => {
+                        if !self.batch(batch, started) { return }
+                        if self.waiting_on_ready(Duration::ZERO) {
+                            self.serve_waiting().await;
+                        }
+                    }
                     // a finite source (tests) ended: the result stays as it is
                     None => self.sub = None,
                 },
                 _ = sleep_until(deadline) => if !self.next_stage(&rx).await { return },
                 _ = tick.tick() => {
+                    if self.waiting_on_ready(CATCH_UP_WAIT) {
+                        self.serve_waiting().await;
+                    }
                     if self.subs.values().any(|s| s.lagging) {
                         self.catch_up_lagging();
                     }
@@ -1125,6 +1143,16 @@ impl Entry {
         cursor::encode_with(&form.plan, Some(&self.lineage), at)
     }
 
+    /// Whether a subscriber is waiting on a ready result (for it to catch up), for at least
+    /// `waited`.
+    fn waiting_on_ready(&self, waited: Duration) -> bool {
+        self.ready
+            && self
+                .subs
+                .values()
+                .any(|s| s.waiting.is_some() && s.joined_at.elapsed() >= waited)
+    }
+
     /// Subscribers that joined before the result was ready: decided now, with their cursors
     /// (a fresh result is a new lineage, so they get the snapshot; a restored one may resume
     /// them).
@@ -1147,12 +1175,19 @@ impl Entry {
         }
     }
 
-    /// The history is in: waiting subscribers get the snapshot (without waiting on anything).
+    /// The history is in: waiting subscribers without a cursor get the snapshot (without waiting
+    /// on anything); those with one are decided after this batch, like any join.
     fn serve_waiting_snapshot(&mut self) {
-        let waiting: Vec<(u64, bool)> = self
+        let waiting: Vec<u64> = self
             .subs
             .iter_mut()
-            .filter_map(|(k, s)| s.waiting.take().map(|since| (*k, since.is_some())))
+            .filter_map(|(k, s)| match s.waiting {
+                Some(None) => {
+                    s.waiting = None;
+                    Some(*k)
+                }
+                _ => None,
+            })
             .collect();
         if waiting.is_empty() {
             return;
@@ -1160,14 +1195,9 @@ impl Entry {
         let body = self.snapshot_body();
         let at = self.at.clone().expect("ready");
         let source = self.source.clone().unwrap_or(Source::Memory);
-        for (sub, cursor) in waiting {
+        for sub in waiting {
             debug!(key = %self.fp, lineage = %self.lineage, sub, "waiting subscriber gets the snapshot");
-            // a fresh result is a new lineage: no cursor resumes it
-            let reason = match cursor {
-                true => Reason::OtherLineage,
-                false => Reason::NoCursor,
-            };
-            self.record(sub, cursor, source.clone(), Some(reason), None);
+            self.record(sub, false, source.clone(), Some(Reason::NoCursor), None);
             self.deliver(sub, body.clone(), &at);
         }
     }
@@ -1614,6 +1644,24 @@ impl Entry {
                 }
             }
         }
+        // no snapshot older than what the client holds (its cursor is ahead: this result was
+        // restored from an older checkpoint), or, while a restored result catches up, older than
+        // what was in Kafka: it waits for the result to catch up
+        let mut behind = false;
+        if let (Decision::Snapshot(reason), Some(at)) = (decision, &self.at) {
+            if self.catching_up.as_ref().is_some_and(|t| at.covers(t)) {
+                self.catching_up = None;
+            }
+            let cursor_ahead = matches!(reason, Reason::OtherLineage | Reason::Ahead)
+                && client_at.as_ref().is_some_and(|c| !at.covers(c));
+            let waited = self.subs.get(&sub).map(|s| s.joined_at.elapsed());
+            if (cursor_ahead || self.catching_up.is_some())
+                && waited.is_some_and(|w| w < CATCH_UP_WAIT)
+            {
+                decision = Decision::Wait;
+                behind = true;
+            }
+        }
         let mut info = self.info.lock().unwrap();
         match decision {
             Decision::Wait => info.joins_wait += 1,
@@ -1622,6 +1670,12 @@ impl Entry {
         }
         drop(info);
         match decision {
+            Decision::Wait if behind => {
+                debug!(key = %self.fp, lineage = %self.lineage, sub, conn, id = %client_id, decision = "wait", since = %since_text, "join: the result is catching up");
+                if let Some(s) = self.subs.get_mut(&sub) {
+                    s.waiting = Some(waiting_since);
+                }
+            }
             Decision::Wait => {
                 debug!(key = %self.fp, lineage = %self.lineage, sub, conn, id = %client_id, decision = "wait", "join: the result is still loading");
                 if let Some(s) = self.subs.get_mut(&sub) {
@@ -1896,7 +1950,7 @@ async fn start(
         match loaded {
             Ok(Ok(Some(stored))) => {
                 match restorable(&hub, &store, &stored, &sql, &params, &filters).await {
-                    Ok((sub, rows, log, checkpoint, lag)) => {
+                    Ok((sub, rows, log, checkpoint, lag, target)) => {
                         return Ok(Start::Restored {
                             sub,
                             stored: Box::new(stored),
@@ -1904,6 +1958,7 @@ async fn start(
                             log,
                             checkpoint,
                             lag,
+                            target,
                             ms: started.elapsed().as_millis() as u64,
                         })
                     }
@@ -1932,6 +1987,7 @@ type Restorable = (
     Vec<store::LogItem>,
     Checkpoint,
     u64,
+    Watermark,
 );
 
 /// Whether a stored result can continue: young enough, in Kafka, not too far behind, and its
@@ -1970,6 +2026,11 @@ async fn restorable(
         .await
         .map_err(|e| format!("Kafka: {e}"))?
         .ok_or("retention: its cursor is no longer in Kafka (or the topic was recreated)")?;
+    let target = hub
+        .engine
+        .latest(&plan)
+        .await
+        .map_err(|e| format!("Kafka: {e}"))?;
     if lag > cache.max_catch_up {
         return Err(format!(
             "max_catch_up: {lag} events behind (max {})",
@@ -1985,7 +2046,7 @@ async fn restorable(
         .restore(sql, params, filters, &checkpoint)
         .await
         .map_err(|e| format!("restoring: {e}"))?;
-    Ok((sub, rows, log, checkpoint, lag))
+    Ok((sub, rows, log, checkpoint, lag, target))
 }
 
 async fn next_batch(
