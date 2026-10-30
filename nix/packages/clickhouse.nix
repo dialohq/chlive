@@ -1,8 +1,10 @@
 # ClickHouse for both dev shells, pinned (nixpkgs has 26.5).
 # Official release binaries: a single `clickhouse` multi-tool.
 {
-  stdenvNoCC,
+  lib,
+  stdenv,
   fetchurl,
+  autoPatchelfHook,
 }:
 let
   version = "26.7.2.59";
@@ -22,19 +24,22 @@ let
     };
   };
 in
-stdenvNoCC.mkDerivation {
+stdenv.mkDerivation {
   pname = "clickhouse";
   inherit version;
-  src = fetchurl assets.${stdenvNoCC.hostPlatform.system};
+  src = fetchurl assets.${stdenv.hostPlatform.system};
+  # The Linux binary expects the FHS loader (/lib64/ld-linux-x86-64.so.2), which NixOS and the sandbox lack.
+  nativeBuildInputs = lib.optional stdenv.hostPlatform.isLinux autoPatchelfHook;
   dontUnpack = true;
   dontStrip = true;
   installPhase = ''
     mkdir -p $out/bin
     ${
-      if stdenvNoCC.hostPlatform.isLinux then
+      if stdenv.hostPlatform.isLinux then
         ''
           tar xzf $src
           install -m755 "$(find . -path '*/bin/clickhouse' -type f | head -1)" $out/bin/clickhouse
+          autoPatchelf $out/bin
         ''
       else
         "install -m755 $src $out/bin/clickhouse"
