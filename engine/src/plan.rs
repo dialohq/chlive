@@ -12,10 +12,11 @@ use crate::binder::{
 use crate::calendar::Interval;
 use crate::diff::Row;
 use crate::order::{KeyOrder, SortKey};
-use crate::rules::{quote_ident, TopicId};
+use crate::rules::{quote_ident, ColumnSource, KafkaField, TopicId};
+use crate::source::Event;
 use crate::table_engine::TableEngine;
 use crate::types::quote_string;
-use crate::types::{decode, DecodeError, Type, Value};
+use crate::types::{decode, decode_kafka, DecodeError, Type, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
@@ -720,11 +721,11 @@ impl HistoryPlan {
     }
 }
 
-/// A column the stream needs: decoded from `json_key` as `ty`.
+/// A column the stream needs: decoded from `source` as `ty`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamColumn {
     pub id: ColumnId,
-    pub json_key: String,
+    pub source: ColumnSource,
     pub ty: Type,
 }
 
@@ -978,18 +979,35 @@ pub struct RowDecodeError {
 impl StreamPlan {
     /// The JSON keys the stream must decode; every other key of an event is skipped.
     pub fn required_keys(&self) -> Vec<String> {
-        self.columns.iter().map(|c| c.json_key.clone()).collect()
+        self.columns
+            .iter()
+            .filter_map(|c| match &c.source {
+                ColumnSource::Json(key) => Some(key.clone()),
+                ColumnSource::Kafka(_) => None,
+            })
+            .collect()
     }
 
-    /// Decode an event's needed fields by their column types.
-    pub fn decode(&self, event: &Row) -> Result<DecodedRow, RowDecodeError> {
+    /// Decode an event's needed fields by their column types: from its JSON, or from the
+    /// message itself for a Kafka field.
+    pub fn decode(&self, event: &Event) -> Result<DecodedRow, RowDecodeError> {
         let mut row = vec![Value::Null; self.width];
         for c in &self.columns {
-            row[c.id.0] =
-                decode(event.get(&c.json_key), &c.ty).map_err(|error| RowDecodeError {
-                    column: c.json_key.clone(),
-                    error,
-                })?;
+            let value = match &c.source {
+                ColumnSource::Json(key) => decode(event.value.get(key), &c.ty),
+                ColumnSource::Kafka(field) => {
+                    let value = match field {
+                        KafkaField::Offset => Some(event.offset),
+                        KafkaField::Partition => Some(i64::from(event.partition)),
+                        KafkaField::Timestamp => event.timestamp,
+                    };
+                    decode_kafka(*field, value, &c.ty)
+                }
+            };
+            row[c.id.0] = value.map_err(|error| RowDecodeError {
+                column: c.source.to_string(),
+                error,
+            })?;
         }
         Ok(row)
     }
@@ -1380,7 +1398,7 @@ impl std::fmt::Display for Plan {
             .stream
             .columns
             .iter()
-            .map(|c| format!("{} {}", c.json_key, c.ty))
+            .map(|c| format!("{} {}", c.source, c.ty))
             .collect();
         writeln!(f, "table:   {}", self.table)?;
         if let Some(note) = engine_note(&self.engine, self.stream.keyed.as_ref()) {
@@ -1789,7 +1807,7 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
                 let c = table.column(*id);
                 StreamColumn {
                     id: *id,
-                    json_key: c.json_key.clone(),
+                    source: c.source.clone(),
                     ty: c.ty.clone(),
                 }
             })
@@ -1852,7 +1870,7 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
                 let c = inner.column(*id);
                 StreamColumn {
                     id: *id,
-                    json_key: c.json_key.clone(),
+                    source: c.source.clone(),
                     ty: c.ty.clone(),
                 }
             })
@@ -1938,7 +1956,7 @@ mod tests {
             id: ColumnId(i),
             name: n.into(),
             clickhouse: n.into(),
-            json_key: n.into(),
+            source: ColumnSource::Json(n.into()),
             ty: Type::parse(ty),
         };
         BoundTable {
@@ -1992,6 +2010,17 @@ mod tests {
 
     fn row(v: serde_json::Value) -> Row {
         v.as_object().unwrap().clone()
+    }
+
+    /// An event at offset 0 of partition 0, without a timestamp.
+    fn event(v: serde_json::Value) -> Event {
+        Event {
+            topic: TopicId("events".into()),
+            partition: 0,
+            offset: 0,
+            timestamp: None,
+            value: row(v),
+        }
     }
 
     #[test]
@@ -2469,7 +2498,7 @@ mod tests {
         );
         let upper = p
             .stream
-            .decode(&row(
+            .decode(&event(
                 json!({"user_id": "a", "session": "ABCDEF00-0000-0000-0000-000000000001"}),
             ))
             .unwrap();
@@ -2480,12 +2509,12 @@ mod tests {
         );
         let other = p
             .stream
-            .decode(&row(json!({"user_id": "b", "session": null})))
+            .decode(&event(json!({"user_id": "b", "session": null})))
             .unwrap();
         assert!(!p.stream.matches(&other));
         assert!(p
             .stream
-            .decode(&row(json!({"user_id": "c", "session": "{abcdef00}"})))
+            .decode(&event(json!({"user_id": "c", "session": "{abcdef00}"})))
             .is_err());
     }
 
@@ -2504,11 +2533,11 @@ mod tests {
         assert_eq!(p.stream.required_keys(), ["user_id", "latency_ms"]);
         let fast = p
             .stream
-            .decode(&row(json!({"user_id": "a", "latency_ms": 50})))
+            .decode(&event(json!({"user_id": "a", "latency_ms": 50})))
             .unwrap();
         let slow = p
             .stream
-            .decode(&row(json!({"user_id": "b", "latency_ms": 500})))
+            .decode(&event(json!({"user_id": "b", "latency_ms": 500})))
             .unwrap();
         assert!(!p.stream.matches(&fast));
         assert!(p.stream.matches(&slow));
@@ -2582,7 +2611,7 @@ mod tests {
             right: lit(Value::String("X".into())),
         };
         let p = plan(&bound(&[1], Some(eq.clone())));
-        let null_coupon = p.stream.decode(&row(json!({"user_id": "a"}))).unwrap();
+        let null_coupon = p.stream.decode(&event(json!({"user_id": "a"}))).unwrap();
         assert!(!p.stream.matches(&null_coupon));
         let p = plan(&bound(&[1], Some(BoundExpr::Not(Box::new(eq.clone())))));
         assert!(!p.stream.matches(&null_coupon));
@@ -2595,14 +2624,14 @@ mod tests {
     #[test]
     fn missing_keys_follow_the_column_type() {
         let p = plan(&bound(&[0, 2, 3], None));
-        let r = p.stream.decode(&row(json!({}))).unwrap();
+        let r = p.stream.decode(&event(json!({}))).unwrap();
         assert_eq!(
             serde_json::to_string(&p.stream.project(&r)).unwrap(),
             r#"{"ts":"1970-01-01 00:00:00.000","latency_ms":0,"coupon":null}"#
         );
         let err = p
             .stream
-            .decode(&row(json!({"latency_ms": "slow"})))
+            .decode(&event(json!({"latency_ms": "slow"})))
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -2662,7 +2691,7 @@ mod tests {
 
         let e = p
             .stream
-            .decode(&row(
+            .decode(&event(
                 json!({"user_id": "b", "latency_ms": "75", "coupon": "X"}),
             ))
             .unwrap();
@@ -2704,7 +2733,7 @@ mod tests {
         assert_eq!(p.stream.required_keys(), ["user_id", "latency_ms"]);
         let e = p
             .stream
-            .decode(&row(json!({"user_id": "a", "latency_ms": 5})))
+            .decode(&event(json!({"user_id": "a", "latency_ms": 5})))
             .unwrap();
         assert_eq!(
             serde_json::to_string(&p.stream.project(&e)).unwrap(),

@@ -142,9 +142,38 @@ customer = { clickhouse = "customer_id", json = "customerId" }
   - `clickhouse`: `database.table`, or `table` in `database` (default: its name in `database`);
   - `topic` (default: the `topic` template, `{table}`, where `{table}` and `{database}` are replaced);
   - `hidden_columns`: globs, added to the global ones (`["_*"]`);
-  - `columns`: renames, by the name queries use; `clickhouse` defaults to that name, and `json` (the key in the topic's events) to the ClickHouse name.
+  - `columns`: renames, by the name queries use; `clickhouse` defaults to that name, and `json` (the key in the topic's events) to the ClickHouse name. Or, instead of `json`, `kafka`: the message's `"offset"`, `"partition"` or `"timestamp"` (see [Kafka columns](#kafka-columns)).
 - **`snapshot_database`** must exist, with the same storage policy as the tables, since ATTACH PARTITION links their parts. The snapshot user needs CREATE TABLE, ALTER, INSERT, SELECT and DROP TABLE there, and the history user SELECT. A separate, non-Replicated database also keeps the clones' DDL off a Replicated database's log.
 - **Kafka properties** are librdkafka's (TLS, SASL, …). They override chlive's own consumer settings, except `enable.auto.commit` and `enable.auto.offset.store`, which stay off since chlive never commits.
+
+### Kafka columns
+
+A table can also store each message's **partition**, **offset** and **timestamp**, which Kafka Connect's `InsertField$Value` transform adds to the row before the sink writes it. The event JSON doesn't have them, so chlive must be told which columns hold them; it then fills them from the messages, exactly as the sink stored them:
+
+```toml
+[tables.events.columns]
+kafka_partition = { kafka = "partition" }
+kafka_offset = { kafka = "offset" }
+kafka_ts = { kafka = "timestamp" }
+offset = { clickhouse = "_offset", kafka = "offset" }   # a hidden name, still queryable
+```
+
+and in the table's sink connector:
+
+```json
+"transforms": "kafka",
+"transforms.kafka.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+"transforms.kafka.partition.field": "kafka_partition",
+"transforms.kafka.offset.field": "kafka_offset",
+"transforms.kafka.timestamp.field": "kafka_ts"
+```
+
+- **Types:** the partition and offset in an integer column (`UInt64` for offsets); the timestamp in `DateTime64(3)` or a 64-bit integer, since `InsertField` writes milliseconds. A `DateTime` (or another precision) would read them as its own unit (`DateTime` overflows to 2106), so it's refused; so is any other type, at bind time, naming the column.
+- **Only from the message:** a JSON key of the same name is overwritten by the transform and ignored by chlive. A message without a timestamp leaves the column at its default (NULL, or the zero value).
+- **Shown:** a column configured with `kafka` is queryable even when a `hidden_columns` glob (`_*`) matches it.
+- **Usable like any column:** in WHERE, ORDER BY, aggregates, and as a ReplacingMergeTree's version column (`ReplacingMergeTree(kafka_offset)`: the latest message of each key wins, as the engine sees them).
+- **Not yet:** the message's topic, key and headers (Kafka Connect has no built-in transform copying a header into the row).
+- The dev stack's `events` has these three columns (`scripts/schema.sql`, the connector's transforms in `nix/shell.nix`, `nix/chlive.dev.toml`).
 
 ### Shared results
 

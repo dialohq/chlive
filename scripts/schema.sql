@@ -14,6 +14,11 @@ CREATE TABLE IF NOT EXISTS default.events (
 ) ENGINE = MergeTree ORDER BY ts;
 -- added later; for tables created before it (before the sink connectors start, so they see it)
 ALTER TABLE default.events ADD COLUMN IF NOT EXISTS session_id Nullable(UUID);
+-- the message's partition, offset and timestamp, stored by the sink's InsertField transform
+-- (nix/shell.nix) and read by chlive from the messages (nix/chlive.dev.toml)
+ALTER TABLE default.events ADD COLUMN IF NOT EXISTS kafka_partition UInt32;
+ALTER TABLE default.events ADD COLUMN IF NOT EXISTS kafka_offset UInt64;
+ALTER TABLE default.events ADD COLUMN IF NOT EXISTS kafka_ts DateTime64(3);
 
 -- Related tables for the example (same assumptions).
 CREATE TABLE IF NOT EXISTS default.customers (

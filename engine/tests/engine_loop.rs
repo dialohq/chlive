@@ -58,6 +58,19 @@ impl HistorySource for FakeHistory {
                 col("ts", "DateTime64(3)"),
                 col("version", "UInt64"),
             ]),
+            // ReplacingMergeTree(_offset): the latest message of each account wins
+            "default.accounts" => Ok(vec![
+                col("account_id", "String"),
+                col("balance", "UInt32"),
+                col("_offset", "UInt64"),
+            ]),
+            // Kafka Connect's InsertField stores the partition, offset and timestamp
+            "default.logs" => Ok(vec![
+                col("msg", "String"),
+                col("_partition", "UInt32"),
+                col("_offset", "UInt64"),
+                col("_ts", "DateTime64(3)"),
+            ]),
             "default.products" => Ok(vec![
                 col("product_id", "String"),
                 col("price", "UInt32"),
@@ -70,6 +83,11 @@ impl HistorySource for FakeHistory {
 
     async fn table_engine(&self, _: &str, table: &str) -> Result<TableEngine, HistoryError> {
         Ok(match table {
+            "accounts" => TableEngine::Replacing {
+                ver: Some("_offset".into()),
+                is_deleted: None,
+                key: Key::from_system("account_id", ""),
+            },
             "carts" => TableEngine::Replacing {
                 ver: Some("version".into()),
                 is_deleted: None,
@@ -285,6 +303,15 @@ impl HistorySource for FakeHistory {
                 s,
                 &[json!({"cart_id": "c1", "total": 5, "ts": click_ts(-5_000), "version": 1})],
             )),
+            "SELECT account_id, balance, account_id AS __key_0, _offset AS __ver \
+             FROM default.accounts FINAL" => Ok(vec![row(
+                json!({"account_id": "a", "balance": 10, "__key_0": "a", "__ver": 0}),
+            )]),
+            "SELECT msg, _partition AS kafka_partition, _offset AS kafka_offset, \
+             _ts AS kafka_ts FROM default.logs WHERE _offset != 2" => Ok(vec![row(json!({
+                "msg": "history", "kafka_partition": 0, "kafka_offset": 0,
+                "kafka_ts": "2026-10-31 14:18:06.588"
+            }))]),
             other => panic!("unexpected history query: {other}"),
         }
     }
@@ -446,6 +473,99 @@ async fn history_up_to_the_watermark_then_events_after_it() {
                 at(1, 0),
                 vec![Diff::insert(row(json!({"ts": "e3", "user_id": "u4"})))]
             ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn kafka_columns_come_from_the_message() {
+    let rules = ConfiguredRules::new(
+        serde_json::from_value(json!({
+            "expose": "all",
+            "logs": { "columns": {
+                "kafka_partition": { "clickhouse": "_partition", "kafka": "partition" },
+                "kafka_offset": { "clickhouse": "_offset", "kafka": "offset" },
+                "kafka_ts": { "clickhouse": "_ts", "kafka": "timestamp" },
+            }},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // offset 0 is history; the JSON's own `_offset` is not the offset
+    let mut source = MemorySource::new();
+    source
+        .push("logs", 0, r#"{"msg": "history"}"#)
+        .push_message(
+            "logs",
+            0,
+            Some(1_793_456_287_031),
+            r#"{"msg": "a", "_offset": 99}"#,
+        )
+        .push_message("logs", 0, Some(1_793_456_287_123), r#"{"msg": "skipped"}"#)
+        .push("logs", 0, r#"{"msg": "no timestamp"}"#);
+    let subscription = Engine::new(rules, FakeHistory, source, FakeSnapshots)
+        .subscribe(
+            "select msg, kafka_partition, kafka_offset, kafka_ts from logs \
+             where kafka_offset != 2",
+        )
+        .await
+        .unwrap();
+    let iterations: Vec<Iteration> = subscription.map(|i| i.unwrap()).collect().await;
+    let diffs: Vec<Diff> = iterations.into_iter().flat_map(|i| i.diffs).collect();
+    let r = |msg: &str, offset: u64, ts: &str| {
+        Diff::insert(row(json!({
+            "msg": msg, "kafka_partition": 0, "kafka_offset": offset, "kafka_ts": ts
+        })))
+    };
+    assert_eq!(
+        diffs,
+        [
+            r("history", 0, "2026-10-31 14:18:06.588"),
+            r("a", 1, "2026-10-31 14:18:07.031"),
+            // a message without a timestamp: InsertField leaves the field out
+            r("no timestamp", 3, "1970-01-01 00:00:00.000"),
+        ]
+    );
+}
+
+/// FINAL on `ReplacingMergeTree(_offset)`, the offset stored by Kafka Connect: each version is
+/// the message's offset, whatever its JSON says.
+#[tokio::test]
+async fn final_versions_by_kafka_offset() {
+    let rules = ConfiguredRules::new(
+        serde_json::from_value(json!({
+            "expose": "all",
+            "accounts": { "columns": {
+                "kafka_offset": { "clickhouse": "_offset", "kafka": "offset" },
+            }},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut source = MemorySource::new();
+    source
+        .push("accounts", 0, r#"{"account_id": "a", "balance": 10}"#) // offset 0: history
+        // from the JSON, the first would be version 99 and the second ignored
+        .push(
+            "accounts",
+            0,
+            r#"{"account_id": "a", "balance": 20, "_offset": 99}"#,
+        )
+        .push("accounts", 0, r#"{"account_id": "a", "balance": 30}"#);
+    let lines: Vec<String> = Engine::new(rules, FakeHistory, source, FakeSnapshots)
+        .with_max_batch(1)
+        .subscribe("select account_id, balance from accounts final")
+        .await
+        .unwrap()
+        .map(|i| i.unwrap().to_string())
+        .collect()
+        .await;
+    assert_eq!(
+        lines,
+        [
+            "+ [\"a\"] {\"account_id\":\"a\",\"balance\":10}\nhistory: 1 rows",
+            "accounts/0:1 ~ [\"a\"] {\"account_id\":\"a\",\"balance\":20}",
+            "accounts/0:2 ~ [\"a\"] {\"account_id\":\"a\",\"balance\":30}",
         ]
     );
 }

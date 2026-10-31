@@ -102,7 +102,7 @@ impl AggregateRun {
         for event in &events {
             let position = self.at.0.entry(event.partition).or_insert(event.offset);
             *position = (*position).max(event.offset);
-            match self.stream.decode(&event.value) {
+            match self.stream.decode(event) {
                 Ok(row) if self.stream.matches(&row) => {
                     let mut object: Row = self
                         .aggregate

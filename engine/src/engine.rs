@@ -1678,7 +1678,7 @@ fn catch_up_iteration(
     }
     // the client's own events after the snapshot: into the state, not sent
     for event in own {
-        if let Ok(row) = plan.decode(&event.value) {
+        if let Ok(row) = plan.decode(&event) {
             state.event(plan, &row, (event.partition, event.offset));
         }
     }
@@ -1820,7 +1820,7 @@ fn timed_event_iteration(
     timed: &mut Timed,
 ) -> Iteration {
     let place = (event.partition, event.offset);
-    let diffs = match plan.decode(&event.value) {
+    let diffs = match plan.decode(&event) {
         Ok(row) => match timed {
             Timed::Rows(t) => {
                 let schedule = plan.schedule(&row, now);
@@ -1899,7 +1899,7 @@ fn event_iteration(
     at: &mut Watermark,
     event: Event,
 ) -> Iteration {
-    let mut diffs = match plan.decode(&event.value) {
+    let mut diffs = match plan.decode(&event) {
         Ok(row) => state.event(plan, &row, (event.partition, event.offset)),
         Err(e) => {
             // ClickHouse's ingestion skips this message too

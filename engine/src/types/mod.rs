@@ -23,6 +23,7 @@ use std::fmt;
 use serde_json::Value as Json;
 
 use crate::ast::Literal;
+use crate::rules::KafkaField;
 
 pub use self::boolean::BoolType;
 pub use self::datetime::{
@@ -283,6 +284,36 @@ pub fn decode(json: Option<&Json>, ty: &Type) -> Result<Value, DecodeError> {
     }
 }
 
+/// Whether Kafka Connect's `InsertField` stores a Kafka field into a column of this type exactly:
+/// offsets and partitions in integer columns, timestamps (milliseconds) in `DateTime64(3)` or a
+/// 64-bit integer. A `DateTime` or another precision reads the milliseconds as its own unit.
+pub fn kafka_accepts(field: KafkaField, ty: &Type) -> bool {
+    match (field, &ty.kind) {
+        (KafkaField::Offset | KafkaField::Partition, Kind::Int(_)) => true,
+        (KafkaField::Timestamp, Kind::Int(t)) => t.bits == 64,
+        (KafkaField::Timestamp, Kind::DateTime(t)) => t.precision == 3,
+        _ => false,
+    }
+}
+
+/// A Kafka field's value (`None`: a message without a timestamp, which `InsertField` leaves
+/// out) as its column stores it; the column's type passed [`kafka_accepts`].
+pub fn decode_kafka(
+    field: KafkaField,
+    value: Option<i64>,
+    ty: &Type,
+) -> Result<Value, DecodeError> {
+    match (value, &ty.kind) {
+        (Some(ms), Kind::DateTime(_)) if field == KafkaField::Timestamp => {
+            Ok(Value::DateTime(DateTime {
+                ticks: ms,
+                precision: 3,
+            }))
+        }
+        (value, _) => decode(value.map(Json::from).as_ref(), ty),
+    }
+}
+
 impl Value {
     /// The value as tagged JSON, exact for every variant (for checkpoints): `null`,
     /// `{"i": "-12"}` (as text: i128 doesn't fit JSON numbers), `{"f": "1.5"}` (text too: NaN and
@@ -497,6 +528,46 @@ mod tests {
             decode(None, &Type::parse("Nullable(UUID)")).unwrap(),
             Value::Null
         );
+    }
+
+    #[test]
+    fn kafka_fields_as_insert_field_stores_them() {
+        let ty = Type::parse;
+        assert!(kafka_accepts(KafkaField::Offset, &ty("UInt64")));
+        assert!(kafka_accepts(KafkaField::Partition, &ty("Int32")));
+        assert!(kafka_accepts(KafkaField::Timestamp, &ty("DateTime64(3)")));
+        assert!(kafka_accepts(
+            KafkaField::Timestamp,
+            &ty("Nullable(UInt64)")
+        ));
+        // seconds, or another unit: InsertField's milliseconds would be misread
+        assert!(!kafka_accepts(KafkaField::Timestamp, &ty("DateTime")));
+        assert!(!kafka_accepts(KafkaField::Timestamp, &ty("DateTime64(6)")));
+        assert!(!kafka_accepts(KafkaField::Timestamp, &ty("UInt32")));
+        assert!(!kafka_accepts(KafkaField::Offset, &ty("String")));
+        assert_eq!(
+            decode_kafka(KafkaField::Offset, Some(42), &ty("UInt64")).unwrap(),
+            Value::Int(42)
+        );
+        assert_eq!(
+            decode_kafka(
+                KafkaField::Timestamp,
+                Some(1_793_456_286_588),
+                &ty("DateTime64(3)")
+            )
+            .unwrap()
+            .to_json(),
+            json!("2026-10-31 14:18:06.588")
+        );
+        assert_eq!(
+            decode_kafka(KafkaField::Timestamp, Some(1_793_456_286_588), &ty("Int64")).unwrap(),
+            Value::Int(1_793_456_286_588)
+        );
+        // no timestamp: left out, so the column's default
+        let none = decode_kafka(KafkaField::Timestamp, None, &ty("DateTime64(3)")).unwrap();
+        assert_eq!(none.to_json(), json!("1970-01-01 00:00:00.000"));
+        let none = decode_kafka(KafkaField::Timestamp, None, &ty("Nullable(DateTime64(3))"));
+        assert_eq!(none.unwrap(), Value::Null);
     }
 
     #[test]

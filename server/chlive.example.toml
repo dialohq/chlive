@@ -123,3 +123,7 @@
 ##   [tables.orders.columns]                # renamed columns, by the name queries use
 ##   customer = { clickhouse = "customer_id", json = "customerId" }
 ##                                          # clickhouse: default the name; json: default clickhouse
+##   offset = { clickhouse = "_offset", kafka = "offset" }
+##                                          # kafka: the column holds the message's "offset",
+##                                          # "partition" or "timestamp" (Kafka Connect's
+##                                          # InsertField), not a JSON key; shown even if hidden

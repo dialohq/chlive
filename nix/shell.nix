@@ -38,6 +38,15 @@ let
         schemaFile = "scripts/schema.sql";
         serverConfig = "nix/chlive.dev.toml";
         cacheDir = ".dnvr/chlive-cache";
+        # events also stores each message's partition, offset and timestamp (scripts/schema.sql),
+        # which the server reads from the messages (nix/chlive.dev.toml)
+        connectorSettings.events = {
+          transforms = "kafka";
+          "transforms.kafka.type" = "org.apache.kafka.connect.transforms.InsertField$Value";
+          "transforms.kafka.partition.field" = "kafka_partition";
+          "transforms.kafka.offset.field" = "kafka_offset";
+          "transforms.kafka.timestamp.field" = "kafka_ts";
+        };
       };
   inherit (stack) chClient stackEnv;
 

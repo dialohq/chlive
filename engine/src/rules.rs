@@ -19,13 +19,53 @@ impl fmt::Display for TopicId {
     }
 }
 
+/// A field of the Kafka message itself rather than of its JSON value, which Kafka Connect's
+/// `InsertField$Value` transform stores in a column (`offset.field`, `partition.field`,
+/// `timestamp.field`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KafkaField {
+    Offset,
+    Partition,
+    /// The message's timestamp, in milliseconds.
+    Timestamp,
+}
+
+impl fmt::Display for KafkaField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            KafkaField::Offset => "offset",
+            KafkaField::Partition => "partition",
+            KafkaField::Timestamp => "timestamp",
+        })
+    }
+}
+
+/// Where an event holds a column's value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ColumnSource {
+    /// A key of the message's JSON object.
+    Json(String),
+    /// A field of the message.
+    Kafka(KafkaField),
+}
+
+impl fmt::Display for ColumnSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ColumnSource::Json(key) => f.write_str(key),
+            ColumnSource::Kafka(field) => write!(f, "kafka {field}"),
+        }
+    }
+}
+
 /// Where a dialect column lives on each side.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnMapping {
     /// Name in the dialect (and in output rows).
     pub name: String,
-    /// Key in the topic's JSON objects.
-    pub json_key: String,
+    /// Where events hold it.
+    pub source: ColumnSource,
 }
 
 pub trait NamingRules: Send + Sync {
@@ -40,9 +80,10 @@ pub trait NamingRules: Send + Sync {
     }
     /// Topic carrying a dialect table's new rows.
     fn topic(&self, table: &str) -> TopicId;
-    /// Dialect name and JSON key of one of the table's ClickHouse columns.
+    /// Dialect name and event source of one of the table's ClickHouse columns.
     fn column(&self, table: &str, clickhouse_column: &str) -> ColumnMapping;
-    /// ClickHouse columns that are not part of the dialect table (e.g. bookkeeping).
+    /// ClickHouse columns that are not part of the dialect table (e.g. bookkeeping). A column
+    /// filled from a Kafka field is never hidden: it was configured to be read.
     fn is_hidden(&self, table: &str, clickhouse_column: &str) -> bool;
 }
 
@@ -124,8 +165,8 @@ pub struct TableConfig {
     pub security: Option<crate::security::TableSecurity>,
 }
 
-/// A column's ClickHouse name (default: its dialect name) and JSON key (default: its ClickHouse
-/// name).
+/// A column's ClickHouse name (default: its dialect name) and where events hold it: a JSON key
+/// (default: its ClickHouse name), or a Kafka field (`kafka = "offset"`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ColumnConfig {
@@ -133,6 +174,8 @@ pub struct ColumnConfig {
     pub clickhouse: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kafka: Option<KafkaField>,
 }
 
 const SETTINGS: [&str; 4] = ["expose", "database", "topic", "hidden_columns"];
@@ -236,13 +279,23 @@ impl ConfiguredRules {
                     )));
                 }
                 let clickhouse = c.clickhouse.clone().unwrap_or_else(|| col.clone());
-                let json_key = c.json.clone().unwrap_or_else(|| clickhouse.clone());
-                if clickhouse.is_empty() || json_key.is_empty() {
+                let source = match (&c.json, c.kafka) {
+                    (Some(_), Some(_)) => {
+                        return Err(err(format!(
+                            "columns.{col}: json and kafka both say where it is; set one"
+                        )));
+                    }
+                    (_, Some(field)) => ColumnSource::Kafka(field),
+                    (json, None) => {
+                        ColumnSource::Json(json.clone().unwrap_or_else(|| clickhouse.clone()))
+                    }
+                };
+                if clickhouse.is_empty() || source == ColumnSource::Json(String::new()) {
                     return Err(err(format!("columns.{col}: empty name")));
                 }
                 let mapping = ColumnMapping {
                     name: col.clone(),
-                    json_key,
+                    source,
                 };
                 if let Some(other) = by_clickhouse.insert(clickhouse.clone(), mapping) {
                     return Err(err(format!(
@@ -316,11 +369,18 @@ impl NamingRules for ConfiguredRules {
             .cloned()
             .unwrap_or_else(|| ColumnMapping {
                 name: clickhouse_column.to_string(),
-                json_key: clickhouse_column.to_string(),
+                source: ColumnSource::Json(clickhouse_column.to_string()),
             })
     }
 
     fn is_hidden(&self, table: &str, clickhouse_column: &str) -> bool {
+        let configured = self
+            .renames
+            .get(table)
+            .and_then(|r| r.get(clickhouse_column));
+        if configured.is_some_and(|m| matches!(m.source, ColumnSource::Kafka(_))) {
+            return false;
+        }
         let per_table = self.config.tables.get(table).map(|t| &t.hidden_columns);
         self.config
             .hidden_columns
@@ -506,7 +566,10 @@ mod tests {
         }));
         let m = |c: &str| {
             let m = r.column("events", c);
-            (m.name, m.json_key)
+            let ColumnSource::Json(key) = m.source else {
+                panic!("{c}: not from JSON");
+            };
+            (m.name, key)
         };
         assert_eq!(m("customer_id"), ("customer".into(), "customerId".into()));
         // the JSON key defaults to the ClickHouse name
@@ -522,6 +585,46 @@ mod tests {
         assert!(
             error(serde_json::json!({ "t": { "columns": { "a b": {} } } })).contains("columns")
         );
+    }
+
+    #[test]
+    fn kafka_columns() {
+        let r = rules(serde_json::json!({
+            "events": { "columns": {
+                "kafka_offset": { "kafka": "offset" },
+                "part": { "clickhouse": "_partition", "kafka": "partition" },
+                "kafka_ts": { "kafka": "timestamp" },
+                "_internal": {},
+            }},
+        }));
+        let source = |c: &str| r.column("events", c).source;
+        assert_eq!(
+            source("kafka_offset"),
+            ColumnSource::Kafka(KafkaField::Offset)
+        );
+        assert_eq!(
+            source("_partition"),
+            ColumnSource::Kafka(KafkaField::Partition)
+        );
+        assert_eq!(r.column("events", "_partition").name, "part");
+        assert_eq!(
+            source("kafka_ts"),
+            ColumnSource::Kafka(KafkaField::Timestamp)
+        );
+        assert_eq!(source("ts"), ColumnSource::Json("ts".into()));
+        assert_eq!(source("kafka_ts").to_string(), "kafka timestamp");
+        // a Kafka column is read whatever the hiding globs say; a JSON one isn't
+        assert!(!r.is_hidden("events", "_partition"));
+        assert!(r.is_hidden("events", "_internal") && r.is_hidden("events", "_offset"));
+        assert!(
+            r.is_hidden("orders", "_partition"),
+            "only for its own table"
+        );
+        let e = error(serde_json::json!({ "t": { "columns": {
+            "a": { "json": "a", "kafka": "offset" } } } }));
+        assert!(e.contains("columns.a: json and kafka both"), "{e}");
+        let e = error(serde_json::json!({ "t": { "columns": { "a": { "kafka": "key" } } } }));
+        assert!(e.contains("unknown variant `key`"), "{e}");
     }
 
     #[test]
@@ -541,7 +644,7 @@ mod tests {
         let c: TablesConfig = serde_json::from_value(serde_json::json!({
             "expose": "all", "database": "d", "topic": "t.{table}", "hidden_columns": ["x"],
             "events": { "clickhouse": "a.b", "topic": "e", "hidden_columns": ["y"],
-                        "columns": { "c": { "clickhouse": "cc", "json": "cj" } } },
+                        "columns": { "c": { "clickhouse": "cc", "json": "cj" }, "k": { "kafka": "timestamp" } } },
             "orders": {},
         }))
         .unwrap();

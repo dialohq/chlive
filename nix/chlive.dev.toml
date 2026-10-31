@@ -16,6 +16,12 @@ dir = ".dnvr/chlive-cache"
 level = "info,chlive_server::hub=debug,chlive_server::store=debug"
 
 [tables.events]
+[tables.events.columns]
+# stored by the sink connector's InsertField transform (nix/shell.nix)
+kafka_partition = { kafka = "partition" }
+kafka_offset = { kafka = "offset" }
+kafka_ts = { kafka = "timestamp" }
+
 [tables.orders]
 [tables.customers]
 [tables.products]

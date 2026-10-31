@@ -140,6 +140,64 @@ async fn live_results_match_direct_queries() -> Result<()> {
 .await
 }
 
+/// `events` stores each message's partition, offset and timestamp (the sink's InsertField): the
+/// live rows have them from the messages, exactly as ClickHouse has them from the sink.
+#[tokio::test]
+async fn kafka_columns_match_the_messages() -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    with_server(config(), |server| {
+        async move {
+            let producer = producer()?;
+            let run = chrono::Utc::now().timestamp_millis();
+            let users: Vec<String> = (0..6).map(|i| format!("kafka-{run}-{i}")).collect();
+            let sql = format!(
+        "select user_id, kafka_partition, kafka_offset, kafka_ts from events where user_id in ({})",
+        users.iter().map(|u| format!("'{u}'")).collect::<Vec<_>>().join(", ")
+    );
+            let conn = LiveConn::connect(server).await?;
+            conn.subscribe("kafka", &sql);
+            conn.wait_ready(&["kafka"], Duration::from_secs(60)).await?;
+            // the JSON's own kafka_offset is overwritten by the sink and ignored by chlive
+            let messages: Vec<String> = users
+                .iter()
+                .map(|u| {
+                    json!({"ts": "2026-10-31 12:00:00.000", "user_id": u, "kafka_offset": 123456})
+                        .to_string()
+                })
+                .collect();
+            let placed = producer.produce_json_each(&messages).await?;
+            let mut produced = std::collections::BTreeMap::new();
+            for (p, o) in &placed {
+                let e = produced.entry(*p).or_insert(*o);
+                *e = (*e).max(*o);
+            }
+            settle(&conn, &produced).await?;
+
+            let live = conn.result("kafka").unwrap();
+            assert!(live.error.is_none(), "{:?}", live.error);
+            assert_eq!(live.inserted, users.len(), "every row came live");
+            for (user, (partition, offset)) in users.iter().zip(&placed) {
+                let row = live
+                    .rows
+                    .iter()
+                    .find(|r| r["user_id"] == user.as_str())
+                    .unwrap_or_else(|| panic!("{user} is missing"));
+                assert_eq!(row["kafka_partition"], json!(partition), "{user}");
+                assert_eq!(row["kafka_offset"], json!(offset), "{user}");
+                assert_ne!(row["kafka_ts"], json!("1970-01-01 00:00:00.000"), "{user}");
+            }
+            assert_eq!(multiset(&live.rows), multiset(&direct(&sql).await?));
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
 #[tokio::test]
 async fn rejections_over_websocket() -> Result<()> {
     if !enabled() {

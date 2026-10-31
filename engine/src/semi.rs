@@ -178,7 +178,7 @@ impl SemiRun {
             // key into `S` is itself in the result (as in ClickHouse)
             if event.topic == semi.inner_topic {
                 advance(&mut self.inner_at, &event);
-                match semi.inner_stream.decode(&event.value) {
+                match semi.inner_stream.decode(&event) {
                     Ok(row) if semi.inner_stream.matches(&row) => {
                         let (k, s) = match semi.inner_key {
                             Some(ik) => {
@@ -200,7 +200,7 @@ impl SemiRun {
             if event.topic == self.plan.stream.topics[0] {
                 advance(&mut self.at, &event);
                 let stream = &self.plan.stream;
-                match stream.decode(&event.value) {
+                match stream.decode(&event) {
                     Ok(row) if stream.matches(&row) => {
                         let s = match semi.outer_key {
                             Some(ok) => key_string(&row[ok.0], semi.float_keys),

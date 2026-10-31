@@ -12,11 +12,11 @@ use crate::ast::{
 use crate::calendar::Interval;
 use crate::error::{render_at, Span};
 use crate::history::{DescribedColumn, HistoryError, HistorySource};
-use crate::rules::{NamingRules, TopicId};
+use crate::rules::{ColumnSource, KafkaField, NamingRules, TopicId};
 use crate::security::{Filters, RowFilter};
 use crate::source::{EventSource, SourceError};
 use crate::table_engine::{Key, TableEngine};
-use crate::types::{Kind, LiteralError, Type, Value};
+use crate::types::{kafka_accepts, Kind, LiteralError, Type, Value};
 
 /// What the binder can look things up in.
 pub struct Catalog<'a> {
@@ -45,8 +45,8 @@ pub struct BoundColumn {
     pub name: String,
     /// Column in ClickHouse.
     pub clickhouse: String,
-    /// Key in the topic's JSON objects.
-    pub json_key: String,
+    /// Where events hold it: a key of their JSON objects, or a Kafka field.
+    pub source: ColumnSource,
     /// From the ClickHouse column type; decides how event JSON is decoded.
     pub ty: Type,
 }
@@ -1507,7 +1507,7 @@ async fn bind_from(
             id: ColumnId(i),
             name: m.name,
             clickhouse: c.name.clone(),
-            json_key: m.json_key,
+            source: m.source,
             ty: Type::parse(&c.ty),
         }
     };
@@ -1566,6 +1566,24 @@ async fn bind_from(
         }
         _ => None,
     };
+    // a Kafka field's column must hold it exactly as Kafka Connect stores it
+    for c in columns.iter().chain(&internal) {
+        if let ColumnSource::Kafka(field) = c.source {
+            if !kafka_accepts(field, &c.ty) {
+                let fits = match field {
+                    KafkaField::Offset | KafkaField::Partition => "an integer",
+                    KafkaField::Timestamp => "DateTime64(3) or a 64-bit integer (milliseconds)",
+                };
+                return Err(BindError::at(
+                    format!(
+                        "column {} of {} holds the Kafka {field}, so it must be {fits}, not {}",
+                        c.name, from.name, c.ty
+                    ),
+                    from.span,
+                ));
+            }
+        }
+    }
     // the row filter's column, hidden or not
     let row_filter = match filter.map(|f| &f.rows) {
         None | Some(RowFilter::All) => None,
@@ -2483,7 +2501,7 @@ mod tests {
         .unwrap();
         let out: Vec<_> = b
             .output()
-            .map(|c| (c.name, c.clickhouse, c.json_key))
+            .map(|c| (c.name, c.clickhouse, c.source.to_string()))
             .collect();
         assert_eq!(
             out,
@@ -2506,6 +2524,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.contains("user_id"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn kafka_columns_are_visible_and_typed() {
+        let rules = configured(serde_json::json!({
+            "events": { "columns": {
+                "kafka_offset": { "clickhouse": "_offset", "kafka": "offset" },
+                "kafka_partition": { "clickhouse": "_partition", "kafka": "partition" },
+                "kafka_ts": { "clickhouse": "ts", "kafka": "timestamp" },
+            }},
+        }));
+        let b = bind_with(
+            rules,
+            "select kafka_partition, kafka_offset, kafka_ts from events where kafka_offset > 5",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let out: Vec<_> = b.output().map(|c| (c.name, c.source.to_string())).collect();
+        assert_eq!(
+            out,
+            [
+                ("kafka_partition".into(), "kafka partition".into()),
+                ("kafka_offset".into(), "kafka offset".into()),
+                ("kafka_ts".into(), "kafka timestamp".into()),
+            ],
+            "configured from Kafka: shown, though `_*` is hidden"
+        );
+        // a column that can't hold the field as Kafka Connect stores it
+        for (column, field, ty) in [
+            ("latency_ms", "timestamp", "UInt32"),
+            ("user_id", "offset", "String"),
+        ] {
+            let rules = configured(serde_json::json!({
+                "events": { "columns": { "k": { "clickhouse": column, "kafka": field } } },
+            }));
+            let e = bind_with(rules, "select k from events", serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert!(
+                e.contains(&format!("column k of events holds the Kafka {field}"))
+                    && e.contains(&format!("not {ty}")),
+                "{e}"
+            );
+            assert!(e.contains("1:15"), "at the table: {e}");
+        }
     }
 
     #[tokio::test]

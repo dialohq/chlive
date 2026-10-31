@@ -160,6 +160,28 @@ impl Producer {
 }
 
 impl Producer {
+    /// Produce these messages (JSON), spread over the partitions. Returns where each one went:
+    /// its partition and offset.
+    pub async fn produce_json_each(&self, messages: &[String]) -> Result<Vec<(i32, i64)>> {
+        let mut placed = Vec::new();
+        for (i, payload) in messages.iter().enumerate() {
+            let d = self
+                .producer
+                .send(
+                    FutureRecord::<(), _>::to(&self.topic)
+                        .payload(payload)
+                        .partition(i as i32 % self.partitions),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|(e, _)| anyhow::anyhow!("kafka delivery failed: {e}"))?;
+            placed.push((d.partition, d.offset));
+        }
+        Ok(placed)
+    }
+}
+
+impl Producer {
     /// Produce these (key, JSON) messages with their Kafka keys, so each key's messages are in
     /// one partition, in order (a keyed topic). Returns the highest acknowledged offset per
     /// partition.

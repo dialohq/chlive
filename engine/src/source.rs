@@ -27,6 +27,8 @@ pub struct Event {
     pub topic: TopicId,
     pub partition: i32,
     pub offset: i64,
+    /// The message's timestamp, in milliseconds (as Kafka Connect's `InsertField` stores it).
+    pub timestamp: Option<i64>,
     /// Only the keys the query needs (see [`decode_pruned`]).
     pub value: Row,
 }
@@ -379,9 +381,10 @@ impl EventSource for KafkaSource {
                     }
                 };
                 let (topic, partition, offset) = (msg.topic().to_string(), msg.partition(), msg.offset());
+                let timestamp = msg.timestamp().to_millis();
                 match decode_pruned(msg.payload().unwrap_or_default(), &keys) {
                     Ok(value) => {
-                        let event = Event { topic: TopicId(topic), partition, offset, value };
+                        let event = Event { topic: TopicId(topic), partition, offset, timestamp, value };
                         drop(msg);
                         return Some((event, (consumer, keys)));
                     }
@@ -394,10 +397,11 @@ impl EventSource for KafkaSource {
 }
 
 /// Events held in memory, for tests and examples: `topic → partition → messages` (a message's
-/// offset is its index). Finite: the stream ends after the last message.
+/// offset is its index), each with its timestamp if it has one. Finite: the stream ends after
+/// the last message.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySource {
-    topics: BTreeMap<TopicId, BTreeMap<i32, Vec<String>>>,
+    topics: BTreeMap<TopicId, BTreeMap<i32, Vec<(Option<i64>, String)>>>,
 }
 
 impl MemorySource {
@@ -405,14 +409,25 @@ impl MemorySource {
         Self::default()
     }
 
-    /// Append a raw message (normally JSON) to a topic partition.
+    /// Append a raw message (normally JSON) to a topic partition, without a timestamp.
     pub fn push(&mut self, topic: &str, partition: i32, message: impl Into<String>) -> &mut Self {
+        self.push_message(topic, partition, None, message)
+    }
+
+    /// Append a raw message with its timestamp (milliseconds) to a topic partition.
+    pub fn push_message(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        timestamp: Option<i64>,
+        message: impl Into<String>,
+    ) -> &mut Self {
         self.topics
             .entry(TopicId(topic.into()))
             .or_default()
             .entry(partition)
             .or_default()
-            .push(message.into());
+            .push((timestamp, message.into()));
         self
     }
 
@@ -454,7 +469,7 @@ impl EventSource for MemorySource {
         for s in starts {
             for (partition, start) in &s.partitions {
                 let messages = self.topics.get(&s.topic).and_then(|t| t.get(partition));
-                for (offset, text) in messages
+                for (offset, (timestamp, text)) in messages
                     .into_iter()
                     .flatten()
                     .enumerate()
@@ -465,6 +480,7 @@ impl EventSource for MemorySource {
                             topic: s.topic.clone(),
                             partition: *partition,
                             offset: offset as i64,
+                            timestamp: *timestamp,
                             value,
                         }),
                         Err(e) => {

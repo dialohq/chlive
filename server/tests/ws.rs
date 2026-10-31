@@ -979,6 +979,7 @@ impl EventSource for Live {
                 topic: TopicId("requests".into()),
                 partition: 0,
                 offset,
+                timestamp: None,
                 value: chlive_engine::source::decode_pruned(text.as_bytes(), keys).unwrap(),
             };
         let first: Vec<Event> = existing

@@ -607,7 +607,7 @@ pub fn check_file(file: &Path, mut o: Overrides) -> Result<Config> {
 #[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
-    use chlive_engine::rules::{ColumnConfig, Expose, TableConfig};
+    use chlive_engine::rules::{ColumnConfig, Expose, KafkaField, TableConfig};
     use figment::Jail;
 
     fn load(jail: &mut Jail, toml: &str) -> Result<Config> {
@@ -832,6 +832,7 @@ mod tests {
                 hidden_columns = ["internal"]
                 [tables.orders.columns]
                 customer = { clickhouse = "customer_id", json = "customerId" }
+                placed = { clickhouse = "_offset", kafka = "offset" }
                 "#,
             )
             .unwrap();
@@ -871,13 +872,24 @@ mod tests {
                     clickhouse: Some("shop.orders_v2".into()),
                     topic: Some("orders-topic".into()),
                     hidden_columns: vec!["internal".into()],
-                    columns: [(
-                        "customer".to_string(),
-                        ColumnConfig {
-                            clickhouse: Some("customer_id".into()),
-                            json: Some("customerId".into()),
-                        }
-                    )]
+                    columns: [
+                        (
+                            "customer".to_string(),
+                            ColumnConfig {
+                                clickhouse: Some("customer_id".into()),
+                                json: Some("customerId".into()),
+                                kafka: None,
+                            }
+                        ),
+                        (
+                            "placed".to_string(),
+                            ColumnConfig {
+                                clickhouse: Some("_offset".into()),
+                                json: None,
+                                kafka: Some(KafkaField::Offset),
+                            }
+                        )
+                    ]
                     .into(),
                     security: None,
                 }

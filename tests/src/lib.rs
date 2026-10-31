@@ -64,12 +64,18 @@ pub fn config() -> Config {
             .unwrap_or_else(|_| "http://127.0.0.1:18123".into()),
         user: "chlive_ro".into(),
         password: "chlive_ro".into(),
-        tables: chlive_engine::rules::TablesConfig::listed([
-            "events",
-            "orders",
-            "customers",
-            "products",
-        ]),
+        // as nix/chlive.dev.toml: events' Kafka columns come from the messages
+        tables: serde_json::from_value(serde_json::json!({
+            "events": { "columns": {
+                "kafka_partition": { "kafka": "partition" },
+                "kafka_offset": { "kafka": "offset" },
+                "kafka_ts": { "kafka": "timestamp" },
+            }},
+            "orders": {},
+            "customers": {},
+            "products": {},
+        }))
+        .expect("a valid [tables]"),
         kafka_brokers: std::env::var("CHLIVE_KAFKA").unwrap_or_else(|_| "127.0.0.1:9092".into()),
         kafka_properties: Default::default(),
         metadata_refresh: chlive_engine::source::METADATA_REFRESH,
