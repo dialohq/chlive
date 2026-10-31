@@ -51,6 +51,8 @@ in
   ];
   inherit (toolchain) env;
   inherit (stack) prerun;
+  # the stack runs as a Rex session, a tab per process (`dnvr up --runner tmux` for tmux)
+  defaultRunner = "rex";
 
   processes = stack.processes // {
     # with CHAT_SECURITY=postgres the server reads its permissions from Postgres: once its

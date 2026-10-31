@@ -3,7 +3,8 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
-    dnvr.url = "github:dialohq/dnvr";
+    # its `feat/rex-runner` branch (the Rex runner, `dnvr down`/`restart`) until that's merged
+    dnvr.url = "github:dialohq/dnvr/feat/rex-runner";
     dnvr.inputs.nixpkgs.follows = "nixpkgs";
     # The production ingestion (Kafka Connect's ClickHouse sink, exactly once) and its pause
     # server, which chlive's snapshots go through. Its `pause-server` branch (the pause server's

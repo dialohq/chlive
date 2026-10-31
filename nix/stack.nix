@@ -290,7 +290,8 @@ in
         } > "$props"
         ${supervise {
           name = "Kafka Connect";
-          start = ''${pkgs.apacheKafka}/bin/connect-distributed.sh "$props"'';
+          # a few small sink connectors: 512 MiB is plenty (its default is a 2 GiB heap)
+          start = ''${pkgs.coreutils}/bin/env KAFKA_HEAP_OPTS="-Xms128M -Xmx512M" ${pkgs.apacheKafka}/bin/connect-distributed.sh "$props"'';
           readyWhen = ''${pkgs.curl}/bin/curl -fs "http://127.0.0.1:$port/connector-plugins" >/dev/null'';
           onReady = ''
             dnvr-state set url "http://127.0.0.1:$port"

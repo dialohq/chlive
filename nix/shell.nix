@@ -56,6 +56,8 @@ in
   };
 
   inherit (stack) prerun;
+  # the stack runs as a Rex session, a tab per process (`dnvr up --runner tmux` for tmux)
+  defaultRunner = "rex";
 
   # Start-up order follows the `dnvr://` refs in each process's `env`.
   processes = stack.processes // {

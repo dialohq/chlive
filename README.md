@@ -4,11 +4,11 @@ A minimal **query-driven live sync layer** for a Kafka → ClickHouse analytics 
 
 ## Quickstart
 
-Everything except Redpanda comes from the nix flake: the Rust and Bun toolchains, **ClickHouse 26.7.2** (packaged in `nix/packages/clickhouse.nix`, because nixpkgs has another version), Kafka Connect, and from [continuous-backup](https://github.com/dialohq/clickhouse-continuous-backup) (a flake input, for now the local checkout `/Users/adam/continuous-backup`) the ClickHouse sink connector and the pause server. Redpanda runs in **Docker**, so Docker must be running. Local services run through [dnvr](https://github.com/dialohq/dnvr). One dev shell runs the whole stack, for the server, the engine and the examples alike.
+Everything except Redpanda comes from the nix flake: the Rust and Bun toolchains, **ClickHouse 26.7.2** (packaged in `nix/packages/clickhouse.nix`, because nixpkgs has another version), Kafka Connect, and from [continuous-backup](https://github.com/dialohq/clickhouse-continuous-backup) (a flake input, its `pause-server` branch for now) the ClickHouse sink connector and the pause server. Redpanda runs in **Docker**, so Docker must be running. Local services run through [dnvr](https://github.com/dialohq/dnvr). One dev shell runs the whole stack, for the server, the engine and the examples alike.
 
 ```sh
 nix develop      # or `direnv allow` once (run `direnv reload` after flake changes)
-dnvr up          # starts everything in a tmux dashboard
+dnvr up          # starts everything as a Rex session, a tab per process
 ```
 
 `dnvr up` starts these processes; the arrows are the start-up order dnvr derives from `dnvr://` dependencies:
@@ -26,7 +26,7 @@ dnvr up          # starts everything in a tmux dashboard
 | `playground` → server, redpanda | the example query playground | `url` |
 | `rust-alerts` → server | the Rust client's example service | |
 
-Dashboard keys: `j`/`k` selects, `Enter` shows a process (a second `Enter` focuses it), `r` restarts, `x` interrupts, `Q` stops everything, and `Ctrl-G` detaches. Running `dnvr up` again reattaches. `dnvr ps` and `dnvr logs <process>` work from any terminal. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `tui` (live queries as a table in the terminal), `e2e` (the tests that need the stack), `bench` (the query benchmark), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
+`dnvr up` runs the stack in [Rex](https://www.superlogical.com/rex) (the `rex` CLI must be on PATH; `dnvr up --runner tmux` runs it in a tmux dashboard instead): a session `chlive@<branch>:default` with one tab per process, kept open after its process exits. Running `dnvr up` again goes back to it. From any terminal: `dnvr ps`, `dnvr logs <process>` (`-f` follows), `dnvr restart <process>`, and `dnvr down` to stop everything. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `tui` (live queries as a table in the terminal), `e2e` (the tests that need the stack), `bench` (the query benchmark), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
 
 Every process picks free ports on each start (`dnvr-state pick-port`), so the stack runs next to anything else, and publishes its addresses; the processes get each other's through `dnvr://<process>/<key>` refs. From a terminal, read them with `dnvr-state get <process>.<key>` (e.g. `dnvr-state get playground.url`, `dnvr-state get server.url`), or list everything with `dnvr-state dump`. The `ch`, `produce`, `tui`, `e2e` and `bench` scripts look them up the same way; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_KAFKA` and `CHLIVE_PAUSE_SERVER` (and `PROXY_URL` for `produce`, `CHLIVE_URL`/`CH_URL`/`PROXY_URL` for `bench`) override them.
 
