@@ -21,6 +21,7 @@ pub(crate) enum Cmd {
         id: String,
         sql: String,
         params: Params,
+        complete: bool,
         events: mpsc::Sender<Event>,
     },
     Unsubscribe(String),
@@ -46,6 +47,8 @@ pub(crate) enum Event {
 struct Sub {
     sql: String,
     params: Params,
+    /// Sent with every `subscribe`: the snapshot holds everything in Kafka when subscribing.
+    complete: bool,
     events: mpsc::Sender<Event>,
     /// The `at` of the last message handed to it: everything handed over is applied in order,
     /// so it's where the subscription's rows will be.
@@ -72,6 +75,7 @@ fn offline(cmd: Option<Cmd>, subs: &mut BTreeMap<String, Sub>) -> Flow {
             id,
             sql,
             params,
+            complete,
             events,
         }) => {
             subs.insert(
@@ -79,6 +83,7 @@ fn offline(cmd: Option<Cmd>, subs: &mut BTreeMap<String, Sub>) -> Flow {
                 Sub {
                     sql,
                     params,
+                    complete,
                     events,
                     at: None,
                 },
@@ -106,6 +111,7 @@ fn subscribe(id: &str, sub: &Sub) -> Message {
         sql: sub.sql.clone(),
         since: sub.at.clone(),
         params: sub.params.clone(),
+        complete: sub.complete,
     })
 }
 
@@ -193,11 +199,13 @@ async fn connected(
                     id,
                     sql,
                     params,
+                    complete,
                     events,
                 }) => {
                     let sub = Sub {
                         sql,
                         params,
+                        complete,
                         events,
                         at: None,
                     };

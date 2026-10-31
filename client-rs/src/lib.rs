@@ -68,7 +68,7 @@ use futures::Stream;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
-pub use chlive_protocol::{Column, Params, Row, ServerMsg, CLIENT_ERROR};
+pub use chlive_protocol::{Column, Params, Row, ServerMsg, CATCH_UP_TIMEOUT, CLIENT_ERROR};
 pub use events::Events;
 pub use live::Live;
 pub use query::Query;
@@ -129,6 +129,17 @@ impl LiveClient {
         sql: impl Into<String>,
         params: Params,
     ) -> Subscription<R> {
+        self.subscribe_opts(sql, params, false)
+    }
+
+    /// [`subscribe_with`](Self::subscribe_with), and with `complete`, a snapshot holding everything
+    /// in Kafka when subscribing ([`Query::complete`]).
+    pub(crate) fn subscribe_opts<R: DeserializeOwned>(
+        &self,
+        sql: impl Into<String>,
+        params: Params,
+        complete: bool,
+    ) -> Subscription<R> {
         let n = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -140,6 +151,7 @@ impl LiveClient {
                 id: id.clone(),
                 sql: sql.into(),
                 params,
+                complete,
                 events: tx,
             })
             .is_ok();
@@ -184,7 +196,8 @@ pub enum Status {
 pub struct LiveError {
     /// `SYNTAX_ERROR`, `INVALID_QUERY` (both with a line:column in the message),
     /// `HISTORY_FAILED`, `STREAM_FAILED`, `AGGREGATE_FAILED`, `SNAPSHOT_FAILED`,
-    /// `TOO_MANY_SUBSCRIPTIONS` (the server's limit per connection), or `CLIENT_ERROR` (a
+    /// `TOO_MANY_SUBSCRIPTIONS` (the server's limit per connection), `CATCH_UP_TIMEOUT` (a
+    /// [`complete`](Query::complete) snapshot couldn't be had in time), or `CLIENT_ERROR` (a
     /// message the client couldn't apply).
     pub code: String,
     pub message: String,

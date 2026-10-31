@@ -59,6 +59,9 @@ pub struct Server {
     /// `now()`: rows due within this long of each other leave together (at most this late).
     #[serde(with = "humantime_serde")]
     pub now_coalescing: Duration,
+    /// A `complete` subscription waits at most this long for its snapshot (else `CATCH_UP_TIMEOUT`).
+    #[serde(with = "humantime_serde")]
+    pub complete_wait: Duration,
 }
 
 impl Default for Server {
@@ -72,6 +75,7 @@ impl Default for Server {
             max_subscriptions_per_connection: s.max_subscriptions_per_connection,
             progress_interval: s.progress_interval,
             now_coalescing: chlive_engine::engine::NOW_COALESCING,
+            complete_wait: s.complete_wait,
         }
     }
 }
@@ -438,6 +442,7 @@ impl Config {
             Ok(())
         };
         positive("server.progress_interval", self.server.progress_interval)?;
+        positive("server.complete_wait", self.server.complete_wait)?;
         positive("kafka.metadata_refresh", self.kafka.metadata_refresh)?;
         positive("snapshots.refresh", self.snapshots.refresh)?;
         positive("snapshots.idle", self.snapshots.idle)?;
@@ -504,6 +509,7 @@ impl Config {
             max_connections: self.server.max_connections,
             max_subscriptions_per_connection: self.server.max_subscriptions_per_connection,
             progress_interval: self.server.progress_interval,
+            complete_wait: self.server.complete_wait,
             cache: crate::CacheSettings {
                 dir: (!self.cache.dir.is_empty()).then(|| self.cache.dir.clone().into()),
                 keep_alive: self.cache.keep_alive,
@@ -636,6 +642,7 @@ mod tests {
                 max_subscriptions_per_connection: 100,
                 progress_interval: Duration::from_secs(1),
                 now_coalescing: Duration::from_millis(100),
+                complete_wait: Duration::from_secs(30),
             }
         );
         assert_eq!(
@@ -780,6 +787,7 @@ mod tests {
                 max_subscriptions_per_connection = 3
                 progress_interval = "250ms"
                 now_coalescing = "0s"
+                complete_wait = "5s"
 
                 [cache]
                 keep_alive = "5s"
@@ -846,6 +854,7 @@ mod tests {
                     max_subscriptions_per_connection: 3,
                     progress_interval: Duration::from_millis(250),
                     now_coalescing: Duration::ZERO,
+                    complete_wait: Duration::from_secs(5),
                 }
             );
             assert_eq!(c.clickhouse.url, "http://ch:8123");
@@ -942,6 +951,7 @@ mod tests {
                 (7, 3)
             );
             assert_eq!(s.progress_interval, Duration::from_millis(250));
+            assert_eq!(s.complete_wait, Duration::from_secs(5));
 
             // a literal password
             let c = load(

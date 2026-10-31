@@ -140,6 +140,82 @@ async fn live_results_match_direct_queries() -> Result<()> {
 .await
 }
 
+/// The Rust client's `history()` asks for a complete snapshot: what was produced right before
+/// subscribing is in the history (not ingested by ClickHouse yet, or not read by a running
+/// result yet), never in the events after it.
+#[tokio::test]
+async fn history_has_everything_produced_before_subscribing() -> Result<()> {
+    use chlive_client::{ClientOptions, LiveClient};
+    use futures::StreamExt;
+
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    with_server(config(), |server| {
+        async move {
+            let producer = producer()?;
+            let run = chrono::Utc::now().timestamp_millis();
+            let users: Vec<String> = (0..9).map(|i| format!("complete-{run}-{i}")).collect();
+            let sql = format!(
+                "select user_id from events where user_id in ({})",
+                users
+                    .iter()
+                    .map(|u| format!("'{u}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let message =
+                |u: &String| json!({"ts": "2026-10-31 12:00:00.000", "user_id": u}).to_string();
+            let client = LiveClient::new(ClientOptions::new(format!("ws://{}/live", server.addr)));
+            let names = |rows: &[std::sync::Arc<Row>]| {
+                let mut n: Vec<String> = rows
+                    .iter()
+                    .map(|r| r["user_id"].as_str().unwrap().to_string())
+                    .collect();
+                n.sort();
+                n
+            };
+
+            // a new result, built from a ClickHouse snapshot that can't have them yet
+            let messages: Vec<String> = users[..6].iter().map(message).collect();
+            producer.produce_json(&messages).await?;
+            let (history, mut first_events) =
+                tokio::time::timeout(Duration::from_secs(60), client.query(&sql).history::<Row>())
+                    .await??;
+            assert_eq!(names(&history), users[..6], "a new result");
+
+            // the running result (kept live by the first): produced right before, all in
+            let messages: Vec<String> = users[6..].iter().map(message).collect();
+            producer.produce_json(&messages).await?;
+            let (history, mut events) =
+                tokio::time::timeout(Duration::from_secs(60), client.query(&sql).history::<Row>())
+                    .await??;
+            assert_eq!(names(&history), users, "a running result");
+            // the first one's events are the later three, the second's none
+            let mut later = Vec::new();
+            for _ in 0..3 {
+                let row = tokio::time::timeout(Duration::from_secs(30), first_events.next())
+                    .await?
+                    .expect("an event")?;
+                later.push(row["user_id"].as_str().unwrap().to_string());
+            }
+            later.sort();
+            assert_eq!(later, users[6..]);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), events.next())
+                    .await
+                    .is_err(),
+                "nothing after the history"
+            );
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
 /// `events` stores each message's partition, offset and timestamp (the sink's InsertField): the
 /// live rows have them from the messages, exactly as ClickHouse has them from the sink.
 #[tokio::test]

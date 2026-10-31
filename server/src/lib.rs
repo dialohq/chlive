@@ -70,6 +70,7 @@ pub async fn start_with(
         engine.clone(),
         settings.cache.clone(),
         settings.progress_interval,
+        settings.complete_wait,
     );
     let router = router_with(hub.clone(), settings);
     let task = tokio::spawn(async move { axum::serve(listener, router).await });

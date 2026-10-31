@@ -19,6 +19,7 @@ pub struct Query {
     pub(crate) client: LiveClient,
     pub(crate) sql: String,
     pub(crate) params: Params,
+    pub(crate) complete: bool,
 }
 
 impl LiveClient {
@@ -28,6 +29,7 @@ impl LiveClient {
             client: self.clone(),
             sql: sql.into(),
             params: Params::new(),
+            complete: false,
         }
     }
 }
@@ -82,9 +84,19 @@ impl Query {
         self
     }
 
+    /// The snapshot holds every event in Kafka when subscribing (up to the topics' latest
+    /// offsets then), not just what the result has: the server holds it until the result gets
+    /// there, or ends the subscription with `CATCH_UP_TIMEOUT` (its `complete_wait`). Also on
+    /// every snapshot after a reconnect. [`history`](Self::history) always asks for it.
+    pub fn complete(mut self) -> Self {
+        self.complete = true;
+        self
+    }
+
     /// Every update: the snapshot, each diff with what it changed, disconnects and resumes.
     pub fn raw<R: DeserializeOwned>(self) -> Subscription<R> {
-        self.client.subscribe_with(self.sql, self.params)
+        self.client
+            .subscribe_opts(self.sql, self.params, self.complete)
     }
 
     /// The whole result after each snapshot and diff. Ends after an error, its last item.
@@ -177,10 +189,11 @@ impl Query {
             .map_err(unreadable)
     }
 
-    /// The result as it is now, and every row inserted after it: each row is in exactly one of
-    /// the two, also over reconnects.
+    /// Every event in Kafka when subscribing, and every row inserted after: each row is in
+    /// exactly one of the two, also over reconnects. The history is [`complete`](Self::complete):
+    /// it waits for the result to get to Kafka's offsets at subscribe time.
     pub async fn history<R: DeserializeOwned>(self) -> Result<(Rows<R>, Events<R>), LiveError> {
-        let mut sub = self.raw::<Row>();
+        let mut sub = self.complete().raw::<Row>();
         while let Some(u) = sub.next().await {
             match u.kind {
                 Kind::Snapshot => {

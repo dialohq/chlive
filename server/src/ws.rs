@@ -17,7 +17,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use chlive_engine::{Engine, Filters, Params};
+use chlive_engine::watermark::Watermark;
+use chlive_engine::{Engine, EngineError, Filters, Params, Plan};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -51,6 +52,9 @@ pub struct ServerSettings {
     /// At most this often, a `progress` tells a client how far its result is complete when only
     /// events that didn't match arrived.
     pub progress_interval: Duration,
+    /// A `complete` subscription (its snapshot holds everything in Kafka when subscribing) waits
+    /// at most this long for the result to get there; then it gets `CATCH_UP_TIMEOUT`.
+    pub complete_wait: Duration,
     /// Shared results: how long they're kept, and their change logs (the `[cache]` section).
     pub cache: CacheSettings,
     /// Who may read which rows (the `[security]` section, its providers started).
@@ -65,6 +69,7 @@ impl Default for ServerSettings {
             max_connections: 10_000,
             max_subscriptions_per_connection: 100,
             progress_interval: Duration::from_secs(1),
+            complete_wait: Duration::from_secs(30),
             cache: CacheSettings::default(),
             security: Arc::new(Security::open()),
         }
@@ -97,7 +102,12 @@ struct ConnInfo {
 
 /// The routes, over a new hub of shared results.
 pub fn router(engine: Arc<Engine>, settings: ServerSettings) -> Router {
-    let hub = Hub::new(engine, settings.cache.clone(), settings.progress_interval);
+    let hub = Hub::new(
+        engine,
+        settings.cache.clone(),
+        settings.progress_interval,
+        settings.complete_wait,
+    );
     router_with(hub, settings)
 }
 
@@ -305,6 +315,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                 sql,
                 since,
                 params,
+                complete,
             } => {
                 greeted = true;
                 // a subscription whose entry failed is over: its id can be used again
@@ -330,7 +341,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                     .await;
                     continue;
                 }
-                debug!(conn, id, sql, "subscribe");
+                debug!(conn, id, sql, complete, "subscribe");
                 let mut access = match permitted(&s.settings.security, user.as_deref(), &sql) {
                     Ok(a) => a,
                     Err(e) => {
@@ -373,9 +384,26 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                         continue;
                     }
                 };
-                let joined =
-                    s.hub
-                        .join(&plan, &sql, &params, &filters, conn, &id, tx.clone(), since);
+                // complete: its snapshot covers Kafka as it is now
+                let target = match target(&s, &plan, complete).await {
+                    Ok(target) => target,
+                    Err(e) => {
+                        debug!(conn, id, error = %e, "subscribe failed");
+                        send(engine_error(&id, &e)).await;
+                        continue;
+                    }
+                };
+                let joined = s.hub.join(
+                    &plan,
+                    &sql,
+                    &params,
+                    &filters,
+                    conn,
+                    &id,
+                    tx.clone(),
+                    since,
+                    target,
+                );
                 let watchers = access
                     .iter()
                     .flat_map(|(_, a)| a.watches())
@@ -397,6 +425,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                         joined,
                         sql,
                         params,
+                        complete,
                         access,
                         filters,
                         watchers,
@@ -428,6 +457,8 @@ struct Live {
     joined: Joined,
     sql: String,
     params: Params,
+    /// Its snapshots cover Kafka as it was when they were asked for.
+    complete: bool,
     /// Per table it reads, its access (watched while it changes).
     access: Vec<(String, TableAccess)>,
     /// The filters its entry was planned with.
@@ -441,6 +472,18 @@ impl Drop for Live {
         for w in &self.watchers {
             w.abort();
         }
+    }
+}
+
+/// A complete subscription's target: the latest offsets of the plan's topics now.
+async fn target(
+    s: &AppState,
+    plan: &Plan,
+    complete: bool,
+) -> Result<Option<Watermark>, EngineError> {
+    match complete {
+        false => Ok(None),
+        true => s.hub.engine().latest(plan).await.map(Some),
     }
 }
 
@@ -504,10 +547,17 @@ async fn refilter(
             .await
             .map_err(|e| engine_error(id, &e)),
     };
+    let plan = match plan {
+        Ok(plan) => match target(s, &plan, live.complete).await {
+            Ok(t) => Ok((plan, t)),
+            Err(e) => Err(engine_error(id, &e)),
+        },
+        Err(e) => Err(e),
+    };
     live.joined.close();
     s.hub.leave(&live.joined.key, live.joined.sub);
-    let plan = match plan {
-        Ok(plan) => plan,
+    let (plan, target) = match plan {
+        Ok(planned) => planned,
         Err(msg) => {
             debug!(conn, id, "permissions changed: the subscription ends");
             let _ = tx.send(Outgoing::Msg(msg)).await;
@@ -525,6 +575,7 @@ async fn refilter(
         id,
         tx.clone(),
         None,
+        target,
     );
     live.filters = filters;
 }

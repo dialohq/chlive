@@ -27,6 +27,10 @@
 ## within this long of each other leave together, in one diff, at most this late. "0s": each
 ## at its own.
 # now_coalescing = "100ms"
+## A subscription asking for a `complete` snapshot (everything in Kafka when it subscribed, which
+## the Rust client's `history()` does) waits at most this long for its result to get there, then
+## gets a CATCH_UP_TIMEOUT error.
+# complete_wait = "30s"
 
 [cache]
 ## Results are shared: every subscription to the same query (and parameter values) shares one

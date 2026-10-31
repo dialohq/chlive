@@ -49,7 +49,9 @@ use serde_json::Value as Json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
-use crate::protocol::{change, engine_error, order_terms, Column, OrderTerm, ServerMsg};
+use crate::protocol::{
+    change, engine_error, order_terms, Column, OrderTerm, ServerMsg, CATCH_UP_TIMEOUT,
+};
 use crate::store::{self, Meta, Store, Stored};
 
 /// Iterations already waiting are sent together, in one `diff`, up to this many.
@@ -192,6 +194,9 @@ pub struct Served {
     pub lineage: String,
     /// It sent a cursor (`since`).
     pub cursor: bool,
+    /// It asked for a `complete` snapshot (everything in Kafka when it subscribed).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub complete: bool,
     #[serde(flatten)]
     pub source: Source,
     /// `snapshot` or `resume`.
@@ -277,6 +282,8 @@ enum Cmd {
         client_id: String,
         out: mpsc::Sender<Outgoing>,
         since: Option<String>,
+        /// A `complete` subscriber: Kafka's offsets when it subscribed, which its snapshot covers.
+        target: Option<Watermark>,
         alive: Arc<AtomicBool>,
         gate: Arc<AtomicBool>,
     },
@@ -319,6 +326,8 @@ pub struct Hub {
     engine: Arc<Engine>,
     cache: CacheSettings,
     progress_interval: Duration,
+    /// How long a `complete` subscriber waits for its snapshot.
+    complete_wait: Duration,
     store: Option<Arc<Store>>,
     entries: Mutex<HashMap<String, Handle>>,
     next: AtomicU64,
@@ -333,6 +342,7 @@ impl Hub {
         engine: Arc<Engine>,
         cache: CacheSettings,
         progress_interval: Duration,
+        complete_wait: Duration,
     ) -> Arc<Self> {
         let store = cache
             .dir
@@ -348,6 +358,7 @@ impl Hub {
             engine,
             cache,
             progress_interval,
+            complete_wait,
             store,
             entries: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
@@ -376,6 +387,7 @@ impl Hub {
         client_id: &str,
         out: mpsc::Sender<Outgoing>,
         since: Option<String>,
+        target: Option<Watermark>,
     ) -> Joined {
         let key = cursor::identity(plan);
         let sub = self.next.fetch_add(1, Ordering::Relaxed);
@@ -387,6 +399,7 @@ impl Hub {
             client_id: client_id.to_string(),
             out,
             since,
+            target,
             alive: alive.clone(),
             gate: gate.clone(),
         };
@@ -693,6 +706,8 @@ pub struct Info {
     pub joins_snapshot: u64,
     pub joins_resume: u64,
     pub joins_wait: u64,
+    /// Complete subscribers whose result didn't get to their target in time.
+    pub complete_timeouts: u64,
     pub resyncs: u64,
     /// How it started: from ClickHouse, or restored from disk.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -740,6 +755,7 @@ impl Info {
             joins_snapshot: 0,
             joins_resume: 0,
             joins_wait: 0,
+            complete_timeouts: 0,
             resyncs: 0,
             source: None,
         }
@@ -773,6 +789,9 @@ struct Sub {
     delivered: Option<Watermark>,
     /// Joined before the result was ready: decided when it is (with its cursor).
     waiting: Option<Option<String>>,
+    /// A `complete` subscriber: no snapshot until the result covers these offsets (Kafka's when
+    /// it subscribed).
+    target: Option<Watermark>,
     /// Its connection's queue was full: nothing is sent until it catches up.
     lagging: bool,
     joined_at: Instant,
@@ -1005,6 +1024,7 @@ impl Entry {
                     if self.waiting_on_ready(CATCH_UP_WAIT) {
                         self.serve_waiting().await;
                     }
+                    self.time_out_complete();
                     if self.subs.values().any(|s| s.lagging) {
                         self.catch_up_lagging();
                     }
@@ -1143,6 +1163,57 @@ impl Entry {
         cursor::encode_with(&form.plan, Some(&self.lineage), at)
     }
 
+    /// Whether a complete subscriber's target is beyond `at`.
+    fn short_of_target(&self, sub: u64, at: &Watermark) -> bool {
+        self.subs
+            .get(&sub)
+            .and_then(|s| s.target.as_ref())
+            .is_some_and(|t| !at.covers(t))
+    }
+
+    /// Complete subscribers still waiting after `complete_wait`: the result didn't get to their
+    /// target in time, so they get `CATCH_UP_TIMEOUT` and are over.
+    fn time_out_complete(&mut self) {
+        let wait = self.hub.complete_wait;
+        let late: Vec<u64> = self
+            .subs
+            .iter()
+            .filter(|(_, s)| {
+                s.target.is_some() && s.waiting.is_some() && s.joined_at.elapsed() >= wait
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for sub in late {
+            let s = &self.subs[&sub];
+            let target = s
+                .target
+                .as_ref()
+                .map(Watermark::describe)
+                .unwrap_or_default();
+            let at = self.at.as_ref().map(Watermark::describe);
+            let id = s.client_id.clone();
+            warn!(key = %self.fp, lineage = %self.lineage, sub, conn = s.conn, id = %id, target, at = at.as_deref().unwrap_or("-"), "a complete subscriber's result didn't catch up in time");
+            s.alive.store(false, Ordering::Relaxed);
+            let message = format!(
+                "the result didn't get to Kafka's offsets at subscribe time ({target}) within {wait:?}; it's at {}",
+                at.as_deref().unwrap_or("its history, still loading"),
+            );
+            self.send_msg(sub, ServerMsg::error(Some(&id), CATCH_UP_TIMEOUT, message));
+            self.subs.remove(&sub);
+            self.info.lock().unwrap().complete_timeouts += 1;
+            self.left();
+        }
+    }
+
+    /// A subscriber left: the last one starts the keep-alive.
+    fn left(&mut self) {
+        if self.subs.is_empty() && self.stage == Stage::Live {
+            self.stage = Stage::KeepAlive;
+            self.deadline = Some(tokio::time::Instant::now() + self.hub.cache.keep_alive);
+            debug!(key = %self.fp, lineage = %self.lineage, secs = self.hub.cache.keep_alive.as_secs_f64(), "no subscribers: keep-alive");
+        }
+    }
+
     /// Whether a subscriber is waiting on a ready result (for it to catch up), for at least
     /// `waited`.
     fn waiting_on_ready(&self, waited: Duration) -> bool {
@@ -1178,10 +1249,14 @@ impl Entry {
     /// The history is in: waiting subscribers without a cursor get the snapshot (without waiting
     /// on anything); those with one are decided after this batch, like any join.
     fn serve_waiting_snapshot(&mut self) {
+        let at = self.at.clone().expect("ready");
         let waiting: Vec<u64> = self
             .subs
             .iter_mut()
             .filter_map(|(k, s)| match s.waiting {
+                // a complete one whose target the history doesn't cover waits on (decided
+                // after each batch)
+                Some(None) if s.target.as_ref().is_some_and(|t| !at.covers(t)) => None,
                 Some(None) => {
                     s.waiting = None;
                     Some(*k)
@@ -1193,7 +1268,6 @@ impl Entry {
             return;
         }
         let body = self.snapshot_body();
-        let at = self.at.clone().expect("ready");
         let source = self.source.clone().unwrap_or(Source::Memory);
         for sub in waiting {
             debug!(key = %self.fp, lineage = %self.lineage, sub, "waiting subscriber gets the snapshot");
@@ -1217,8 +1291,9 @@ impl Entry {
             return;
         };
         // only a subscriber that waited for the result gets it as it started
-        let waited_ms = matches!(source, Source::Restored { .. } | Source::Clickhouse { .. })
-            .then(|| s.joined_at.elapsed().as_millis() as u64);
+        let waited_ms = (matches!(source, Source::Restored { .. } | Source::Clickhouse { .. })
+            || s.target.is_some())
+        .then(|| s.joined_at.elapsed().as_millis() as u64);
         let served = Served {
             at: store::now_ms() as u64,
             conn: s.conn,
@@ -1227,6 +1302,7 @@ impl Entry {
             sql: self.sql.clone(),
             lineage: self.lineage.clone(),
             cursor,
+            complete: s.target.is_some(),
             source,
             decision: if resumed.is_some() {
                 "resume"
@@ -1524,6 +1600,7 @@ impl Entry {
                 client_id,
                 out,
                 since,
+                target,
                 alive,
                 gate,
             } => {
@@ -1554,6 +1631,7 @@ impl Entry {
                         gate,
                         delivered: None,
                         waiting: None,
+                        target,
                         lagging: false,
                         joined_at: Instant::now(),
                         served: None,
@@ -1566,11 +1644,7 @@ impl Entry {
                 if let Some(s) = self.subs.remove(&sub) {
                     debug!(key = %self.fp, lineage = %self.lineage, sub, conn = s.conn, id = %s.client_id, left = self.subs.len(), "leave");
                 }
-                if self.subs.is_empty() && self.stage == Stage::Live {
-                    self.stage = Stage::KeepAlive;
-                    self.deadline = Some(tokio::time::Instant::now() + self.hub.cache.keep_alive);
-                    debug!(key = %self.fp, lineage = %self.lineage, secs = self.hub.cache.keep_alive.as_secs_f64(), "no subscribers: keep-alive");
-                }
+                self.left();
             }
             Cmd::Evict => {
                 if self.subs.is_empty() && self.stage == Stage::Warm {
@@ -1658,6 +1732,14 @@ impl Entry {
             if (cursor_ahead || self.catching_up.is_some())
                 && waited.is_some_and(|w| w < CATCH_UP_WAIT)
             {
+                decision = Decision::Wait;
+                behind = true;
+            }
+        }
+        // a complete subscriber: nor older than what was in Kafka when it subscribed, however
+        // long that takes (until `complete_wait`, see `time_out_complete`)
+        if let (Decision::Snapshot(_), Some(at)) = (decision, &self.at) {
+            if self.short_of_target(sub, at) {
                 decision = Decision::Wait;
                 behind = true;
             }

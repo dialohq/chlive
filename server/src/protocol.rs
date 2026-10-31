@@ -164,6 +164,7 @@ mod tests {
                 sql: "select * from events".into(),
                 since: None,
                 params: Default::default(),
+                complete: false,
             }
         );
         let m: ClientMsg = serde_json::from_value(

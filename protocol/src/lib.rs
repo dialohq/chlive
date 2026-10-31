@@ -39,6 +39,13 @@
 //! normal `snapshot` that replaces them, never older than the cursor: when the server's result
 //! is behind it (e.g. restored from an older checkpoint after a restart), the snapshot waits
 //! for the result to catch up (at most 10 seconds).
+//!
+//! A `subscribe` with `complete: true` asks for a snapshot holding every event in the query's
+//! topics up to their latest offsets when the server got the `subscribe`: the snapshot waits
+//! for the result to get there (from ClickHouse's snapshot, which trails Kafka, or a shared
+//! result behind on a burst), and if it can't within the server's `complete_wait`, the
+//! subscription ends with `CATCH_UP_TIMEOUT` instead. Without it, the snapshot is whatever the
+//! result has, and what's in Kafka beyond it comes as diffs. A `resume` isn't affected.
 
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +75,9 @@ pub enum ClientMsg {
         /// Values for the query's parameters (`{name:Type}`).
         #[serde(default, skip_serializing_if = "Params::is_empty")]
         params: Params,
+        /// The snapshot holds everything in Kafka when subscribing (see the module docs).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        complete: bool,
     },
     Unsubscribe {
         id: String,
@@ -259,6 +269,9 @@ pub const SNAPSHOT_FAILED: &str = "SNAPSHOT_FAILED";
 /// A table the query reads, or a column it names, isn't one this connection's user may read
 /// (anymore: a live subscription that loses it ends with this); or a misplaced `hello`.
 pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
+/// A `complete` subscription's result didn't get to Kafka's offsets at subscribe time within
+/// the server's `complete_wait`.
+pub const CATCH_UP_TIMEOUT: &str = "CATCH_UP_TIMEOUT";
 /// Never sent: a client's code for a message it couldn't apply.
 pub const CLIENT_ERROR: &str = "CLIENT_ERROR";
 
@@ -308,9 +321,12 @@ mod tests {
             "type": "subscribe", "id": "s1", "sql": "x", "params": {"id": "u1", "n": 5}
         }));
         assert!(matches!(m, ClientMsg::Subscribe { params, .. } if params["n"] == 5));
-        // no params: none sent
+        let m: ClientMsg =
+            round_trip(json!({"type": "subscribe", "id": "s1", "sql": "x", "complete": true}));
+        assert!(matches!(m, ClientMsg::Subscribe { complete: true, .. }));
+        // no params, not complete: neither sent
         let m: ClientMsg = serde_json::from_value(
-            json!({"type": "subscribe", "id": "s1", "sql": "x", "params": {}}),
+            json!({"type": "subscribe", "id": "s1", "sql": "x", "params": {}, "complete": false}),
         )
         .unwrap();
         assert_eq!(

@@ -910,6 +910,8 @@ struct LiveInner {
     subscribes: std::sync::atomic::AtomicUsize,
     /// The first offset still in the topic (retention).
     low: std::sync::atomic::AtomicI64,
+    /// The last messages, in the topic but not delivered yet (a consumer behind).
+    held: std::sync::atomic::AtomicUsize,
 }
 
 impl Live {
@@ -921,6 +923,7 @@ impl Live {
             pushed: tokio::sync::broadcast::channel(100_000).0,
             subscribes: Default::default(),
             low: Default::default(),
+            held: Default::default(),
         }))
     }
 
@@ -932,6 +935,24 @@ impl Live {
         let mut messages = self.0.messages.lock().unwrap();
         messages.push(message.clone());
         let _ = self.0.pushed.send(((messages.len() - 1) as i64, message));
+    }
+
+    /// In the topic (its bounds count it), but delivered only on [`release`](Self::release).
+    fn push_held(&self, user: &str, latency: u32) {
+        let mut messages = self.0.messages.lock().unwrap();
+        messages.push(json!({"user_id": user, "latency_ms": latency}).to_string());
+        self.0
+            .held
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Deliver the held messages.
+    fn release(&self) {
+        let messages = self.0.messages.lock().unwrap();
+        let held = self.0.held.swap(0, std::sync::atomic::Ordering::SeqCst);
+        for o in messages.len() - held..messages.len() {
+            let _ = self.0.pushed.send((o as i64, messages[o].clone()));
+        }
     }
 
     fn subscribes(&self) -> usize {
@@ -972,7 +993,11 @@ impl EventSource for Live {
         // what's there, and what's pushed after, with nothing lost in between
         let (existing, rx) = {
             let messages = self.0.messages.lock().unwrap();
-            (messages.clone(), self.0.pushed.subscribe())
+            let held = self.0.held.load(std::sync::atomic::Ordering::SeqCst);
+            (
+                messages[..messages.len() - held].to_vec(),
+                self.0.pushed.subscribe(),
+            )
         };
         let event =
             move |offset: i64, text: &str, keys: &std::collections::HashSet<String>| Event {
@@ -1746,6 +1771,114 @@ async fn a_cursor_ahead_of_the_result_waits_for_it_to_catch_up() {
         json!([{"user_id": "h1"}, {"user_id": "u1"}, {"user_id": "u2"}]),
         "as new as the cursor"
     );
+}
+
+/// A `complete` subscribe.
+async fn subscribe_complete(c: &mut Client, id: &str, sql: &str) {
+    c.send(json!({"type": "subscribe", "id": id, "sql": sql, "complete": true}))
+        .await;
+}
+
+#[tokio::test]
+async fn a_complete_snapshot_has_what_was_in_kafka_when_subscribing() {
+    let live = Live::new();
+    let server = live_server(&live, ServerSettings::default()).await;
+    let sql = "select user_id from requests";
+    // a new result: its history is the snapshot's (h1), and u1 is in Kafka but not read yet
+    live.push_held("u1", 1);
+    let mut a = Client::connect(&server).await;
+    subscribe_complete(&mut a, "a", sql).await;
+    assert_eq!(a.next().await, None, "not the history alone");
+    live.release();
+    let snap = a.expect().await;
+    assert_eq!(snap["type"], "snapshot", "{snap}");
+    assert_eq!(snap["rows"], json!([{"user_id": "h1"}, {"user_id": "u1"}]));
+
+    // a running result, behind Kafka: a plain subscriber gets what it has, a complete one waits
+    live.push_held("u2", 1);
+    let mut b = Client::connect(&server).await;
+    b.subscribe("b", sql).await;
+    let snap = b.expect().await;
+    assert_eq!(snap["rows"], json!([{"user_id": "h1"}, {"user_id": "u1"}]));
+    let mut c = Client::connect(&server).await;
+    subscribe_complete(&mut c, "c", sql).await;
+    assert_eq!(c.next().await, None);
+    live.release();
+    let snap = c.expect().await;
+    assert_eq!(snap["type"], "snapshot", "{snap}");
+    assert_eq!(
+        snap["rows"],
+        json!([{"user_id": "h1"}, {"user_id": "u1"}, {"user_id": "u2"}])
+    );
+    assert_eq!(c.next().await, None, "u2 isn't sent again");
+    assert_eq!(b.inserts("b", 1).await, [json!({"user_id": "u2"})]);
+    assert_eq!(a.inserts("a", 1).await, [json!({"user_id": "u2"})]);
+
+    // caught up: a complete subscriber gets it at once
+    let mut d = Client::connect(&server).await;
+    subscribe_complete(&mut d, "d", sql).await;
+    assert_eq!(d.expect().await["rows"].as_array().unwrap().len(), 3);
+    let joins = debug(&server).await[0]["subscribers"].clone();
+    let complete: std::collections::BTreeMap<&str, bool> = joins
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["id"].as_str().unwrap(), s["served"]["complete"] == true))
+        .collect();
+    assert_eq!(
+        complete,
+        [("a", true), ("b", false), ("c", true), ("d", true)].into()
+    );
+}
+
+#[tokio::test]
+async fn a_complete_subscriber_gets_an_error_if_the_result_cant_catch_up() {
+    let live = Live::new();
+    let settings = ServerSettings {
+        complete_wait: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let server = live_server(&live, settings).await;
+    let sql = "select user_id from requests";
+    let mut a = Client::connect(&server).await;
+    a.subscribe("a", sql).await;
+    assert_eq!(a.expect().await["type"], "snapshot");
+    live.push_held("u1", 1);
+    let mut c = Client::connect(&server).await;
+    subscribe_complete(&mut c, "c", sql).await;
+    let e = c.expect().await;
+    assert_eq!(
+        (e["type"].as_str(), e["id"].as_str(), e["code"].as_str()),
+        (Some("error"), Some("c"), Some("CATCH_UP_TIMEOUT")),
+        "{e}"
+    );
+    assert!(e["message"].as_str().unwrap().contains("{0: 1}"), "{e}");
+    // over: its id is free again, and the entry and its other subscriber go on
+    c.subscribe("c", sql).await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    live.release();
+    assert_eq!(a.inserts("a", 1).await, [json!({"user_id": "u1"})]);
+    assert_eq!(c.inserts("c", 1).await, [json!({"user_id": "u1"})]);
+    let e = &debug(&server).await[0];
+    assert_eq!(e["completeTimeouts"], 1);
+    assert_eq!(e["subscribers"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_complete_subscriber_still_resumes() {
+    let live = Live::new();
+    let server = live_server(&live, ServerSettings::default()).await;
+    let sql = "select user_id from requests";
+    let mut c = Client::connect(&server).await;
+    c.subscribe("s", sql).await;
+    let at = c.expect().await["at"].as_str().unwrap().to_string();
+    live.push("u1", 1);
+    c.inserts("s", 1).await;
+    let mut d = Client::connect(&server).await;
+    d.send(json!({"type": "subscribe", "id": "d", "sql": sql, "since": at, "complete": true}))
+        .await;
+    assert_eq!(d.expect().await["type"], "resume");
+    assert_eq!(d.inserts("d", 1).await, [json!({"user_id": "u1"})]);
 }
 
 #[tokio::test]

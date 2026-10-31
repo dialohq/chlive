@@ -173,6 +173,23 @@ async fn parameters_are_sent_and_sent_again_after_a_reconnect() {
 }
 
 #[tokio::test]
+async fn only_complete_queries_ask_for_a_complete_snapshot() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let _plain = client.query(SQL).raw::<Row>();
+    let mut ws = server.next().await;
+    assert_eq!(
+        ws.recv().await,
+        json!({"type": "subscribe", "id": "s1", "sql": SQL})
+    );
+    let _complete = client.query(SQL).complete().raw::<Row>();
+    assert_eq!(
+        ws.recv().await,
+        json!({"type": "subscribe", "id": "s2", "sql": SQL, "complete": true})
+    );
+}
+
+#[tokio::test]
 async fn errors_are_per_subscription() {
     let mut server = FakeServer::start().await;
     let client = server.client();
@@ -747,7 +764,12 @@ async fn history_then_each_new_row_with_none_in_both() {
     let mut server = FakeServer::start().await;
     let client = server.client();
     let started = tokio::spawn(client.query(SQL).history::<User>());
-    let mut ws = subscribed(&mut server).await;
+    // a complete snapshot: everything in Kafka when subscribing
+    let mut ws = server.next().await;
+    assert_eq!(
+        ws.recv().await,
+        json!({"type": "subscribe", "id": "s1", "sql": SQL, "complete": true})
+    );
     ws.send(snapshot("s1", json!([{"user_id": "a"}, {"user_id": "b"}])))
         .await;
     ws.send(diff("s1", "c1", json!([insert("c")]))).await;
@@ -758,7 +780,11 @@ async fn history_then_each_new_row_with_none_in_both() {
     // a reconnect the server can't resume: the history isn't new again, what came meanwhile is
     ws.close().await;
     let mut ws = server.next().await;
-    assert_eq!(ws.recv().await["since"], "c1");
+    let again = ws.recv().await;
+    assert_eq!(
+        (&again["since"], &again["complete"]),
+        (&json!("c1"), &json!(true))
+    );
     ws.send(snapshot(
         "s1",
         json!([{"user_id": "a"}, {"user_id": "b"}, {"user_id": "c"}, {"user_id": "d"}]),
