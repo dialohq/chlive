@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use serde_json::Value as Json;
 
-use crate::binder::{ColumnId, OrderKey};
+use crate::bound::{ColumnId, OrderKey};
 use crate::diff::{ArrayEdit, Diff, Row};
 use crate::order::{KeyOrder, Ranking, SortKey};
 use crate::types::{decode, Type, Value};

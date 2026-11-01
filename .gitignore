@@ -6,3 +6,4 @@ dist/
 .dnvr/
 chlive-cache/
 result
+client/wasm/

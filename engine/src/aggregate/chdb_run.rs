@@ -13,6 +13,7 @@ use crate::diff::Row;
 use crate::engine::{EngineError, Iteration, Origin};
 use crate::plan::{AggregatePlan, StreamPlan};
 use crate::source::Event;
+use crate::types::quote_string;
 use crate::watermark::Watermark;
 
 /// A chDB table that goes away with its subscription.
@@ -167,5 +168,58 @@ impl AggregateRun {
                 (Value::Array(key).to_string(), row)
             })
             .collect()
+    }
+}
+
+/// chDB's `url()` running `sql` on main ClickHouse over HTTP. The result comes as
+/// RowBinaryWithNamesAndTypes, which carries aggregate states as they are and, unlike Native,
+/// names its columns and types even when there are no rows (no history), so chDB always
+/// knows the table's structure. The credentials go in headers (so they're in no URL or query
+/// log).
+pub fn http_source(http_url: &str, sql: &str, user: &str, password: &str) -> String {
+    let mut url = reqwest::Url::parse(http_url)
+        .unwrap_or_else(|_| reqwest::Url::parse("http://invalid/").expect("a URL"));
+    url.query_pairs_mut()
+        .append_pair("query", &format!("{sql} FORMAT RowBinaryWithNamesAndTypes"));
+    format!(
+        "url({}, 'RowBinaryWithNamesAndTypes', headers('X-ClickHouse-User' = {}, 'X-ClickHouse-Key' = {}))",
+        quote_string(url.as_str()),
+        quote_string(user),
+        quote_string(password)
+    )
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::http_source;
+
+    #[test]
+    fn chdb_reads_states_over_http() {
+        let sql = "SELECT country AS __k0, uniqExactState(user_id) AS __a0_0 \
+                   FROM db.`__chlive_snap_events_1` WHERE path = 'a&b' GROUP BY __k0";
+        let src = http_source("http://ch:8123", sql, "ro", "it's secret");
+        // the query (with its FORMAT) is in the URL, encoded; the credentials are headers
+        assert_eq!(
+            src,
+            "url('http://ch:8123/?query=SELECT+country+AS+__k0%2C+uniqExactState%28user_id%29+AS+__a0_0+\
+             FROM+db.%60__chlive_snap_events_1%60+WHERE+path+%3D+%27a%26b%27+GROUP+BY+__k0+FORMAT+RowBinaryWithNamesAndTypes', \
+             'RowBinaryWithNamesAndTypes', headers('X-ClickHouse-User' = 'ro', 'X-ClickHouse-Key' = 'it\\'s secret'))"
+        );
+        assert!(
+            !src.contains("secret") || !src.split("headers").next().unwrap().contains("secret")
+        );
+        // HTTPS, a path, and parameters already in the URL are kept
+        let src = http_source(
+            "https://ch.example:8443/proxy?database=x",
+            "SELECT 1",
+            "u",
+            "",
+        );
+        assert!(
+            src.starts_with(
+                "url('https://ch.example:8443/proxy?database=x&query=SELECT+1+FORMAT+RowBinaryWithNamesAndTypes'"
+            ),
+            "{src}"
+        );
     }
 }

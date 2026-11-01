@@ -27,32 +27,21 @@
 //! each event is in exactly one.
 
 pub mod aggregate;
-pub mod ast;
 pub mod binder;
-pub mod calendar;
 pub mod chdb;
-pub mod checkpoint;
 pub mod clock;
-pub mod cursor;
-pub mod diff;
 pub mod engine;
-pub mod error;
 pub mod history;
-pub mod keyed;
-pub mod lexer;
-pub mod order;
-pub mod parser;
-pub mod plan;
-pub mod rules;
-pub mod security;
 pub mod semi;
 pub mod snapshot;
 pub mod source;
-pub mod table_engine;
-pub mod timeline;
-pub mod types;
-pub mod watermark;
 pub mod write;
+
+// the pure part (the dialect, the plans, the stream's state), shared with the clients
+pub use chlive_core::{
+    ast, bound, calendar, checkpoint, cursor, diff, error, event, keyed, lexer, order, parser,
+    plan, rules, security, state, table, table_engine, timeline, types, watermark,
+};
 
 pub use binder::{BoundColumn, BoundExpr, BoundQuery, Params};
 pub use checkpoint::Checkpoint;

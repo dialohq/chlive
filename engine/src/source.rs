@@ -22,16 +22,7 @@ use tracing::warn;
 use crate::diff::Row;
 use crate::rules::TopicId;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Event {
-    pub topic: TopicId,
-    pub partition: i32,
-    pub offset: i64,
-    /// The message's timestamp, in milliseconds (as Kafka Connect's `InsertField` stores it).
-    pub timestamp: Option<i64>,
-    /// Only the keys the query needs (see [`decode_pruned`]).
-    pub value: Row,
-}
+pub use chlive_core::event::Event;
 
 #[derive(Debug, thiserror::Error)]
 #[error("event source: {0}")]

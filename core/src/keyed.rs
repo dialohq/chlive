@@ -22,7 +22,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value as Json};
 
@@ -38,6 +38,28 @@ pub const BUFFER: u64 = 2000;
 const GONE_LOG: usize = 100_000;
 /// After a refill that couldn't be used, how long until the next.
 const REFILL_RETRY: Duration = Duration::from_secs(1);
+
+/// Milliseconds on a monotonic clock, for the refills' retries. Refills are the engine's (they read
+/// snapshots); a client's copy of the state never asks for one, so on WebAssembly (no clock
+/// without the host) time stands still.
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> u64 {
+    0
+}
+
+/// When a refill may be asked for again.
+fn retry_at() -> u64 {
+    now_ms() + REFILL_RETRY.as_millis() as u64
+}
 
 /// A new version of a key, from an event at `at` (partition, offset).
 pub struct NewVersion {
@@ -84,7 +106,7 @@ struct Window {
     /// A refill was asked for and hasn't come.
     requested: bool,
     /// After a refill: not before this.
-    retry_at: Option<Instant>,
+    retry_at: Option<u64>,
     /// The snapshot the last refill came from (the next needs a newer one).
     last_refill: Option<Watermark>,
     /// Each kept row's latest event, and the newest event of a row let go: a refill from a
@@ -106,7 +128,7 @@ struct OrderedWindow {
     /// Every matching row is kept: nothing past them, so no bound.
     exhaustive: bool,
     requested: bool,
-    retry_at: Option<Instant>,
+    retry_at: Option<u64>,
     last_refill: Option<Watermark>,
     /// A matching row's latest version was dropped since the last rebuild (let go, ignored past
     /// the bound, or leaving past it): a rebuild from the same snapshot can bring it back.
@@ -737,7 +759,7 @@ impl KeyedState {
             let wanted = !w.exhaustive
                 && w.ranking.len() < (w.most() - w.capacity).saturating_add(w.capacity / 4)
                 && !w.requested
-                && w.retry_at.is_none_or(|t| Instant::now() >= t);
+                && w.retry_at.is_none_or(|t| now_ms() >= t);
             if wanted {
                 w.requested = true;
             }
@@ -751,7 +773,7 @@ impl KeyedState {
             && low
             && !w.requested
             && w.pending.is_none()
-            && w.retry_at.is_none_or(|t| Instant::now() >= t);
+            && w.retry_at.is_none_or(|t| now_ms() >= t);
         if wanted {
             w.requested = true;
         }
@@ -773,11 +795,11 @@ impl KeyedState {
     pub fn refill_failed(&mut self) {
         if let Some(w) = &mut self.window {
             w.requested = false;
-            w.retry_at = Some(Instant::now() + REFILL_RETRY);
+            w.retry_at = Some(retry_at());
         }
         if let Some(w) = &mut self.ordered_window {
             w.requested = false;
-            w.retry_at = Some(Instant::now() + REFILL_RETRY);
+            w.retry_at = Some(retry_at());
         }
     }
 
@@ -797,7 +819,7 @@ impl KeyedState {
         }
         if !w.gone.covers(&refill.at) {
             tracing::info!(at = %refill.at.describe(), "a refill from a snapshot older than the departures known: asking again");
-            w.retry_at = Some(Instant::now() + REFILL_RETRY);
+            w.retry_at = Some(retry_at());
             return Vec::new();
         }
         w.last_refill = Some(refill.at.clone());
@@ -822,7 +844,7 @@ impl KeyedState {
             diffs.extend(inserted(w.seq.len() - 1, w.seq.len(), edges, |k| w.at(k)));
         }
         w.exhaustive = all;
-        w.retry_at = Some(Instant::now() + REFILL_RETRY);
+        w.retry_at = Some(retry_at());
         diffs
     }
 
@@ -1106,7 +1128,7 @@ mod tests {
 
     #[test]
     fn history_rows_and_checkpoints() {
-        use crate::binder::ColumnId;
+        use crate::bound::ColumnId;
         use crate::plan::KeyedColumn;
         use crate::types::Type;
         let mut s = KeyedState::default();
@@ -1136,7 +1158,7 @@ mod tests {
 
     #[test]
     fn ordered_rows_are_inserted_moved_and_deleted_at_their_places() {
-        use crate::binder::{ColumnId, OrderKey};
+        use crate::bound::{ColumnId, OrderKey};
         let order = KeyOrder(vec![OrderKey {
             column: ColumnId(0),
             desc: false,
@@ -1429,7 +1451,7 @@ mod tests {
     }
 
     fn top(limit: u64, buffer: u64) -> KeyedState {
-        use crate::binder::{ColumnId, OrderKey};
+        use crate::bound::{ColumnId, OrderKey};
         let order = KeyOrder(vec![OrderKey {
             column: ColumnId(0),
             desc: false,
@@ -1741,7 +1763,7 @@ mod tests {
 
     #[test]
     fn an_ordered_window_with_an_offset_shows_the_ranks_after_it() {
-        use crate::binder::{ColumnId, OrderKey};
+        use crate::bound::{ColumnId, OrderKey};
         let order = KeyOrder(vec![OrderKey {
             column: ColumnId(0),
             desc: false,

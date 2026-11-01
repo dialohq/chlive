@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 
 use serde_json::{json, Value as Json};
 
-use crate::binder::OrderKey;
+use crate::bound::OrderKey;
 use crate::diff::{Diff, Row};
 use crate::types::Value;
 
@@ -628,7 +628,7 @@ impl HeldWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binder::ColumnId;
+    use crate::bound::ColumnId;
 
     fn order(keys: &[(bool, bool)]) -> KeyOrder {
         KeyOrder(

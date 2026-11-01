@@ -3,6 +3,9 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
+    # the Rust toolchain, with the wasm32 target nixpkgs' rustc lacks (the TS client's core)
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     # its `feat/rex-runner` branch (the Rex runner, `dnvr down`/`restart`) until that's merged
     dnvr.url = "github:dialohq/dnvr/feat/rex-runner";
     dnvr.inputs.nixpkgs.follows = "nixpkgs";
@@ -30,6 +33,7 @@
           pkgs,
           presets,
           dnvrState,
+          system,
           ...
         }:
         let
@@ -41,6 +45,11 @@
           chlive = pkgs.callPackage ./nix/packages/chlive.nix { inherit libchdb; };
         in
         {
+          # nixpkgs with rust-overlay's `rust-bin` (nothing else changes: same packages)
+          _module.args.pkgs = import inputs.nixpkgs {
+            inherit system;
+            overlays = [ inputs.rust-overlay.overlays.default ];
+          };
           formatter = pkgs.nixfmt;
           packages = {
             inherit

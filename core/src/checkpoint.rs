@@ -58,7 +58,7 @@ impl Checkpoint {
 }
 
 /// Reads a running subscription's checkpoint (between iterations).
-pub(crate) type Checkpointer = Arc<dyn Fn() -> Checkpoint + Send + Sync>;
+pub type Checkpointer = Arc<dyn Fn() -> Checkpoint + Send + Sync>;
 
 #[cfg(test)]
 mod tests {

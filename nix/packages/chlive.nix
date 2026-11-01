@@ -23,6 +23,7 @@ rustPlatform.buildRustPackage {
       ../../Cargo.toml
       ../../Cargo.lock
       ../../server
+      ../../core
       ../../engine
       ../../protocol
       ../../client-rs

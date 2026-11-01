@@ -30,30 +30,11 @@ use crate::watermark::Watermark;
 pub use clone::{ClickHouseCloner, Cloner};
 pub use pause::{PauseServer, Paused, Pauser};
 
-/// Clones are named `__chlive_snap_<table>_<n>` next to their source table.
-pub const CLONE_PREFIX: &str = "__chlive_snap_";
+pub use chlive_core::table::{SnapshotTable, CLONE_PREFIX};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("{0}")]
 pub struct SnapshotError(pub String);
-
-/// A table to snapshot: where it is in ClickHouse, and the topic it's ingested from.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SnapshotTable {
-    pub database: String,
-    pub table: String,
-    pub topic: String,
-}
-
-impl SnapshotTable {
-    pub fn new(database: &str, table: &str, topic: &str) -> Self {
-        Self {
-            database: database.into(),
-            table: table.into(),
-            topic: topic.into(),
-        }
-    }
-}
 
 /// A clone of a table and the offsets it holds.
 #[derive(Debug)]

@@ -26,7 +26,7 @@ dnvr up          # starts everything as a Rex session, a tab per process
 | `playground` → server, redpanda | the example query playground | `url` |
 | `rust-alerts` → server | the Rust client's example service | |
 
-`dnvr up` runs the stack in [Rex](https://www.superlogical.com/rex) (the `rex` CLI must be on PATH; `dnvr up --runner tmux` runs it in a tmux dashboard instead): a session `chlive@<branch>:default` with one tab per process, kept open after its process exits. Running `dnvr up` again goes back to it. From any terminal: `dnvr ps`, `dnvr logs <process>` (`-f` follows), `dnvr restart <process>`, and `dnvr down` to stop everything. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `tui` (live queries as a table in the terminal), `e2e` (the tests that need the stack), `bench` (the query benchmark), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
+`dnvr up` runs the stack in [Rex](https://www.superlogical.com/rex) (the `rex` CLI must be on PATH; `dnvr up --runner tmux` runs it in a tmux dashboard instead): a session `chlive@<branch>:default` with one tab per process, kept open after its process exits. Running `dnvr up` again goes back to it. From any terminal: `dnvr ps`, `dnvr logs <process>` (`-f` follows), `dnvr restart <process>`, and `dnvr down` to stop everything. There is no live traffic generator; new events come from the playground's buttons, `produce`, or anything else producing to Kafka. The shell also has these scripts: `ch` (clickhouse client), `produce` (JSON events to a topic, e.g. `produce events '{"user_id": "u7", "latency_ms": 120}'`; or JSON lines on stdin), `tui` (live queries as a table in the terminal), `e2e` (the tests that need the stack), `bench` (the query benchmark), `wasm` (builds `chlive-wasm` into `client/wasm/`), and `reset-data` (wipe Redpanda and ClickHouse data together, since the sink's offsets in ClickHouse must match Kafka's; run it with the group stopped).
 
 Every process picks free ports on each start (`dnvr-state pick-port`), so the stack runs next to anything else, and publishes its addresses; the processes get each other's through `dnvr://<process>/<key>` refs. From a terminal, read them with `dnvr-state get <process>.<key>` (e.g. `dnvr-state get playground.url`, `dnvr-state get server.url`), or list everything with `dnvr-state dump`. The `ch`, `produce`, `tui`, `e2e` and `bench` scripts look them up the same way; `CHLIVE_CLICKHOUSE_URL`, `CHLIVE_KAFKA` and `CHLIVE_PAUSE_SERVER` (and `PROXY_URL` for `produce`, `CHLIVE_URL`/`CH_URL`/`PROXY_URL` for `bench`) override them.
 
@@ -81,7 +81,9 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `nix/chlive.dev.toml` | the dev server's config (the stack's addresses come as flags) |
 | `nix/packages/` | custom derivations: `chlive.nix` (the server and `clc`), `clickhouse.nix` (26.7.2), `libchdb.nix` (chDB, same version), `redpanda.nix` (the Docker-run Redpanda process) |
 | `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
-| `engine/` | `chlive-engine` (Rust): the SQL dialect (parser, binder, planner) and the event loop over ClickHouse and Kafka |
+| `core/` | `chlive-core` (Rust, no IO; also WebAssembly): the dialect (parser), bound queries, plans, a live result's state as events come (ordering, windows, FINAL, time windows, native aggregates), the diffs it makes, and a client's result rows |
+| `engine/` | `chlive-engine` (Rust): binding against the catalog, and the event loop over ClickHouse and Kafka, on `chlive-core` |
+| `wasm/` | `chlive-wasm`: `chlive-core` for the TS client (`wasm` builds it into `client/wasm/`); see `docs/bench/wasm.md` |
 | `protocol/` | `chlive-protocol` (Rust): the WebSocket protocol's messages, shared by the server and the Rust client |
 | `server/` | `chlive-server` (Rust; binary `chlive`): the WebSocket protocol over the engine, and its config (`chlive.example.toml`: every key and default) |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
@@ -89,7 +91,7 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `examples/` | example apps: `playground`, the query playground (React); `rust-alerts`, an event-driven service on `chlive-client`; `chat`, the permissions demo (its own dev shell) |
 | `tui/` | `chlive-tui` (Rust; binary `clc`): a terminal UI on `chlive-client`; type a query, watch its result as a table updated on every diff |
 | `tests/` | end-to-end tests (`chlive-e2e`): the server over the full stack, with a small Kafka producer |
-| `bench/` | `queries.ts`: a ladder of queries, simple to most complex, benchmarked through `@chlive/client` against the stack; results in `docs/bench/` |
+| `bench/` | `queries.ts`: a ladder of queries, simple to most complex, benchmarked through `@chlive/client` against the stack; `wasm.ts`: `chlive-wasm` against the TS client's store; results in `docs/bench/` |
 
 ## Server configuration
 

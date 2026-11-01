@@ -144,6 +144,18 @@ in
   };
 
   scripts = stack.scripts // {
+    wasm = {
+      description = "Build chlive-wasm (chlive-core for the TS client) into client/wasm/";
+      text = ''
+        cd "$DNVR_ROOT"
+        cargo build -p chlive-wasm --target wasm32-unknown-unknown --profile wasm
+        rm -rf client/wasm
+        wasm-bindgen --target web --out-dir client/wasm target/wasm32-unknown-unknown/wasm/chlive_wasm.wasm
+        wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int \
+          -o client/wasm/chlive_wasm_bg.wasm client/wasm/chlive_wasm_bg.wasm
+        ls -l client/wasm/chlive_wasm_bg.wasm
+      '';
+    };
     tui = {
       description = "A terminal table for live queries against the stack's server, e.g. `tui \"select * from events\"`";
       runtimeInputs = [ dnvrState ];

@@ -753,7 +753,7 @@ impl AggregateState for MinMaxMultiset {
 mod tests {
     use super::*;
     use crate::aggregate::{native, result_type};
-    use crate::binder::AggFunc;
+    use crate::bound::AggFunc;
 
     fn state(func: AggFunc, arg: &str) -> (Box<dyn AggregateState>, Type) {
         let arg = Type::parse(arg);

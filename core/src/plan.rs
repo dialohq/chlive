@@ -5,15 +5,15 @@
 use std::cmp::Ordering;
 
 use crate::ast::CmpOp;
-use crate::binder::{
+use crate::bound::{
     AggExpr, AggFunc, Aggregation, BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId,
     OrderKey, TimeWindow,
 };
 use crate::calendar::Interval;
 use crate::diff::Row;
+use crate::event::Event;
 use crate::order::{KeyOrder, SortKey};
 use crate::rules::{quote_ident, ColumnSource, KafkaField, TopicId};
-use crate::source::Event;
 use crate::table_engine::TableEngine;
 use crate::types::quote_string;
 use crate::types::{decode, decode_kafka, DecodeError, Type, Value};
@@ -22,7 +22,7 @@ use crate::types::{decode, decode_kafka, DecodeError, Type, Value};
 pub struct Plan {
     pub table: String,
     /// What history snapshots are taken of: the ClickHouse table and its topic.
-    pub source: crate::snapshot::SnapshotTable,
+    pub source: crate::table::SnapshotTable,
     /// The table's engine; a ReplacingMergeTree is read without FINAL (every version).
     pub engine: TableEngine,
     /// Output columns, in output order.
@@ -41,7 +41,7 @@ pub struct Plan {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemiPlan {
     /// The inner table's snapshots, and its topic.
-    pub inner: crate::snapshot::SnapshotTable,
+    pub inner: crate::table::SnapshotTable,
     pub inner_topic: TopicId,
     /// The inner table, quoted (`db.t`), for explain and the cursor.
     pub inner_table: String,
@@ -256,24 +256,6 @@ impl AggregatePlan {
         format!(
             "CREATE TABLE {table} ENGINE = AggregatingMergeTree ORDER BY {order} \
              SETTINGS allow_nullable_key = 1 AS SELECT * FROM {source}"
-        )
-    }
-
-    /// chDB's `url()` running `sql` on main ClickHouse over HTTP. The result comes as
-    /// RowBinaryWithNamesAndTypes, which carries aggregate states as they are and, unlike Native,
-    /// names its columns and types even when there are no rows (no history), so chDB always
-    /// knows the table's structure. The credentials go in headers (so they're in no URL or query
-    /// log).
-    pub fn http_source(http_url: &str, sql: &str, user: &str, password: &str) -> String {
-        let mut url = reqwest::Url::parse(http_url)
-            .unwrap_or_else(|_| reqwest::Url::parse("http://invalid/").expect("a URL"));
-        url.query_pairs_mut()
-            .append_pair("query", &format!("{sql} FORMAT RowBinaryWithNamesAndTypes"));
-        format!(
-            "url({}, 'RowBinaryWithNamesAndTypes', headers('X-ClickHouse-User' = {}, 'X-ClickHouse-Key' = {}))",
-            quote_string(url.as_str()),
-            quote_string(user),
-            quote_string(password)
         )
     }
 
@@ -1850,7 +1832,7 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
     }
 }
 
-fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
+fn semi_plan(s: &crate::bound::SemiJoin, outer: &BoundTable) -> SemiPlan {
     let inner = &s.inner;
     let mut needed: Vec<ColumnId> = s.keys.iter().map(|(_, ik)| *ik).collect();
     if let Some(f) = &s.inner_filter {
@@ -1917,37 +1899,8 @@ fn semi_plan(s: &crate::binder::SemiJoin, outer: &BoundTable) -> SemiPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binder::Projected;
+    use crate::bound::Projected;
 
-    #[test]
-    fn chdb_reads_states_over_http() {
-        let sql = "SELECT country AS __k0, uniqExactState(user_id) AS __a0_0 \
-                   FROM db.`__chlive_snap_events_1` WHERE path = 'a&b' GROUP BY __k0";
-        let src = AggregatePlan::http_source("http://ch:8123", sql, "ro", "it's secret");
-        // the query (with its FORMAT) is in the URL, encoded; the credentials are headers
-        assert_eq!(
-            src,
-            "url('http://ch:8123/?query=SELECT+country+AS+__k0%2C+uniqExactState%28user_id%29+AS+__a0_0+\
-             FROM+db.%60__chlive_snap_events_1%60+WHERE+path+%3D+%27a%26b%27+GROUP+BY+__k0+FORMAT+RowBinaryWithNamesAndTypes', \
-             'RowBinaryWithNamesAndTypes', headers('X-ClickHouse-User' = 'ro', 'X-ClickHouse-Key' = 'it\\'s secret'))"
-        );
-        assert!(
-            !src.contains("secret") || !src.split("headers").next().unwrap().contains("secret")
-        );
-        // HTTPS, a path, and parameters already in the URL are kept
-        let src = AggregatePlan::http_source(
-            "https://ch.example:8443/proxy?database=x",
-            "SELECT 1",
-            "u",
-            "",
-        );
-        assert!(
-            src.starts_with(
-                "url('https://ch.example:8443/proxy?database=x&query=SELECT+1+FORMAT+RowBinaryWithNamesAndTypes'"
-            ),
-            "{src}"
-        );
-    }
     use crate::watermark::Watermark;
     use serde_json::json;
 
@@ -2072,7 +2025,7 @@ mod tests {
             key: crate::table_engine::Key::from_system("user_id", ""),
         };
         let without = crate::cursor::fingerprint(&plan(&b));
-        b.table.final_key = Some(crate::binder::FinalKey {
+        b.table.final_key = Some(crate::bound::FinalKey {
             key: vec![ColumnId(1)],
             ver: Some(ColumnId(2)),
             deleted: None,

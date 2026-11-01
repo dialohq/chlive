@@ -9,37 +9,7 @@ use chlive_engine::EngineError;
 
 /// The wire form of an engine diff.
 pub fn change(d: Diff) -> Change {
-    match d {
-        Diff::Insert { row, index, id } => Change::Insert { row, index, id },
-        Diff::Delete { index } => Change::Delete {
-            index: Some(index),
-            id: None,
-        },
-        Diff::DeleteId { id } => Change::Delete {
-            index: None,
-            id: Some(id),
-        },
-        Diff::Update {
-            id,
-            set,
-            index,
-            edit,
-        } => Change::Update {
-            id,
-            set,
-            index,
-            edit: edit
-                .into_iter()
-                .map(|(column, e)| {
-                    let e = ArrayEdit {
-                        remove: e.remove.into_iter().map(|(s, c)| [s, c]).collect(),
-                        append: e.append,
-                    };
-                    (column, serde_json::to_value(e).expect("an edit is JSON"))
-                })
-                .collect(),
-        },
-    }
+    d.into_change()
 }
 
 /// An engine diff from its wire form (the server's change log, as sent).

@@ -289,6 +289,43 @@ impl std::fmt::Display for Diff {
     }
 }
 
+impl Diff {
+    /// Its wire form (the protocol's change).
+    pub fn into_change(self) -> chlive_protocol::Change {
+        match self {
+            Diff::Insert { row, index, id } => chlive_protocol::Change::Insert { row, index, id },
+            Diff::Delete { index } => chlive_protocol::Change::Delete {
+                index: Some(index),
+                id: None,
+            },
+            Diff::DeleteId { id } => chlive_protocol::Change::Delete {
+                index: None,
+                id: Some(id),
+            },
+            Diff::Update {
+                id,
+                set,
+                index,
+                edit,
+            } => chlive_protocol::Change::Update {
+                id,
+                set,
+                index,
+                edit: edit
+                    .into_iter()
+                    .map(|(column, e)| {
+                        let e = chlive_protocol::ArrayEdit {
+                            remove: e.remove.into_iter().map(|(s, c)| [s, c]).collect(),
+                            append: e.append,
+                        };
+                        (column, serde_json::to_value(e).expect("an edit is JSON"))
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

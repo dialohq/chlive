@@ -1,0 +1,15 @@
+[package]
+name = "chlive-core"
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+description = "chlive's pure part: the dialect, the plans and the stream's state, without IO (also for WebAssembly)"
+
+[dependencies]
+chlive-protocol = { path = "../protocol" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+chrono-tz = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std"] }

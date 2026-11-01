@@ -1,3 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["server", "tests", "engine", "protocol", "client-rs", "examples/rust-alerts", "tui"]
+members = ["server", "tests", "core", "engine", "wasm", "protocol", "client-rs", "examples/rust-alerts", "tui"]
+
+# The WebAssembly build (`wasm`): small rather than fast to build.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -405,7 +405,7 @@ mod tests {
             ),
         ];
         for (r, expected) in cases {
-            let e = refused(&engine, &[r.clone()], &u).await;
+            let e = refused(&engine, std::slice::from_ref(&r), &u).await;
             assert!(e.contains(expected), "{r}: {e}");
         }
         // one bad row: none of them go
