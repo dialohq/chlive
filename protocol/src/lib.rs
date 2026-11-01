@@ -55,6 +55,13 @@
 //! `INVALID_INSERT` (a row doesn't fit the table; nothing was produced) or `WRITE_FAILED`
 //! (Kafka; the message says which rows went in). Like queries, an insert reaches subscribers as
 //! a new event; an update or delete is an insert by the table's own convention.
+//!
+//! Optimistic results: a `subscribe` with `optimistic: true` gets a `plan` right before each
+//! `snapshot` or `resume`: how the server places rows in that result (its WHERE with the user's
+//! row filters, ORDER BY, LIMIT, OFFSET, FINAL, `now()` windows), so that the client can show
+//! its own inserts where the server's diffs will put them, before they come. Queries a client
+//! can't predict (aggregates, semi-joins, ordered or identified by columns the result doesn't
+//! have) get a `plan` with a `reason` instead.
 
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +94,10 @@ pub enum ClientMsg {
         /// The snapshot holds everything in Kafka when subscribing (see the module docs).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         complete: bool,
+        /// A `plan` comes before each snapshot, to predict the client's own rows with (see the
+        /// module docs).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optimistic: bool,
     },
     Unsubscribe {
         id: String,
@@ -140,6 +151,17 @@ pub enum ServerMsg {
         changes: Vec<Change>,
         /// The cursor after these changes.
         at: String,
+    },
+    /// An `optimistic` subscription's plan, before each of its snapshots (and resumes): how the
+    /// server places rows in this result, for the client to place its own pending rows the
+    /// same way (chlive-core's `ClientPlan`). Without one, `reason` says why the query isn't
+    /// predicted.
+    Plan {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        plan: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// The cursor moved without changes to the result (events that didn't match).
     Progress { id: String, at: String },
@@ -318,6 +340,7 @@ impl ServerMsg {
             | ServerMsg::Resume { id, .. }
             | ServerMsg::Diff { id, .. }
             | ServerMsg::Progress { id, .. }
+            | ServerMsg::Plan { id, .. }
             | ServerMsg::Ack { id, .. } => Some(id),
             ServerMsg::Error { id, .. } => id.as_deref(),
         }
@@ -356,6 +379,9 @@ mod tests {
         let m: ClientMsg =
             round_trip(json!({"type": "subscribe", "id": "s1", "sql": "x", "complete": true}));
         assert!(matches!(m, ClientMsg::Subscribe { complete: true, .. }));
+        let m: ClientMsg =
+            round_trip(json!({"type": "subscribe", "id": "s1", "sql": "x", "optimistic": true}));
+        assert!(matches!(m, ClientMsg::Subscribe { optimistic: true, .. }));
         // no params, not complete: neither sent
         let m: ClientMsg = serde_json::from_value(
             json!({"type": "subscribe", "id": "s1", "sql": "x", "params": {}, "complete": false}),
@@ -411,6 +437,13 @@ mod tests {
         ], "at": "c2"}));
         assert!(matches!(&m, ServerMsg::Diff { changes, .. } if changes.len() == 7));
         round_trip::<ServerMsg>(json!({"type": "progress", "id": "s1", "at": "c3"}));
+        let m: ServerMsg = round_trip(
+            json!({"type": "plan", "id": "s1", "plan": {"v": 1, "stream": {"filter": "all"}}}),
+        );
+        assert_eq!(m.id(), Some("s1"));
+        round_trip::<ServerMsg>(
+            json!({"type": "plan", "id": "s1", "reason": "GROUP BY and aggregates aren't predicted yet"}),
+        );
         let m: ServerMsg =
             round_trip(json!({"type": "ack", "id": "w1", "offsets": [[0, 41], [2, 7]]}));
         assert!(matches!(&m, ServerMsg::Ack { offsets, .. } if offsets == &[(0, 41), (2, 7)]));

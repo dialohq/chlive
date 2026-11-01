@@ -175,6 +175,7 @@ fn subscribe(id: &str, sub: &Sub) -> Message {
         since: sub.at.clone(),
         params: sub.params.clone(),
         complete: sub.complete,
+        optimistic: false,
     })
 }
 

@@ -476,6 +476,8 @@ impl<R: DeserializeOwned> Subscription<R> {
                     }
                     // inserts' answers go to them, never to a subscription
                     ServerMsg::Ack { .. } => None,
+                    // never asked for yet
+                    ServerMsg::Plan { .. } => None,
                     ServerMsg::Error { code, message, .. } => {
                         return Some(self.fail(&code, message));
                     }

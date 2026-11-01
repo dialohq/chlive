@@ -111,13 +111,19 @@ pub struct TableRef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CmpOp {
+    #[serde(rename = "=")]
     Eq,
+    #[serde(rename = "!=")]
     NotEq,
+    #[serde(rename = "<")]
     Lt,
+    #[serde(rename = "<=")]
     LtEq,
+    #[serde(rename = ">")]
     Gt,
+    #[serde(rename = ">=")]
     GtEq,
 }
 

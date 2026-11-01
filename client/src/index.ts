@@ -712,6 +712,9 @@ export class LiveClient {
         case "ack":
           // inserts' answers are theirs, never a subscription's
           return;
+        case "plan":
+          // never asked for yet
+          return;
         case "snapshot":
           rec.store.applySnapshot(msg);
           stats.snapshots++;

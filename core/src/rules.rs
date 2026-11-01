@@ -10,7 +10,8 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A Kafka topic.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TopicId(pub String);
 
 impl fmt::Display for TopicId {
@@ -41,8 +42,9 @@ impl fmt::Display for KafkaField {
     }
 }
 
-/// Where an event holds a column's value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Where an event holds a column's value: `{"json": key}` or `{"kafka": field}` in a plan.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ColumnSource {
     /// A key of the message's JSON object.
     Json(String),

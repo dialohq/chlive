@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ast::CmpOp;
 use crate::calendar::Interval;
 use crate::error::Span;
@@ -14,7 +16,8 @@ use crate::types::{Type, Value};
 pub type Params = BTreeMap<String, serde_json::Value>;
 
 /// Index of a column in [`BoundTable::columns`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ColumnId(pub usize);
 
 /// A column of a dialect table, with where it lives on each side.
@@ -226,7 +229,7 @@ impl AggFunc {
 }
 
 /// One ORDER BY key, with ClickHouse's defaults resolved: ascending, NULLS LAST.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderKey {
     pub column: ColumnId,
     pub desc: bool,
@@ -234,7 +237,8 @@ pub struct OrderKey {
 }
 
 /// A typed expression. Literals are already coerced to the type they are compared with.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BoundExpr {
     Column(ColumnId),
     Literal(Value),

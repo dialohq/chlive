@@ -6,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chlive_engine::diff::Row;
 use chlive_engine::history::{DescribedColumn, HistoryError, HistorySource};
+use chlive_engine::plan::{ClientPlan, Filter};
 use chlive_engine::rules::{ConfiguredRules, TopicId};
 use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Snapshots};
 use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
@@ -2495,4 +2496,68 @@ async fn insert_limits() {
     assert_eq!(error_code(&mut c, "w2").await, "INVALID_INSERT");
     insert(&mut c, "w3", json!([{}, {}])).await;
     assert_eq!(c.expect().await["type"], "ack");
+}
+
+/// An optimistic subscription's next two messages: its plan (or why there's none), then its
+/// snapshot.
+async fn plan_then_snapshot(c: &mut Client, id: &str) -> Result<ClientPlan, String> {
+    let m = c.expect().await;
+    assert_eq!((&m["type"], &m["id"]), (&json!("plan"), &json!(id)), "{m}");
+    let snapshot = c.expect().await;
+    assert_eq!(snapshot["type"], "snapshot", "{snapshot}");
+    match m.get("plan") {
+        Some(p) => Ok(serde_json::from_value(p.clone()).unwrap()),
+        None => Err(m["reason"].as_str().unwrap().to_string()),
+    }
+}
+
+#[tokio::test]
+async fn optimistic_subscriptions_get_their_plan_before_each_snapshot() {
+    let p = MemoryProvider::loaded();
+    p.set(0, "alice", &["fast"]);
+    let server = server_with(secured(p.clone())).await;
+    let mut a = Client::connect(&server).await;
+    hello(&mut a, "alice").await;
+    let sql = "select user_id, latency_ms from requests order by latency_ms desc limit 2";
+    a.send(json!({"type": "subscribe", "id": "s", "sql": sql, "optimistic": true}))
+        .await;
+    let plan = plan_then_snapshot(&mut a, "s").await.unwrap();
+    assert_eq!(plan.v, ClientPlan::VERSION);
+    assert!(plan.stream.topics.is_empty());
+    assert_eq!(plan.stream.limit, Some(2));
+    // the user's row filter is in its WHERE
+    let where_ = |plan: &ClientPlan| match &plan.stream.filter {
+        Filter::Where { text, .. } => text.clone(),
+        Filter::All => String::new(),
+    };
+    assert_eq!(where_(&plan), "user_id IN ('fast')");
+
+    // new permissions: a new plan, then the new snapshot
+    p.set(0, "alice", &["fast", "slower"]);
+    loop {
+        let m = a.expect().await;
+        if m["type"] == "plan" {
+            let plan: ClientPlan = serde_json::from_value(m["plan"].clone()).unwrap();
+            assert_eq!(where_(&plan), "user_id IN ('fast', 'slower')");
+            assert_eq!(a.expect().await["type"], "snapshot");
+            break;
+        }
+        assert_eq!(m["type"], "diff", "{m}");
+    }
+
+    // what a client can't predict: why, and the snapshot as usual
+    let mut c = Client::connect(&server).await;
+    hello(&mut c, "alice").await;
+    let sql = "select user_id from requests order by latency_ms";
+    c.send(json!({"type": "subscribe", "id": "g", "sql": sql, "optimistic": true}))
+        .await;
+    assert_eq!(
+        plan_then_snapshot(&mut c, "g").await.unwrap_err(),
+        "the result is ordered by latency_ms, which it doesn't have"
+    );
+    // not optimistic: no plan
+    let mut n = Client::connect(&server).await;
+    hello(&mut n, "alice").await;
+    n.subscribe("n", "select user_id from requests").await;
+    assert_eq!(n.expect().await["type"], "snapshot");
 }

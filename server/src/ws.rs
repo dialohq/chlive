@@ -329,6 +329,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                 since,
                 params,
                 complete,
+                optimistic,
             } => {
                 greeted = true;
                 // a subscription whose entry failed is over: its id can be used again
@@ -354,7 +355,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                     .await;
                     continue;
                 }
-                debug!(conn, id, sql, complete, "subscribe");
+                debug!(conn, id, sql, complete, optimistic, "subscribe");
                 let mut access = match permitted(&s.settings.security, user.as_deref(), &sql) {
                     Ok(a) => a,
                     Err(e) => {
@@ -406,6 +407,9 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                         continue;
                     }
                 };
+                if optimistic {
+                    send(plan_msg(&id, &plan)).await;
+                }
                 let joined = s.hub.join(
                     &plan,
                     &sql,
@@ -439,6 +443,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                         sql,
                         params,
                         complete,
+                        optimistic,
                         access,
                         filters,
                         watchers,
@@ -513,6 +518,8 @@ struct Live {
     params: Params,
     /// Its snapshots cover Kafka as it was when they were asked for.
     complete: bool,
+    /// A `plan` comes before each of its snapshots.
+    optimistic: bool,
     /// Per table it reads, its access (watched while it changes).
     access: Vec<(String, TableAccess)>,
     /// The filters its entry was planned with.
@@ -557,6 +564,19 @@ async fn insert(
             offsets,
         },
         Err(e) => engine_error(id, &e),
+    }
+}
+
+/// An optimistic subscription's `plan` message: the plan a client predicts with, or why not.
+fn plan_msg(id: &str, plan: &Plan) -> ServerMsg {
+    let (plan, reason) = match plan.client() {
+        Ok(p) => (Some(serde_json::to_value(p).expect("a plan is JSON")), None),
+        Err(reason) => (None, Some(reason)),
+    };
+    ServerMsg::Plan {
+        id: id.to_string(),
+        plan,
+        reason,
     }
 }
 
@@ -651,6 +671,9 @@ async fn refilter(
         }
     };
     debug!(conn, id, "permissions changed: new snapshot");
+    if live.optimistic {
+        let _ = tx.send(Outgoing::Msg(plan_msg(id, &plan))).await;
+    }
     live.joined = s.hub.join(
         &plan,
         &live.sql,

@@ -137,6 +137,7 @@ mod tests {
                 since: None,
                 params: Default::default(),
                 complete: false,
+                optimistic: false,
             }
         );
         let m: ClientMsg = serde_json::from_value(

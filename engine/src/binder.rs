@@ -3363,4 +3363,111 @@ mod tests {
             "LIMIT in an EXISTS sub-query is not supported yet at 1:63"
         );
     }
+
+    fn event_row(i: i64) -> Row {
+        serde_json::json!({
+            "ts": format!("2026-11-01 12:{:02}:00.{:03}", i % 60, (i * 37) % 1000),
+            "user_id": (["a", "b", "c"][(i % 3) as usize]),
+            "latency_ms": (i * 7919) % 200,
+            "coupon": if i % 4 == 0 { serde_json::Value::Null } else { format!("x{}", i % 2).into() },
+            "paid": i % 5 == 0,
+            "tags": ["t"],
+            "product_id": format!("p{}", i % 6),
+            "version": i,
+            "deleted": u8::from(i % 9 == 8),
+            "item_id": format!("i{}", i % 4),
+            "name": format!("n{i}"),
+            "_version": i,
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    /// The plans clients predict with: the same after JSON (every value, type, timezone and
+    /// expression), placing the same rows the same way; queries a client can't predict say why.
+    #[tokio::test]
+    async fn client_plans_survive_json_and_place_rows_the_same() {
+        use crate::plan::{plan, ClientPlan};
+        use crate::source::Event;
+        use crate::state::ResultState;
+
+        let predicted = [
+            "select ts, user_id, latency_ms from events",
+            "select * from events where latency_ms > 100 and user_id in ('a', 'b') \
+             and coupon is not null and not paid order by latency_ms desc, ts limit 10",
+            "select user_id, latency_ms from events where coupon = 'x1' or latency_ms <= 30 \
+             order by latency_ms nulls first limit 5 offset 2",
+            "select user_id from events where coupon not in ('x0') limit 3",
+            "select user_id from events limit 3 offset 2",
+            "select ts, user_id from events where ts > now('Europe/Warsaw') - interval 1 day \
+             and ts <= now() + interval 90 minute order by ts",
+            "select product_id, version from products final where version > 1",
+            "select * from products final order by version desc limit 5",
+            "select item_id, name from items final",
+        ];
+        let now = 1_793_534_400_000_000_000i128; // 2026-11-01 12:00 UTC
+        for sql in predicted {
+            let plan = plan(&bind_sql(sql).await.unwrap());
+            let client = plan.client().unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(client.stream.topics.is_empty(), "{sql}");
+            let json = serde_json::to_string(&client).unwrap();
+            let back: ClientPlan = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, client, "{sql}: {json}");
+
+            let (ours, theirs) = (&plan.stream, &back.stream);
+            let (mut a, mut b) = (ResultState::for_plan(ours), ResultState::for_plan(theirs));
+            let mut placed = 0;
+            for i in 0..60 {
+                let event = Event {
+                    topic: TopicId("events".into()),
+                    partition: 0,
+                    offset: i,
+                    timestamp: None,
+                    value: event_row(i),
+                };
+                let (ra, rb) = (ours.decode(&event).unwrap(), theirs.decode(&event).unwrap());
+                assert_eq!(ra, rb, "{sql}");
+                // with now(), in the result by the row's schedule, as the engine has it
+                let (sa, sb) = (ours.schedule(&ra, now), theirs.schedule(&rb, now));
+                assert_eq!(sa, sb, "{sql}");
+                let matches = if ours.timed() { sa.in_now } else { ours.matches(&ra) };
+                assert_eq!(ours.matches(&ra), theirs.matches(&rb), "{sql}");
+                let diffs = a.event_matching(ours, &ra, (0, i), matches);
+                assert_eq!(
+                    diffs,
+                    b.event_matching(theirs, &rb, (0, i), matches),
+                    "{sql}"
+                );
+                placed += diffs.len();
+            }
+            assert!(placed > 0, "{sql}: no rows placed");
+            if std::env::var_os("SHOW_PLAN").is_some() {
+                println!("{sql}\n{json}\n");
+            }
+        }
+
+        let not_predicted = [
+            (
+                "select user_id, count() from events group by user_id",
+                "GROUP BY and aggregates aren't predicted yet",
+            ),
+            (
+                "select ts from events where user_id in (select user_id from sessions)",
+                "IN (SELECT …) and EXISTS aren't predicted",
+            ),
+            (
+                "select user_id from events order by latency_ms limit 5",
+                "the result is ordered by latency_ms, which it doesn't have",
+            ),
+            (
+                "select version from products final",
+                "FINAL's key product_id isn't in the result",
+            ),
+        ];
+        for (sql, reason) in not_predicted {
+            let plan = plan(&bind_sql(sql).await.unwrap());
+            assert_eq!(plan.client().unwrap_err(), reason, "{sql}");
+        }
+    }
 }

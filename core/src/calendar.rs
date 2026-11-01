@@ -5,10 +5,12 @@
 
 use chrono::{DateTime, Days, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
+use serde::{Deserialize, Serialize};
 
 const NS: i128 = 1_000_000_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Unit {
     Millisecond,
     Second,
@@ -51,7 +53,7 @@ impl Unit {
 }
 
 /// `± INTERVAL n unit`; `amount` carries the sign.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interval {
     pub amount: i64,
     pub unit: Unit,

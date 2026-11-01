@@ -240,6 +240,34 @@ impl fmt::Display for Type {
     }
 }
 
+/// As its ClickHouse name, in plans.
+impl serde::Serialize for Type {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.clickhouse)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Type {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Type::parse(&String::deserialize(d)?))
+    }
+}
+
+/// In [`Value::save`]'s form, in plans.
+impl serde::Serialize for Value {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.save().serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Value {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let json = Json::deserialize(d)?;
+        Value::load(&json)
+            .ok_or_else(|| serde::de::Error::custom(format!("not a saved value: {json}")))
+    }
+}
+
 fn strip_wrapper<'a>(t: &'a str, name: &str) -> Option<&'a str> {
     t.strip_prefix(name)?.strip_prefix('(')?.strip_suffix(')')
 }

@@ -26,8 +26,17 @@ export type ClientMessage =
   /** Who the client is: before any `subscribe`, at most once per connection. */
   | { type: "hello"; user?: string }
   /** `since`: the `at` of a result the client already holds (e.g. cached), to resume from it.
-   * `params`: values for the query's parameters. */
-  | { type: "subscribe"; id: string; sql: string; since?: string; params?: Params }
+   * `params`: values for the query's parameters. `complete`: the snapshot holds everything in
+   * Kafka when subscribing. `optimistic`: a `plan` comes before each snapshot. */
+  | {
+      type: "subscribe";
+      id: string;
+      sql: string;
+      since?: string;
+      params?: Params;
+      complete?: boolean;
+      optimistic?: boolean;
+    }
   | { type: "unsubscribe"; id: string }
   /** Rows to insert into `table`, each by column name (as queries name them); answered by an
    * `ack` or an `error` with this id (the client's own, apart from subscriptions'). */
@@ -153,4 +162,24 @@ export interface AckMessage {
   offsets: [number, number][];
 }
 
-export type ServerMessage = SnapshotMessage | ResumeMessage | DiffMessage | ProgressMessage | AckMessage | ErrorMessage;
+/**
+ * An `optimistic` subscription's plan, before each of its snapshots (and resumes): how the
+ * server places rows in this result (chlive-core's `ClientPlan`, opaque here), for placing the
+ * client's own pending rows the same way. Without one, `reason` says why the query isn't
+ * predicted.
+ */
+export interface PlanMessage {
+  type: "plan";
+  id: string;
+  plan?: unknown;
+  reason?: string;
+}
+
+export type ServerMessage =
+  | SnapshotMessage
+  | ResumeMessage
+  | DiffMessage
+  | ProgressMessage
+  | PlanMessage
+  | AckMessage
+  | ErrorMessage;

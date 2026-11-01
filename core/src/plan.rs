@@ -4,6 +4,8 @@
 
 use std::cmp::Ordering;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ast::CmpOp;
 use crate::bound::{
     AggExpr, AggFunc, Aggregation, BoundColumn, BoundExpr, BoundQuery, BoundTable, ColumnId,
@@ -704,14 +706,16 @@ impl HistoryPlan {
 }
 
 /// A column the stream needs: decoded from `source` as `ty`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamColumn {
     pub id: ColumnId,
+    /// Its dialect name in the table (what an insert's rows call it).
+    pub name: String,
     pub source: ColumnSource,
     pub ty: Type,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamPlan {
     /// The only topics the query needs; nothing else is consumed.
     pub topics: Vec<TopicId>,
@@ -750,7 +754,7 @@ pub struct Schedule {
 
 /// The `now()` side of a comparison in the WHERE, for the stream: `column op now(['tz']) ±
 /// INTERVAL …` flips once for a row, at its threshold ([`WindowPlan::threshold`]).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowPlan {
     pub column: ColumnId,
     pub ty: Type,
@@ -792,7 +796,7 @@ fn now_text(tz: Option<chrono_tz::Tz>, intervals: &[Interval]) -> String {
 
 /// FINAL for the stream: what identifies a row, which version it is, and whether it's deleted;
 /// and where history rows carry the key and version (hidden fields, removed before output).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyedPlan {
     pub key: Vec<KeyedColumn>,
     pub ver: Option<KeyedColumn>,
@@ -807,7 +811,7 @@ pub struct KeyedPlan {
 /// or ranked by ORDER BY), the first m held back and `buffer` more after them. The history
 /// reads `m + n + buffer` rows (all of them without LIMIT). A refill reads `m + n + 2·buffer`
 /// (candidates for the buffer), or with ORDER BY `m + n + buffer` (a fresh top, rebuilt).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct KeyedWindowPlan {
     /// `None`: no LIMIT, every row after the first m.
     pub limit: Option<u64>,
@@ -838,7 +842,7 @@ impl KeyedWindowPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyedColumn {
     pub id: ColumnId,
     pub ty: Type,
@@ -889,7 +893,7 @@ fn id_of(key: &[Value]) -> String {
 }
 
 /// ORDER BY for the stream: the keys, and where each key's value is found in a history row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderPlan {
     pub keys: KeyOrder,
     pub columns: Vec<OrderColumn>,
@@ -900,7 +904,7 @@ pub struct OrderPlan {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderColumn {
     pub id: ColumnId,
     /// Its output name when selected, otherwise the column's dialect name.
@@ -936,7 +940,8 @@ impl OrderPlan {
 }
 
 /// Decides whether an event is relevant to the query.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Filter {
     /// Every event of the subscribed topics.
     All,
@@ -1372,6 +1377,59 @@ fn engine_note(engine: &TableEngine, keyed: Option<&KeyedPlan>) -> Option<String
 }
 
 /// What `--explain` shows.
+/// What a client needs to place rows of its own as the server would (an `optimistic`
+/// subscription's `plan` message): the stream plan, without what only the server uses (its
+/// topics). Row-level security is already in its WHERE.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientPlan {
+    /// The format's version, [`ClientPlan::VERSION`]; a client refuses others.
+    pub v: u32,
+    pub stream: StreamPlan,
+}
+
+impl ClientPlan {
+    pub const VERSION: u32 = 1;
+}
+
+impl Plan {
+    /// The plan a client predicts with, or why there's none: a client has only the result's
+    /// rows, so the columns it ranks or identifies them by must be in them (ORDER BY's, FINAL's
+    /// key; not FINAL's version: a client's own row is the newest); and aggregates and
+    /// semi-joins aren't predicted.
+    pub fn client(&self) -> Result<ClientPlan, String> {
+        if self.aggregate.is_some() {
+            return Err("GROUP BY and aggregates aren't predicted yet".into());
+        }
+        if self.semi.is_some() {
+            return Err("IN (SELECT …) and EXISTS aren't predicted".into());
+        }
+        let s = &self.stream;
+        let shown = |id: ColumnId| s.output.iter().any(|(_, c)| *c == id);
+        let name = |id: ColumnId| {
+            s.columns
+                .iter()
+                .find(|c| c.id == id)
+                .map_or_else(String::new, |c| c.name.clone())
+        };
+        if let Some(c) = s.order.iter().flat_map(|o| &o.columns).find(|c| !shown(c.id)) {
+            return Err(format!(
+                "the result is ordered by {}, which it doesn't have",
+                c.name
+            ));
+        }
+        if let Some(c) = s.keyed.iter().flat_map(|k| &k.key).find(|c| !shown(c.id)) {
+            return Err(format!("FINAL's key {} isn't in the result", name(c.id)));
+        }
+        Ok(ClientPlan {
+            v: ClientPlan::VERSION,
+            stream: StreamPlan {
+                topics: Vec::new(),
+                ..s.clone()
+            },
+        })
+    }
+}
+
 impl std::fmt::Display for Plan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let columns: Vec<&str> = self.columns.iter().map(|c| c.name.as_str()).collect();
@@ -1789,6 +1847,7 @@ pub fn plan_with(bound: &BoundQuery, final_buffer: u64) -> Plan {
                 let c = table.column(*id);
                 StreamColumn {
                     id: *id,
+                    name: c.name.clone(),
                     source: c.source.clone(),
                     ty: c.ty.clone(),
                 }
@@ -1852,6 +1911,7 @@ fn semi_plan(s: &crate::bound::SemiJoin, outer: &BoundTable) -> SemiPlan {
                 let c = inner.column(*id);
                 StreamColumn {
                     id: *id,
+                    name: c.name.clone(),
                     source: c.source.clone(),
                     ty: c.ty.clone(),
                 }

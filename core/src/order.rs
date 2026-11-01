@@ -38,7 +38,8 @@ fn bad(what: &str) -> String {
 }
 
 /// Compares sort keys by ORDER BY's keys: each one's direction and NULL placement.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct KeyOrder(pub Vec<OrderKey>);
 
 impl KeyOrder {

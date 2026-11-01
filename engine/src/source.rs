@@ -533,8 +533,11 @@ impl EventSink for MemorySink {
 /// the last message.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySource {
-    topics: BTreeMap<TopicId, BTreeMap<i32, Vec<(Option<i64>, String)>>>,
+    topics: BTreeMap<TopicId, BTreeMap<i32, Messages>>,
 }
+
+/// A partition's messages, in offset order: each one's timestamp (if any) and JSON.
+type Messages = Vec<(Option<i64>, String)>;
 
 impl MemorySource {
     pub fn new() -> Self {
