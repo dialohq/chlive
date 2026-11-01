@@ -2295,3 +2295,204 @@ async fn columns_must_be_granted_and_star_follows_them() {
     assert_eq!(star[0]["type"], "snapshot", "{star:?}");
     assert_eq!(columns_of(&star[0]), ["user_id"]);
 }
+
+// --- inserts ------------------------------------------------------------------------------------
+
+/// What's inserted is produced like Kafka would: appended to `requests`, and delivered to every
+/// subscription reading it.
+#[async_trait]
+impl chlive_engine::source::EventSink for Live {
+    async fn produce(
+        &self,
+        topic: &TopicId,
+        messages: Vec<chlive_engine::source::Outgoing>,
+    ) -> Vec<Result<(i32, i64), SourceError>> {
+        assert_eq!(topic.0, "requests");
+        messages
+            .into_iter()
+            .map(|m| {
+                self.push_raw(m.value);
+                Ok((0, self.0.messages.lock().unwrap().len() as i64 - 1))
+            })
+            .collect()
+    }
+}
+
+/// A server whose `requests` takes inserts as `insert` says, with these settings.
+async fn insert_server(
+    live: &Live,
+    insert: Value,
+    settings: ServerSettings,
+) -> chlive_server::Server {
+    let tables = serde_json::from_value(json!({"requests": {"insert": insert}})).unwrap();
+    let engine = Engine::new(
+        ConfiguredRules::new(tables).unwrap(),
+        FakeHistory,
+        live.clone(),
+        FakeSnapshots,
+    )
+    .with_sink(live.clone());
+    chlive_server::start_with("127.0.0.1:0", settings, engine)
+        .await
+        .unwrap()
+}
+
+async fn insert(c: &mut Client, id: &str, rows: Value) {
+    c.send(json!({"type": "insert", "id": id, "table": "requests", "rows": rows}))
+        .await;
+}
+
+/// The next error's code, for `id`.
+async fn error_code(c: &mut Client, id: &str) -> String {
+    let m = c.expect().await;
+    assert_eq!(
+        (m["type"].as_str(), m["id"].as_str()),
+        (Some("error"), Some(id)),
+        "{m}"
+    );
+    m["code"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn inserts_are_acked_and_arrive_like_any_event() {
+    let live = Live::new();
+    let server = insert_server(&live, json!({"user": "user_id"}), ServerSettings::default()).await;
+    let mut reader = Client::connect(&server).await;
+    reader
+        .subscribe("s", "select user_id, latency_ms from requests")
+        .await;
+    assert_eq!(reader.expect().await["type"], "snapshot");
+
+    let mut w = Client::connect(&server).await;
+    hello(&mut w, "alice").await;
+    insert(
+        &mut w,
+        "w1",
+        json!([{"latency_ms": 12}, {"latency_ms": "40"}]),
+    )
+    .await;
+    let ack = w.expect().await;
+    assert_eq!(
+        ack,
+        json!({"type": "ack", "id": "w1", "offsets": [[0, 1], [0, 2]]})
+    );
+    // as alice: the server sets user_id
+    assert_eq!(
+        reader.inserts("s", 2).await,
+        [
+            json!({"user_id": "alice", "latency_ms": 12}),
+            json!({"user_id": "alice", "latency_ms": 40})
+        ]
+    );
+    // and not as anyone else
+    insert(&mut w, "w2", json!([{"user_id": "bob", "latency_ms": 1}])).await;
+    assert_eq!(error_code(&mut w, "w2").await, "INVALID_INSERT");
+    insert(&mut w, "w3", json!([{"latency_ms": -1}])).await;
+    assert_eq!(error_code(&mut w, "w3").await, "INVALID_INSERT");
+    // no hello: no user
+    let mut anon = Client::connect(&server).await;
+    insert(&mut anon, "w1", json!([{"latency_ms": 1}])).await;
+    assert_eq!(error_code(&mut anon, "w1").await, "PERMISSION_DENIED");
+    assert_eq!(reader.next().await, None, "nothing refused went in");
+    let state: Value =
+        serde_json::from_str(&http_get(&format!("http://{}/debug/state", server.addr)).await)
+            .unwrap();
+    assert_eq!(
+        (
+            &state["server"]["inserts"],
+            &state["server"]["insertsFailed"]
+        ),
+        (&json!(1), &json!(3))
+    );
+}
+
+#[tokio::test]
+async fn tables_take_inserts_only_when_configured() {
+    let live = Live::new();
+    let server = live_server(&live, ServerSettings::default()).await;
+    let mut c = Client::connect(&server).await;
+    insert(&mut c, "w1", json!([{"user_id": "u", "latency_ms": 1}])).await;
+    let m = c.expect().await;
+    assert_eq!(m["code"], "PERMISSION_DENIED");
+    assert_eq!(m["message"], "requests doesn't take inserts");
+    // a public one takes anyone's rows as they are
+    let server = insert_server(&live, json!({"public": true}), ServerSettings::default()).await;
+    let mut c = Client::connect(&server).await;
+    insert(&mut c, "w1", json!([{"user_id": "u", "latency_ms": 1}])).await;
+    assert_eq!(c.expect().await["type"], "ack");
+}
+
+#[tokio::test]
+async fn insert_grants_decide_who_inserts_which_rows_and_columns() {
+    let live = Live::new();
+    let p = MemoryProvider::loaded();
+    let source = |grant| Source {
+        provider: p.clone(),
+        grant,
+    };
+    let security = Security::open().inserts(
+        "requests",
+        chlive_server::security::InsertRule {
+            table: None,
+            rows: Some(("user_id".into(), source(0))),
+            columns: Some(source(1)),
+        },
+    );
+    let settings = ServerSettings {
+        security: std::sync::Arc::new(security),
+        ..Default::default()
+    };
+    let server = insert_server(&live, json!({}), settings).await;
+    p.set(0, "alice", &["team-a"]);
+    p.set(1, "alice", &["user_id"]);
+    let mut c = Client::connect(&server).await;
+    hello(&mut c, "alice").await;
+    insert(&mut c, "w1", json!([{"user_id": "team-b"}])).await;
+    let m = c.expect().await;
+    assert_eq!(m["code"], "INVALID_INSERT");
+    assert!(
+        m["message"]
+            .as_str()
+            .unwrap()
+            .contains("user_id = \"team-b\""),
+        "{m}"
+    );
+    insert(
+        &mut c,
+        "w2",
+        json!([{"user_id": "team-a", "latency_ms": 5}]),
+    )
+    .await;
+    assert!(c.expect().await["message"]
+        .as_str()
+        .unwrap()
+        .contains("may not set latency_ms"));
+    insert(&mut c, "w3", json!([{"user_id": "team-a"}])).await;
+    assert_eq!(c.expect().await["type"], "ack");
+    // grants change: the next insert follows them
+    p.set(0, "alice", &[]);
+    insert(&mut c, "w4", json!([{"user_id": "team-a"}])).await;
+    assert_eq!(error_code(&mut c, "w4").await, "INVALID_INSERT");
+}
+
+#[tokio::test]
+async fn insert_limits() {
+    let live = Live::new();
+    let settings = ServerSettings {
+        max_insert_rows: 2,
+        ..Default::default()
+    };
+    let server = insert_server(&live, json!({"public": true}), settings).await;
+    let mut c = Client::connect(&server).await;
+    insert(&mut c, "w1", json!([{}, {}, {}])).await;
+    let m = c.expect().await;
+    assert_eq!(m["code"], "INVALID_INSERT");
+    assert!(
+        m["message"].as_str().unwrap().contains("max_insert_rows"),
+        "{m}"
+    );
+    insert(&mut c, "w2", json!([])).await;
+    assert_eq!(error_code(&mut c, "w2").await, "INVALID_INSERT");
+    insert(&mut c, "w3", json!([{}, {}])).await;
+    assert_eq!(c.expect().await["type"], "ack");
+}

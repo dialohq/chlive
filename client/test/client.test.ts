@@ -1,7 +1,7 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 
-import { type CachedResult, cacheKey, LiveClient, type LiveState, opfsAvailable, type ResultCache } from "../src/index.ts";
+import { type CachedResult, cacheKey, InsertError, LiveClient, type LiveState, opfsAvailable, type ResultCache } from "../src/index.ts";
 
 /** Minimal in-memory WebSocket double. */
 class FakeSocket {
@@ -638,4 +638,44 @@ test("a user says hello first on every connection, and caches results as theirs"
     { type: "subscribe", id: "s1", sql: SQL, since: "c2" },
   ]);
   client.close();
+});
+
+test("inserts are sent once connected, after hello, and answered by id", async () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", user: "alice", minBackoffMs: 5, WebSocket: FakeSocket as any, cache: false });
+  // no subscription: the insert connects
+  const first = client.insert("messages", { body: "hi" });
+  const ws = FakeSocket.all[0];
+  ws.open();
+  assert.deepEqual(ws.sent, [
+    { type: "hello", user: "alice" },
+    { type: "insert", id: "w1", table: "messages", rows: [{ body: "hi" }] },
+  ]);
+  ws.deliver({ type: "ack", id: "w1", offsets: [[2, 40]] });
+  assert.deepEqual(await first, { offsets: [[2, 40]] });
+  // while connected: sent at once; an error is that insert's
+  const second = client.insert("messages", [{ body: "a" }, { body: "b" }]);
+  assert.deepEqual(ws.sent.at(-1), { type: "insert", id: "w2", table: "messages", rows: [{ body: "a" }, { body: "b" }] });
+  ws.deliver({ type: "error", id: "w2", code: "INVALID_INSERT", message: "no column nope in messages" });
+  await assert.rejects(second, (e: InsertError) => e instanceof InsertError && e.code === "INVALID_INSERT");
+  client.close();
+});
+
+test("an insert unanswered when the connection drops is DISCONNECTED; closing fails the rest", async () => {
+  FakeSocket.all = [];
+  const client = new LiveClient({ url: "ws://x/live", minBackoffMs: 5, WebSocket: FakeSocket as any, cache: false });
+  const sent = client.insert("messages", { body: "hi" });
+  FakeSocket.all[0].open();
+  FakeSocket.all[0].close();
+  await assert.rejects(sent, (e: InsertError) => e.code === "DISCONNECTED");
+  // queued while reconnecting: sent on the next connection
+  const queued = client.insert("messages", { body: "again" });
+  await tick(20);
+  FakeSocket.all[1].open();
+  assert.deepEqual(FakeSocket.all[1].sent, [{ type: "insert", id: "w2", table: "messages", rows: [{ body: "again" }] }]);
+  const unsent = client.insert("messages", { body: "late" });
+  client.close();
+  await assert.rejects(queued, (e: InsertError) => e.code === "CLIENT_ERROR");
+  await assert.rejects(unsent, (e: InsertError) => e.code === "CLIENT_ERROR");
+  await assert.rejects(client.insert("messages", {}), (e: InsertError) => e.code === "CLIENT_ERROR");
 });

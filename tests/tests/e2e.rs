@@ -216,6 +216,100 @@ async fn history_has_everything_produced_before_subscribing() -> Result<()> {
     .await
 }
 
+/// Rows inserted through the server (the Rust client): acked with their offsets, in a live
+/// result at once, and in ClickHouse as written (renders, types, the Kafka columns); a row the
+/// table can't take is refused and never produced.
+#[tokio::test]
+async fn inserted_rows_reach_subscribers_and_clickhouse() -> Result<()> {
+    use chlive_client::{ClientOptions, LiveClient};
+    use futures::StreamExt;
+
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    with_server(config(), |server| {
+        async move {
+            let run = chrono::Utc::now().timestamp_millis();
+            let users: Vec<String> = (0..4).map(|i| format!("insert-{run}-{i}")).collect();
+            let sql = format!(
+                "select ts, user_id, latency_ms, session_id, kafka_partition, kafka_offset from events where user_id in ({})",
+                users.iter().map(|u| format!("'{u}'")).collect::<Vec<_>>().join(", ")
+            );
+            let client = LiveClient::new(ClientOptions::new(format!("ws://{}/live", server.addr)));
+            let (history, mut inserted) = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.query(&sql).history::<Row>(),
+            )
+            .await??;
+            assert!(history.is_empty());
+
+            let rows: Vec<serde_json::Value> = users
+                .iter()
+                .enumerate()
+                .map(|(i, u)| {
+                    json!({"ts": "2026-11-01 12:00:00.250", "user_id": u, "latency_ms": i * 10,
+                           "session_id": "6F1D3A201B2C4D5E8F90A1B2C3D4E5F6"})
+                })
+                .collect();
+            let ack = client.insert("events", &rows).await?;
+            assert_eq!(ack.offsets.len(), users.len());
+
+            // live: each row once, with the offset the ack said
+            let mut live = Vec::new();
+            for _ in &users {
+                let row = tokio::time::timeout(Duration::from_secs(30), inserted.next())
+                    .await?
+                    .expect("a row")?;
+                live.push(row);
+            }
+            for (user, (partition, offset)) in users.iter().zip(&ack.offsets) {
+                let row = live
+                    .iter()
+                    .find(|r| r["user_id"] == user.as_str())
+                    .unwrap_or_else(|| panic!("{user} isn't live"));
+                assert_eq!(row["kafka_partition"], json!(partition), "{user}");
+                assert_eq!(row["kafka_offset"], json!(offset), "{user}");
+                assert_eq!(row["ts"], "2026-11-01 12:00:00.250");
+                assert_eq!(row["session_id"], "6f1d3a20-1b2c-4d5e-8f90-a1b2c3d4e5f6");
+            }
+
+            // ClickHouse has the same rows
+            let mut produced = std::collections::BTreeMap::new();
+            for (p, o) in &ack.offsets {
+                let e = produced.entry(*p).or_insert(*o);
+                *e = (*e).max(*o);
+            }
+            wait_ingested(&produced).await?;
+            let live: Vec<Row> = live.iter().map(|r| (**r).clone()).collect();
+            assert_eq!(multiset(&live), multiset(&direct(&sql).await?));
+
+            // refused: a column it doesn't have, a value that doesn't fit, a Kafka column
+            for bad in [
+                json!({"user_id": users[0], "nope": 1}),
+                json!({"user_id": users[0], "latency_ms": -5}),
+                json!({"user_id": users[0], "kafka_offset": 1}),
+            ] {
+                let e = client.insert("events", [&bad]).await.unwrap_err();
+                assert_eq!(e.code, "INVALID_INSERT", "{bad}: {e}");
+            }
+            // a table without [tables.orders.insert]
+            let e = client.insert("orders", [json!({})]).await.unwrap_err();
+            assert_eq!(e.code, "PERMISSION_DENIED", "{e}");
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), inserted.next())
+                    .await
+                    .is_err(),
+                "nothing refused went in"
+            );
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
 /// `events` stores each message's partition, offset and timestamp (the sink's InsertField): the
 /// live rows have them from the messages, exactly as ClickHouse has them from the sink.
 #[tokio::test]

@@ -17,19 +17,7 @@ impl ColumnType for IntType {
     /// ClickHouse, a value outside the type's range wraps around, except that unsigned types
     /// reject negative values.
     fn decode(&self, json: &Json) -> Option<Value> {
-        let n: i128 = match json {
-            Json::Number(n) => n
-                .as_i64()
-                .map(i128::from)
-                .or_else(|| n.as_u64().map(i128::from))?,
-            Json::String(s) => match s.as_str() {
-                "true" => 1,
-                "false" => 0,
-                s => s.parse().ok()?,
-            },
-            Json::Bool(b) => i128::from(*b),
-            _ => return None,
-        };
+        let n = read(json)?;
         if !self.signed && n < 0 {
             return None;
         }
@@ -68,6 +56,17 @@ impl ColumnType for IntType {
 }
 
 impl IntType {
+    /// Like [`decode`](ColumnType::decode), but a value outside the type's range is refused
+    /// rather than wrapped (for inserts: what's written is what was meant).
+    pub fn decode_exact(&self, json: &Json) -> Option<Value> {
+        let n = read(json)?;
+        let (min, max) = match self.signed {
+            true => (-(1i128 << (self.bits - 1)), (1i128 << (self.bits - 1)) - 1),
+            false => (0, (1i128 << self.bits) - 1),
+        };
+        (min..=max).contains(&n).then_some(Value::Int(n))
+    }
+
     /// `n` modulo 2^bits, as the type's two's complement reads it.
     fn wrap(&self, n: i128) -> i128 {
         let m = n.rem_euclid(1i128 << self.bits);
@@ -77,6 +76,23 @@ impl IntType {
             m
         }
     }
+}
+
+/// An integer, a quoted one, or a boolean (also quoted).
+fn read(json: &Json) -> Option<i128> {
+    Some(match json {
+        Json::Number(n) => n
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| n.as_u64().map(i128::from))?,
+        Json::String(s) => match s.as_str() {
+            "true" => 1,
+            "false" => 0,
+            s => s.parse().ok()?,
+        },
+        Json::Bool(b) => i128::from(*b),
+        _ => return None,
+    })
 }
 
 impl Scalar for i128 {

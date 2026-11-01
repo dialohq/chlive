@@ -82,3 +82,73 @@ pub struct GrantSource {
     /// permission slug).
     pub grants: String,
 }
+
+/// `[tables.<name>.insert]`: the table takes inserts (without it, it doesn't), and from whom. The
+/// engine checks rows against an [`InsertFilter`]; the server decides the filters (its
+/// permission providers are the server's). Column names are dialect names, as clients write
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct InsertConfig {
+    /// Anyone inserts any row, anonymous connections too.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub public: bool,
+    /// A column the server sets to the inserting user (`hello`); a row may not set it itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The column whose value is the message's Kafka key (one key's rows stay in order, in one
+    /// partition); without it, messages have no key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Whether a subject may insert at all: while this grant answers anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<GrantSource>,
+    /// Which values of a column a subject's rows may have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<RowGrant>,
+    /// Which columns a subject may set; without it, every one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<GrantSource>,
+}
+
+impl InsertConfig {
+    /// Whether any grant decides who may insert what.
+    pub fn has_grants(&self) -> bool {
+        self.table.is_some() || self.rows.is_some() || self.columns.is_some()
+    }
+}
+
+/// A grant of a column's values: a row's `column` must be one of them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowGrant {
+    /// The column (dialect name).
+    pub column: String,
+    /// The permission provider (in `[security.providers]`).
+    pub provider: String,
+    /// As the provider takes it.
+    pub grants: String,
+}
+
+/// What one user may insert into one table: the server's decision, which the engine checks
+/// every row against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertFilter {
+    /// The rows it may insert; for [`RowFilter::In`], `column` is a dialect name.
+    pub rows: RowFilter,
+    /// The columns (dialect names) it may set; none: every one.
+    pub columns: Option<BTreeSet<String>>,
+    /// Who inserts (`hello`), for the table's `user` column.
+    pub user: Option<String>,
+}
+
+impl InsertFilter {
+    /// Any row, any column, as `user`.
+    pub fn open(user: Option<&str>) -> Self {
+        Self {
+            rows: RowFilter::All,
+            columns: None,
+            user: user.map(str::to_string),
+        }
+    }
+}

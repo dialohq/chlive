@@ -792,3 +792,84 @@ async fn history_then_each_new_row_with_none_in_both() {
     .await;
     assert_eq!(*within(new.next()).await.unwrap().unwrap(), user("d"));
 }
+
+#[tokio::test]
+async fn inserts_are_sent_once_connected_and_answered_by_id() {
+    let mut server = FakeServer::start().await;
+    let mut opts = ClientOptions::new(&server.url).user("alice");
+    opts.min_backoff = Duration::from_millis(5);
+    let client = LiveClient::new(opts);
+    // no subscription: the insert opens the connection, after `hello`
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move { client.insert("messages", [json!({"body": "hi"})]).await }
+    });
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await, json!({"type": "hello", "user": "alice"}));
+    let sent = ws.recv().await;
+    assert_eq!(
+        sent,
+        json!({"type": "insert", "id": "w1", "table": "messages", "rows": [{"body": "hi"}]})
+    );
+    ws.send(json!({"type": "ack", "id": "w1", "offsets": [[2, 40]]}))
+        .await;
+    let ack = within(first).await.unwrap().unwrap();
+    assert_eq!(ack.offsets, [(2, 40)]);
+
+    // an error is that insert's
+    #[derive(serde::Serialize)]
+    struct Message {
+        body: &'static str,
+    }
+    let second = tokio::spawn({
+        let client = client.clone();
+        async move { client.insert("messages", [Message { body: "x" }]).await }
+    });
+    let id = ws.recv().await["id"].clone();
+    ws.send(json!({"type": "error", "id": id, "code": "INVALID_INSERT", "message": "no"}))
+        .await;
+    let e = within(second).await.unwrap().unwrap_err();
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("INVALID_INSERT", "no")
+    );
+
+    // not a JSON object: refused before sending
+    let e = client.insert("messages", [1]).await.unwrap_err();
+    assert_eq!(e.code, "CLIENT_ERROR");
+}
+
+#[tokio::test]
+async fn an_insert_unanswered_when_the_connection_drops_is_disconnected() {
+    let mut server = FakeServer::start().await;
+    let client = server.client();
+    let pending = tokio::spawn({
+        let client = client.clone();
+        async move { client.insert("messages", [json!({"body": "hi"})]).await }
+    });
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await["type"], "insert", "no user: no hello");
+    ws.close().await;
+    let e = within(pending).await.unwrap().unwrap_err();
+    assert_eq!(e.code, "DISCONNECTED");
+    // closed: queued inserts fail
+    client.close().await;
+    let e = client.insert("messages", [json!({})]).await.unwrap_err();
+    assert_eq!(e.code, "CLIENT_ERROR");
+}
+
+#[tokio::test]
+async fn hello_comes_before_resubscribing() {
+    let mut server = FakeServer::start().await;
+    let mut opts = ClientOptions::new(&server.url).user("bob");
+    opts.min_backoff = Duration::from_millis(5);
+    let client = LiveClient::new(opts);
+    let _sub = client.subscribe::<Row>(SQL);
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await["type"], "hello");
+    assert_eq!(ws.recv().await["type"], "subscribe");
+    ws.close().await;
+    let mut again = server.next().await;
+    assert_eq!(again.recv().await, json!({"type": "hello", "user": "bob"}));
+    assert_eq!(again.recv().await["type"], "subscribe");
+}

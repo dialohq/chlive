@@ -47,7 +47,9 @@ curl -X POST https://api.workos.com/authorization/organization_memberships/<alic
 Every process is prefixed `chat-` (`dnvr logs chat-server`, …); `ch` is a ClickHouse client,
 `produce <topic> '<json>'` writes to Kafka, `reset-data` wipes the stack's data (stopped).
 
-Messages go straight to Kafka through Redpanda's HTTP proxy (`/kafka`); the sink puts them into
+Messages are inserted through chlive (`client.insert("messages", …)`), as the pane's user: the
+server sets `user_id` to who's inserting (`[tables.messages.insert] user = "user_id"`), so a pane
+can't post as someone else, and the app holds no Kafka credentials. The sink puts them into
 ClickHouse and chlive into the panes permitted to see them.
 
 ## Permissions from WorkOS (`nix/chlive.chat.toml`, `scripts/chat/workos.ts`)

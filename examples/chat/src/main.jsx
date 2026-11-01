@@ -1,7 +1,8 @@
 // The chat demo: one group chat, two users side by side, every list live through chlive. Each
 // pane is its own connection, as its user: chlive shows it what that user may read, per WorkOS
 // (polled) or Postgres (followed live): whether they may read the messages, whose, and (Postgres
-// only) which columns of the users. Messages go straight to Kafka through Redpanda's HTTP proxy.
+// only) which columns of the users. Messages are inserted through chlive too, as the pane's user
+// (the server sets `user_id`): the app holds no Kafka credentials.
 import { StrictMode, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { LiveClient, defaultUrl } from "@chlive/client";
@@ -17,20 +18,6 @@ function useUserClient(user) {
     return () => c.close();
   }, [user]);
   return c;
-}
-
-/** Write messages (JSON values) to a Kafka topic. */
-async function produce(topic, values) {
-  const res = await fetch(`/kafka/topics/${topic}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/vnd.kafka.json.v2+json" },
-    body: JSON.stringify({ records: values.map((value) => ({ value })) }),
-  });
-  if (!res.ok) throw new Error(`${topic}: HTTP ${res.status}`);
-  const { offsets } = await res.json();
-  // the proxy answers 200 even when a record fails
-  const failed = offsets.find((o) => o.error_code);
-  if (failed) throw new Error(`${topic}: Kafka error ${failed.error_code}`);
 }
 
 /** Now, as ClickHouse reads a DateTime64(3) (UTC). */
@@ -50,7 +37,7 @@ function Pane(props) {
   if (!userClient) return <section className="pane" />;
   return (
     <LiveClientProvider client={userClient}>
-      <Chat key={attempt} {...props} retry={() => setAttempt((n) => n + 1)} />
+      <Chat key={attempt} {...props} client={userClient} retry={() => setAttempt((n) => n + 1)} />
     </LiveClientProvider>
   );
 }
@@ -60,7 +47,7 @@ function Pane(props) {
  * names in plain text), the messages of the authors they may see (if they may read messages at
  * all), and a composer.
  */
-function Chat({ userId, setUserId, retry }) {
+function Chat({ client, userId, setUserId, retry }) {
   const users = useLiveQuery("select * from users final order by user_id");
   const messages = useLiveQuery(
     "select ts, user_id, body, message_id from messages order by ts desc limit 200",
@@ -81,7 +68,7 @@ function Chat({ userId, setUserId, retry }) {
     if (!body) return;
     setDraft("");
     try {
-      await produce("messages", [{ ts: utcNow(), message_id: crypto.randomUUID(), user_id: userId, body }]);
+      await client.insert("messages", { ts: utcNow(), message_id: crypto.randomUUID(), body });
       setError("");
     } catch (err) {
       setError(String(err.message ?? err));

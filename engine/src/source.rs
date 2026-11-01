@@ -396,6 +396,147 @@ impl EventSource for KafkaSource {
     }
 }
 
+/// One message to produce: its Kafka key, if any, and its value (a JSON row).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outgoing {
+    pub key: Option<String>,
+    pub value: String,
+}
+
+/// Where inserted rows go: Kafka ([`KafkaSink`]), or memory for tests ([`MemorySink`]).
+#[async_trait]
+pub trait EventSink: Send + Sync {
+    /// Produce the messages to `topic`, each once the broker has it; each one's partition and
+    /// offset, or why it wasn't produced, in order.
+    async fn produce(
+        &self,
+        topic: &TopicId,
+        messages: Vec<Outgoing>,
+    ) -> Vec<Result<(i32, i64), SourceError>>;
+}
+
+/// How long a message may take to be acknowledged by the brokers.
+const PRODUCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Produces to Kafka: idempotently, each message acknowledged by every in-sync replica. The
+/// producer is made on the first message, so a server nobody inserts through has none.
+pub struct KafkaSink {
+    brokers: String,
+    properties: BTreeMap<String, String>,
+    producer: Mutex<Option<rdkafka::producer::FutureProducer>>,
+}
+
+impl KafkaSink {
+    /// With librdkafka `properties` (TLS, SASL, …), over chlive's own settings.
+    pub fn new(brokers: &str, properties: BTreeMap<String, String>) -> Self {
+        Self {
+            brokers: brokers.to_string(),
+            properties,
+            producer: Mutex::new(None),
+        }
+    }
+
+    fn producer(&self) -> Result<rdkafka::producer::FutureProducer, SourceError> {
+        let mut producer = self.producer.lock().unwrap();
+        if let Some(p) = &*producer {
+            return Ok(p.clone());
+        }
+        let p: rdkafka::producer::FutureProducer = producer_config(&self.brokers, &self.properties)
+            .create()
+            .map_err(|e| SourceError(format!("creating the Kafka producer: {e}")))?;
+        *producer = Some(p.clone());
+        Ok(p)
+    }
+}
+
+/// The producer's settings: idempotent (so acks from all in-sync replicas, no duplicates on
+/// retries), batched briefly; then `properties` over them.
+pub fn producer_config(brokers: &str, properties: &BTreeMap<String, String>) -> ClientConfig {
+    let mut c = ClientConfig::new();
+    c.set("bootstrap.servers", brokers)
+        .set("enable.idempotence", "true")
+        .set("linger.ms", "5");
+    for (k, v) in properties {
+        c.set(k, v);
+    }
+    c
+}
+
+#[async_trait]
+impl EventSink for KafkaSink {
+    async fn produce(
+        &self,
+        topic: &TopicId,
+        messages: Vec<Outgoing>,
+    ) -> Vec<Result<(i32, i64), SourceError>> {
+        let producer = match self.producer() {
+            Ok(p) => p,
+            Err(e) => {
+                return messages
+                    .iter()
+                    .map(|_| Err(SourceError(e.0.clone())))
+                    .collect()
+            }
+        };
+        let sends = messages.iter().map(|m| {
+            let mut record = rdkafka::producer::FutureRecord::to(&topic.0).payload(&m.value);
+            if let Some(k) = &m.key {
+                record = record.key(k);
+            }
+            let producer = &producer;
+            async move {
+                producer
+                    .send(record, PRODUCE_TIMEOUT)
+                    .await
+                    .map(|d| (d.partition, d.offset))
+                    .map_err(|(e, _)| SourceError(format!("producing to {topic}: {e}")))
+            }
+        });
+        futures::future::join_all(sends).await
+    }
+}
+
+/// Keeps what's produced, for tests: messages go to partition 0 of their topic, at the next
+/// offset.
+#[derive(Debug, Clone, Default)]
+pub struct MemorySink {
+    produced: Arc<Mutex<BTreeMap<TopicId, Vec<Outgoing>>>>,
+}
+
+impl MemorySink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What was produced to `topic`, in order.
+    pub fn produced(&self, topic: &str) -> Vec<Outgoing> {
+        let produced = self.produced.lock().unwrap();
+        produced
+            .get(&TopicId(topic.into()))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl EventSink for MemorySink {
+    async fn produce(
+        &self,
+        topic: &TopicId,
+        messages: Vec<Outgoing>,
+    ) -> Vec<Result<(i32, i64), SourceError>> {
+        let mut produced = self.produced.lock().unwrap();
+        let list = produced.entry(topic.clone()).or_default();
+        messages
+            .into_iter()
+            .map(|m| {
+                list.push(m);
+                Ok((0, list.len() as i64 - 1))
+            })
+            .collect()
+    }
+}
+
 /// Events held in memory, for tests and examples: `topic → partition → messages` (a message's
 /// offset is its index), each with its timestamp if it has one. Finite: the stream ends after
 /// the last message.

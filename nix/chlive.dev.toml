@@ -21,6 +21,9 @@ level = "info,chlive_server::hub=debug,chlive_server::store=debug"
 kafka_partition = { kafka = "partition" }
 kafka_offset = { kafka = "offset" }
 kafka_ts = { kafka = "timestamp" }
+# anyone may insert events through the server (`client.insert("events", …)`)
+[tables.events.insert]
+public = true
 
 [tables.orders]
 [tables.customers]

@@ -30,5 +30,10 @@ provider = "workos"
 column = "user_id"
 grants = "feed:read"
 
+# Messages are inserted through chlive (the app holds no Kafka credentials): any user, as
+# themselves (the server sets user_id to who inserts).
+[tables.messages.insert]
+user = "user_id"
+
 [tables.users.security]
 public = true

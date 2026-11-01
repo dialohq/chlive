@@ -115,12 +115,9 @@ in
       '';
     };
 
-    # The app (Vite): /live proxied to the server, /kafka to Redpanda's HTTP proxy.
+    # The app (Vite): /live proxied to the server, which it also inserts messages through.
     ${name "app"} = {
-      env = {
-        CHLIVE_URL = ref "server" "url";
-        PROXY_URL = ref "redpanda" "proxyUrl";
-      };
+      env.CHLIVE_URL = ref "server" "url";
       command = ''
         cd "$DNVR_ROOT"
         [ -d node_modules/react ] || bun install

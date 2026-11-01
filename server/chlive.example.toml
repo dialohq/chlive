@@ -31,6 +31,10 @@
 ## the Rust client's `history()` does) waits at most this long for its result to get there, then
 ## gets a CATCH_UP_TIMEOUT error.
 # complete_wait = "30s"
+## Inserts (into tables with `[tables.<name>.insert]`): rows one carries at most, and how many one
+## connection may have unanswered at once; more get INVALID_INSERT.
+# max_insert_rows = 1000
+# max_inserts_in_flight = 100
 
 [cache]
 ## Results are shared: every subscription to the same query (and parameter values) shares one

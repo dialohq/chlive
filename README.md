@@ -126,7 +126,7 @@ customer = { clickhouse = "customer_id", json = "customerId" }
 
 - **Sections:**
   - `[cache]`: shared results, see [Shared results](#shared-results);
-  - `[server]`: `listen`, `path` (`/live`), `allowed_origins`, `max_connections` (10 000; more get 503), `max_subscriptions_per_connection` (100; more get `TOO_MANY_SUBSCRIPTIONS`), `progress_interval` (1 s) and `complete_wait` (30 s; how long a complete snapshot waits for its result);
+  - `[server]`: `listen`, `path` (`/live`), `allowed_origins`, `max_connections` (10 000; more get 503), `max_subscriptions_per_connection` (100; more get `TOO_MANY_SUBSCRIPTIONS`), `progress_interval` (1 s), `complete_wait` (30 s; how long a complete snapshot waits for its result), `max_insert_rows` (1000) and `max_inserts_in_flight` (100 per connection);
   - `[clickhouse]`: `url` (HTTP or HTTPS; the only way the server talks to ClickHouse), `user` (`chlive_ro`) and `snapshot_user` (`chlive_snap`) with their passwords, and `snapshot_database`;
   - `[kafka]`: `brokers`, `metadata_refresh` (30 s) and `properties`;
   - `[pause_server]`: `url`;
@@ -143,8 +143,31 @@ customer = { clickhouse = "customer_id", json = "customerId" }
   - `topic` (default: the `topic` template, `{table}`, where `{table}` and `{database}` are replaced);
   - `hidden_columns`: globs, added to the global ones (`["_*"]`);
   - `columns`: renames, by the name queries use; `clickhouse` defaults to that name, and `json` (the key in the topic's events) to the ClickHouse name. Or, instead of `json`, `kafka`: the message's `"offset"`, `"partition"` or `"timestamp"` (see [Kafka columns](#kafka-columns)).
+  - `insert`: whether clients may insert rows, and whose (see [Inserts](#inserts)).
 - **`snapshot_database`** must exist, with the same storage policy as the tables, since ATTACH PARTITION links their parts. The snapshot user needs CREATE TABLE, ALTER, INSERT, SELECT and DROP TABLE there, and the history user SELECT. A separate, non-Replicated database also keeps the clones' DDL off a Replicated database's log.
 - **Kafka properties** are librdkafka's (TLS, SASL, …). They override chlive's own consumer settings, except `enable.auto.commit` and `enable.auto.offset.store`, which stay off since chlive never commits.
+
+### Inserts
+
+Clients can write too, through the server, so an app needs chlive's connection and no Kafka credentials: `client.insert(table, rows)` (TS and Rust). The server checks the rows against the user's write permissions and the table, and produces them to the table's topic. The sink stores them, and every subscription sees them like any other event. The ack holds each row's Kafka partition and offset.
+
+```toml
+[tables.messages.insert]                        # without this section, a table takes no inserts
+user = "user_id"                                # set by the server to the `hello` user, never by a row
+key = "chat_id"                                 # the Kafka key: one chat's rows in order, in one partition
+# who may insert what: each its own grant, like reads' (`[security.providers]`)
+table = { provider = "workos", grants = "messages:write" }                                   # at all
+rows = { column = "chat_id", provider = "pg", grants = "SELECT chat_id FROM members WHERE user_id = {subject:String}" }
+columns = { provider = "pg", grants = "SELECT column_name FROM writable WHERE user_id = {subject:String}" }
+# public = true                                 # anyone, anonymous too (no user, no grants)
+```
+
+- **Opt-in per table**, whatever the read security: a table without `[tables.<t>.insert]` refuses inserts (`PERMISSION_DENIED`). With the section, either `public = true` or every insert needs a user (`hello`).
+- **Rows are checked before anything is produced.** Each key is a column of the table, by the name queries use; not a hidden one, and not one filled from Kafka. Each value must read as its column's type, strictly: NULL only in a Nullable column, an integer only within its type's range. One bad row refuses the whole insert (`INVALID_INSERT`, naming the row).
+- **The message** holds each value as ClickHouse renders it (`"2026-11-01 12:00:00.250"`, a dashed UUID), under the column's JSON key, so what ClickHouse stores and what the stream decodes are the same. Columns a row leaves out stay out: ClickHouse stores their DEFAULT, and the stream reads NULL or the type's zero, as for any message.
+- **Grants** are the read grants' kinds, with their own queries or permissions: `table` (inserts allowed while it grants anything), `rows` (the row's `column` must be one of the values granted), and `columns` (the columns it may set). They're asked on each insert.
+- **Not atomic.** The rows of one insert are produced together, each acknowledged by the brokers (idempotently). If Kafka fails partway, `WRITE_FAILED` says which rows went in.
+- **Updates and deletes are inserts**, by the table's own convention: a new version of a key in a ReplacingMergeTree (with `ReplacingMergeTree(kafka_offset)`, Kafka orders the versions; see [Kafka columns](#kafka-columns)), with its is-deleted column set to delete. FINAL queries then show the latest.
 
 ### Kafka columns
 
@@ -340,6 +363,9 @@ import { LiveClient } from "@chlive/client";
 const live = new LiveClient({ url: "ws://localhost:8080/live" }); // offline cache on by default
 const sub = live.subscribe(sql, (s) => render(s.status, s.rows, s.error), { params });
 sub.unsubscribe();
+
+// writing (see Inserts): each row's [partition, offset], or an InsertError with a code
+const { offsets } = await live.insert("messages", { chat_id: "c7", body: "hi" });
 ```
 
 `status` is `loading` (nothing yet), `cached` (rows from the offline cache, being caught up), `live`, `error`, or, from the hooks, `idle`.
@@ -406,6 +432,7 @@ while let Some(u) = sub.next().await {
 - **Rows** are deserialized into the type you subscribe with, once per row. `subscribe::<Row>` keeps them as JSON objects. A row that doesn't fit the type fails the subscription with `CLIENT_ERROR`, as an unknown change op or an index outside the result does, and the rows stay as they were before that diff.
 - **Backpressure.** Messages are applied when the stream is polled. A subscription that isn't read fills a small buffer, and then the connection waits for it. Nothing is dropped, and the server just falls behind on Kafka. Subscriptions sharing a client should all be read, e.g. with `tokio::select!` as in `examples/rust-alerts`. Use a client per subscription where one might lag.
 - **Complete histories.** `client.query(sql).history()` returns the rows as of subscribing and a stream of the rows inserted after, each row in exactly one. It asks for a `complete` snapshot (see the protocol), so the history holds every event in Kafka when it subscribed, including ones ClickHouse hasn't ingested yet or a shared result hasn't read yet. The server holds the snapshot until the result gets there, or ends the subscription with `CATCH_UP_TIMEOUT` after `server.complete_wait`. Any other view asks for it with `.complete()`, e.g. `client.query(sql).complete().fetch()`. Without it, a snapshot is whatever the server's result has, and the newer events come as diffs.
+- **Writing:** `client.insert("messages", rows).await` takes anything that serializes to JSON objects and returns an `Ack` with each row's `(partition, offset)` (see [Inserts](#inserts)). `ClientOptions::new(url).user("alice")` says who the client is (`hello`, on every connect), for what it may read and insert. An insert waits for the connection; one sent but unanswered when it drops fails with `DISCONNECTED` (it may or may not have gone in) and isn't sent again.
 - **Cancelling:** dropping a subscription unsubscribes; `client.close().await` ends every stream.
 
 **Terminal UI.** `clc` (the `chlive-tui` crate, `tui/`) is a small user of the client: an input for the query and a table of its result (columns with their ClickHouse types), updated on every diff, with the rows a diff inserted or changed highlighted for a second. In the dev shell, `tui` connects it to the stack's server:
@@ -438,6 +465,7 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 {"type": "subscribe", "id": "s1", "sql": "select user_id, latency_ms from events where latency_ms > 100"}
 {"type": "subscribe", "id": "s2", "sql": "select * from events where session_id = {s:UUID}", "params": {"s": "abcdef00-…"}}
 {"type": "unsubscribe", "id": "s1"}
+{"type": "insert", "id": "w1", "table": "messages", "rows": [{"chat_id": "c7", "body": "hi"}]}
 // server → client
 {"type": "snapshot", "id": "s1", "columns": [{"name": "user_id", "type": "String"}, …], "rows": [{"user_id": "u1", "latency_ms": 340}, …]}
 {"type": "diff", "id": "s1", "changes": [{"op": "insert", "row": {…}}, …]}
@@ -445,6 +473,7 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 {"type": "snapshot", "id": "s2", "columns": […], "rows": […], "order": [{"column": "latency_ms", "direction": "desc", "nulls": "last"}]}
 {"type": "diff", "id": "s2", "changes": [{"op": "insert", "row": {…}, "index": 2}, …]}
 {"type": "error", "id": "s1", "code": "INVALID_QUERY", "message": "unknown column nope in table events (…) at 1:8"}
+{"type": "ack", "id": "w1", "offsets": [[3, 1842]]}
 ```
 
 - `snapshot` comes first and once; `diff`s follow, each with the changes of the events that were ready (never empty). The ops are `insert`, `delete` and `update`; clients reject ops they don't know.
@@ -454,8 +483,9 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 - `{"op": "delete", "index": k}` removes the row at `k`, and `{"op": "delete", "id": …}` the row with that id (FINAL); the rows after it move up. With LIMIT (`"limit": n` in the snapshot), each insert that overflows the result is followed by the delete it causes. With OFFSET (`"offset": m` in the snapshot, informational), the diffs already account for the rows above the result: a row sliding in from above is an ordinary insert.
 - A `diff` is atomic: its changes apply in sequence, each index into the list as the previous change left it, and only the state after all of them is meaningful (in between, an insert and its delete can briefly make one row more than the LIMIT). The client applies a whole diff to one copy of the rows before its listeners see it.
 - **Resuming.** `snapshot`, `diff` and `{"type": "progress", "id", "at"}` carry `at`, an opaque cursor: how far the result is complete, per Kafka partition, counting events that didn't match. A client that kept a result subscribes with `"since": <at>`; the server answers `{"type": "resume", "id", "columns", "order"?, "limit"?}` instead of a snapshot (the client's rows are still valid), then diffs with only what was missed. If it can't resume (another query or schema, a cursor from an earlier server result for the query, one older than the result's change log, …), it sends a normal `snapshot`.
-- **Complete snapshots.** A `subscribe` with `"complete": true` gets a snapshot holding every event in the query's topics up to their latest offsets when the server got the `subscribe`. Otherwise a snapshot is whatever the result has: a new result's ClickHouse snapshot (which trails Kafka by the sink's lag and the snapshot's age), or a shared result's current state (behind on a burst). The newer events then come as diffs. The server waits for the result to get there; if it can't within `server.complete_wait` (30 s), the subscription ends with `CATCH_UP_TIMEOUT`. A `resume` is unaffected. `/client` doesn't ask for it; the Rust client's `history()` does.
-- Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`, `TOO_MANY_SUBSCRIPTIONS` (over `server.max_subscriptions_per_connection`), `CATCH_UP_TIMEOUT` (a complete snapshot not had within `server.complete_wait`). After an error, that subscription is over.
+- **Complete snapshots.** A `subscribe` with `"complete": true` gets a snapshot holding every event in the query's topics up to their latest offsets when the server got the `subscribe`. Otherwise a snapshot is whatever the result has: a new result's ClickHouse snapshot (which trails Kafka by the sink's lag and the snapshot's age), or a shared result's current state (behind on a burst). The newer events then come as diffs. The server waits for the result to get there; if it can't within `server.complete_wait` (30 s), the subscription ends with `CATCH_UP_TIMEOUT`. A `resume` is unaffected. `@chlive/client` doesn't ask for it; the Rust client's `history()` does.
+- **Inserts.** `insert` writes rows into a table (see [Inserts](#inserts)); its id is the client's, apart from subscriptions'. The answer is an `ack` with each row's `[partition, offset]`, in order, or an `error` with that id: `PERMISSION_DENIED`, `INVALID_INSERT` (nothing went in) or `WRITE_FAILED` (Kafka; the message says which rows went in).
+- Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`, `TOO_MANY_SUBSCRIPTIONS` (over `server.max_subscriptions_per_connection`), `CATCH_UP_TIMEOUT` (a complete snapshot not had within `server.complete_wait`), and for inserts `INVALID_INSERT` and `WRITE_FAILED`. After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
 
 ### GROUP BY and aggregates

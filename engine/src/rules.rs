@@ -85,6 +85,10 @@ pub trait NamingRules: Send + Sync {
     /// ClickHouse columns that are not part of the dialect table (e.g. bookkeeping). A column
     /// filled from a Kafka field is never hidden: it was configured to be read.
     fn is_hidden(&self, table: &str, clickhouse_column: &str) -> bool;
+    /// Whether the table takes inserts, and how (`[tables.<name>.insert]`); none: it doesn't.
+    fn insert(&self, _table: &str) -> Option<crate::security::InsertConfig> {
+        None
+    }
 }
 
 /// Which tables queries can use.
@@ -163,6 +167,9 @@ pub struct TableConfig {
     /// Who may read which rows (the server's row-level security).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<crate::security::TableSecurity>,
+    /// Whether it takes inserts, and from whom (see [`crate::security::InsertConfig`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert: Option<crate::security::InsertConfig>,
 }
 
 /// A column's ClickHouse name (default: its dialect name) and where events hold it: a JSON key
@@ -304,6 +311,29 @@ impl ConfiguredRules {
                     )));
                 }
             }
+            if let Some(i) = &t.insert {
+                if i.public && (i.user.is_some() || i.has_grants()) {
+                    return Err(err(
+                        "insert: public takes anyone's rows, so it has no user or grants".into(),
+                    ));
+                }
+                let names = [("user", &i.user), ("key", &i.key)];
+                let row_column = i.rows.as_ref().map(|r| ("rows.column", &r.column));
+                for (what, col) in names
+                    .iter()
+                    .filter_map(|(w, c)| c.as_ref().map(|c| (*w, c)))
+                    .chain(row_column)
+                {
+                    if !is_ident(col) {
+                        return Err(err(format!("insert.{what}: {col:?} is not a column name")));
+                    }
+                }
+                if i.user.is_some() && i.user == i.rows.as_ref().map(|r| r.column.clone()) {
+                    return Err(err(
+                        "insert: the user column is the server's, so rows can't grant it".into(),
+                    ));
+                }
+            }
             renames.insert(name.clone(), by_clickhouse);
         }
         Ok(Self { config, renames })
@@ -327,6 +357,10 @@ impl Default for ConfiguredRules {
 }
 
 impl NamingRules for ConfiguredRules {
+    fn insert(&self, table: &str) -> Option<crate::security::InsertConfig> {
+        self.config.tables.get(table).and_then(|t| t.insert.clone())
+    }
+
     fn exposes(&self, table: &str) -> bool {
         self.config.tables.contains_key(table) || self.config.expose == Expose::All
     }

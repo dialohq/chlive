@@ -64,13 +64,17 @@ pub fn config() -> Config {
             .unwrap_or_else(|_| "http://127.0.0.1:18123".into()),
         user: "chlive_ro".into(),
         password: "chlive_ro".into(),
-        // as nix/chlive.dev.toml: events' Kafka columns come from the messages
+        // as nix/chlive.dev.toml: events' Kafka columns come from the messages, and anyone may
+        // insert events
         tables: serde_json::from_value(serde_json::json!({
-            "events": { "columns": {
-                "kafka_partition": { "kafka": "partition" },
-                "kafka_offset": { "kafka": "offset" },
-                "kafka_ts": { "kafka": "timestamp" },
-            }},
+            "events": {
+                "columns": {
+                    "kafka_partition": { "kafka": "partition" },
+                    "kafka_offset": { "kafka": "offset" },
+                    "kafka_ts": { "kafka": "timestamp" },
+                },
+                "insert": { "public": true },
+            },
             "orders": {},
             "customers": {},
             "products": {},

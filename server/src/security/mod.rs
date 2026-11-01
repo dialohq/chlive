@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use chlive_engine::rules::TablesConfig;
-use chlive_engine::security::GrantSource;
+use chlive_engine::security::{GrantSource, InsertFilter};
 use chlive_engine::{RowFilter, TableFilter};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -213,6 +213,65 @@ impl TableAccess {
     }
 }
 
+/// Who may insert what into a table: while `table` grants them anything, rows whose `rows`
+/// column is one of what it grants them, and the columns `columns` grants them (each: none,
+/// no limit).
+#[derive(Clone, Default)]
+pub struct InsertRule {
+    pub table: Option<Source>,
+    /// The column (dialect name), and its granted values.
+    pub rows: Option<(String, Source)>,
+    pub columns: Option<Source>,
+}
+
+/// What a user may insert into a table, once its providers have answered.
+pub struct InsertAccess {
+    table: String,
+    user: Option<String>,
+    allowed: Option<watch::Receiver<Granted>>,
+    rows: Option<(String, watch::Receiver<Granted>)>,
+    columns: Option<watch::Receiver<Granted>>,
+}
+
+impl InsertAccess {
+    /// What it allows, once its providers have loaded; an error says why nothing.
+    pub async fn decide(&mut self) -> Result<InsertFilter, String> {
+        let receivers = self
+            .allowed
+            .iter_mut()
+            .chain(self.rows.iter_mut().map(|(_, r)| r))
+            .chain(self.columns.iter_mut());
+        let mut values = Vec::new();
+        for r in receivers {
+            match r.wait_for(Option::is_some).await {
+                Ok(v) => values.push(v.clone().expect("loaded")),
+                Err(_) => {
+                    return Err(format!(
+                        "the permissions for inserting into {} are unavailable",
+                        self.table
+                    ))
+                }
+            }
+        }
+        let mut values = values.into_iter();
+        let mut filter = InsertFilter::open(self.user.as_deref());
+        if self.allowed.is_some() && values.next().expect("one per receiver").is_empty() {
+            return Err(format!("you may not insert into {}", self.table));
+        }
+        if let Some((column, _)) = &self.rows {
+            filter.rows = RowFilter::In {
+                column: column.clone(),
+                values: values.next().expect("one per receiver").as_ref().clone(),
+            };
+        }
+        if self.columns.is_some() {
+            let granted = values.next().expect("one per receiver");
+            filter.columns = Some(granted.iter().cloned().collect());
+        }
+        Ok(filter)
+    }
+}
+
 /// Every table's rule, and the providers behind them.
 pub struct Security {
     /// For tables without a rule; `None`: no security at all.
@@ -220,6 +279,8 @@ pub struct Security {
     /// Which tables a subject may read (`[security.tables]`).
     tables_grant: Option<Source>,
     tables: BTreeMap<String, Rule>,
+    /// Who may insert what, for tables whose inserts have grants (`[tables.<t>.insert]`).
+    inserts: BTreeMap<String, InsertRule>,
 }
 
 impl fmt::Debug for Security {
@@ -245,6 +306,7 @@ impl Security {
             default: None,
             tables_grant: None,
             tables: BTreeMap::new(),
+            inserts: BTreeMap::new(),
         }
     }
 
@@ -291,6 +353,12 @@ impl Security {
     /// The tables a subject may read: those `source` grants them.
     pub fn tables(mut self, source: Source) -> Self {
         self.tables_grant = Some(source);
+        self
+    }
+
+    /// Who may insert what into `table`.
+    pub fn inserts(mut self, table: &str, rule: InsertRule) -> Self {
+        self.inserts.insert(table.to_string(), rule);
         self
     }
 
@@ -348,7 +416,43 @@ impl Security {
                 },
             );
         }
+        for (table, i) in planned.inserts {
+            let rule = InsertRule {
+                table: i.table.map(source),
+                rows: i.rows.map(|(column, s)| (column, source(s))),
+                columns: i.columns.map(source),
+            };
+            out.inserts.insert(table, rule);
+        }
         Ok(out)
+    }
+
+    /// What `user` (none: anonymous) may insert into `table`, as its grants say; without
+    /// grants, any row (whether the table takes inserts at all, and from whom, is the engine's
+    /// check: `[tables.<t>.insert]`). Reads' security doesn't apply.
+    pub fn insert_access(&self, user: Option<&str>, table: &str) -> Result<InsertAccess, String> {
+        let mut access = InsertAccess {
+            table: table.to_string(),
+            user: user.map(str::to_string),
+            allowed: None,
+            rows: None,
+            columns: None,
+        };
+        let Some(rule) = self.inserts.get(table) else {
+            return Ok(access);
+        };
+        let watch = |s: &Source| -> Result<watch::Receiver<Granted>, String> {
+            let user = user.ok_or_else(|| {
+                format!("inserting into {table} needs a user (send `hello` first)")
+            })?;
+            Ok(s.provider.watch(s.grant, user))
+        };
+        access.allowed = rule.table.as_ref().map(watch).transpose()?;
+        if let Some((column, s)) = &rule.rows {
+            access.rows = Some((column.clone(), watch(s)?));
+        }
+        access.columns = rule.columns.as_ref().map(watch).transpose()?;
+        Ok(access)
     }
 
     /// What `user` (none: anonymous) may read of `table`; an error says why not at all.
@@ -392,8 +496,16 @@ impl Security {
 struct Planned {
     tables: Option<(String, usize)>,
     rules: BTreeMap<String, PlannedRule>,
+    /// Inserts' grants: table, rows (column, grant), columns.
+    inserts: BTreeMap<String, PlannedInsert>,
     /// Per provider, its grants.
     grants: BTreeMap<String, ProviderGrants>,
+}
+
+struct PlannedInsert {
+    table: Option<(String, usize)>,
+    rows: Option<(String, (String, usize))>,
+    columns: Option<(String, usize)>,
 }
 
 struct PlannedRule {
@@ -521,6 +633,47 @@ fn plan(security: &SecurityConfig, tables: &TablesConfig) -> Result<Planned> {
             },
         );
     }
+    let mut inserts = BTreeMap::new();
+    for (table, config) in &tables.tables {
+        let Some(i) = config.insert.as_ref().filter(|i| i.has_grants()) else {
+            continue;
+        };
+        let at = format!("tables.{table}.insert");
+        let table_grant = match &i.table {
+            Some(g) => Some(register(
+                &format!("{at}.table"),
+                &g.provider,
+                &g.grants,
+                GrantKind::Check,
+            )?),
+            None => None,
+        };
+        let planned = PlannedInsert {
+            table: table_grant,
+            rows: match &i.rows {
+                Some(r) => Some((
+                    r.column.clone(),
+                    register(
+                        &format!("{at}.rows"),
+                        &r.provider,
+                        &r.grants,
+                        GrantKind::Values,
+                    )?,
+                )),
+                None => None,
+            },
+            columns: match &i.columns {
+                Some(g) => Some(register(
+                    &format!("{at}.columns"),
+                    &g.provider,
+                    &g.grants,
+                    GrantKind::Values,
+                )?),
+                None => None,
+            },
+        };
+        inserts.insert(table.clone(), planned);
+    }
     for (name, provider) in &security.providers {
         let checked = match provider {
             ProviderConfig::Postgres(c) => c.check(),
@@ -531,6 +684,7 @@ fn plan(security: &SecurityConfig, tables: &TablesConfig) -> Result<Planned> {
     Ok(Planned {
         tables: tables_grant,
         rules,
+        inserts,
         grants,
     })
 }
@@ -809,5 +963,79 @@ mod tests {
         );
         p.set(0, "alice", &[]);
         assert!(matches!(a.current(), Decision::Denied(e) if e.contains("table users")));
+    }
+
+    #[test]
+    fn insert_grants_are_planned_without_read_security() {
+        let (security, tables) = config(&format!(
+            r#"{PROVIDER}
+            [tables.messages.insert]
+            user = "author"
+            table = {{ provider = "pg", grants = "SELECT a FROM can_write WHERE u = {{subject:String}}" }}
+            rows = {{ column = "chat_id", provider = "pg", grants = "SELECT c FROM members WHERE u = {{subject:String}}" }}
+            [tables.notes.insert]
+            public = true
+            "#
+        ));
+        let p = plan(&security, &tables).unwrap();
+        let pg = |i| ("pg".to_string(), i);
+        assert_eq!(p.inserts["messages"].table, Some(pg(1)));
+        assert_eq!(p.inserts["messages"].rows, Some(("chat_id".into(), pg(2))));
+        assert_eq!(p.inserts["messages"].columns, None);
+        assert!(!p.inserts.contains_key("notes"), "nothing to ask for");
+        assert!(
+            !p.rules.contains_key("messages"),
+            "reads are another matter"
+        );
+        let (security, tables) = config(&format!(
+            "{PROVIDER}\n[tables.m.insert]\ncolumns = {{ provider = \"nope\", grants = \"x\" }}\n"
+        ));
+        let e = format!("{:#}", plan(&security, &tables).err().unwrap());
+        assert!(
+            e.contains("tables.m.insert.columns: no provider nope"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_a_user_may_insert() {
+        let p = MemoryProvider::loaded();
+        let source = |grant| Source {
+            provider: p.clone(),
+            grant,
+        };
+        let security = Security::open().inserts(
+            "messages",
+            InsertRule {
+                table: Some(source(0)),
+                rows: Some(("chat_id".into(), source(1))),
+                columns: Some(source(2)),
+            },
+        );
+        // tables without grants: anything (the engine checks whether they take inserts at all)
+        let mut a = security.insert_access(None, "notes").unwrap();
+        assert_eq!(a.decide().await, Ok(InsertFilter::open(None)));
+        assert!(security
+            .insert_access(None, "messages")
+            .err()
+            .unwrap()
+            .contains("needs a user"));
+        let mut a = security.insert_access(Some("alice"), "messages").unwrap();
+        assert!(a.decide().await.unwrap_err().contains("may not insert"));
+        p.set(0, "alice", &["yes"]);
+        p.set(1, "alice", &["c1", "c2"]);
+        p.set(2, "alice", &["body", "chat_id"]);
+        let mut a = security.insert_access(Some("alice"), "messages").unwrap();
+        assert_eq!(
+            a.decide().await,
+            Ok(InsertFilter {
+                rows: RowFilter::In {
+                    column: "chat_id".into(),
+                    values: vec!["c1".into(), "c2".into()],
+                },
+                columns: Some(["body".to_string(), "chat_id".to_string()].into()),
+                user: Some("alice".into()),
+            })
+        );
     }
 }

@@ -31,6 +31,34 @@ export interface LiveError {
   message: string;
 }
 
+/** An insert went in: each row's Kafka `[partition, offset]`, in order. */
+export interface Ack {
+  offsets: [number, number][];
+}
+
+/**
+ * Why an insert failed: `PERMISSION_DENIED`, `INVALID_INSERT` (nothing went in), `WRITE_FAILED`
+ * (Kafka; the message says which rows went in), `DISCONNECTED` (the connection dropped before
+ * the server answered: the rows may or may not have gone in), or `CLIENT_ERROR` (the client is
+ * closed).
+ */
+export class InsertError extends Error implements LiveError {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "InsertError";
+    this.code = code;
+  }
+}
+
+/** An insert waiting for its answer; `sent` once it's on the current connection. */
+interface PendingInsert {
+  msg: ClientMessage & { type: "insert" };
+  sent: boolean;
+  resolve: (ack: Ack) => void;
+  reject: (e: InsertError) => void;
+}
+
 export interface LiveState<R extends Row = Row> {
   status: Status;
   /** Exactly the selected columns, in the query's order (and in its ORDER BY order, if any). */
@@ -239,6 +267,8 @@ export class LiveClient {
   private results = new Map<string, Result>();
   /** Results by their server subscription's id. */
   private byWire = new Map<string, Result>();
+  /** Inserts waiting for their answer, by id. */
+  private inserts = new Map<string, PendingInsert>();
   private nextId = 1;
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -397,6 +427,25 @@ export class LiveClient {
     for (const r of this.results.values()) this.flushSave(r);
   }
 
+  /**
+   * Insert rows into a table, each by column name (as queries name them): resolves with each
+   * row's Kafka partition and offset once the server has produced it, or rejects with an
+   * {@link InsertError}. The server checks them against the user's write permissions and the
+   * table's columns. Sent once connected; one sent but unanswered when the connection drops
+   * rejects with `DISCONNECTED` (it isn't sent again). An update or delete is an insert by the
+   * table's own convention (e.g. a new version in a ReplacingMergeTree).
+   */
+  insert(table: string, rows: Row | Row[]): Promise<Ack> {
+    if (this.closed) return Promise.reject(new InsertError("CLIENT_ERROR", "LiveClient is closed"));
+    const msg = { type: "insert" as const, id: `w${this.nextId++}`, table, rows: Array.isArray(rows) ? rows : [rows] };
+    return new Promise<Ack>((resolve, reject) => {
+      const pending: PendingInsert = { msg, sent: false, resolve, reject };
+      this.inserts.set(msg.id, pending);
+      pending.sent = this.send(msg);
+      if (!pending.sent) this.ensureConnected();
+    });
+  }
+
   /** Close the socket and stop reconnecting; save pending results and close the cache. */
   close(): void {
     this.flush();
@@ -410,6 +459,8 @@ export class LiveClient {
     for (const r of this.results.values()) this.clearTimers(r);
     this.results.clear();
     this.byWire.clear();
+    for (const p of this.inserts.values()) p.reject(new InsertError("CLIENT_ERROR", "LiveClient is closed"));
+    this.inserts.clear();
     this.ws?.close();
     this.ws = null;
   }
@@ -602,6 +653,7 @@ export class LiveClient {
       this.backoff = this.opts.minBackoffMs;
       if (this.opts.user !== undefined) this.send({ type: "hello", user: this.opts.user });
       for (const r of this.byWire.values()) this.sendSubscribe(r);
+      for (const p of this.inserts.values()) if (!p.sent) p.sent = this.send(p.msg);
     };
     ws.onmessage = (ev: MessageEvent) => {
       const text = String(ev.data);
@@ -612,6 +664,13 @@ export class LiveClient {
       this.ws = null;
       for (const r of this.byWire.values()) {
         if (r.state.status === "live") this.emit(r, { ...r.state, status: "loading" });
+      }
+      for (const [id, p] of this.inserts) {
+        if (!p.sent) continue;
+        this.inserts.delete(id);
+        p.reject(
+          new InsertError("DISCONNECTED", "the connection dropped before the server answered; the rows may or may not have gone in"),
+        );
       }
       this.scheduleReconnect();
     };
@@ -626,11 +685,19 @@ export class LiveClient {
     this.backoff = Math.min(this.backoff * 2, this.opts.maxBackoffMs);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      if (this.byWire.size > 0) this.ensureConnected();
+      if (this.byWire.size > 0 || this.inserts.size > 0) this.ensureConnected();
     }, delay);
   }
 
   private onMessage(msg: ServerMessage, bytes: number): void {
+    const pending = msg.id ? this.inserts.get(msg.id) : undefined;
+    if (pending) {
+      this.inserts.delete(pending.msg.id);
+      if (msg.type === "ack") pending.resolve({ offsets: msg.offsets });
+      else if (msg.type === "error") pending.reject(new InsertError(msg.code, msg.message));
+      else pending.reject(new InsertError("CLIENT_ERROR", `an unexpected answer to an insert: ${msg.type}`));
+      return;
+    }
     const rec = msg.id ? this.byWire.get(msg.id) : undefined;
     if (!rec) return;
     const started = performance.now();
@@ -642,6 +709,9 @@ export class LiveClient {
     };
     try {
       switch (msg.type) {
+        case "ack":
+          // inserts' answers are theirs, never a subscription's
+          return;
         case "snapshot":
           rec.store.applySnapshot(msg);
           stats.snapshots++;

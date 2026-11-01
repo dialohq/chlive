@@ -28,7 +28,10 @@ export type ClientMessage =
   /** `since`: the `at` of a result the client already holds (e.g. cached), to resume from it.
    * `params`: values for the query's parameters. */
   | { type: "subscribe"; id: string; sql: string; since?: string; params?: Params }
-  | { type: "unsubscribe"; id: string };
+  | { type: "unsubscribe"; id: string }
+  /** Rows to insert into `table`, each by column name (as queries name them); answered by an
+   * `ack` or an `error` with this id (the client's own, apart from subscriptions'). */
+  | { type: "insert"; id: string; table: string; rows: Row[] };
 
 /**
  * One change to a result; unknown ops must be rejected.
@@ -132,6 +135,9 @@ export interface DiffMessage {
  * `at line:column`); `HISTORY_FAILED` / `STREAM_FAILED` are ClickHouse / Kafka problems;
  * `BAD_MESSAGE` (no id) and `DUPLICATE_ID` are protocol misuse; `TOO_MANY_SUBSCRIPTIONS`: the
  * connection is at the server's `max_subscriptions_per_connection`.
+ * For an insert: `PERMISSION_DENIED` (the table takes no inserts, or not these from this user),
+ * `INVALID_INSERT` (a row doesn't fit the table; nothing went in) or `WRITE_FAILED` (Kafka; the
+ * message says which rows went in).
  */
 export interface ErrorMessage {
   type: "error";
@@ -140,4 +146,11 @@ export interface ErrorMessage {
   message: string;
 }
 
-export type ServerMessage = SnapshotMessage | ResumeMessage | DiffMessage | ProgressMessage | ErrorMessage;
+/** An insert went in: each row's Kafka `[partition, offset]`, in order. */
+export interface AckMessage {
+  type: "ack";
+  id: string;
+  offsets: [number, number][];
+}
+
+export type ServerMessage = SnapshotMessage | ResumeMessage | DiffMessage | ProgressMessage | AckMessage | ErrorMessage;

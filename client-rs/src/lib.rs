@@ -68,7 +68,10 @@ use futures::Stream;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
-pub use chlive_protocol::{Column, Params, Row, ServerMsg, CATCH_UP_TIMEOUT, CLIENT_ERROR};
+pub use chlive_protocol::{
+    Column, Params, Row, ServerMsg, CATCH_UP_TIMEOUT, CLIENT_ERROR, DISCONNECTED, INVALID_INSERT,
+    WRITE_FAILED,
+};
 pub use events::Events;
 pub use live::Live;
 pub use query::Query;
@@ -87,6 +90,9 @@ pub struct ClientOptions {
     /// The first reconnect delay; doubles up to `max_backoff`.
     pub min_backoff: Duration,
     pub max_backoff: Duration,
+    /// Who the client is (`hello`, sent on every connect): what the server's security lets it
+    /// read and insert. None: anonymous.
+    pub user: Option<String>,
 }
 
 impl ClientOptions {
@@ -95,7 +101,14 @@ impl ClientOptions {
             url: url.into(),
             min_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(10),
+            user: None,
         }
+    }
+
+    /// Connect as `user` (see [`ClientOptions::user`]).
+    pub fn user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
+        self
     }
 }
 
@@ -172,6 +185,46 @@ impl LiveClient {
         }
     }
 
+    /// Insert rows into a table (each serialized as a JSON object by column name, as queries
+    /// name them): each row's Kafka partition and offset once the server has produced it. The
+    /// server checks them against the user's write permissions and the table's columns; an error
+    /// is `PERMISSION_DENIED`, `INVALID_INSERT` (nothing went in), `WRITE_FAILED`, or
+    /// `DISCONNECTED` (the connection dropped before the answer: the rows may or may not have
+    /// gone in). Sent once connected; an update or delete is an insert by the table's own
+    /// convention (e.g. a new version in a ReplacingMergeTree).
+    pub async fn insert<T: serde::Serialize>(
+        &self,
+        table: impl Into<String>,
+        rows: impl IntoIterator<Item = T>,
+    ) -> Result<Ack, LiveError> {
+        let rows = rows
+            .into_iter()
+            .map(|r| match serde_json::to_value(r) {
+                Ok(serde_json::Value::Object(row)) => Ok(row),
+                Ok(other) => Err(format!("a row is a JSON object, not {other}")),
+                Err(e) => Err(format!("a row doesn't serialize: {e}")),
+            })
+            .collect::<Result<Vec<Row>, _>>()
+            .map_err(|message| LiveError {
+                code: CLIENT_ERROR.into(),
+                message,
+            })?;
+        let n = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (done, answer) = tokio::sync::oneshot::channel();
+        let insert = Cmd::Insert {
+            id: format!("w{n}"),
+            table: table.into(),
+            rows,
+            done,
+        };
+        if self.cmds.send(insert).is_err() {
+            return Err(query::closed());
+        }
+        answer.await.unwrap_or_else(|_| Err(query::closed()))
+    }
+
     /// Close the socket and stop reconnecting; every subscription's stream ends.
     pub async fn close(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -189,6 +242,12 @@ pub enum Status {
     Loading,
     Live,
     Error(LiveError),
+}
+
+/// An insert went in: each row's Kafka `(partition, offset)`, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ack {
+    pub offsets: Vec<(i32, i64)>,
 }
 
 /// Why a subscription failed.
@@ -415,6 +474,8 @@ impl<R: DeserializeOwned> Subscription<R> {
                         self.at = Some(at);
                         None
                     }
+                    // inserts' answers go to them, never to a subscription
+                    ServerMsg::Ack { .. } => None,
                     ServerMsg::Error { code, message, .. } => {
                         return Some(self.fail(&code, message));
                     }

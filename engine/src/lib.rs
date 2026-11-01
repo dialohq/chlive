@@ -52,6 +52,7 @@ pub mod table_engine;
 pub mod timeline;
 pub mod types;
 pub mod watermark;
+pub mod write;
 
 pub use binder::{BoundColumn, BoundExpr, BoundQuery, Params};
 pub use checkpoint::Checkpoint;

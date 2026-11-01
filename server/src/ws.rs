@@ -26,8 +26,8 @@ use tracing::{debug, info, warn};
 
 use crate::hub::{CacheSettings, Hub, Joined, Outgoing};
 use crate::protocol::{
-    engine_error, ClientMsg, ServerMsg, BAD_MESSAGE, DUPLICATE_ID, PERMISSION_DENIED,
-    TOO_MANY_SUBSCRIPTIONS,
+    engine_error, ClientMsg, ServerMsg, BAD_MESSAGE, DUPLICATE_ID, INVALID_INSERT,
+    PERMISSION_DENIED, TOO_MANY_SUBSCRIPTIONS,
 };
 use crate::security::{Decision, Security, TableAccess};
 
@@ -55,6 +55,10 @@ pub struct ServerSettings {
     /// A `complete` subscription (its snapshot holds everything in Kafka when subscribing) waits
     /// at most this long for the result to get there; then it gets `CATCH_UP_TIMEOUT`.
     pub complete_wait: Duration,
+    /// Rows one `insert` may carry at most; more get `INVALID_INSERT`.
+    pub max_insert_rows: usize,
+    /// Inserts one connection may have unanswered at once; more get `INVALID_INSERT`.
+    pub max_inserts_in_flight: usize,
     /// Shared results: how long they're kept, and their change logs (the `[cache]` section).
     pub cache: CacheSettings,
     /// Who may read which rows (the `[security]` section, its providers started).
@@ -70,6 +74,8 @@ impl Default for ServerSettings {
             max_subscriptions_per_connection: 100,
             progress_interval: Duration::from_secs(1),
             complete_wait: Duration::from_secs(30),
+            max_insert_rows: 1000,
+            max_inserts_in_flight: 100,
             cache: CacheSettings::default(),
             security: Arc::new(Security::open()),
         }
@@ -86,6 +92,8 @@ struct AppState {
     conns: Arc<Mutex<HashMap<u64, ConnInfo>>>,
     /// Unix milliseconds.
     started_at: u64,
+    /// Inserts acked, and refused or failed (for `/debug/state`).
+    inserts: Arc<(AtomicU64, AtomicU64)>,
 }
 
 /// An open connection, as `/debug/state` shows it.
@@ -121,6 +129,7 @@ pub fn router_with(hub: Arc<Hub>, settings: ServerSettings) -> Router {
         connections: Arc::default(),
         conns: Arc::default(),
         started_at: crate::store::now_ms() as u64,
+        inserts: Arc::default(),
     };
     Router::new()
         .route(&path, get(live))
@@ -174,6 +183,8 @@ async fn debug_state(State(s): State<AppState>) -> impl IntoResponse {
         "connections": s.connections.load(Ordering::Relaxed),
         "maxConnections": s.settings.max_connections,
         "outbox": OUTBOX,
+        "inserts": s.inserts.0.load(Ordering::Relaxed),
+        "insertsFailed": s.inserts.1.load(Ordering::Relaxed),
     });
     state["snapshots"] = serde_json::to_value(snapshots).expect("statuses serialize");
     state["connections"] = conns.into();
@@ -261,6 +272,8 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
     let mut user: Option<String> = None;
     // `hello` only comes first
     let mut greeted = false;
+    // inserts sent and not answered yet
+    let in_flight = Arc::new(AtomicUsize::new(0));
     // a subscription whose permissions changed, by id
     let (changed_tx, mut changed_rx) = mpsc::unbounded_channel::<String>();
     loop {
@@ -440,6 +453,47 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                 }
                 listed(&subscriptions);
             }
+            ClientMsg::Insert { id, table, rows } => {
+                greeted = true;
+                let refuse = |message: String| ServerMsg::error(Some(&id), INVALID_INSERT, message);
+                if rows.is_empty() || rows.len() > s.settings.max_insert_rows {
+                    s.inserts.1.fetch_add(1, Ordering::Relaxed);
+                    send(refuse(format!(
+                        "an insert has 1 to {} rows (server.max_insert_rows), not {}",
+                        s.settings.max_insert_rows,
+                        rows.len()
+                    )))
+                    .await;
+                    continue;
+                }
+                if in_flight.load(Ordering::Relaxed) >= s.settings.max_inserts_in_flight {
+                    s.inserts.1.fetch_add(1, Ordering::Relaxed);
+                    send(refuse(format!(
+                        "at most {} inserts at once per connection (server.max_inserts_in_flight)",
+                        s.settings.max_inserts_in_flight
+                    )))
+                    .await;
+                    continue;
+                }
+                debug!(conn, id, table, rows = rows.len(), "insert");
+                in_flight.fetch_add(1, Ordering::Relaxed);
+                let (s, tx, user, in_flight) =
+                    (s.clone(), tx.clone(), user.clone(), in_flight.clone());
+                // answered on its own, so the connection's other messages don't wait on Kafka
+                tokio::spawn(async move {
+                    let answer = insert(&s, user.as_deref(), &id, &table, &rows).await;
+                    let counter = match &answer {
+                        ServerMsg::Ack { .. } => &s.inserts.0,
+                        _ => {
+                            debug!(conn, id, table, answer = ?answer, "insert refused");
+                            &s.inserts.1
+                        }
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    in_flight.fetch_sub(1, Ordering::Relaxed);
+                    let _ = tx.send(Outgoing::Msg(answer)).await;
+                });
+            }
         }
     }
 
@@ -472,6 +526,37 @@ impl Drop for Live {
         for w in &self.watchers {
             w.abort();
         }
+    }
+}
+
+/// An insert's answer: its ack, or why not (its permissions, its rows, Kafka).
+async fn insert(
+    s: &AppState,
+    user: Option<&str>,
+    id: &str,
+    table: &str,
+    rows: &[chlive_engine::diff::Row],
+) -> ServerMsg {
+    let denied = |e: String| ServerMsg::error(Some(id), PERMISSION_DENIED, e);
+    let mut access = match s.settings.security.insert_access(user, table) {
+        Ok(a) => a,
+        Err(e) => return denied(e),
+    };
+    let filter = match tokio::time::timeout(PERMISSIONS_WAIT, access.decide()).await {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => return denied(e),
+        Err(_) => {
+            return denied(format!(
+                "the permissions for inserting into {table} aren't loaded yet; try again"
+            ))
+        }
+    };
+    match s.hub.engine().insert(table, rows, &filter).await {
+        Ok(offsets) => ServerMsg::Ack {
+            id: id.to_string(),
+            offsets,
+        },
+        Err(e) => engine_error(id, &e),
     }
 }
 

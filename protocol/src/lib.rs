@@ -46,6 +46,15 @@
 //! result behind on a burst), and if it can't within the server's `complete_wait`, the
 //! subscription ends with `CATCH_UP_TIMEOUT` instead. Without it, the snapshot is whatever the
 //! result has, and what's in Kafka beyond it comes as diffs. A `resume` isn't affected.
+//!
+//! Writing: an `insert` of rows into a table (each a JSON object by column name, as queries
+//! name them), with an id of the client's choosing (its own, apart from subscriptions'). The
+//! server checks the user's write permissions and the rows, produces them to the table's topic,
+//! and answers with an `ack` holding each row's Kafka partition and offset, in order; or an
+//! `error`: `PERMISSION_DENIED` (the table takes no inserts, or not these from this user),
+//! `INVALID_INSERT` (a row doesn't fit the table; nothing was produced) or `WRITE_FAILED`
+//! (Kafka; the message says which rows went in). Like queries, an insert reaches subscribers as
+//! a new event; an update or delete is an insert by the table's own convention.
 
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +90,12 @@ pub enum ClientMsg {
     },
     Unsubscribe {
         id: String,
+    },
+    /// Rows to insert into `table` (see the module docs).
+    Insert {
+        id: String,
+        table: String,
+        rows: Vec<Row>,
     },
 }
 
@@ -128,6 +143,11 @@ pub enum ServerMsg {
     },
     /// The cursor moved without changes to the result (events that didn't match).
     Progress { id: String, at: String },
+    /// An `insert` went in: each row's Kafka `[partition, offset]`, in order.
+    Ack {
+        id: String,
+        offsets: Vec<(i32, i64)>,
+    },
     Error {
         /// Absent when the message can't be attributed to a subscription.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,11 +289,18 @@ pub const SNAPSHOT_FAILED: &str = "SNAPSHOT_FAILED";
 /// A table the query reads, or a column it names, isn't one this connection's user may read
 /// (anymore: a live subscription that loses it ends with this); or a misplaced `hello`.
 pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
+/// An `insert` with rows the table can't take (or too many); nothing was produced.
+pub const INVALID_INSERT: &str = "INVALID_INSERT";
+/// Producing an `insert`'s rows to Kafka failed.
+pub const WRITE_FAILED: &str = "WRITE_FAILED";
 /// A `complete` subscription's result didn't get to Kafka's offsets at subscribe time within
 /// the server's `complete_wait`.
 pub const CATCH_UP_TIMEOUT: &str = "CATCH_UP_TIMEOUT";
 /// Never sent: a client's code for a message it couldn't apply.
 pub const CLIENT_ERROR: &str = "CLIENT_ERROR";
+/// Never sent: a client's code for an insert whose connection dropped before its answer (it may
+/// or may not have gone in).
+pub const DISCONNECTED: &str = "DISCONNECTED";
 
 impl ServerMsg {
     pub fn error(id: Option<&str>, code: &str, message: impl Into<String>) -> Self {
@@ -290,7 +317,8 @@ impl ServerMsg {
             ServerMsg::Snapshot { id, .. }
             | ServerMsg::Resume { id, .. }
             | ServerMsg::Diff { id, .. }
-            | ServerMsg::Progress { id, .. } => Some(id),
+            | ServerMsg::Progress { id, .. }
+            | ServerMsg::Ack { id, .. } => Some(id),
             ServerMsg::Error { id, .. } => id.as_deref(),
         }
     }
@@ -317,6 +345,10 @@ mod tests {
             round_trip(json!({"type": "subscribe", "id": "s1", "sql": "x", "since": "c"}));
         assert!(matches!(m, ClientMsg::Subscribe { since: Some(c), .. } if c == "c"));
         round_trip::<ClientMsg>(json!({"type": "unsubscribe", "id": "s1"}));
+        let m: ClientMsg = round_trip(json!({
+            "type": "insert", "id": "w1", "table": "messages", "rows": [{"body": "hi"}, {"body": "yo"}]
+        }));
+        assert!(matches!(m, ClientMsg::Insert { rows, .. } if rows.len() == 2));
         let m: ClientMsg = round_trip(json!({
             "type": "subscribe", "id": "s1", "sql": "x", "params": {"id": "u1", "n": 5}
         }));
@@ -379,6 +411,10 @@ mod tests {
         ], "at": "c2"}));
         assert!(matches!(&m, ServerMsg::Diff { changes, .. } if changes.len() == 7));
         round_trip::<ServerMsg>(json!({"type": "progress", "id": "s1", "at": "c3"}));
+        let m: ServerMsg =
+            round_trip(json!({"type": "ack", "id": "w1", "offsets": [[0, 41], [2, 7]]}));
+        assert!(matches!(&m, ServerMsg::Ack { offsets, .. } if offsets == &[(0, 41), (2, 7)]));
+        assert_eq!(m.id(), Some("w1"));
         let m: ServerMsg =
             round_trip(json!({"type": "error", "code": "BAD_MESSAGE", "message": "nope"}));
         assert_eq!(m.id(), None);

@@ -134,6 +134,8 @@ pub fn error_code(e: &EngineError) -> &'static str {
         EngineError::Aggregate(_) => AGGREGATE_FAILED,
         EngineError::Snapshot(_) => SNAPSHOT_FAILED,
         EngineError::Checkpoint(_) => SNAPSHOT_FAILED,
+        EngineError::Insert(_) => INVALID_INSERT,
+        EngineError::Write(_) => WRITE_FAILED,
     }
 }
 

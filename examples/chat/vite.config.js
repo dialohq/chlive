@@ -2,9 +2,8 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// The server and Redpanda's HTTP proxy, as the dnvr `chat-app` process gets them.
+// The server, as the dnvr `chat-app` process gets it.
 const server = new URL(process.env.CHLIVE_URL ?? "ws://127.0.0.1:8080/live");
-const kafkaProxy = process.env.PROXY_URL ?? "http://127.0.0.1:8082";
 
 const src = (p) => fileURLToPath(new URL(`../../client/src/${p}`, import.meta.url));
 
@@ -23,8 +22,6 @@ export default defineConfig({
   server: {
     proxy: {
       "/live": { target: server.origin, ws: true },
-      // Redpanda's HTTP proxy: messages and memberships go straight to Kafka
-      "/kafka": { target: kafkaProxy, rewrite: (p) => p.replace(/^\/kafka/, "") },
     },
   },
 });

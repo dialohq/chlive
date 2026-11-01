@@ -62,6 +62,10 @@ pub struct Server {
     /// A `complete` subscription waits at most this long for its snapshot (else `CATCH_UP_TIMEOUT`).
     #[serde(with = "humantime_serde")]
     pub complete_wait: Duration,
+    /// Rows one `insert` carries at most.
+    pub max_insert_rows: usize,
+    /// Inserts one connection has unanswered at most.
+    pub max_inserts_in_flight: usize,
 }
 
 impl Default for Server {
@@ -76,6 +80,8 @@ impl Default for Server {
             progress_interval: s.progress_interval,
             now_coalescing: chlive_engine::engine::NOW_COALESCING,
             complete_wait: s.complete_wait,
+            max_insert_rows: s.max_insert_rows,
+            max_inserts_in_flight: s.max_inserts_in_flight,
         }
     }
 }
@@ -449,6 +455,9 @@ impl Config {
         if !self.server.path.starts_with('/') {
             bail!("server.path: {:?} must start with /", self.server.path);
         }
+        if self.server.max_insert_rows == 0 || self.server.max_inserts_in_flight == 0 {
+            bail!("server.max_insert_rows and server.max_inserts_in_flight: must be more than 0");
+        }
         if self.server.max_connections == 0 || self.server.max_subscriptions_per_connection == 0 {
             bail!("server.max_connections and server.max_subscriptions_per_connection: must be more than 0");
         }
@@ -510,6 +519,8 @@ impl Config {
             max_subscriptions_per_connection: self.server.max_subscriptions_per_connection,
             progress_interval: self.server.progress_interval,
             complete_wait: self.server.complete_wait,
+            max_insert_rows: self.server.max_insert_rows,
+            max_inserts_in_flight: self.server.max_inserts_in_flight,
             cache: crate::CacheSettings {
                 dir: (!self.cache.dir.is_empty()).then(|| self.cache.dir.clone().into()),
                 keep_alive: self.cache.keep_alive,
@@ -614,6 +625,7 @@ pub fn check_file(file: &Path, mut o: Overrides) -> Result<Config> {
 mod tests {
     use super::*;
     use chlive_engine::rules::{ColumnConfig, Expose, KafkaField, TableConfig};
+    use chlive_engine::security::InsertConfig;
     use figment::Jail;
 
     fn load(jail: &mut Jail, toml: &str) -> Result<Config> {
@@ -643,6 +655,8 @@ mod tests {
                 progress_interval: Duration::from_secs(1),
                 now_coalescing: Duration::from_millis(100),
                 complete_wait: Duration::from_secs(30),
+                max_insert_rows: 1000,
+                max_inserts_in_flight: 100,
             }
         );
         assert_eq!(
@@ -788,6 +802,8 @@ mod tests {
                 progress_interval = "250ms"
                 now_coalescing = "0s"
                 complete_wait = "5s"
+                max_insert_rows = 10
+                max_inserts_in_flight = 2
 
                 [cache]
                 keep_alive = "5s"
@@ -841,6 +857,9 @@ mod tests {
                 [tables.orders.columns]
                 customer = { clickhouse = "customer_id", json = "customerId" }
                 placed = { clickhouse = "_offset", kafka = "offset" }
+                [tables.orders.insert]
+                user = "customer"
+                key = "customer"
                 "#,
             )
             .unwrap();
@@ -855,6 +874,8 @@ mod tests {
                     progress_interval: Duration::from_millis(250),
                     now_coalescing: Duration::ZERO,
                     complete_wait: Duration::from_secs(5),
+                    max_insert_rows: 10,
+                    max_inserts_in_flight: 2,
                 }
             );
             assert_eq!(c.clickhouse.url, "http://ch:8123");
@@ -901,6 +922,11 @@ mod tests {
                     ]
                     .into(),
                     security: None,
+                    insert: Some(InsertConfig {
+                        user: Some("customer".into()),
+                        key: Some("customer".into()),
+                        ..Default::default()
+                    }),
                 }
             );
 
@@ -952,6 +978,7 @@ mod tests {
             );
             assert_eq!(s.progress_interval, Duration::from_millis(250));
             assert_eq!(s.complete_wait, Duration::from_secs(5));
+            assert_eq!((s.max_insert_rows, s.max_inserts_in_flight), (10, 2));
 
             // a literal password
             let c = load(

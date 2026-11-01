@@ -30,6 +30,11 @@ provider = "pg"
 column = "user_id"
 grants = "SELECT author_id FROM permissions WHERE viewer_id = {subject:String}"
 
+# Messages are inserted through chlive (the app holds no Kafka credentials): any user, as
+# themselves (the server sets user_id to who inserts).
+[tables.messages.insert]
+user = "user_id"
+
 [tables.users.security]
 public = true
 columns = { provider = "pg", grants = "SELECT column_name FROM column_permissions WHERE user_id = {subject:String} AND table_name = 'users'" }

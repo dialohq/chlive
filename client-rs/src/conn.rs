@@ -9,12 +9,12 @@
 
 use std::collections::BTreeMap;
 
-use chlive_protocol::{ClientMsg, Params, ServerMsg};
+use chlive_protocol::{ClientMsg, Params, Row, ServerMsg};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::ClientOptions;
+use crate::{Ack, ClientOptions, LiveError};
 
 pub(crate) enum Cmd {
     Subscribe {
@@ -25,7 +25,48 @@ pub(crate) enum Cmd {
         events: mpsc::Sender<Event>,
     },
     Unsubscribe(String),
+    Insert {
+        id: String,
+        table: String,
+        rows: Vec<Row>,
+        done: oneshot::Sender<Result<Ack, LiveError>>,
+    },
     Close(oneshot::Sender<()>),
+}
+
+/// An insert waiting for its answer.
+pub(crate) struct Insert {
+    table: String,
+    rows: Vec<Row>,
+    done: oneshot::Sender<Result<Ack, LiveError>>,
+}
+
+/// Inserts not sent yet (sent on the next open), and sent ones waiting for their `ack`: a drop
+/// fails those, since whether they went in is unknown.
+#[derive(Default)]
+struct Inserts {
+    queued: BTreeMap<String, Insert>,
+    sent: BTreeMap<String, Insert>,
+}
+
+impl Inserts {
+    /// The connection dropped: what was sent and not answered may or may not have gone in.
+    fn disconnected(&mut self) {
+        for (_, i) in std::mem::take(&mut self.sent) {
+            let _ = i.done.send(Err(LiveError {
+                code: chlive_protocol::DISCONNECTED.into(),
+                message: "the connection dropped before the server answered; the rows may or may not have gone in".into(),
+            }));
+        }
+    }
+
+    /// The client closed: nothing more is sent.
+    fn closed(&mut self) {
+        self.disconnected();
+        for (_, i) in std::mem::take(&mut self.queued) {
+            let _ = i.done.send(Err(crate::query::closed()));
+        }
+    }
 }
 
 /// What a subscription hears from the connection.
@@ -67,10 +108,23 @@ enum Flow {
     Stop,
 }
 
-/// A command while disconnected: subscriptions are only recorded (sent on the next open).
-fn offline(cmd: Option<Cmd>, subs: &mut BTreeMap<String, Sub>) -> Flow {
+/// A command while disconnected: subscriptions and inserts are only recorded (sent on the next
+/// open).
+fn offline(cmd: Option<Cmd>, subs: &mut BTreeMap<String, Sub>, inserts: &mut Inserts) -> Flow {
     match cmd {
-        None => Flow::Stop,
+        None => {
+            inserts.closed();
+            Flow::Stop
+        }
+        Some(Cmd::Insert {
+            id,
+            table,
+            rows,
+            done,
+        }) => {
+            inserts.queued.insert(id, Insert { table, rows, done });
+            Flow::Go
+        }
         Some(Cmd::Subscribe {
             id,
             sql,
@@ -95,6 +149,7 @@ fn offline(cmd: Option<Cmd>, subs: &mut BTreeMap<String, Sub>) -> Flow {
             Flow::Go
         }
         Some(Cmd::Close(done)) => {
+            inserts.closed();
             let _ = done.send(());
             Flow::Stop
         }
@@ -103,6 +158,14 @@ fn offline(cmd: Option<Cmd>, subs: &mut BTreeMap<String, Sub>) -> Flow {
 
 fn text(msg: &ClientMsg) -> Message {
     Message::text(serde_json::to_string(msg).expect("client messages serialize"))
+}
+
+fn insert(id: &str, i: &Insert) -> Message {
+    text(&ClientMsg::Insert {
+        id: id.to_string(),
+        table: i.table.clone(),
+        rows: i.rows.clone(),
+    })
 }
 
 fn subscribe(id: &str, sub: &Sub) -> Message {
@@ -117,11 +180,12 @@ fn subscribe(id: &str, sub: &Sub) -> Message {
 
 async fn run(opts: ClientOptions, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
     let mut subs: BTreeMap<String, Sub> = BTreeMap::new();
+    let mut inserts = Inserts::default();
     let mut backoff = opts.min_backoff;
     loop {
-        // connect only when there's something to subscribe to
-        while subs.is_empty() {
-            if let Flow::Stop = offline(cmds.recv().await, &mut subs) {
+        // connect only when there's something to subscribe to, or to insert
+        while subs.is_empty() && inserts.queued.is_empty() {
+            if let Flow::Stop = offline(cmds.recv().await, &mut subs, &mut inserts) {
                 return;
             }
         }
@@ -134,7 +198,7 @@ async fn run(opts: ClientOptions, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
         let ws = loop {
             tokio::select! {
                 r = &mut connecting => break r,
-                cmd = cmds.recv() => if let Flow::Stop = offline(cmd, &mut subs) {
+                cmd = cmds.recv() => if let Flow::Stop = offline(cmd, &mut subs, &mut inserts) {
                     return;
                 },
             }
@@ -143,7 +207,9 @@ async fn run(opts: ClientOptions, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
             Err(e) => tracing::warn!(url = %opts.url, error = %e, "chlive: can't connect"),
             Ok((ws, _)) => {
                 backoff = opts.min_backoff;
-                if let Flow::Stop = connected(ws, &mut subs, &mut cmds).await {
+                let flow = connected(ws, &opts, &mut subs, &mut inserts, &mut cmds).await;
+                inserts.disconnected();
+                if let Flow::Stop = flow {
                     return;
                 }
                 for sub in subs.values() {
@@ -158,7 +224,7 @@ async fn run(opts: ClientOptions, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
         loop {
             tokio::select! {
                 _ = &mut wait => break,
-                cmd = cmds.recv() => if let Flow::Stop = offline(cmd, &mut subs) {
+                cmd = cmds.recv() => if let Flow::Stop = offline(cmd, &mut subs, &mut inserts) {
                     return;
                 },
             }
@@ -172,26 +238,45 @@ type Socket =
 /// One open connection, until it drops (`Go`: reconnect) or the client closes (`Stop`).
 async fn connected(
     ws: Socket,
+    opts: &ClientOptions,
     subs: &mut BTreeMap<String, Sub>,
+    inserts: &mut Inserts,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
 ) -> Flow {
     let (mut sink, mut stream) = ws.split();
+    if let Some(user) = &opts.user {
+        let hello = ClientMsg::Hello {
+            user: Some(user.clone()),
+        };
+        if sink.send(text(&hello)).await.is_err() {
+            return Flow::Go;
+        }
+    }
     for (id, sub) in subs.iter() {
         if sink.send(subscribe(id, sub)).await.is_err() {
             return Flow::Go;
         }
         let _ = sub.events.send(Event::Subscribed).await;
     }
+    for (id, i) in std::mem::take(&mut inserts.queued) {
+        let sent = sink.send(insert(&id, &i)).await.is_ok();
+        inserts.sent.insert(id, i);
+        if !sent {
+            return Flow::Go;
+        }
+    }
     loop {
         tokio::select! {
             cmd = cmds.recv() => match cmd {
                 None => {
                     let _ = sink.close().await;
+                    inserts.closed();
                     return Flow::Stop;
                 }
                 Some(Cmd::Close(done)) => {
                     let _ = sink.close().await;
                     subs.clear();
+                    inserts.closed();
                     let _ = done.send(());
                     return Flow::Stop;
                 }
@@ -225,9 +310,17 @@ async fn connected(
                         return Flow::Go;
                     }
                 }
+                Some(Cmd::Insert { id, table, rows, done }) => {
+                    let i = Insert { table, rows, done };
+                    let sent = sink.send(insert(&id, &i)).await.is_ok();
+                    inserts.sent.insert(id, i);
+                    if !sent {
+                        return Flow::Go;
+                    }
+                }
             },
             frame = stream.next() => match frame {
-                Some(Ok(Message::Text(t))) => dispatch(subs, t.as_str()).await,
+                Some(Ok(Message::Text(t))) => dispatch(subs, inserts, t.as_str()).await,
                 Some(Ok(Message::Close(_))) | None => return Flow::Go,
                 Some(Err(e)) => {
                     tracing::warn!(error = %e, "chlive: connection lost");
@@ -239,8 +332,9 @@ async fn connected(
     }
 }
 
-/// Hand a message to its subscription. One that doesn't parse fails only that subscription.
-async fn dispatch(subs: &mut BTreeMap<String, Sub>, text: &str) {
+/// Hand a message to its insert or subscription. One that doesn't parse fails only that
+/// subscription.
+async fn dispatch(subs: &mut BTreeMap<String, Sub>, inserts: &mut Inserts, text: &str) {
     let bytes = text.len();
     let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -253,6 +347,18 @@ async fn dispatch(subs: &mut BTreeMap<String, Sub>, text: &str) {
         tracing::warn!(message = %value, "chlive: a message for no subscription");
         return;
     };
+    if let Some(i) = inserts.sent.remove(id) {
+        let answer = match serde_json::from_value::<ServerMsg>(value.clone()) {
+            Ok(ServerMsg::Ack { offsets, .. }) => Ok(Ack { offsets }),
+            Ok(ServerMsg::Error { code, message, .. }) => Err(LiveError { code, message }),
+            _ => Err(LiveError {
+                code: crate::CLIENT_ERROR.into(),
+                message: format!("an unexpected answer to an insert: {value}"),
+            }),
+        };
+        let _ = i.done.send(answer);
+        return;
+    }
     // messages for subscriptions that are gone are ignored
     let Some(sub) = subs.get_mut(id) else { return };
     let event = match serde_json::from_value::<ServerMsg>(value.clone()) {

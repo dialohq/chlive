@@ -32,7 +32,9 @@ use crate::snapshot::{
     ClickHouseCloner, InUse, Lease, PauseServer, SnapshotConfig, SnapshotError, SnapshotManager,
     Snapshots,
 };
-use crate::source::{Event, EventSource, KafkaSource, SourceError, TopicStart};
+use crate::source::{
+    Event, EventSink, EventSource, KafkaSink, KafkaSource, SourceError, TopicStart,
+};
 use crate::timeline::{Entry, KeyEntry, KeyTimeline, Timeline};
 use crate::watermark::Watermark;
 
@@ -60,6 +62,12 @@ pub enum EngineError {
     /// A checkpoint that doesn't fit the query (another shape, a bad format).
     #[error("checkpoint: {0}")]
     Checkpoint(String),
+    /// Rows an insert can't take (see [`crate::write`]).
+    #[error("{0}")]
+    Insert(String),
+    /// Producing inserted rows failed.
+    #[error("{0}")]
+    Write(String),
 }
 
 /// Everything [`Engine::connect`] needs for the standard setup: ClickHouse over HTTP (history,
@@ -112,9 +120,13 @@ impl Default for Config {
 }
 
 pub struct Engine {
-    rules: Arc<dyn NamingRules>,
-    history: Arc<dyn HistorySource>,
-    source: Arc<dyn EventSource>,
+    pub(crate) rules: Arc<dyn NamingRules>,
+    pub(crate) history: Arc<dyn HistorySource>,
+    pub(crate) source: Arc<dyn EventSource>,
+    /// Where inserted rows are produced (none: inserts fail).
+    pub(crate) sink: Option<Arc<dyn EventSink>>,
+    /// Tables as inserts see them (see [`crate::write`]).
+    pub(crate) described: crate::write::Described,
     snapshots: Arc<dyn Snapshots>,
     /// Where chDB reads aggregate states from (main ClickHouse, over HTTP).
     states_from: HttpSource,
@@ -142,6 +154,7 @@ impl Engine {
     /// The standard setup from a [`Config`]; fails on an invalid table mapping. Starts the
     /// snapshot task, so it must run inside a tokio runtime.
     pub fn connect(config: Config) -> Result<Self, ConfigError> {
+        let sink = KafkaSink::new(&config.kafka_brokers, config.kafka_properties.clone());
         let rules = ConfiguredRules::new(config.tables)?;
         let semi_refresh = config.snapshots.refresh;
         let now_coalescing = config.now_coalescing;
@@ -166,7 +179,14 @@ impl Engine {
         )
         .with_semi_refresh(semi_refresh)
         .with_now_coalescing(now_coalescing)
-        .with_clickhouse(&config.clickhouse_url, &config.user, &config.password))
+        .with_clickhouse(&config.clickhouse_url, &config.user, &config.password)
+        .with_sink(sink))
+    }
+
+    /// Where inserted rows are produced (see [`crate::write`]); without one, inserts fail.
+    pub fn with_sink(mut self, sink: impl EventSink + 'static) -> Self {
+        self.sink = Some(Arc::new(sink));
+        self
     }
 
     /// Main ClickHouse over HTTP, which chDB reads aggregate states from (the history's
@@ -199,6 +219,8 @@ impl Engine {
             history: Arc::new(history),
             source: Arc::new(source),
             snapshots: Arc::new(snapshots),
+            sink: None,
+            described: Default::default(),
             states_from: HttpSource {
                 url: "http://127.0.0.1:8123".into(),
                 user: "default".into(),
