@@ -69,6 +69,8 @@ in
     ${name "postgres"} = {
       imports = [ presets.postgres ];
       package = pkgs.postgresql;
+      # initdb refuses root: started as root (e.g. a dev VM), it runs as this user
+      runAsUser = "postgres";
       database = "chat";
       port = pgPort;
       settings = {

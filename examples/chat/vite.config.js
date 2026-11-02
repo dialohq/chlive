@@ -20,6 +20,8 @@ export default defineConfig({
   optimizeDeps: { exclude: ["@sqlite.org/sqlite-wasm"] },
   worker: { format: "es" },
   server: {
+    // also reached through `tailscale serve` (https://<machine>.<tailnet>.ts.net)
+    allowedHosts: [".ts.net"],
     proxy: {
       "/live": { target: server.origin, ws: true },
     },
