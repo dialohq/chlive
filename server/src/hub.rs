@@ -114,6 +114,11 @@ pub enum Outgoing {
         open: Arc<AtomicBool>,
         msg: Box<Outgoing>,
     },
+    /// The connection ends: a Close frame with this code and reason, and nothing after it.
+    Close {
+        code: u16,
+        reason: &'static str,
+    },
 }
 
 /// The id a shared body is serialized with; replaced by each subscriber's own.
@@ -133,6 +138,8 @@ impl Outgoing {
                 true => return msg.render(),
                 false => return None,
             },
+            // the writer sends it as a frame of its own
+            Outgoing::Close { .. } => return None,
         })
     }
 }

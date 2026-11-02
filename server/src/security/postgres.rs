@@ -8,9 +8,15 @@
 //! all in the stream, some also in what was read; applying a row is setting it by its key, so
 //! replaying them converges, and the values are told only once the stream is past the read.
 //!
+//! Grants tables are in the provider's `schema` (`public` by default), or the one a grant names
+//! (`FROM app.session_grants`); a table is always matched by its schema and name, so a table of
+//! the same name elsewhere (in `public`) is never read.
+//!
 //! Postgres needs `wal_level = logical`, a publication of the grants tables (with a primary key
-//! as replica identity, the default, or REPLICA IDENTITY FULL), and a user that may replicate
-//! and read them. The slot is the provider's own: one per server.
+//! as replica identity, the default, or REPLICA IDENTITY FULL), and a user with REPLICATION,
+//! USAGE on the tables' schemas and SELECT on the tables; nothing else (not even `public`). The
+//! publication is the database's own (chlive only checks that the tables are in it); the slot is
+//! the provider's own: one per server.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -39,6 +45,13 @@ pub struct PostgresConfig {
     pub publication: String,
     /// The provider's replication slot, made anew at each start: one per server.
     pub slot: String,
+    /// Where grants tables are when a grant doesn't say (`FROM app.grants` does).
+    #[serde(default = "public")]
+    pub schema: String,
+}
+
+fn public() -> String {
+    "public".into()
 }
 
 impl PostgresConfig {
@@ -81,9 +94,14 @@ struct Table {
     key: Vec<usize>,
 }
 
+/// A table, by its schema and name.
+type TableName = (String, String);
+
 /// What the stream has built so far, and who's watching it.
 struct State {
     grants: Vec<Grant>,
+    /// Each grant's table, its schema resolved.
+    tables: Vec<TableName>,
     indexes: Vec<GrantIndex>,
     /// The values are complete (the stream is past the tables' read), until it starts over.
     loaded: bool,
@@ -126,17 +144,22 @@ impl State {
         }
     }
 
-    /// The grants reading the table `name` (in `public`).
-    fn grants_of(&self, name: &str) -> Vec<usize> {
+    /// The grants reading the table `schema.name`.
+    fn grants_of(&self, schema: &str, name: &str) -> Vec<usize> {
         (0..self.grants.len())
-            .filter(|&g| self.grants[g].table == name)
+            .filter(|&g| self.tables[g].0 == schema && self.tables[g].1 == name)
             .collect()
     }
 
-    /// The row `key` of table `name` (in `public`), with these `columns`, now is `row` (none:
-    /// gone).
-    fn apply(&mut self, name: &str, columns: &[String], key: Key, row: Option<&[Option<String>]>) {
-        for g in self.grants_of(name) {
+    /// The row `key` of table `schema.name`, with these `columns`, now is `row` (none: gone).
+    fn apply(
+        &mut self,
+        (schema, name): (&str, &str),
+        columns: &[String],
+        key: Key,
+        row: Option<&[Option<String>]>,
+    ) {
+        for g in self.grants_of(schema, name) {
             let granted = row.and_then(|row| {
                 self.grants[g].eval(|column| {
                     let i = columns.iter().position(|c| c == column)?;
@@ -149,8 +172,8 @@ impl State {
         }
     }
 
-    fn clear(&mut self, name: &str) {
-        for g in self.grants_of(name) {
+    fn clear(&mut self, schema: &str, name: &str) {
+        for g in self.grants_of(schema, name) {
             for subject in self.indexes[g].clear() {
                 self.touched.insert((g, subject));
             }
@@ -174,9 +197,17 @@ impl PostgresProvider {
     /// Follow `grants`' tables in the background (read again whenever the stream fails).
     pub fn start(name: &str, config: &PostgresConfig, grants: Vec<Grant>) -> Result<Arc<Self>> {
         config.check()?;
+        let tables = grants
+            .iter()
+            .map(|g| {
+                let schema = g.schema.as_ref().unwrap_or(&config.schema);
+                (schema.clone(), g.table.clone())
+            })
+            .collect();
         let state = Arc::new(Mutex::new(State {
             indexes: grants.iter().map(|_| GrantIndex::default()).collect(),
             grants,
+            tables,
             loaded: false,
             touched: BTreeSet::new(),
             watchers: Watchers::default(),
@@ -212,13 +243,7 @@ async fn follow(
         .context("connecting")?;
     let _connection = AbortOnDrop(tokio::spawn(connection));
 
-    let names: BTreeSet<String> = state
-        .lock()
-        .unwrap()
-        .grants
-        .iter()
-        .map(|g| g.table.clone())
-        .collect();
+    let names: BTreeSet<TableName> = state.lock().unwrap().tables.iter().cloned().collect();
     let mut tables = HashMap::new();
     for table in &names {
         tables.insert(
@@ -261,22 +286,23 @@ async fn follow(
         .context("starting replication")?;
 
     // the tables as they are now (changes since the slot was made replay over it)
-    for (table, t) in &tables {
+    for ((schema, table), t) in &tables {
         let columns: Vec<String> = t
             .columns
             .iter()
             .map(|c| format!("{}::text", quote(c)))
             .collect();
-        let sql = format!("SELECT {} FROM public.{}", columns.join(", "), quote(table));
+        let qualified = qualified(schema, table);
+        let sql = format!("SELECT {} FROM {qualified}", columns.join(", "));
         let rows = client
             .query(&sql, &[])
             .await
-            .with_context(|| format!("reading {table}"))?;
+            .with_context(|| format!("reading {qualified}"))?;
         let mut s = state.lock().unwrap();
         for row in rows {
             let values: Vec<Option<String>> = (0..t.columns.len()).map(|i| row.get(i)).collect();
             let key = t.key.iter().map(|&i| values[i].clone()).collect();
-            s.apply(table, &t.columns, key, Some(&values));
+            s.apply((schema, table), &t.columns, key, Some(&values));
         }
     }
     // the stream is past the read once it's past this
@@ -317,9 +343,7 @@ async fn follow(
                     }
                     Message::Truncate { relations: ids } => {
                         for r in ids.iter().filter_map(|id| relations.get(id)) {
-                            if r.namespace == "public" {
-                                s.clear(&r.name);
-                            }
+                            s.clear(&r.namespace, &r.name);
                         }
                     }
                     Message::Other(_) => {}
@@ -350,9 +374,9 @@ async fn describe(
     client: &tokio_postgres::Client,
     config: &PostgresConfig,
     state: &Mutex<State>,
-    table: &str,
+    (schema, table): &TableName,
 ) -> Result<Table> {
-    let qualified = format!("public.{}", quote(table));
+    let qualified = qualified(schema, table);
     let Some(identity) = client
         .query_opt(
             "SELECT relreplident::text FROM pg_class WHERE oid = to_regclass($1)",
@@ -392,22 +416,23 @@ async fn describe(
             "{qualified} has no replica identity: give it a primary key (or REPLICA IDENTITY FULL)"
         );
     }
-    for grant in state
-        .lock()
-        .unwrap()
-        .grants
-        .iter()
-        .filter(|g| g.table == table)
-    {
-        if let Some(c) = grant.columns().find(|c| !columns.iter().any(|x| x == c)) {
-            bail!("{qualified} has no column {c} (its grants read it)");
-        }
+    let missing = {
+        let s = state.lock().unwrap();
+        s.grants_of(schema, table).into_iter().find_map(|g| {
+            s.grants[g]
+                .columns()
+                .find(|c| !columns.iter().any(|x| x == c))
+                .map(str::to_string)
+        })
+    };
+    if let Some(c) = missing {
+        bail!("{qualified} has no column {c} (its grants read it)");
     }
     let published = client
         .query_opt(
             "SELECT 1 FROM pg_publication_tables \
-             WHERE pubname = $1 AND schemaname = 'public' AND tablename = $2",
-            &[&config.publication, &table],
+             WHERE pubname = $1 AND schemaname = $2 AND tablename = $3",
+            &[&config.publication, schema, table],
         )
         .await?
         .is_some();
@@ -429,7 +454,8 @@ fn relation_of(relations: &HashMap<u32, Relation>, id: u32) -> Result<&Relation>
 /// A change of a row of `r`: `old` its key (or whole row) before, when sent; `new` the row now
 /// (none: deleted).
 fn change(s: &mut State, r: &Relation, old: Option<&[Cell]>, new: Option<&[Cell]>) {
-    if r.namespace != "public" || s.grants_of(&r.name).is_empty() {
+    let table = (r.namespace.as_str(), r.name.as_str());
+    if s.grants_of(table.0, table.1).is_empty() {
         return;
     }
     let columns: Vec<String> = r.columns.iter().map(|c| c.name.clone()).collect();
@@ -455,17 +481,22 @@ fn change(s: &mut State, r: &Relation, old: Option<&[Cell]>, new: Option<&[Cell]
         let old_key = key_of(&text(old));
         // deleted, or its key changed: the old key is gone
         if new_key.as_ref() != Some(&old_key) {
-            s.apply(&r.name, &columns, old_key, None);
+            s.apply(table, &columns, old_key, None);
         }
     }
     if let (Some(key), Some(new)) = (new_key, &new) {
-        s.apply(&r.name, &columns, key, Some(new));
+        s.apply(table, &columns, key, Some(new));
     }
 }
 
 /// An identifier, double-quoted.
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// `"schema"."table"`.
+fn qualified(schema: &str, table: &str) -> String {
+    format!("{}.{}", quote(schema), quote(table))
 }
 
 /// Ends a task when dropped (the connection, with the stream that uses it).

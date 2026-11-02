@@ -7,6 +7,12 @@
  * subscribing), then `diff`s as events arrive — or an `error`, after which that subscription is
  * over. When the user's permissions change, a new `snapshot` replaces the result; when they lose a
  * table the query reads, or a column it names, a `PERMISSION_DENIED` error ends it.
+ *
+ * A server verifying credentials takes the `hello`'s `token` (nothing comes before it) and
+ * answers `authenticated` (the subject, and when the credential expires); `renew` brings a fresh
+ * one before then, and the connection carries on. A connection without a valid credential gets
+ * an `error` with no id (one of the `AUTH_*` codes) and is closed with code `AUTH_CLOSE` (4401),
+ * the code as the reason.
  */
 
 /** A result row: exactly the selected columns, rendered the way ClickHouse renders JSON. */
@@ -23,8 +29,11 @@ export interface Column {
 export type Params = Record<string, unknown>;
 
 export type ClientMessage =
-  /** Who the client is: before any `subscribe`, at most once per connection. */
-  | { type: "hello"; user?: string }
+  /** Who the client is: first, at most once per connection: a credential (`token`), or, on a
+   * server trusting declared users (dev, tests), a `user`. */
+  | { type: "hello"; user?: string; token?: string }
+  /** A fresh credential for the connection's subject, before the current one expires. */
+  | { type: "renew"; token: string }
   /** `since`: the `at` of a result the client already holds (e.g. cached), to resume from it.
    * `params`: values for the query's parameters. `complete`: the snapshot holds everything in
    * Kafka when subscribing. `optimistic`: a `plan` comes before each snapshot. */
@@ -175,6 +184,21 @@ export interface PlanMessage {
   reason?: string;
 }
 
+/** The `hello`'s (or a `renew`'s) credential is verified: the connection is `subject`'s until
+ * `expires_at` (Unix ms), when the server closes it unless renewed. */
+export interface AuthenticatedMessage {
+  type: "authenticated";
+  id?: undefined;
+  subject: string;
+  expires_at: number;
+}
+
+/** The credential's error codes: none (or a declared user), a signature that doesn't verify,
+ * another issuer or audience, expired. Nothing more is said. */
+export const AUTH_CODES = ["AUTH_MISSING", "AUTH_BAD_SIGNATURE", "AUTH_WRONG_AUDIENCE", "AUTH_EXPIRED"] as const;
+/** The close code of a connection closed for its credential; the reason is the code. */
+export const AUTH_CLOSE = 4401;
+
 export type ServerMessage =
   | SnapshotMessage
   | ResumeMessage
@@ -182,4 +206,5 @@ export type ServerMessage =
   | ProgressMessage
   | PlanMessage
   | AckMessage
+  | AuthenticatedMessage
   | ErrorMessage;

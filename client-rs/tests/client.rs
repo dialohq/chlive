@@ -873,3 +873,166 @@ async fn hello_comes_before_resubscribing() {
     assert_eq!(again.recv().await, json!({"type": "hello", "user": "bob"}));
     assert_eq!(again.recv().await["type"], "subscribe");
 }
+
+impl FakeConn {
+    /// Close with a code and reason, as the server does for a credential.
+    async fn close_with(mut self, code: u16, reason: &str) {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        let frame = CloseFrame {
+            code: code.into(),
+            reason: reason.into(),
+        };
+        let _ = self.0.close(Some(frame)).await;
+    }
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// A client whose credentials are `t1`, `t2`, … (one per call), telling `errors` what's refused.
+fn credentialed(
+    server: &FakeServer,
+    refresh_before: Duration,
+) -> (LiveClient, mpsc::UnboundedReceiver<LiveError>) {
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (tx, errors) = mpsc::unbounded_channel();
+    let mut opts = ClientOptions::new(&server.url)
+        .credentials(move || {
+            let n = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            async move { Ok::<_, std::convert::Infallible>(format!("t{n}")) }
+        })
+        .on_auth_error(move |e| {
+            let _ = tx.send(e.clone());
+        });
+    opts.min_backoff = Duration::from_millis(5);
+    opts.refresh_before = refresh_before;
+    (LiveClient::new(opts), errors)
+}
+
+#[tokio::test]
+async fn a_credential_comes_first_on_every_connect_and_is_renewed_before_it_expires() {
+    let mut server = FakeServer::start().await;
+    let (client, _errors) = credentialed(&server, Duration::from_millis(200));
+    let mut sub = client.subscribe::<Row>(SQL);
+    next(&mut sub).await;
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await, json!({"type": "hello", "token": "t1"}));
+    assert_eq!(ws.recv().await["type"], "subscribe");
+    ws.send(json!({"type": "authenticated", "subject": "agent:7", "expires_at": unix_ms() + 400}))
+        .await;
+    ws.send(snapshot("s1", json!([{"user_id": "h1"}]))).await;
+    assert_eq!(next(&mut sub).await.kind, Kind::Snapshot);
+    // 200 ms before it expires: a fresh one, on the same connection
+    let t = std::time::Instant::now();
+    assert_eq!(ws.recv().await, json!({"type": "renew", "token": "t2"}));
+    assert!(
+        t.elapsed() < Duration::from_millis(350),
+        "{:?}",
+        t.elapsed()
+    );
+    ws.send(
+        json!({"type": "authenticated", "subject": "agent:7", "expires_at": unix_ms() + 60_000}),
+    )
+    .await;
+    ws.send(diff("s1", "c1", json!([insert("e1")]))).await;
+    assert_eq!(users(&next(&mut sub).await), ["h1", "e1"]);
+
+    // a dropped connection: a new credential for the new one
+    ws.close().await;
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await, json!({"type": "hello", "token": "t3"}));
+}
+
+#[tokio::test]
+async fn an_expired_credential_reconnects_at_once_and_resumes() {
+    let mut server = FakeServer::start().await;
+    let (client, mut errors) = credentialed(&server, Duration::from_secs(60));
+    let mut sub = client.subscribe::<Row>(SQL);
+    next(&mut sub).await;
+    let mut ws = server.next().await;
+    ws.recv().await;
+    ws.recv().await;
+    ws.send(
+        json!({"type": "authenticated", "subject": "agent:7", "expires_at": unix_ms() + 60_000}),
+    )
+    .await;
+    ws.send(snapshot("s1", json!([{"user_id": "h1"}]))).await;
+    next(&mut sub).await;
+    ws.send(
+        json!({"type": "error", "code": "AUTH_EXPIRED", "message": "the credential has expired"}),
+    )
+    .await;
+    ws.close_with(4401, "AUTH_EXPIRED").await;
+    assert_eq!(within(errors.recv()).await.unwrap().code, "AUTH_EXPIRED");
+    let u = next(&mut sub).await;
+    assert_eq!((u.kind, users(&u)), (Kind::Disconnected, vec!["h1"]));
+    // a new credential, and the subscription resumes from its cursor
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await, json!({"type": "hello", "token": "t2"}));
+    assert_eq!(
+        ws.recv().await,
+        json!({"type": "subscribe", "id": "s1", "sql": SQL, "since": "c0"})
+    );
+}
+
+#[tokio::test]
+async fn refused_credentials_are_told_and_retried_with_backoff() {
+    let mut server = FakeServer::start().await;
+    let (client, mut errors) = credentialed(&server, Duration::from_secs(60));
+    let _sub = client.subscribe::<Row>(SQL);
+    for (n, code) in ["AUTH_BAD_SIGNATURE", "AUTH_WRONG_AUDIENCE", "AUTH_EXPIRED"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut ws = server.next().await;
+        assert_eq!(ws.recv().await["token"], format!("t{}", n + 1));
+        ws.send(json!({"type": "error", "code": code, "message": "no"}))
+            .await;
+        ws.close_with(4401, code).await;
+        let e = within(errors.recv()).await.unwrap();
+        assert_eq!(e.code, code);
+    }
+    // a renewal refused: told, and the connection carries on
+    let mut ws = server.next().await;
+    ws.recv().await;
+    ws.send(json!({"type": "error", "code": "PERMISSION_DENIED", "message": "another subject"}))
+        .await;
+    assert_eq!(
+        within(errors.recv()).await.unwrap().code,
+        "PERMISSION_DENIED"
+    );
+    assert_eq!(ws.recv().await["type"], "subscribe");
+}
+
+#[tokio::test]
+async fn a_failing_provider_is_told_and_asked_again() {
+    let mut server = FakeServer::start().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (tx, mut errors) = mpsc::unbounded_channel();
+    let c = calls.clone();
+    let mut opts = ClientOptions::new(&server.url)
+        .credentials(move || {
+            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                match n {
+                    0 => Err("the issuer is down".to_string()),
+                    _ => Ok("t2".to_string()),
+                }
+            }
+        })
+        .on_auth_error(move |e| {
+            let _ = tx.send(e.clone());
+        });
+    opts.min_backoff = Duration::from_millis(5);
+    let client = LiveClient::new(opts);
+    let _sub = client.subscribe::<Row>(SQL);
+    let e = within(errors.recv()).await.unwrap();
+    assert_eq!(e.code, "CLIENT_ERROR");
+    assert!(e.message.contains("the issuer is down"), "{e}");
+    let mut ws = server.next().await;
+    assert_eq!(ws.recv().await, json!({"type": "hello", "token": "t2"}));
+}

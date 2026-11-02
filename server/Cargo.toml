@@ -36,10 +36,16 @@ pgwire-replication = { version = "0.4.1", default-features = false, features = [
 bytes = "1"
 # the WorkOS provider (src/security/workos.rs): its API, polled
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# credentials (src/auth.rs): JWTs, verified with the issuer's public keys only (rust_crypto:
+# pure Rust, no aws-lc build)
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 # binary only
 clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
+chlive-client = { path = "../client-rs" }
+# minting the auth tests' credentials (the server only ever verifies them)
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 figment = { version = "0.10", features = ["toml", "env", "test"] }
 async-trait = "0.1"
 tokio-tungstenite = "0.30"

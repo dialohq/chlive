@@ -69,8 +69,9 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
 pub use chlive_protocol::{
-    Column, Params, Row, ServerMsg, CATCH_UP_TIMEOUT, CLIENT_ERROR, DISCONNECTED, INVALID_INSERT,
-    WRITE_FAILED,
+    Column, Params, Row, ServerMsg, AUTH_BAD_SIGNATURE, AUTH_EXPIRED, AUTH_MISSING,
+    AUTH_WRONG_AUDIENCE, CATCH_UP_TIMEOUT, CLIENT_ERROR, DISCONNECTED, INVALID_INSERT,
+    PERMISSION_DENIED, WRITE_FAILED,
 };
 pub use events::Events;
 pub use live::Live;
@@ -90,9 +91,18 @@ pub struct ClientOptions {
     /// The first reconnect delay; doubles up to `max_backoff`.
     pub min_backoff: Duration,
     pub max_backoff: Duration,
-    /// Who the client is (`hello`, sent on every connect): what the server's security lets it
-    /// read and insert. None: anonymous.
+    /// Who the client says it is (`hello {user}`, sent on every connect), on a server that
+    /// trusts declared users (`[auth] mode = "declared"`: dev and tests). None: anonymous.
     pub user: Option<String>,
+    /// Where the credential comes from, on a server that verifies them (`mode = "jwt"`): asked
+    /// before every connect, and again before the credential expires
+    /// ([`credentials`](Self::credentials)).
+    pub credentials: Option<Credentials>,
+    /// A credential is renewed this long before it expires (or halfway, if it's shorter-lived).
+    pub refresh_before: Duration,
+    /// Told when the server refuses a credential, or the provider fails
+    /// ([`on_auth_error`](Self::on_auth_error)).
+    pub on_auth_error: Option<AuthErrorHandler>,
 }
 
 impl ClientOptions {
@@ -102,6 +112,9 @@ impl ClientOptions {
             min_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(10),
             user: None,
+            credentials: None,
+            refresh_before: Duration::from_secs(60),
+            on_auth_error: None,
         }
     }
 
@@ -109,6 +122,63 @@ impl ClientOptions {
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.user = Some(user.into());
         self
+    }
+
+    /// Present a credential (`hello {token}`) from `provider`, called before every connect and
+    /// again before the credential expires (the connection, its subscriptions and their cursors
+    /// carry on). E.g. a token from the service that issues them:
+    ///
+    /// ```no_run
+    /// # async fn issue() -> Result<String, std::io::Error> { Ok(String::new()) }
+    /// use chlive_client::ClientOptions;
+    /// let opts = ClientOptions::new("wss://chlive.example/live").credentials(|| issue());
+    /// ```
+    ///
+    /// If the credential expires anyway, the server closes the connection (`AUTH_EXPIRED`) and
+    /// the client reconnects at once with a new one, resuming every subscription from its cursor.
+    pub fn credentials<F, Fut, E>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<String, E>> + Send + 'static,
+        E: std::fmt::Display,
+    {
+        self.credentials = Some(Credentials(Arc::new(move || {
+            let token = provider();
+            Box::pin(async move { token.await.map_err(|e| e.to_string()) })
+        })));
+        self
+    }
+
+    /// Call `handler` when a credential is refused (its code: `AUTH_MISSING`,
+    /// `AUTH_BAD_SIGNATURE`, `AUTH_WRONG_AUDIENCE`, `AUTH_EXPIRED`, or `PERMISSION_DENIED` for a
+    /// renewal for another subject), or when the provider fails (`CLIENT_ERROR`). The client
+    /// keeps reconnecting (with backoff), asking the provider each time.
+    pub fn on_auth_error(mut self, handler: impl Fn(&LiveError) + Send + Sync + 'static) -> Self {
+        self.on_auth_error = Some(AuthErrorHandler(Arc::new(handler)));
+        self
+    }
+}
+
+/// A credential provider (see [`ClientOptions::credentials`]).
+#[derive(Clone)]
+pub struct Credentials(pub(crate) Arc<CredentialsFn>);
+
+type CredentialsFn =
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<String, String>> + Send + Sync;
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Credentials(..)")
+    }
+}
+
+/// See [`ClientOptions::on_auth_error`].
+#[derive(Clone)]
+pub struct AuthErrorHandler(pub(crate) Arc<dyn Fn(&LiveError) + Send + Sync>);
+
+impl std::fmt::Debug for AuthErrorHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthErrorHandler(..)")
     }
 }
 
@@ -478,6 +548,8 @@ impl<R: DeserializeOwned> Subscription<R> {
                     ServerMsg::Ack { .. } => None,
                     // never asked for yet
                     ServerMsg::Plan { .. } => None,
+                    // the connection's, never a subscription's
+                    ServerMsg::Authenticated { .. } => None,
                     ServerMsg::Error { code, message, .. } => {
                         return Some(self.fail(&code, message));
                     }

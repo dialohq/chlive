@@ -103,6 +103,8 @@ pub struct ColumnRef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
+    /// `FROM app.grants`: only where the parse allows it ([`crate::parser::ParseOptions`]).
+    pub schema: Option<String>,
     pub name: String,
     /// `FROM events e` / `FROM events AS e`.
     pub alias: Option<String>,

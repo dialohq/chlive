@@ -9,8 +9,23 @@ use crate::error::{Span, SyntaxError};
 use crate::lexer::{tokenize, Token, TokenKind};
 
 pub fn parse(src: &str) -> Result<Query, SyntaxError> {
+    parse_with(src, ParseOptions::default())
+}
+
+/// What a parse accepts beyond chlive's own queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParseOptions {
+    /// `FROM schema.table` (grants over Postgres tables); chlive's queries name tables alone.
+    pub qualified_tables: bool,
+}
+
+pub fn parse_with(src: &str, options: ParseOptions) -> Result<Query, SyntaxError> {
     let tokens = tokenize(src)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        options,
+    };
     let query = p.query()?;
     Ok(query)
 }
@@ -18,6 +33,7 @@ pub fn parse(src: &str) -> Result<Query, SyntaxError> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    options: ParseOptions,
 }
 
 impl Parser {
@@ -777,15 +793,33 @@ impl Parser {
 
     fn table(&mut self) -> Result<TableRef, SyntaxError> {
         let t = self.peek().clone();
-        let TokenKind::Ident(name) = t.kind else {
+        let TokenKind::Ident(mut name) = t.kind else {
             return Err(self.expected("a table name"));
         };
         self.next();
+        let mut schema = None;
+        let mut span = t.span;
         if self.peek().kind == TokenKind::Dot {
-            return Err(SyntaxError::new(
-                "qualified table names are not supported",
-                self.peek().span,
-            ));
+            if !self.options.qualified_tables {
+                return Err(SyntaxError::new(
+                    "qualified table names are not supported",
+                    self.peek().span,
+                ));
+            }
+            self.next();
+            let n = self.peek().clone();
+            let TokenKind::Ident(table) = n.kind else {
+                return Err(self.expected("a table name after `.`"));
+            };
+            self.next();
+            if self.peek().kind == TokenKind::Dot {
+                return Err(SyntaxError::new(
+                    "tables are `table` or `schema.table`",
+                    self.peek().span,
+                ));
+            }
+            schema = Some(std::mem::replace(&mut name, table));
+            span.end = n.span.end;
         }
         let alias = if self.peek().kind == TokenKind::Keyword("AS") {
             self.next();
@@ -807,10 +841,11 @@ impl Parser {
         };
         let final_span = self.at_word("FINAL").then(|| self.next().span);
         Ok(TableRef {
+            schema,
             name,
             alias,
             final_span,
-            span: t.span,
+            span,
         })
     }
 
@@ -1253,6 +1288,38 @@ mod tests {
         assert_eq!(
             error("select {x:UInt8} from t"),
             "parameters can only be used in WHERE at 1:8"
+        );
+    }
+
+    #[test]
+    fn qualified_tables_only_where_allowed() {
+        let options = ParseOptions {
+            qualified_tables: true,
+        };
+        let q = parse_with("select a from app.grants g where g.s = 'x'", options).unwrap();
+        assert_eq!(q.from.schema.as_deref(), Some("app"));
+        assert_eq!(q.from.name, "grants");
+        assert_eq!(q.from.alias.as_deref(), Some("g"));
+        assert_eq!(
+            parse_with("select a from grants", options)
+                .unwrap()
+                .from
+                .schema,
+            None
+        );
+        let render = |src: &str| parse_with(src, options).unwrap_err().render(src);
+        assert_eq!(
+            render("select a from db.app.grants"),
+            "tables are `table` or `schema.table` at 1:21"
+        );
+        assert_eq!(
+            render("select a from app."),
+            "expected a table name after `.`, found end of input at 1:19"
+        );
+        // chlive's own queries: still refused, where they were
+        assert_eq!(
+            error("select * from db.events"),
+            "qualified table names are not supported at 1:17"
         );
     }
 

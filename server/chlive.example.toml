@@ -36,6 +36,35 @@
 # max_insert_rows = 1000
 # max_inserts_in_flight = 100
 
+[auth]
+## Who a connection is, the subject that grants ({subject:String}) and inserts' user column get:
+##   "none": nobody; connections are anonymous, and a `hello` is refused
+##   "jwt": the subject of a credential each connection presents (`hello {token}`, renewed with
+##          `renew {token}` before it expires): a JWT the issuer signed, verified with its public
+##          keys; a connection without a valid one is closed (code 4401, the reason AUTH_MISSING,
+##          AUTH_BAD_SIGNATURE, AUTH_WRONG_AUDIENCE or AUTH_EXPIRED)
+##   "declared": whoever `hello {user}` says, unverified: for dev and tests only
+# mode = "none"
+## jwt: the credentials' issuer (`iss`) and the audience their `aud` must hold; both required.
+##   issuer = "https://auth.example.com"
+##   audience = "chlive"
+## jwt: the issuer's public keys, a JWKS, from a URL, a file, or both (their union). Read at
+## start (which fails without them), again every jwks_refresh, and when a credential names a key
+## id they don't have (at most every jwks_cooldown), so rotating keys needs no restart. Shared
+## secrets ("kty": "oct", HS256) are refused: chlive verifies credentials, it can't make them.
+##   jwks_url = "https://auth.example.com/.well-known/jwks.json"
+##   jwks_file = "/etc/chlive/jwks.json"
+# jwks_refresh = "5m"
+# jwks_cooldown = "30s"
+## The signing algorithms taken (public-key ones only).
+# algorithms = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA"]
+## The claim holding the subject: an opaque string (e.g. "user:alice"), matched by grants as is.
+# subject_claim = "sub"
+## Clock skew allowed on exp and nbf; a connection is closed this long after its credential's exp.
+# leeway = "5s"
+## jwt: a connection without a `hello` this long after connecting is closed (AUTH_MISSING).
+# hello_timeout = "10s"
+
 [cache]
 ## Results are shared: every subscription to the same query (and parameter values) shares one
 ## result, which new subscribers get at once (no ClickHouse query), with a log of its changes, so

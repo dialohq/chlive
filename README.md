@@ -134,6 +134,8 @@ customer = { clickhouse = "customer_id", json = "customerId" }
   - `[pause_server]`: `url`;
   - `[snapshots]`: `refresh` (10 s) and `idle` (1 h);
   - `[log]`: `level` (an `EnvFilter` directive; `RUST_LOG` wins when set) and `format` (`text` or `json`);
+  - `[auth]`: who a connection is, see [Authentication](#authentication);
+  - `[security]`: who may read and insert what (permission providers), see [Permissions from Postgres](#permissions-from-postgres);
   - `[tables]`: see below.
 - **Durations** are written `"250ms"`, `"10s"`, `"5m"` or `"1h"`. Unknown keys are errors, so a typo stops the server at start, with the key named.
 - **Env vars** are `CHLIVE_<SECTION>__<KEY>`, with `__` for each level, e.g. `CHLIVE_KAFKA__BROKERS`, `CHLIVE_SERVER__MAX_CONNECTIONS=500` or `CHLIVE_TABLES__EVENTS__TOPIC=prod.events`. Values are read as TOML when they can be (`500`, `["a", "b"]`). Only names whose first part is a section count: `CHLIVE_URL`, `CHLIVE_E2E` and the test scripts' `CHLIVE_CLICKHOUSE_URL` aren't config.
@@ -149,13 +151,79 @@ customer = { clickhouse = "customer_id", json = "customerId" }
 - **`snapshot_database`** must exist, with the same storage policy as the tables, since ATTACH PARTITION links their parts. The snapshot user needs CREATE TABLE, ALTER, INSERT, SELECT and DROP TABLE there, and the history user SELECT. A separate, non-Replicated database also keeps the clones' DDL off a Replicated database's log.
 - **Kafka properties** are librdkafka's (TLS, SASL, …). They override chlive's own consumer settings, except `enable.auto.commit` and `enable.auto.offset.store`, which stay off since chlive never commits.
 
+### Authentication
+
+Who a connection is decides what it may read and insert: the subject is `{subject:String}` in every grant, and what an insert's user column is set to. The subject comes from a credential the client presents, issued by a service of your own (for end users and headless agents alike) and verified by chlive without calling it:
+
+```toml
+[auth]
+mode = "jwt"
+issuer = "https://auth.example.com"            # the credentials' iss
+audience = "chlive"                            # what their aud must hold
+jwks_url = "https://auth.example.com/.well-known/jwks.json"   # the issuer's public keys
+# jwks_file = "/etc/chlive/jwks.json"          # or a file, or both (their union)
+# subject_claim = "sub"                        # an opaque string: "user:alice", "agent:<uuid>", …
+```
+
+- **Credentials are JWTs** signed by the issuer with a private key (RS256/384/512, PS256/384/512, ES256/384 or EdDSA; `algorithms` narrows them). chlive holds only the public keys, so it can verify credentials but never make them: shared secrets (HS256, a JWKS `"kty": "oct"`) are refused at start.
+- **Keys rotate without a restart.** The JWKS is read at start (the server doesn't start without it), again every `jwks_refresh` (5 min), and when a credential names a key id it doesn't have (at most every `jwks_cooldown`, 30 s). A source that fails to load keeps its previous keys.
+- **The credential comes in the first message**, `{"type": "hello", "token": "eyJ…"}`, since browsers can't set headers on a WebSocket. The server answers `{"type": "authenticated", "subject", "expires_at"}`. Subscriptions and inserts may follow the hello at once; nothing may come before it, and a connection without one within `hello_timeout` (10 s) is closed.
+- **Credentials are short-lived, connections needn't be.** Before `expires_at`, the client sends `{"type": "renew", "token": …}` with a fresh credential for the same subject: the connection, its subscriptions and their cursors carry on, with no new snapshot. Not renewed, the connection is closed once the credential expires (plus `leeway`, 5 s); the client reconnects with a new one and resumes every result from its cursor. Both clients do all of this from a function you give them (below).
+- **Failures say which, and nothing more:** an `error` with no id and one of `AUTH_MISSING` (no credential, or a declared `user`), `AUTH_BAD_SIGNATURE` (malformed, or no trusted key verifies it), `AUTH_WRONG_AUDIENCE` (another issuer or audience, or no subject) and `AUTH_EXPIRED`, then a Close frame with code 4401 and the code as its reason. The signature is checked before any claim, and the messages are fixed. A refused `renew` is the same error without the close: the connection lasts until the current credential expires. A renewal for another subject is `PERMISSION_DENIED`.
+- **Modes.** Without `[auth]` (`mode = "none"`), connections are anonymous and a `hello` is refused. `mode = "declared"` trusts `{"type": "hello", "user": "alice"}` as it is, for dev and tests only (the dev and chat stacks use it).
+
+```ts
+const live = new LiveClient({
+  url: "wss://chlive.example.com/live",
+  token: () => fetch("/api/chlive-token").then((r) => r.text()), // before each connection and each renewal
+  onAuthError: (e) => console.warn(e.code, e.message),
+});
+live.subject; // the verified subject, once the server says
+```
+
+```rust
+let client = LiveClient::new(
+    ClientOptions::new("wss://chlive.example.com/live")
+        .credentials(|| issuer.token_for("agent:7")) // an async fn: Result<String, impl Display>
+        .on_auth_error(|e| tracing::warn!(%e, "chlive refused the credential")),
+);
+```
+
+The credential is renewed `refreshBeforeMs` / `refresh_before` before it expires (60 s, or halfway for shorter-lived ones). A function that fails is reported (`CLIENT_ERROR`) and asked again. In TS, `user` with a `token` only names whose offline cache it is: a credential for anyone else closes the client.
+
+### Permissions from Postgres
+
+The `postgres` provider follows grants tables with logical replication: read once, then every change. A grant is one query over one table:
+
+```toml
+[security]
+default = "deny"
+tables = { provider = "pg", grants = "SELECT table_name FROM table_grants WHERE subject = {subject:String}" }
+
+[security.providers.pg]
+kind = "postgres"
+url = "postgres://chlive@db:5432/app"
+publication = "chlive_grants"                   # the application's (chlive only checks it)
+slot = "chlive_1"                               # made anew at each start: one per server
+schema = "app"                                  # where unqualified grants tables are (default "public")
+
+[tables.sessions.security]
+provider = "pg"
+column = "session_id"
+grants = "SELECT session_id FROM app.session_grants WHERE user_id = {subject:String}"   # or name the schema
+```
+
+- **Grants tables can be in any schema**, named in the grant (`FROM app.session_grants`) or by the provider's `schema`. A table is always found by its schema and name, so a table of the same name elsewhere (in `public`) is never read, nor are its replicated changes.
+- **The role** needs `REPLICATION`, `USAGE` on the grants tables' schemas and `SELECT` on the tables; nothing else, not even `public`. Postgres needs `wal_level = logical`, and the tables need a replica identity (a primary key, the default, or `REPLICA IDENTITY FULL`) and to be in the publication. The server says at start which one is missing.
+- **Changes apply live:** a subscription whose rows filter changes gets a new snapshot; one that loses its table, or a column it names, ends with `PERMISSION_DENIED`.
+
 ### Inserts
 
 Clients can write too, through the server, so an app needs chlive's connection and no Kafka credentials: `client.insert(table, rows)` (TS and Rust). The server checks the rows against the user's write permissions and the table, and produces them to the table's topic. The sink stores them, and every subscription sees them like any other event. The ack holds each row's Kafka partition and offset.
 
 ```toml
 [tables.messages.insert]                        # without this section, a table takes no inserts
-user = "user_id"                                # set by the server to the `hello` user, never by a row
+user = "user_id"                                # set by the server to the connection's subject, never by a row
 key = "chat_id"                                 # the Kafka key: one chat's rows in order, in one partition
 # who may insert what: each its own grant, like reads' (`[security.providers]`)
 table = { provider = "workos", grants = "messages:write" }                                   # at all
@@ -164,7 +232,7 @@ columns = { provider = "pg", grants = "SELECT column_name FROM writable WHERE us
 # public = true                                 # anyone, anonymous too (no user, no grants)
 ```
 
-- **Opt-in per table**, whatever the read security: a table without `[tables.<t>.insert]` refuses inserts (`PERMISSION_DENIED`). With the section, either `public = true` or every insert needs a user (`hello`).
+- **Opt-in per table**, whatever the read security: a table without `[tables.<t>.insert]` refuses inserts (`PERMISSION_DENIED`). With the section, either `public = true` or every insert needs a subject (see [Authentication](#authentication)).
 - **Rows are checked before anything is produced.** Each key is a column of the table, by the name queries use; not a hidden one, and not one filled from Kafka. Each value must read as its column's type, strictly: NULL only in a Nullable column, an integer only within its type's range. One bad row refuses the whole insert (`INVALID_INSERT`, naming the row).
 - **The message** holds each value as ClickHouse renders it (`"2026-11-01 12:00:00.250"`, a dashed UUID), under the column's JSON key, so what ClickHouse stores and what the stream decodes are the same. Columns a row leaves out stay out: ClickHouse stores their DEFAULT, and the stream reads NULL or the type's zero, as for any message.
 - **Grants** are the read grants' kinds, with their own queries or permissions: `table` (inserts allowed while it grants anything), `rows` (the row's `column` must be one of the values granted), and `columns` (the columns it may set). They're asked on each insert.
@@ -387,6 +455,9 @@ sub.unsubscribe();
 // writing (see Inserts): each row's [partition, offset], or an InsertError with a code
 const { offsets } = await live.insert("messages", { chat_id: "c7", body: "hi" });
 
+// authenticated (see Authentication): a credential from your issuer, renewed before it expires
+const authed = new LiveClient({ url, token: () => getToken() });
+
 // optimistic (see Optimistic inserts): inserts show at once, marked until the server has them
 const app = new LiveClient({ url, optimistic: true });
 const { rows, pending } = useLiveQuery<Message>(sql); // pending: Set of the rows not back yet
@@ -456,7 +527,7 @@ while let Some(u) = sub.next().await {
 - **Rows** are deserialized into the type you subscribe with, once per row. `subscribe::<Row>` keeps them as JSON objects. A row that doesn't fit the type fails the subscription with `CLIENT_ERROR`, as an unknown change op or an index outside the result does, and the rows stay as they were before that diff.
 - **Backpressure.** Messages are applied when the stream is polled. A subscription that isn't read fills a small buffer, and then the connection waits for it. Nothing is dropped, and the server just falls behind on Kafka. Subscriptions sharing a client should all be read, e.g. with `tokio::select!` as in `examples/rust-alerts`. Use a client per subscription where one might lag.
 - **Complete histories.** `client.query(sql).history()` returns the rows as of subscribing and a stream of the rows inserted after, each row in exactly one. It asks for a `complete` snapshot (see the protocol), so the history holds every event in Kafka when it subscribed, including ones ClickHouse hasn't ingested yet or a shared result hasn't read yet. The server holds the snapshot until the result gets there, or ends the subscription with `CATCH_UP_TIMEOUT` after `server.complete_wait`. Any other view asks for it with `.complete()`, e.g. `client.query(sql).complete().fetch()`. Without it, a snapshot is whatever the server's result has, and the newer events come as diffs.
-- **Writing:** `client.insert("messages", rows).await` takes anything that serializes to JSON objects and returns an `Ack` with each row's `(partition, offset)` (see [Inserts](#inserts)). `ClientOptions::new(url).user("alice")` says who the client is (`hello`, on every connect), for what it may read and insert. An insert waits for the connection; one sent but unanswered when it drops fails with `DISCONNECTED` (it may or may not have gone in) and isn't sent again.
+- **Writing:** `client.insert("messages", rows).await` takes anything that serializes to JSON objects and returns an `Ack` with each row's `(partition, offset)` (see [Inserts](#inserts)). `ClientOptions::new(url).credentials(provider)` presents a credential on every connect and renews it (see [Authentication](#authentication)); `.user("alice")` says who the client is on a dev server that trusts declared users. An insert waits for the connection; one sent but unanswered when it drops fails with `DISCONNECTED` (it may or may not have gone in) and isn't sent again.
 - **Cancelling:** dropping a subscription unsubscribes; `client.close().await` ends every stream.
 
 **Terminal UI.** `clc` (the `chlive-tui` crate, `tui/`) is a small user of the client: an input for the query and a table of its result (columns with their ClickHouse types), updated on every diff, with the rows a diff inserted or changed highlighted for a second. In the dev shell, `tui` connects it to the stack's server:
@@ -486,6 +557,8 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 
 ```jsonc
 // client → server
+{"type": "hello", "token": "eyJ…"}           // first (see Authentication; a dev server takes {"user": "alice"})
+{"type": "renew", "token": "eyJ…"}           // a fresh credential, before it expires
 {"type": "subscribe", "id": "s1", "sql": "select user_id, latency_ms from events where latency_ms > 100"}
 {"type": "subscribe", "id": "s2", "sql": "select * from events where session_id = {s:UUID}", "params": {"s": "abcdef00-…"}}
 {"type": "unsubscribe", "id": "s1"}
@@ -498,6 +571,8 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 {"type": "diff", "id": "s2", "changes": [{"op": "insert", "row": {…}, "index": 2}, …]}
 {"type": "error", "id": "s1", "code": "INVALID_QUERY", "message": "unknown column nope in table events (…) at 1:8"}
 {"type": "ack", "id": "w1", "offsets": [[3, 1842]]}
+{"type": "authenticated", "subject": "user:alice", "expires_at": 1762088400000}   // to hello and renew
+{"type": "error", "code": "AUTH_EXPIRED", "message": "the credential has expired"} // then closed: 4401 "AUTH_EXPIRED"
 ```
 
 - `snapshot` comes first and once; `diff`s follow, each with the changes of the events that were ready (never empty). The ops are `insert`, `delete` and `update`; clients reject ops they don't know.
@@ -510,7 +585,7 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 - **Complete snapshots.** A `subscribe` with `"complete": true` gets a snapshot holding every event in the query's topics up to their latest offsets when the server got the `subscribe`. Otherwise a snapshot is whatever the result has: a new result's ClickHouse snapshot (which trails Kafka by the sink's lag and the snapshot's age), or a shared result's current state (behind on a burst). The newer events then come as diffs. The server waits for the result to get there; if it can't within `server.complete_wait` (30 s), the subscription ends with `CATCH_UP_TIMEOUT`. A `resume` is unaffected. `@chlive/client` doesn't ask for it; the Rust client's `history()` does.
 - **Plans.** A `subscribe` with `"optimistic": true` gets `{"type": "plan", "id", "plan"}` right before each `snapshot` or `resume`: the result's stream plan (`chlive-core`'s `ClientPlan`, versioned by `"v"`). It holds the WHERE with the user's row filters, ORDER BY, LIMIT, OFFSET, FINAL's key and the `now()` windows, so a client can place its own inserts where the server's diffs will put them before they arrive (optimistic updates). The plan is per subscription: its row filters are part of it, and a permission change brings a new plan with the new snapshot. The plan also names its `table`, and the `user_column` the table's inserts are stamped with. Some queries can't be predicted from a result's rows: aggregates, IN/EXISTS sub-queries, OFFSET, and results ordered by a column they don't have or missing FINAL's key. Those get `{"type": "plan", "id", "reason"}` instead. `@chlive/client` asks for plans with `optimistic: true` (see [Optimistic inserts](#optimistic-inserts)); the Rust client doesn't yet.
 - **Inserts.** `insert` writes rows into a table (see [Inserts](#inserts)); its id is the client's, apart from subscriptions'. The answer is an `ack` with each row's `[partition, offset]`, in order, or an `error` with that id: `PERMISSION_DENIED`, `INVALID_INSERT` (nothing went in) or `WRITE_FAILED` (Kafka; the message says which rows went in).
-- Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`, `TOO_MANY_SUBSCRIPTIONS` (over `server.max_subscriptions_per_connection`), `CATCH_UP_TIMEOUT` (a complete snapshot not had within `server.complete_wait`), and for inserts `INVALID_INSERT` and `WRITE_FAILED`. After an error, that subscription is over.
+- Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`, `TOO_MANY_SUBSCRIPTIONS` (over `server.max_subscriptions_per_connection`), `CATCH_UP_TIMEOUT` (a complete snapshot not had within `server.complete_wait`), and for inserts `INVALID_INSERT` and `WRITE_FAILED`. After an error, that subscription is over. The connection's own (no id): `AUTH_MISSING`, `AUTH_BAD_SIGNATURE`, `AUTH_WRONG_AUDIENCE` and `AUTH_EXPIRED` (see [Authentication](#authentication)), and `PERMISSION_DENIED` for a misplaced `hello` or a renewal for another subject.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
 
 ### GROUP BY and aggregates
@@ -581,13 +656,14 @@ The playground uses it: the "Client state" panel shows a hit or miss, whether th
 ## Tests
 
 ```sh
-cargo test --workspace     # engine (lexer, parser, binder, planner, types, watermark), server protocol over a real WebSocket,
-                           # the protocol's messages, the Rust client's result store and connection (against a fake server)
+cargo test --workspace     # engine (lexer, parser, binder, planner, types, watermark), server protocol over a real WebSocket
+                           # (credentials too: signed with test keys in server/tests/keys/), the protocol's messages, the Rust
+                           # client's result store and connection (against a fake server)
 bun run test               # builds chlive-wasm, then: client state, reconnect/resume, optimistic inserts, the cache store on bun:sqlite (bun test)
 e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chlive-e2e, against `dnvr up`; output kept in .dnvr/e2e.log
 ```
 
-`e2e` runs the engine's ClickHouse and Kafka tests, then the server end to end. The latter subscribe over WebSocket while producing events, and check that each live result (snapshot plus inserts) equals the same query run directly on ClickHouse once everything is ingested; one does so through the Rust client. They count rows across the whole `events` table, so don't produce other events (e.g. with the playground's buttons) while they run.
+`e2e` runs the engine's ClickHouse and Kafka tests, then the server end to end. The latter subscribe over WebSocket while producing events, and check that each live result (snapshot plus inserts) equals the same query run directly on ClickHouse once everything is ingested; one does so through the Rust client. One follows grants in the stack's Postgres (`CHLIVE_POSTGRES_URL`; `pg` is psql on it), in a schema of their own, read by a role that can't see `public`. They count rows across the whole `events` table, so don't produce other events (e.g. with the playground's buttons) while they run.
 
 ## Benchmarks
 

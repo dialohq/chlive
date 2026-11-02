@@ -2,6 +2,7 @@
 //! each query (ClickHouse history, then Kafka events); the server only speaks the
 //! [`protocol`] with clients.
 
+pub mod auth;
 pub mod config;
 pub mod hub;
 pub mod log;

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -24,10 +24,11 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
+use crate::auth::Auth;
 use crate::hub::{CacheSettings, Hub, Joined, Outgoing};
 use crate::protocol::{
-    engine_error, ClientMsg, ServerMsg, BAD_MESSAGE, DUPLICATE_ID, INVALID_INSERT,
-    PERMISSION_DENIED, TOO_MANY_SUBSCRIPTIONS,
+    engine_error, ClientMsg, ServerMsg, AUTH_CLOSE, AUTH_EXPIRED, AUTH_MISSING, BAD_MESSAGE,
+    DUPLICATE_ID, INVALID_INSERT, PERMISSION_DENIED, TOO_MANY_SUBSCRIPTIONS,
 };
 use crate::security::{Decision, Security, TableAccess};
 
@@ -63,6 +64,8 @@ pub struct ServerSettings {
     pub cache: CacheSettings,
     /// Who may read which rows (the `[security]` section, its providers started).
     pub security: Arc<Security>,
+    /// Who a connection is (the `[auth]` section, its keys loaded).
+    pub auth: Arc<Auth>,
 }
 
 impl Default for ServerSettings {
@@ -78,6 +81,7 @@ impl Default for ServerSettings {
             max_inserts_in_flight: 100,
             cache: CacheSettings::default(),
             security: Arc::new(Security::open()),
+            auth: Arc::new(Auth::None),
         }
     }
 }
@@ -102,7 +106,7 @@ struct ConnInfo {
     connected_at: u64,
     /// Weak: the writer ends when the connection drops its sender.
     outbox: mpsc::WeakSender<Outgoing>,
-    /// Its user (`hello`).
+    /// Its user: the verified subject, or the declared user (`hello`).
     user: Option<String>,
     /// Its subscriptions: id, and the entry's key (as listed).
     subscriptions: Vec<(String, String)>,
@@ -253,6 +257,14 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
     };
     let writer = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
+            if let Outgoing::Close { code, reason } = out {
+                let frame = CloseFrame {
+                    code,
+                    reason: reason.into(),
+                };
+                let _ = sink.send(Message::Close(Some(frame))).await;
+                break;
+            }
             let Some(text) = out.render() else {
                 continue;
             };
@@ -268,10 +280,31 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
         }
     };
 
+    // closed for its credential (or its `hello`): the error, then a Close frame saying which
+    let close = |code: &'static str, message: &str| {
+        let (tx, msg) = (tx.clone(), ServerMsg::error(None, code, message));
+        async move {
+            let _ = tx.send(Outgoing::Msg(msg)).await;
+            let _ = tx
+                .send(Outgoing::Close {
+                    code: AUTH_CLOSE,
+                    reason: code,
+                })
+                .await;
+        }
+    };
+
     let mut subscriptions: HashMap<String, Live> = HashMap::new();
+    // the verified subject, or the declared user
     let mut user: Option<String> = None;
     // `hello` only comes first
     let mut greeted = false;
+    let auth = s.settings.auth.clone();
+    // with credentials: when the connection must have said hello (then renewed) by
+    let mut deadline = match &*auth {
+        Auth::Jwt(v) => Some(tokio::time::Instant::now() + v.hello_timeout),
+        _ => None,
+    };
     // inserts sent and not answered yet
     let in_flight = Arc::new(AtomicUsize::new(0));
     // a subscription whose permissions changed, by id
@@ -283,6 +316,14 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                 refilter(&s, conn, &id, &mut subscriptions, &tx).await;
                 listed(&subscriptions);
                 continue;
+            }
+            _ = until(deadline) => {
+                match user {
+                    Some(_) => close(AUTH_EXPIRED, "the credential has expired").await,
+                    None => close(AUTH_MISSING, "no hello {token} in time").await,
+                }
+                debug!(conn, user, "credential missing or expired: closed");
+                break;
             }
         };
         let Some(Ok(msg)) = msg else {
@@ -305,8 +346,14 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                 continue;
             }
         };
+        // with credentials, nothing comes before a verified hello
+        if let (Auth::Jwt(_), None, false) = (&*auth, &user, matches!(msg, ClientMsg::Hello { .. }))
+        {
+            close(AUTH_MISSING, "a credential comes first: hello {token}").await;
+            break;
+        }
         match msg {
-            ClientMsg::Hello { user: who } => {
+            ClientMsg::Hello { user: who, token } => {
                 if greeted {
                     send(ServerMsg::error(
                         None,
@@ -317,11 +364,84 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                     continue;
                 }
                 greeted = true;
+                let who = match (&*auth, who, token) {
+                    (Auth::Declared, who, None) => who,
+                    (Auth::None, None, None) => None,
+                    (Auth::Jwt(v), None, Some(token)) => match v.verify(&token).await {
+                        Ok(verified) => {
+                            deadline = Some(v.deadline(&verified).into());
+                            send(ServerMsg::Authenticated {
+                                subject: verified.subject.clone(),
+                                expires_at: verified.expires_at,
+                            })
+                            .await;
+                            Some(verified.subject)
+                        }
+                        Err(e) => {
+                            debug!(conn, code = e.code(), "credential refused");
+                            close(e.code(), e.message()).await;
+                            break;
+                        }
+                    },
+                    (Auth::Jwt(_), ..) => {
+                        close(
+                            AUTH_MISSING,
+                            "a credential is needed (hello {token}); declared users aren't taken",
+                        )
+                        .await;
+                        break;
+                    }
+                    (Auth::Declared, _, Some(_)) => {
+                        let m = "this server takes declared users (hello {user}), not credentials";
+                        close(PERMISSION_DENIED, m).await;
+                        break;
+                    }
+                    (Auth::None, ..) => {
+                        let m =
+                            "this server takes no users or credentials: connections are anonymous";
+                        close(PERMISSION_DENIED, m).await;
+                        break;
+                    }
+                };
                 debug!(conn, user = who, "hello");
                 if let Some(c) = s.conns.lock().unwrap().get_mut(&conn) {
                     c.user = who.clone();
                 }
                 user = who;
+            }
+            ClientMsg::Renew { token } => {
+                let Auth::Jwt(v) = &*auth else {
+                    send(ServerMsg::error(
+                        None,
+                        PERMISSION_DENIED,
+                        "this server takes no credentials",
+                    ))
+                    .await;
+                    continue;
+                };
+                match v.verify(&token).await {
+                    Ok(verified) if Some(&verified.subject) == user.as_ref() => {
+                        debug!(conn, user, "credential renewed");
+                        deadline = Some(v.deadline(&verified).into());
+                        send(ServerMsg::Authenticated {
+                            subject: verified.subject,
+                            expires_at: verified.expires_at,
+                        })
+                        .await;
+                    }
+                    Ok(_) => {
+                        send(ServerMsg::error(
+                            None,
+                            PERMISSION_DENIED,
+                            "a renewed credential is for the connection's subject",
+                        ))
+                        .await;
+                    }
+                    Err(e) => {
+                        debug!(conn, code = e.code(), "renewal refused");
+                        send(ServerMsg::error(None, e.code(), e.message())).await;
+                    }
+                }
             }
             ClientMsg::Subscribe {
                 id,
@@ -509,6 +629,14 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
     drop(tx);
     let _ = writer.await;
     info!(conn, "disconnected");
+}
+
+/// Until `deadline`, or forever without one.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// A running subscription: its entry, and what it's allowed to read.

@@ -1,9 +1,11 @@
 import type { ValueParsers } from "./parsers.ts";
 import { covered, loadedWasm, loadWasm, type PendingRows, Prediction } from "./optimistic.ts";
-import type { ClientMessage, DiffMessage, Params, Row, ServerMessage } from "./protocol.ts";
+import { AUTH_CLOSE, AUTH_CODES } from "./protocol.ts";
+import type { AuthenticatedMessage, ClientMessage, DiffMessage, Params, Row, ServerMessage } from "./protocol.ts";
 import { type CachedResult, ResultStore } from "./state.ts";
 
 export type * from "./protocol.ts";
+export { AUTH_CLOSE, AUTH_CODES } from "./protocol.ts";
 export { ResultStore, type CachedResult, type ResultStoreOptions } from "./state.ts";
 export {
   defaultParsers,
@@ -193,10 +195,33 @@ export interface LiveClientOptions {
   /** e.g. `ws://localhost:8080/live` */
   url: string;
   /**
-   * Who the client is, said to the server (`hello`) on every connection: tables it secures show
-   * each user only the rows they may see. Results are cached per user.
+   * Who the client is, said to the server (`hello`) on every connection, for a server that
+   * trusts declared users (`[auth] mode = "declared"`: dev and tests): tables it secures show
+   * each user only the rows they may see. Results are cached per user. With `token`, it isn't
+   * sent: it only names whose cache the results are, and must be the credential's subject.
    */
   user?: string;
+  /**
+   * The credential, for a server that verifies them (`[auth] mode = "jwt"`): a token (a JWT from
+   * the service that issues them), or a function giving one, called before every connection and
+   * again before the credential expires (`refreshBeforeMs`); the connection, its subscriptions
+   * and their cursors carry on. If it expires anyway, the server closes the connection
+   * (`AUTH_EXPIRED`), and the client connects again at once with a new one, resuming every
+   * result from its cursor. Sent in the first message, since browsers can't set headers on a
+   * WebSocket.
+   */
+  token?: string | (() => string | Promise<string>);
+  /** A credential is renewed this long before it expires, or halfway if it's shorter-lived
+   * (default 60 000 ms). */
+  refreshBeforeMs?: number;
+  /**
+   * Told when the server refuses the credential (`AUTH_MISSING`, `AUTH_BAD_SIGNATURE`,
+   * `AUTH_WRONG_AUDIENCE`, `AUTH_EXPIRED`, or `PERMISSION_DENIED` for a renewal for another
+   * subject), or the `token` function fails, or the credential isn't `user`'s (`CLIENT_ERROR`).
+   * The client keeps reconnecting with backoff, asking `token` each time (except when the
+   * subject isn't `user`: then it closes).
+   */
+  onAuthError?: (error: LiveError) => void;
   /** Initial reconnect delay; doubles up to `maxBackoffMs`. */
   minBackoffMs?: number;
   maxBackoffMs?: number;
@@ -303,8 +328,10 @@ const PENDING_MS = 30_000;
  * snapshot if it can't resume). Results are saved back as they change.
  */
 export class LiveClient {
-  private readonly opts: Required<Omit<LiveClientOptions, "WebSocket" | "cache" | "parsers" | "user">> &
-    Pick<LiveClientOptions, "WebSocket" | "parsers" | "user">;
+  private readonly opts: Required<
+    Omit<LiveClientOptions, "WebSocket" | "cache" | "parsers" | "user" | "token" | "onAuthError">
+  > &
+    Pick<LiveClientOptions, "WebSocket" | "parsers" | "user" | "token" | "onAuthError">;
   /** Resolves to the cache once it's set up and memory is warmed from it (`undefined` without
    * one); reads wait for it. */
   private readonly cacheReady: Promise<ResultCache | undefined> | undefined;
@@ -324,6 +351,12 @@ export class LiveClient {
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
+  /** Asking `token` for the next connection's credential. */
+  private connecting = false;
+  /** The current connection's credential is verified (`authenticated`). */
+  private authenticated = false;
+  private verifiedSubject: string | undefined;
+  private renewTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: LiveClientOptions) {
     const { cache = opfsAvailable(), ...rest } = opts;
@@ -335,6 +368,7 @@ export class LiveClient {
       gcTimeMs: 300_000,
       memoryRows: 100_000,
       optimistic: false,
+      refreshBeforeMs: 60_000,
       ...rest,
     };
     this.backoff = this.opts.minBackoffMs;
@@ -627,6 +661,7 @@ export class LiveClient {
     }
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.renewTimer) clearTimeout(this.renewTimer);
     if (this.pendingTimer) clearInterval(this.pendingTimer);
     for (const r of this.results.values()) r.prediction?.free();
     for (const r of this.results.values()) this.clearTimers(r);
@@ -825,13 +860,80 @@ export class LiveClient {
   }
 
   private ensureConnected(): void {
-    if (this.ws || this.closed || this.reconnectTimer) return;
+    if (this.ws || this.connecting || this.closed || this.reconnectTimer) return;
+    if (this.opts.token === undefined) return this.open(undefined);
+    // the credential first: the server gives a connection only so long to present it
+    this.connecting = true;
+    this.credential().then(
+      (token) => {
+        this.connecting = false;
+        if (!this.closed && (this.byWire.size > 0 || this.inserts.size > 0)) this.open(token);
+      },
+      (e) => {
+        this.connecting = false;
+        this.authError({ code: "CLIENT_ERROR", message: `the token function failed: ${errorText(e)}` });
+        this.scheduleReconnect();
+      },
+    );
+  }
+
+  /** The subject of the connection's verified credential (`token`), once the server says. */
+  get subject(): string | undefined {
+    return this.verifiedSubject;
+  }
+
+  private async credential(): Promise<string> {
+    const token = this.opts.token!;
+    return typeof token === "function" ? await token() : token;
+  }
+
+  private authError(error: LiveError): void {
+    if (this.opts.onAuthError) this.opts.onAuthError(error);
+    else console.warn(`chlive: ${error.code}: ${error.message}`);
+  }
+
+  /** The credential is verified: renew it before it expires (with a `token` function). */
+  private onAuthenticated(msg: AuthenticatedMessage): void {
+    const { user, token } = this.opts;
+    if (user !== undefined && msg.subject !== user) {
+      // the cached results are `user`'s: never show them to someone else
+      this.authError({ code: "CLIENT_ERROR", message: `the credential is for ${msg.subject}, not ${user}` });
+      this.close();
+      return;
+    }
+    this.authenticated = true;
+    this.verifiedSubject = msg.subject;
+    if (this.renewTimer) clearTimeout(this.renewTimer);
+    this.renewTimer = null;
+    if (typeof token !== "function") return;
+    const left = Math.max(0, msg.expires_at - Date.now());
+    const ws = this.ws;
+    this.renewTimer = setTimeout(() => this.renew(ws), left - Math.min(this.opts.refreshBeforeMs, left / 2));
+  }
+
+  /** A fresh credential on the same connection; if `token` fails, asked again 5 s later. */
+  private renew(ws: WebSocket | null): void {
+    this.renewTimer = null;
+    this.credential().then(
+      (token) => {
+        if (this.ws === ws) this.send({ type: "renew", token });
+      },
+      (e) => {
+        this.authError({ code: "CLIENT_ERROR", message: `the token function failed: ${errorText(e)}` });
+        if (this.ws === ws && !this.closed) this.renewTimer = setTimeout(() => this.renew(ws), 5000);
+      },
+    );
+  }
+
+  private open(token: string | undefined): void {
     const Impl = this.opts.WebSocket ?? globalThis.WebSocket;
     const ws = new Impl(this.opts.url);
     this.ws = ws;
     ws.onopen = () => {
       this.backoff = this.opts.minBackoffMs;
-      if (this.opts.user !== undefined) this.send({ type: "hello", user: this.opts.user });
+      // subscriptions and inserts may follow at once: the server takes them after the hello
+      if (token !== undefined) this.send({ type: "hello", token });
+      else if (this.opts.user !== undefined) this.send({ type: "hello", user: this.opts.user });
       for (const r of this.byWire.values()) this.sendSubscribe(r);
       for (const p of this.inserts.values()) if (!p.sent) p.sent = this.send(p.msg);
     };
@@ -839,9 +941,15 @@ export class LiveClient {
       const text = String(ev.data);
       this.onMessage(JSON.parse(text) as ServerMessage, text);
     };
-    ws.onclose = () => {
+    ws.onclose = (ev?: CloseEvent) => {
       if (this.ws !== ws) return;
       this.ws = null;
+      // expired after it was verified: a new credential at once (one refused at the hello
+      // waits like any failed connection)
+      const expired = ev?.code === AUTH_CLOSE && ev.reason === "AUTH_EXPIRED" && this.authenticated;
+      this.authenticated = false;
+      if (this.renewTimer) clearTimeout(this.renewTimer);
+      this.renewTimer = null;
       for (const r of this.byWire.values()) {
         if (r.state.status === "live") this.emit(r, { ...r.state, status: "loading" });
       }
@@ -852,7 +960,10 @@ export class LiveClient {
           new InsertError("DISCONNECTED", "the connection dropped before the server answered; the rows may or may not have gone in"),
         );
       }
-      this.scheduleReconnect();
+      if (expired) {
+        this.backoff = this.opts.minBackoffMs;
+        if (this.byWire.size > 0 || this.inserts.size > 0) this.ensureConnected();
+      } else this.scheduleReconnect();
     };
     ws.onerror = () => {
       // `onclose` follows and handles reconnection.
@@ -870,6 +981,14 @@ export class LiveClient {
   }
 
   private onMessage(msg: ServerMessage, text: string): void {
+    // the connection's own: its credential
+    if (msg.type === "authenticated") return this.onAuthenticated(msg);
+    if (msg.type === "error" && msg.id === undefined) {
+      if ((AUTH_CODES as readonly string[]).includes(msg.code) || msg.code === "PERMISSION_DENIED") {
+        this.authError({ code: msg.code, message: msg.message });
+      }
+      return;
+    }
     const bytes = text.length;
     const pending = msg.id ? this.inserts.get(msg.id) : undefined;
     if (pending) {
@@ -1091,6 +1210,10 @@ export function cacheKey(sql: string, params: Params | undefined): string {
 function splitKey(key: string): [sql: string, params: string | undefined] {
   const i = key.indexOf("\u0000");
   return i < 0 ? [key, undefined] : [key.slice(0, i), key.slice(i + 1)];
+}
+
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 function newStats(id: string): SubscriptionStats {

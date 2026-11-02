@@ -14,12 +14,13 @@ use figment::value::{Dict, Map};
 use figment::{Figment, Metadata, Profile, Provider};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::AuthConfig;
 use crate::security::{Security, SecurityConfig};
 use crate::ServerSettings;
 
 /// The sections, in order; env vars are read only for these (`CHLIVE_URL` and the like aren't
 /// config).
-pub const SECTIONS: [&str; 9] = [
+pub const SECTIONS: [&str; 10] = [
     "server",
     "cache",
     "clickhouse",
@@ -29,6 +30,7 @@ pub const SECTIONS: [&str; 9] = [
     "log",
     "tables",
     "security",
+    "auth",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -44,6 +46,8 @@ pub struct Config {
     pub tables: TablesConfig,
     /// Who may read which rows (see [`crate::security`]).
     pub security: SecurityConfig,
+    /// Who a connection is (see [`crate::auth`]).
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -482,6 +486,7 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("log.level: {:?}: {e}", self.log.level))?;
         ConfiguredRules::new(self.tables.clone())?;
         Security::check(&self.security, &self.tables)?;
+        self.auth.check()?;
         Ok(())
     }
 
@@ -509,10 +514,12 @@ impl Config {
         })
     }
 
-    /// The server's settings; its security is open until [`Security::start`] replaces it.
+    /// The server's settings; its security is open until [`Security::start`] replaces it, and
+    /// connections anonymous until [`crate::auth::Auth::start`] does.
     pub fn server_settings(&self) -> ServerSettings {
         ServerSettings {
             security: std::sync::Arc::new(Security::open()),
+            auth: std::sync::Arc::new(crate::auth::Auth::None),
             path: self.server.path.clone(),
             allowed_origins: self.server.allowed_origins.clone(),
             max_connections: self.server.max_connections,
@@ -843,6 +850,19 @@ mod tests {
                 level = "warn,chlive_server=debug"
                 format = "json"
 
+                [auth]
+                mode = "jwt"
+                issuer = "https://auth.example"
+                audience = "chlive-prod"
+                jwks_url = "https://auth.example/jwks.json"
+                jwks_file = "/etc/chlive/jwks.json"
+                jwks_refresh = "1m"
+                jwks_cooldown = "5s"
+                algorithms = ["ES256"]
+                subject_claim = "uid"
+                leeway = "1s"
+                hello_timeout = "3s"
+
                 [tables]
                 expose = "all"
                 database = "analytics"
@@ -891,6 +911,22 @@ mod tests {
             assert_eq!(c.snapshots.idle, Duration::from_secs(600));
             assert_eq!(c.log.level, "warn,chlive_server=debug");
             assert_eq!(c.log.format, LogFormat::Json);
+            assert_eq!(
+                c.auth,
+                crate::auth::AuthConfig {
+                    mode: crate::auth::Mode::Jwt,
+                    issuer: Some("https://auth.example".into()),
+                    audience: Some("chlive-prod".into()),
+                    jwks_url: Some("https://auth.example/jwks.json".into()),
+                    jwks_file: Some("/etc/chlive/jwks.json".into()),
+                    jwks_refresh: Duration::from_secs(60),
+                    jwks_cooldown: Duration::from_secs(5),
+                    algorithms: vec!["ES256".into()],
+                    subject_claim: "uid".into(),
+                    leeway: Duration::from_secs(1),
+                    hello_timeout: Duration::from_secs(3),
+                }
+            );
             assert_eq!(c.tables.expose, Expose::All);
             assert_eq!(c.tables.database, "analytics");
             assert_eq!(c.tables.topic, "prod.{table}");

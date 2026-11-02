@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use chlive_e2e::*;
 use chlive_engine::history::HistorySource;
 use futures::FutureExt;
@@ -2415,6 +2415,174 @@ async fn predictions_match_the_server() -> Result<()> {
             }
             // it matched most of them (the rest: not matching, or past a LIMIT)
             assert!(shown_in >= cases.len() / 2, "shown in {shown_in} of {}", cases.len());
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}
+
+/// The Postgres permissions provider, with its grants tables in the application's own schema:
+/// a role that can't even see `public` (where tables of the same names say otherwise, and are
+/// published too), a rows grant naming its schema and a tables grant left to the provider's
+/// `schema`; read at start, then followed through CDC: an insert, a change in `public` (ignored),
+/// a key change, and a revoke.
+#[tokio::test]
+async fn postgres_grants_from_another_schema() -> Result<()> {
+    use chlive_client::{ClientOptions, Kind, LiveClient, Status};
+    use futures::StreamExt;
+
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    let admin_url = std::env::var("CHLIVE_POSTGRES_URL")
+        .unwrap_or_else(|_| "postgres://postgres@127.0.0.1:54328/chlive".into());
+    let (pg, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .context("the stack's Postgres (CHLIVE_POSTGRES_URL)")?;
+    tokio::spawn(connection);
+
+    let run = chrono::Utc::now().timestamp_millis();
+    let [u1, u2, u3] = [1, 2, 3].map(|i| format!("pg-{run}-{i}"));
+    pg.batch_execute(&format!(
+        "DROP PUBLICATION IF EXISTS e2e_app_grants;
+         DROP SCHEMA IF EXISTS e2e_app CASCADE;
+         DROP TABLE IF EXISTS public.session_grants, public.table_grants;
+         DO $$ BEGIN
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'chlive_e2e') THEN
+             CREATE ROLE chlive_e2e LOGIN REPLICATION PASSWORD 'e2e';
+           END IF;
+         END $$;
+         CREATE SCHEMA e2e_app;
+         CREATE TABLE e2e_app.session_grants (subject text, user_id text, PRIMARY KEY (subject, user_id));
+         CREATE TABLE e2e_app.table_grants (subject text, table_name text, PRIMARY KEY (subject, table_name));
+         CREATE TABLE public.session_grants (subject text, user_id text, PRIMARY KEY (subject, user_id));
+         CREATE TABLE public.table_grants (subject text, table_name text, PRIMARY KEY (subject, table_name));
+         GRANT USAGE ON SCHEMA e2e_app TO chlive_e2e;
+         GRANT SELECT ON e2e_app.session_grants, e2e_app.table_grants TO chlive_e2e;
+         REVOKE ALL ON SCHEMA public FROM PUBLIC, chlive_e2e;
+         CREATE PUBLICATION e2e_app_grants FOR TABLE e2e_app.session_grants, e2e_app.table_grants,
+           public.session_grants, public.table_grants;
+         INSERT INTO e2e_app.session_grants VALUES ('user:alice', '{u1}');
+         INSERT INTO e2e_app.table_grants VALUES ('user:alice', 'events');
+         INSERT INTO public.session_grants VALUES ('user:alice', '{u2}'), ('user:alice', '{u3}');
+         INSERT INTO public.table_grants VALUES ('user:alice', 'events');"
+    ))
+    .await
+    .context("setting up the grants schema")?;
+
+    // the provider connects as the restricted role
+    let c: tokio_postgres::Config = admin_url.parse()?;
+    let host = match c.get_hosts() {
+        [tokio_postgres::config::Host::Tcp(h)] => h.clone(),
+        _ => bail!("CHLIVE_POSTGRES_URL: one TCP host"),
+    };
+    let port = c.get_ports().first().copied().unwrap_or(5432);
+    let db = c.get_dbname().unwrap_or("postgres");
+    let security: chlive_server::security::SecurityConfig = serde_json::from_value(json!({
+        "default": "deny",
+        // unqualified: the provider's schema
+        "tables": {"provider": "pg", "grants": "SELECT table_name FROM table_grants WHERE subject = {subject:String}"},
+        "providers": {"pg": {
+            "kind": "postgres",
+            "url": format!("postgres://chlive_e2e:e2e@{host}:{port}/{db}"),
+            "publication": "e2e_app_grants",
+            "slot": "chlive_e2e_grants",
+            "schema": "e2e_app",
+        }},
+    }))?;
+    let mut engine = config();
+    let mut tables = serde_json::to_value(&engine.tables)?;
+    tables["events"]["security"] = json!({
+        "provider": "pg",
+        "column": "user_id",
+        // qualified
+        "grants": "SELECT user_id FROM e2e_app.session_grants WHERE subject = {subject:String}",
+    });
+    engine.tables = serde_json::from_value(tables)?;
+    let settings = chlive_server::ServerSettings {
+        security: std::sync::Arc::new(chlive_server::security::Security::start(
+            &security,
+            &engine.tables,
+        )?),
+        auth: std::sync::Arc::new(chlive_server::auth::Auth::Declared),
+        ..Default::default()
+    };
+
+    let producer = producer()?;
+    let events: Vec<String> = [&u1, &u2, &u3]
+        .iter()
+        .map(|u| json!({"ts": "2026-11-02 12:00:00.000", "user_id": u}).to_string())
+        .collect();
+    producer.produce_json(&events).await?;
+
+    with_server_settings(engine, settings, |server| {
+        async move {
+            let client = LiveClient::new(
+                ClientOptions::new(format!("ws://{}/live", server.addr)).user("user:alice"),
+            );
+            let sql = format!("select user_id from events where user_id in ('{u1}', '{u2}', '{u3}')");
+            let mut sub = client.subscribe::<Row>(&sql);
+            // updates until the rows are `want`: their kinds
+            let mut until = async |want: &[&String]| -> Result<Vec<Kind>> {
+                let mut want: Vec<String> = want.iter().map(|u| u.to_string()).collect();
+                want.sort();
+                let mut kinds = Vec::new();
+                loop {
+                    let u = tokio::time::timeout(Duration::from_secs(60), sub.next())
+                        .await
+                        .context("waiting for the rows")?
+                        .context("the subscription ended")?;
+                    if let Status::Error(e) = &u.status {
+                        bail!("{e}");
+                    }
+                    kinds.push(u.kind);
+                    let mut got: Vec<String> = u
+                        .rows
+                        .iter()
+                        .map(|r| r["user_id"].as_str().unwrap().to_string())
+                        .collect();
+                    got.sort();
+                    if got == want {
+                        return Ok(kinds);
+                    }
+                }
+            };
+
+            // the initial read: e2e_app's grant, not public's
+            until(&[&u1]).await?;
+            // CDC: a new grant, a new snapshot
+            pg.execute(
+                "INSERT INTO e2e_app.session_grants VALUES ('user:alice', $1)",
+                &[&u2],
+            )
+            .await?;
+            assert!(until(&[&u1, &u2]).await?.contains(&Kind::Snapshot));
+            // public's table changing is no change; then a key change in e2e_app: u1 goes, u3
+            // comes (and nothing of public's)
+            pg.execute("DELETE FROM public.session_grants", &[]).await?;
+            pg.execute(
+                "INSERT INTO public.session_grants VALUES ('user:alice', $1)",
+                &[&u1],
+            )
+            .await?;
+            pg.execute(
+                "UPDATE e2e_app.session_grants SET user_id = $1 WHERE subject = 'user:alice' AND user_id = $2",
+                &[&u3, &u1],
+            )
+            .await?;
+            until(&[&u2, &u3]).await?;
+            // the table revoked in e2e_app (public's still grants it): the subscription ends
+            pg.execute("DELETE FROM e2e_app.table_grants", &[]).await?;
+            let u = tokio::time::timeout(Duration::from_secs(30), sub.next())
+                .await?
+                .context("the subscription ended")?;
+            match u.status {
+                Status::Error(e) => assert_eq!(e.code, "PERMISSION_DENIED", "{e}"),
+                other => bail!("not revoked: {other:?} {:?}", u.kind),
+            }
             Ok(())
         }
         .boxed()

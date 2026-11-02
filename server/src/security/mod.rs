@@ -443,7 +443,7 @@ impl Security {
         };
         let watch = |s: &Source| -> Result<watch::Receiver<Granted>, String> {
             let user = user.ok_or_else(|| {
-                format!("inserting into {table} needs a user (send `hello` first)")
+                format!("inserting into {table} needs a user (an authenticated connection)")
             })?;
             Ok(s.provider.watch(s.grant, user))
         };
@@ -460,7 +460,7 @@ impl Security {
         let Some(default) = self.default else {
             return Ok(TableAccess::open(table));
         };
-        let needs_user = || format!("table {table} needs a user (send `hello` before subscribing)");
+        let needs_user = || format!("table {table} needs a user (an authenticated connection)");
         let watch = |s: &Source| -> Result<watch::Receiver<Granted>, String> {
             let user = user.ok_or_else(needs_user)?;
             Ok(s.provider.watch(s.grant, user))

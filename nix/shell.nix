@@ -1,6 +1,6 @@
 # The dnvr dev shell: the toolchain, its env, the local stack (nix/stack.nix: Redpanda in
 # Docker, ClickHouse, Kafka Connect with the ClickHouse sink, the pause server, schema, the
-# server), the seed, the examples and scripts.
+# server), Postgres (for the permissions provider's e2e test), the seed, the examples and scripts.
 #
 # Every process picks its own ports (`dnvr-state pick-port`) and publishes its address; the
 # others get it through `dnvr://<process>/<key>` env refs. From outside, read them with
@@ -52,13 +52,21 @@ let
 
   toolchain = import ./toolchain.nix { inherit pkgs dnvrState libchdb; };
 
+  # The tests' Postgres (the permissions provider's source): a fixed port (dnvr's preset doesn't
+  # pick one; the chat stack's is 54329), the `chlive` database.
+  pgPort = 54328;
+  pgUrl = "postgres://postgres@127.0.0.1:${toString pgPort}/chlive";
+
 in
 { ... }:
 {
-  description = "chlive: Redpanda (Docker) + ClickHouse + Kafka Connect's ClickHouse sink + pause server + chlive-server (WebSocket over chlive-engine) + examples";
+  description = "chlive: Redpanda (Docker) + ClickHouse + Kafka Connect's ClickHouse sink + pause server + chlive-server (WebSocket over chlive-engine) + Postgres (the permissions provider's tests) + examples";
 
-  # ClickHouse is also on PATH for ad-hoc use (Redpanda runs in Docker)
-  packages = toolchain.packages ++ [ clickhouse ];
+  # ClickHouse and Postgres are also on PATH for ad-hoc use (Redpanda runs in Docker)
+  packages = toolchain.packages ++ [
+    clickhouse
+    pkgs.postgresql
+  ];
 
   env = toolchain.env // {
     SEED_COUNT = toString seedCount;
@@ -94,6 +102,23 @@ in
         dnvr-state set seeded 1
         exec tail -f /dev/null
       '';
+    };
+
+    # Postgres with logical replication, for the e2e tests of the Postgres permissions provider
+    # (they make their own schemas, roles and publications). dnvr's preset: data under
+    # .dnvr/postgres, `database` published once the database exists.
+    postgres = {
+      imports = [ presets.postgres ];
+      package = pkgs.postgresql;
+      # initdb refuses root: started as root (e.g. a dev VM), it runs as this user
+      runAsUser = "postgres";
+      database = "chlive";
+      port = pgPort;
+      settings = {
+        wal_level = "logical";
+        max_replication_slots = 10;
+        max_wal_senders = 10;
+      };
     };
 
     # As chlive_ro (snapshots as chlive_snap), against this stack. Publishes `url` (the
@@ -147,6 +172,18 @@ in
   };
 
   scripts = stack.scripts // {
+    pg = {
+      description = "psql connected to the stack's Postgres (the `chlive` database)";
+      text = ''exec ${pkgs.postgresql}/bin/psql "${pgUrl}" "$@"'';
+    };
+    reset-data = {
+      inherit (stack.scripts.reset-data) description;
+      text = ''
+        ${stack.scripts.reset-data.text}
+        rm -rf "''${DNVR_ROOT:?}/.dnvr/postgres"
+        echo "removed Postgres data too"
+      '';
+    };
     wasm = {
       description = "Build chlive-wasm (chlive-core for the TS client) into client/wasm/";
       text = ''
@@ -174,6 +211,7 @@ in
       runtimeInputs = [ dnvrState ];
       text = ''
         ${stackEnv}
+        export CHLIVE_POSTGRES_URL="''${CHLIVE_POSTGRES_URL:-${pgUrl}}"
         cd "$DNVR_ROOT"
         # the whole output is kept (the stack's tests can be timing-sensitive: a failure's
         # details shouldn't depend on what the terminal kept)

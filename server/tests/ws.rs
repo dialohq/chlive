@@ -12,6 +12,7 @@ use chlive_engine::snapshot::{Lease, Snapshot, SnapshotError, SnapshotTable, Sna
 use chlive_engine::source::{Event, EventSource, MemorySource, SourceError, TopicStart};
 use chlive_engine::watermark::Watermark;
 use chlive_engine::Engine;
+use chlive_server::auth::Auth;
 use chlive_server::security::{Default as SecurityDefault, MemoryProvider, Security, Source};
 use chlive_server::{CacheSettings, ServerSettings};
 use futures::stream::{self, BoxStream, StreamExt};
@@ -1981,12 +1982,21 @@ async fn an_entry_that_fails_tells_every_subscriber_and_goes() {
 /// `requests` secured by user_id, its grants in `provider` (grant 0); nothing else readable.
 fn secured(provider: std::sync::Arc<MemoryProvider>) -> ServerSettings {
     ServerSettings {
+        auth: std::sync::Arc::new(Auth::Declared),
         security: std::sync::Arc::new(Security::secured(SecurityDefault::Deny).rows(
             "requests",
             "user_id",
             Source { provider, grant: 0 },
         )),
         ..ServerSettings::default()
+    }
+}
+
+/// Settings trusting `hello {user}` (dev and tests).
+fn declared() -> ServerSettings {
+    ServerSettings {
+        auth: std::sync::Arc::new(Auth::Declared),
+        ..Default::default()
     }
 }
 
@@ -2132,6 +2142,7 @@ fn tables_and_columns(provider: std::sync::Arc<MemoryProvider>) -> ServerSetting
         grant,
     };
     ServerSettings {
+        auth: std::sync::Arc::new(Auth::Declared),
         security: std::sync::Arc::new(
             Security::secured(SecurityDefault::Deny)
                 .public("requests")
@@ -2210,6 +2221,7 @@ async fn a_table_grant_allows_while_it_answers_anything() {
     let p = MemoryProvider::loaded();
     p.set(0, "alice", &["requests:read"]);
     let settings = ServerSettings {
+        auth: std::sync::Arc::new(Auth::Declared),
         security: std::sync::Arc::new(Security::secured(SecurityDefault::Deny).table(
             "requests",
             Source {
@@ -2357,7 +2369,7 @@ async fn error_code(c: &mut Client, id: &str) -> String {
 #[tokio::test]
 async fn inserts_are_acked_and_arrive_like_any_event() {
     let live = Live::new();
-    let server = insert_server(&live, json!({"user": "user_id"}), ServerSettings::default()).await;
+    let server = insert_server(&live, json!({"user": "user_id"}), declared()).await;
     let mut reader = Client::connect(&server).await;
     reader
         .subscribe("s", "select user_id, latency_ms from requests")
@@ -2440,6 +2452,7 @@ async fn insert_grants_decide_who_inserts_which_rows_and_columns() {
         },
     );
     let settings = ServerSettings {
+        auth: std::sync::Arc::new(Auth::Declared),
         security: std::sync::Arc::new(security),
         ..Default::default()
     };
@@ -2480,6 +2493,7 @@ async fn insert_grants_decide_who_inserts_which_rows_and_columns() {
 async fn insert_limits() {
     let live = Live::new();
     let settings = ServerSettings {
+        auth: std::sync::Arc::new(Auth::Declared),
         max_insert_rows: 2,
         ..Default::default()
     };
@@ -2565,7 +2579,7 @@ async fn optimistic_subscriptions_get_their_plan_before_each_snapshot() {
 #[tokio::test]
 async fn a_plan_names_its_table_and_the_column_inserts_stamp_with_the_user() {
     let live = Live::new();
-    let server = insert_server(&live, json!({"user": "user_id"}), ServerSettings::default()).await;
+    let server = insert_server(&live, json!({"user": "user_id"}), declared()).await;
     let mut c = Client::connect(&server).await;
     hello(&mut c, "alice").await;
     let sql = "select user_id, latency_ms from requests order by latency_ms desc limit 3";
@@ -2582,4 +2596,492 @@ async fn a_plan_names_its_table_and_the_column_inserts_stamp_with_the_user() {
         plan_then_snapshot(&mut c, "o").await.unwrap_err(),
         "OFFSET isn't predicted"
     );
+}
+
+// --- authentication -----------------------------------------------------------------------------
+
+const ISSUER: &str = "https://auth.test";
+const AUDIENCE: &str = "chlive-test";
+
+/// A test key's file (`tests/keys/`: Ed25519 keys made for these tests only; k1 and k2 are the
+/// issuer's, k3 isn't).
+fn key_file(key: &str, ext: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/keys/{key}.{ext}"))
+}
+
+fn jwks(keys: &[&str]) -> String {
+    let keys: Vec<Value> = keys
+        .iter()
+        .map(|k| serde_json::from_str(&std::fs::read_to_string(key_file(k, "jwk.json")).unwrap()))
+        .collect::<Result<_, _>>()
+        .unwrap();
+    json!({ "keys": keys }).to_string()
+}
+
+/// A file of its own holding the issuer's keys.
+fn jwks_file(keys: &[&str]) -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("chlive-jwks-{}-{n}.json", std::process::id()));
+    std::fs::write(&path, jwks(keys)).unwrap();
+    path
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A credential's claims: for `subject`, expiring in `secs` (negative: expired).
+fn claims(subject: &str, secs: i64) -> Value {
+    json!({"iss": ISSUER, "aud": AUDIENCE, "sub": subject, "iat": unix_now(), "exp": unix_now() + secs})
+}
+
+/// `claims` signed by `key`, its header naming `kid` (none: no kid).
+fn sign(key: &str, kid: Option<&str>, claims: &Value) -> String {
+    let pem = std::fs::read(key_file(key, "pem")).unwrap();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+    header.kid = kid.map(str::to_string);
+    jsonwebtoken::encode(
+        &header,
+        claims,
+        &jsonwebtoken::EncodingKey::from_ed_pem(&pem).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A credential for `subject` signed by the issuer's k1, valid for `secs`.
+fn token(subject: &str, secs: i64) -> String {
+    sign("k1", Some("k1"), &claims(subject, secs))
+}
+
+/// Verifying credentials with keys k1 and k2 (from a file), the way `f` changes it.
+async fn jwt(f: impl FnOnce(&mut chlive_server::auth::AuthConfig)) -> std::sync::Arc<Auth> {
+    let mut c = chlive_server::auth::AuthConfig {
+        mode: chlive_server::auth::Mode::Jwt,
+        issuer: Some(ISSUER.into()),
+        audience: Some(AUDIENCE.into()),
+        jwks_file: Some(jwks_file(&["k1", "k2"])),
+        leeway: Duration::ZERO,
+        ..Default::default()
+    };
+    f(&mut c);
+    std::sync::Arc::new(Auth::start(&c).await.unwrap())
+}
+
+impl Client {
+    /// The connection's Close frame: its code and reason (after any messages, which are
+    /// skipped).
+    async fn closed(&mut self) -> (u16, String) {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), self.0.next()).await {
+                Ok(Some(Ok(Message::Close(Some(f))))) => {
+                    return (f.code.into(), f.reason.to_string())
+                }
+                Ok(Some(Ok(Message::Close(None)))) | Ok(None) => return (0, String::new()),
+                Ok(Some(Ok(_))) => continue,
+                other => panic!("no close: {other:?}"),
+            }
+        }
+    }
+
+    /// Refused for its credential: the error with `code` (and no id), then a 4401 Close frame
+    /// saying it.
+    async fn refused(&mut self, code: &str) -> String {
+        // a credential's expiry may be seconds away
+        let mut m = None;
+        for _ in 0..10 {
+            m = self.next().await;
+            if m.is_some() {
+                break;
+            }
+        }
+        let m = m.expect("an error");
+        assert_eq!(
+            (m["type"].as_str(), m["code"].as_str(), &m["id"]),
+            (Some("error"), Some(code), &Value::Null),
+            "{m}"
+        );
+        assert_eq!(self.closed().await, (4401, code.to_string()));
+        m["message"].as_str().unwrap().to_string()
+    }
+}
+
+#[tokio::test]
+async fn a_valid_credential_names_the_subject() {
+    let p = MemoryProvider::loaded();
+    p.set(0, "user:alice", &["slow", "fast"]);
+    let server = server_with(ServerSettings {
+        auth: jwt(|_| {}).await,
+        ..secured(p)
+    })
+    .await;
+    let mut a = Client::connect(&server).await;
+    let t = token("user:alice", 60);
+    // subscribes may follow the hello at once: they wait for it
+    a.send(json!({"type": "hello", "token": t})).await;
+    a.subscribe("s", "select user_id from requests").await;
+    let m = a.expect().await;
+    assert_eq!(m["type"], "authenticated", "{m}");
+    assert_eq!(m["subject"], "user:alice");
+    let exp = m["expires_at"].as_i64().unwrap();
+    assert!((exp / 1000 - unix_now() - 60).abs() <= 1, "{m}");
+    assert_eq!(a.expect().await["type"], "snapshot");
+    assert_eq!(
+        a.inserts("s", 2).await,
+        [json!({"user_id": "fast"}), json!({"user_id": "slow"})]
+    );
+    let state = http_get(&format!("http://{}/debug/state", server.addr)).await;
+    assert!(state.contains("\"user\":\"user:alice\""), "{state}");
+
+    // a token without a kid: tried with each of the issuer's keys
+    let mut b = Client::connect(&server).await;
+    let t = sign("k2", None, &claims("user:bob", 60));
+    b.send(json!({"type": "hello", "token": t})).await;
+    assert_eq!(b.expect().await["subject"], "user:bob");
+}
+
+#[tokio::test]
+async fn each_invalid_credential_has_its_code() {
+    let auth = jwt(|c| c.hello_timeout = Duration::from_millis(300)).await;
+    let server = server_with(ServerSettings {
+        auth,
+        ..Default::default()
+    })
+    .await;
+    let refused = |hello: Value, code: &'static str| {
+        let addr = server.addr;
+        async move {
+            let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/live"))
+                .await
+                .unwrap();
+            let mut c = Client(ws);
+            c.send(hello.clone()).await;
+            let message = c.refused(code).await;
+            // nothing of the credential, or of what was expected
+            for secret in ["alice", "auth.test", "chlive-test", "k1", "k3"] {
+                assert!(!message.contains(secret), "{hello}: {message}");
+            }
+        }
+    };
+    use chlive_server::protocol::{
+        AUTH_BAD_SIGNATURE as BAD, AUTH_EXPIRED as EXPIRED, AUTH_MISSING as MISSING,
+        AUTH_WRONG_AUDIENCE as WRONG,
+    };
+
+    // no credential
+    refused(
+        json!({"type": "subscribe", "id": "s", "sql": "select * from requests"}),
+        MISSING,
+    )
+    .await;
+    refused(json!({"type": "hello"}), MISSING).await;
+    refused(json!({"type": "hello", "user": "alice"}), MISSING).await;
+    let t = token("alice", 60);
+    refused(
+        json!({"type": "hello", "user": "alice", "token": t}),
+        MISSING,
+    )
+    .await;
+    refused(json!({"type": "renew", "token": t}), MISSING).await;
+    let mut late = Client::connect(&server).await;
+    late.refused(MISSING).await;
+
+    // bad signature: an untrusted key, under its own kid or the issuer's
+    let hello = |t: String| json!({"type": "hello", "token": t});
+    refused(hello(sign("k3", Some("k3"), &claims("alice", 60))), BAD).await;
+    refused(hello(sign("k3", Some("k1"), &claims("alice", 60))), BAD).await;
+    refused(hello(sign("k3", None, &claims("alice", 60))), BAD).await;
+    // expired too: the signature is checked first, so nothing says it's expired
+    refused(hello(sign("k3", Some("k1"), &claims("alice", -60))), BAD).await;
+    // its claims changed after signing
+    let good = token("alice", 60);
+    let parts: Vec<&str> = good.split('.').collect();
+    let mallory = sign("k3", None, &claims("mallory", 60));
+    let forged = format!(
+        "{}.{}.{}",
+        parts[0],
+        mallory.split('.').nth(1).unwrap(),
+        parts[2]
+    );
+    refused(hello(forged), BAD).await;
+    refused(hello("not a token".into()), BAD).await;
+    refused(hello("e30.e30.e30".into()), BAD).await;
+    // a shared secret (HS256): never a key the server takes
+    let hs = jsonwebtoken::encode(
+        &jsonwebtoken::Header {
+            kid: Some("k1".into()),
+            ..jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256)
+        },
+        &claims("alice", 60),
+        &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+    )
+    .unwrap();
+    refused(hello(hs), BAD).await;
+
+    // not for this server
+    let mut c = claims("alice", 60);
+    c["iss"] = json!("https://someone.else");
+    refused(hello(sign("k1", Some("k1"), &c)), WRONG).await;
+    let mut c = claims("alice", 60);
+    c["aud"] = json!("another-service");
+    refused(hello(sign("k1", Some("k1"), &c)), WRONG).await;
+    let mut c = claims("alice", 60);
+    c.as_object_mut().unwrap().remove("sub");
+    refused(hello(sign("k1", Some("k1"), &c)), WRONG).await;
+
+    // expired
+    refused(hello(token("alice", -60)), EXPIRED).await;
+    let mut c = claims("alice", 60);
+    c["nbf"] = json!(unix_now() + 30);
+    refused(hello(sign("k1", Some("k1"), &c)), EXPIRED).await;
+}
+
+#[tokio::test]
+async fn inserts_stamp_the_verified_subject() {
+    let live = Live::new();
+    let settings = ServerSettings {
+        auth: jwt(|_| {}).await,
+        ..Default::default()
+    };
+    let server = insert_server(&live, json!({"user": "user_id"}), settings).await;
+    let mut w = Client::connect(&server).await;
+    w.send(json!({"type": "hello", "token": token("user:alice", 60)}))
+        .await;
+    assert_eq!(w.expect().await["type"], "authenticated");
+    w.subscribe("s", "select user_id, latency_ms from requests")
+        .await;
+    assert_eq!(w.expect().await["type"], "snapshot");
+    insert(&mut w, "w1", json!([{"latency_ms": 12}])).await;
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        got.push(w.expect().await);
+    }
+    let diff = got.iter().find(|m| m["type"] == "diff").expect("the row");
+    assert_eq!(
+        diff["changes"][0]["row"],
+        json!({"user_id": "user:alice", "latency_ms": 12})
+    );
+    assert!(got.iter().any(|m| m["type"] == "ack"), "{got:?}");
+}
+
+#[tokio::test]
+async fn a_renewed_credential_keeps_the_subscription() {
+    let live = Live::new();
+    let settings = ServerSettings {
+        auth: jwt(|_| {}).await,
+        ..Default::default()
+    };
+    let server = live_server(&live, settings).await;
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "hello", "token": token("agent:7", 2)}))
+        .await;
+    let first = c.expect().await;
+    assert_eq!(first["type"], "authenticated");
+    c.subscribe("s", "select user_id from requests").await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    live.push("before", 1);
+    assert_eq!(users(&mut c, "s", 1).await.0, ["before"]);
+
+    // a fresh credential before this one expires: the same connection, subscription and cursor
+    c.send(json!({"type": "renew", "token": token("agent:7", 4)}))
+        .await;
+    let renewed = c.expect().await;
+    assert_eq!(renewed["type"], "authenticated", "{renewed}");
+    assert!(renewed["expires_at"].as_i64() > first["expires_at"].as_i64());
+    // past the first one's expiry
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    live.push("after", 2);
+    assert_eq!(users(&mut c, "s", 1).await.0, ["after"]);
+
+    // another subject's, or a bad one: refused, and the connection carries on
+    c.send(json!({"type": "renew", "token": token("agent:8", 60)}))
+        .await;
+    let m = c.expect().await;
+    assert_eq!(
+        (&m["code"], &m["id"]),
+        (&json!("PERMISSION_DENIED"), &Value::Null),
+        "{m}"
+    );
+    c.send(json!({"type": "renew", "token": token("agent:7", -60)}))
+        .await;
+    assert_eq!(c.expect().await["code"], "AUTH_EXPIRED");
+    live.push("still", 3);
+    assert_eq!(users(&mut c, "s", 1).await.0, ["still"]);
+
+    // one snapshot all along; then, not renewed, it expires
+    assert_eq!(
+        c.refused("AUTH_EXPIRED").await,
+        "the credential has expired"
+    );
+}
+
+#[tokio::test]
+async fn keys_rotate() {
+    // from a file, read again every jwks_refresh
+    let file = jwks_file(&["k1", "k2"]);
+    let server = server_with(ServerSettings {
+        auth: jwt(|c| {
+            c.jwks_file = Some(file.clone());
+            c.jwks_refresh = Duration::from_millis(100);
+        })
+        .await,
+        ..Default::default()
+    })
+    .await;
+    let hello = |key: &'static str| {
+        let addr = server.addr;
+        async move {
+            let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/live"))
+                .await
+                .unwrap();
+            let mut c = Client(ws);
+            c.send(json!({"type": "hello", "token": sign(key, Some(key), &claims("alice", 60))}))
+                .await;
+            c.expect().await
+        }
+    };
+    assert_eq!(hello("k1").await["type"], "authenticated");
+    assert_eq!(hello("k2").await["type"], "authenticated");
+    std::fs::write(&file, jwks(&["k2", "k3"])).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(hello("k1").await["code"], "AUTH_BAD_SIGNATURE");
+    assert_eq!(hello("k3").await["type"], "authenticated");
+    std::fs::remove_file(&file).unwrap();
+    // a source that fails keeps its keys
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(hello("k2").await["type"], "authenticated");
+
+    // from a URL: a key id it doesn't have reads it again (at most every jwks_cooldown)
+    let served = std::sync::Arc::new(std::sync::Mutex::new(jwks(&["k1"])));
+    let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let issuer = {
+        let (served, fetches) = (served.clone(), fetches.clone());
+        axum::Router::new().route(
+            "/jwks.json",
+            axum::routing::get(move || {
+                fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = served.lock().unwrap().clone();
+                async move { body }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/jwks.json", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, issuer).await });
+    let server = server_with(ServerSettings {
+        auth: jwt(|c| {
+            c.jwks_file = None;
+            c.jwks_url = Some(url);
+            c.jwks_cooldown = Duration::from_millis(200);
+        })
+        .await,
+        ..Default::default()
+    })
+    .await;
+    let hello = |key: &'static str| {
+        let addr = server.addr;
+        async move {
+            let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/live"))
+                .await
+                .unwrap();
+            let mut c = Client(ws);
+            c.send(json!({"type": "hello", "token": sign(key, Some(key), &claims("alice", 60))}))
+                .await;
+            c.expect().await
+        }
+    };
+    let fetched = || fetches.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(hello("k1").await["type"], "authenticated");
+    assert_eq!(fetched(), 1);
+    // the issuer rotates to k2
+    *served.lock().unwrap() = jwks(&["k1", "k2"]);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(hello("k2").await["type"], "authenticated");
+    assert_eq!(fetched(), 2);
+    // within the cooldown, an unknown key id doesn't fetch again
+    assert_eq!(hello("k3").await["code"], "AUTH_BAD_SIGNATURE");
+    assert_eq!(hello("k3").await["code"], "AUTH_BAD_SIGNATURE");
+    assert_eq!(fetched(), 2);
+}
+
+#[tokio::test]
+async fn declared_users_are_an_explicit_opt_in() {
+    // by default: anonymous, and a hello is refused
+    let server = server().await;
+    let mut c = Client::connect(&server).await;
+    hello(&mut c, "alice").await;
+    c.refused("PERMISSION_DENIED").await;
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "hello", "token": token("alice", 60)}))
+        .await;
+    c.refused("PERMISSION_DENIED").await;
+    let mut anon = Client::connect(&server).await;
+    anon.subscribe("s", "select user_id from requests").await;
+    assert_eq!(anon.expect().await["type"], "snapshot");
+
+    // declared (dev, tests): the hello's user, as said; no credentials
+    let live = Live::new();
+    let server = insert_server(&live, json!({"user": "user_id"}), declared()).await;
+    let mut c = Client::connect(&server).await;
+    hello(&mut c, "alice").await;
+    insert(&mut c, "w1", json!([{"latency_ms": 5}])).await;
+    assert_eq!(c.expect().await["type"], "ack");
+    assert!(live
+        .0
+        .messages
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .contains("\"alice\""));
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "hello", "token": token("alice", 60)}))
+        .await;
+    c.refused("PERMISSION_DENIED").await;
+}
+
+#[tokio::test]
+async fn the_rust_client_renews_against_the_server() {
+    use chlive_client::{ClientOptions, Kind, LiveClient};
+    let live = Live::new();
+    let settings = ServerSettings {
+        auth: jwt(|_| {}).await,
+        ..Default::default()
+    };
+    let server = live_server(&live, settings).await;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    let opts = ClientOptions::new(format!("ws://{}/live", server.addr)).credentials(move || {
+        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // short-lived: renewed halfway, about every second
+        async { Ok::<_, String>(token("agent:7", 2)) }
+    });
+    let client = LiveClient::new(opts);
+    let mut sub = client.subscribe::<chlive_client::Row>("select user_id from requests");
+    let mut kinds = Vec::new();
+    let mut seen = Vec::new();
+    for i in 0..5 {
+        live.push(&format!("e{i}"), i);
+        while !seen.contains(&format!("e{i}")) {
+            let u = tokio::time::timeout(Duration::from_secs(5), sub.next())
+                .await
+                .unwrap()
+                .unwrap();
+            kinds.push(u.kind);
+            seen = u
+                .rows
+                .iter()
+                .map(|r| r["user_id"].as_str().unwrap().to_string())
+                .collect();
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+    }
+    // past two expiries of its first credential: one connection, one snapshot
+    let snapshots = kinds.iter().filter(|k| **k == Kind::Snapshot).count();
+    assert_eq!(snapshots, 1, "{kinds:?}");
+    assert!(!kinds.contains(&Kind::Disconnected), "{kinds:?}");
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 4);
 }

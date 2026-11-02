@@ -9,6 +9,11 @@ snapshot_database = "chlive_snapshots"
 [cache]
 dir = ".dnvr/chat-chlive-cache"
 
+# The app says who each pane is (`hello {user}`), unverified: a demo. A real deployment verifies
+# credentials instead (`mode = "jwt"`, see the README's "Authentication").
+[auth]
+mode = "declared"
+
 [log]
 level = "info,chlive_server::hub=debug"
 

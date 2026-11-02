@@ -3,8 +3,20 @@
 //! used by `chlive-server` and the Rust client, `chlive-client`.
 //!
 //! The client may first say who it is (`hello`); a server that secures its tables shows each
-//! user only the tables, rows and columns they may see (`*` is the columns they may see). It subscribes with an id of its choosing (scoped to the
-//! connection) and a dialect query. The server answers with a `snapshot` (the history), then
+//! user only the tables, rows and columns they may see (`*` is the columns they may see). It
+//! subscribes with an id of its choosing (scoped to the connection) and a dialect query.
+//!
+//! Authentication: a server that verifies credentials (`[auth] mode = "jwt"`) takes the
+//! `hello`'s `token` (a JWT its issuer signed), and the connection is the token's subject's.
+//! Nothing comes before the `hello`, which the server answers with `authenticated` (the subject,
+//! and when the credential expires). Before then, the client sends `renew` with a fresh token for
+//! the same subject, answered with `authenticated` again: the connection, its subscriptions and
+//! their cursors carry on, with no new snapshot. A refused `renew` is an `error` (with no id) and
+//! the connection carries on until the credential expires. A connection without a valid
+//! credential gets an `error` with no id (`AUTH_MISSING`, `AUTH_BAD_SIGNATURE`,
+//! `AUTH_WRONG_AUDIENCE` or `AUTH_EXPIRED`, nothing more said), and is closed with code
+//! [`AUTH_CLOSE`] (4401) and the code as the reason. A server in dev mode (`mode = "declared"`)
+//! trusts the `hello`'s `user` instead, and one without authentication refuses any `hello`. The server answers with a `snapshot` (the history), then
 //! `diff`s as events arrive, or an `error`, after which that subscription is over. When what
 //! the user may see changes (their permissions), the subscription gets a new `snapshot` that
 //! replaces its result, and the diffs continue from it; when they lose a table it reads, or a
@@ -76,11 +88,19 @@ pub type Params = std::collections::BTreeMap<String, serde_json::Value>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ClientMsg {
-    /// Who the client is: before any `subscribe`, at most once per connection. Without one,
-    /// the connection is anonymous.
+    /// Who the client is: first, at most once per connection. Without one, the connection is
+    /// anonymous (on a server that allows it). A server verifying credentials takes a `token`
+    /// and answers `authenticated`; one that trusts declared users (dev, tests) takes `user`.
     Hello {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// A fresh credential for the connection's subject, before the current one expires: the
+    /// connection, its subscriptions and their cursors carry on (see the module docs).
+    Renew {
+        token: String,
     },
     Subscribe {
         id: String,
@@ -170,6 +190,9 @@ pub enum ServerMsg {
         id: String,
         offsets: Vec<(i32, i64)>,
     },
+    /// The `hello`'s (or a `renew`'s) credential is verified: the connection is `subject`'s
+    /// until `expires_at` (Unix milliseconds), when it's closed unless renewed.
+    Authenticated { subject: String, expires_at: i64 },
     Error {
         /// Absent when the message can't be attributed to a subscription.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,6 +341,31 @@ pub const WRITE_FAILED: &str = "WRITE_FAILED";
 /// A `complete` subscription's result didn't get to Kafka's offsets at subscribe time within
 /// the server's `complete_wait`.
 pub const CATCH_UP_TIMEOUT: &str = "CATCH_UP_TIMEOUT";
+/// No credential: none in the `hello`, a declared `user` instead, a message before the `hello`,
+/// or no `hello` within the server's `hello_timeout`.
+pub const AUTH_MISSING: &str = "AUTH_MISSING";
+/// The credential can't be verified: malformed, signed by a key the server doesn't trust, or
+/// with an algorithm it doesn't take.
+pub const AUTH_BAD_SIGNATURE: &str = "AUTH_BAD_SIGNATURE";
+/// The credential's issuer or audience isn't the server's.
+pub const AUTH_WRONG_AUDIENCE: &str = "AUTH_WRONG_AUDIENCE";
+/// The credential expired (or isn't valid yet).
+pub const AUTH_EXPIRED: &str = "AUTH_EXPIRED";
+/// The WebSocket close code of a connection closed for its credential (or its `hello`); the
+/// close reason is the error's code, e.g. `AUTH_EXPIRED`.
+pub const AUTH_CLOSE: u16 = 4401;
+
+/// Whether `code` is one of the credential's (`AUTH_*`).
+pub fn is_auth_error(code: &str) -> bool {
+    [
+        AUTH_MISSING,
+        AUTH_BAD_SIGNATURE,
+        AUTH_WRONG_AUDIENCE,
+        AUTH_EXPIRED,
+    ]
+    .contains(&code)
+}
+
 /// Never sent: a client's code for a message it couldn't apply.
 pub const CLIENT_ERROR: &str = "CLIENT_ERROR";
 /// Never sent: a client's code for an insert whose connection dropped before its answer (it may
@@ -343,6 +391,7 @@ impl ServerMsg {
             | ServerMsg::Plan { id, .. }
             | ServerMsg::Ack { id, .. } => Some(id),
             ServerMsg::Error { id, .. } => id.as_deref(),
+            ServerMsg::Authenticated { .. } => None,
         }
     }
 }
@@ -381,7 +430,30 @@ mod tests {
         assert!(matches!(m, ClientMsg::Subscribe { complete: true, .. }));
         let m: ClientMsg =
             round_trip(json!({"type": "subscribe", "id": "s1", "sql": "x", "optimistic": true}));
-        assert!(matches!(m, ClientMsg::Subscribe { optimistic: true, .. }));
+        assert!(matches!(
+            m,
+            ClientMsg::Subscribe {
+                optimistic: true,
+                ..
+            }
+        ));
+        let m: ClientMsg = round_trip(json!({"type": "hello", "token": "eyJ…"}));
+        assert!(matches!(
+            m,
+            ClientMsg::Hello {
+                user: None,
+                token: Some(_)
+            }
+        ));
+        let m: ClientMsg = round_trip(json!({"type": "hello", "user": "alice"}));
+        assert!(matches!(
+            m,
+            ClientMsg::Hello {
+                user: Some(_),
+                token: None
+            }
+        ));
+        round_trip::<ClientMsg>(json!({"type": "renew", "token": "eyJ…"}));
         // no params, not complete: neither sent
         let m: ClientMsg = serde_json::from_value(
             json!({"type": "subscribe", "id": "s1", "sql": "x", "params": {}, "complete": false}),
@@ -454,6 +526,11 @@ mod tests {
         round_trip::<ServerMsg>(
             json!({"type": "error", "id": "s1", "code": SYNTAX_ERROR, "message": "x at 1:2"}),
         );
+        let m: ServerMsg = round_trip(
+            json!({"type": "authenticated", "subject": "user:alice", "expires_at": 1762000000000_i64}),
+        );
+        assert_eq!(m.id(), None);
+        assert!(is_auth_error(AUTH_EXPIRED) && !is_auth_error(PERMISSION_DENIED));
     }
 
     #[test]

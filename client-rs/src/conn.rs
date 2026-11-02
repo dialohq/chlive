@@ -8,13 +8,17 @@
 //! stops reading the socket, which slows the server (it falls behind on Kafka, never drops).
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chlive_protocol::{ClientMsg, Params, Row, ServerMsg};
+use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{Ack, ClientOptions, LiveError};
+use crate::{Ack, ClientOptions, LiveError, CLIENT_ERROR};
 
 pub(crate) enum Cmd {
     Subscribe {
@@ -105,6 +109,8 @@ pub(crate) fn spawn(opts: ClientOptions) -> mpsc::UnboundedSender<Cmd> {
 /// Whether to keep going.
 enum Flow {
     Go,
+    /// The credential expired: reconnect at once, with a new one.
+    Now,
     Stop,
 }
 
@@ -190,65 +196,142 @@ async fn run(opts: ClientOptions, mut cmds: mpsc::UnboundedReceiver<Cmd>) {
                 return;
             }
         }
-        let connecting = tokio_tungstenite::connect_async_with_config(
-            opts.url.as_str(),
-            Some(ws_config()),
-            false,
-        );
-        tokio::pin!(connecting);
-        let ws = loop {
-            tokio::select! {
-                r = &mut connecting => break r,
-                cmd = cmds.recv() => if let Flow::Stop = offline(cmd, &mut subs, &mut inserts) {
-                    return;
+        let flow = 'attempt: {
+            // the credential first: the server gives a connection only so long to present it
+            let token = match &opts.credentials {
+                None => None,
+                Some(c) => match taking((c.0)(), &mut cmds, &mut subs, &mut inserts).await {
+                    None => return,
+                    Some(Ok(token)) => Some(token),
+                    Some(Err(e)) => {
+                        auth_error(&opts, CLIENT_ERROR, format!("the credentials failed: {e}"));
+                        break 'attempt Flow::Go;
+                    }
                 },
+            };
+            let connecting = tokio_tungstenite::connect_async_with_config(
+                opts.url.as_str(),
+                Some(ws_config()),
+                false,
+            );
+            let Some(ws) = taking(connecting, &mut cmds, &mut subs, &mut inserts).await else {
+                return;
+            };
+            match ws {
+                Err(e) => {
+                    tracing::warn!(url = %opts.url, error = %e, "chlive: can't connect");
+                    Flow::Go
+                }
+                Ok((ws, _)) => {
+                    backoff = opts.min_backoff;
+                    let flow =
+                        connected(ws, &opts, token, &mut subs, &mut inserts, &mut cmds).await;
+                    inserts.disconnected();
+                    if let Flow::Stop = flow {
+                        return;
+                    }
+                    for sub in subs.values() {
+                        let _ = sub.events.send(Event::Disconnected).await;
+                    }
+                    flow
+                }
             }
         };
-        match ws {
-            Err(e) => tracing::warn!(url = %opts.url, error = %e, "chlive: can't connect"),
-            Ok((ws, _)) => {
-                backoff = opts.min_backoff;
-                let flow = connected(ws, &opts, &mut subs, &mut inserts, &mut cmds).await;
-                inserts.disconnected();
-                if let Flow::Stop = flow {
-                    return;
-                }
-                for sub in subs.values() {
-                    let _ = sub.events.send(Event::Disconnected).await;
-                }
-            }
+        if let Flow::Now = flow {
+            continue;
         }
         // wait, still taking commands
         let wait = tokio::time::sleep(backoff);
-        tokio::pin!(wait);
         backoff = (backoff * 2).min(opts.max_backoff);
-        loop {
-            tokio::select! {
-                _ = &mut wait => break,
-                cmd = cmds.recv() => if let Flow::Stop = offline(cmd, &mut subs, &mut inserts) {
-                    return;
-                },
-            }
+        if taking(wait, &mut cmds, &mut subs, &mut inserts)
+            .await
+            .is_none()
+        {
+            return;
         }
     }
 }
 
+/// `fut`'s output, taking commands while disconnected meanwhile; `None`: the client closed.
+async fn taking<F: Future>(
+    fut: F,
+    cmds: &mut mpsc::UnboundedReceiver<Cmd>,
+    subs: &mut BTreeMap<String, Sub>,
+    inserts: &mut Inserts,
+) -> Option<F::Output> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            cmd = cmds.recv() => if let Flow::Stop = offline(cmd, subs, inserts) {
+                return None;
+            },
+        }
+    }
+}
+
+/// `f`'s output, or never without one.
+async fn opt<F: Future + Unpin>(f: &mut Option<F>) -> F::Output {
+    match f {
+        Some(f) => f.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Tell the application (and the log) that a credential was refused, or couldn't be had.
+fn auth_error(opts: &ClientOptions, code: &str, message: impl Into<String>) {
+    let e = LiveError {
+        code: code.into(),
+        message: message.into(),
+    };
+    tracing::warn!(error = %e, "chlive: authentication");
+    if let Some(handler) = &opts.on_auth_error {
+        (handler.0)(&e);
+    }
+}
+
+/// How long until a credential expiring at `expires_at` (Unix ms) is renewed: `before` its
+/// expiry, or halfway if it has less than twice that left.
+fn renewal(before: Duration, expires_at: i64) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default();
+    let left = (expires_at - now).max(0) as u64;
+    let before = (before.as_millis() as u64).min(left / 2);
+    Duration::from_millis(left - before)
+}
+
+/// A provider that failed to renew is asked again this much later (while the credential lasts).
+const RENEW_RETRY: Duration = Duration::from_secs(5);
+
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// One open connection, until it drops (`Go`: reconnect) or the client closes (`Stop`).
+/// One open connection, until it drops (`Go`: reconnect), its credential expires (`Now`:
+/// reconnect at once, with a new one) or the client closes (`Stop`).
 async fn connected(
     ws: Socket,
     opts: &ClientOptions,
+    token: Option<String>,
     subs: &mut BTreeMap<String, Sub>,
     inserts: &mut Inserts,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
 ) -> Flow {
     let (mut sink, mut stream) = ws.split();
-    if let Some(user) = &opts.user {
-        let hello = ClientMsg::Hello {
+    let hello = match (token, &opts.user) {
+        (Some(token), _) => Some(ClientMsg::Hello {
+            user: None,
+            token: Some(token),
+        }),
+        (None, Some(user)) => Some(ClientMsg::Hello {
             user: Some(user.clone()),
-        };
+            token: None,
+        }),
+        (None, None) => None,
+    };
+    // subscriptions and inserts may follow at once: the server takes them after the hello
+    if let Some(hello) = hello {
         if sink.send(text(&hello)).await.is_err() {
             return Flow::Go;
         }
@@ -266,6 +349,11 @@ async fn connected(
             return Flow::Go;
         }
     }
+    // the credential: verified (so an expiry is a reason to reconnect at once), when to ask for
+    // the next one, and the asking
+    let mut authenticated = false;
+    let mut renew_at: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    let mut renewing: Option<BoxFuture<'static, Result<String, String>>> = None;
     loop {
         tokio::select! {
             cmd = cmds.recv() => match cmd {
@@ -320,9 +408,54 @@ async fn connected(
                     }
                 }
             },
+            _ = opt(&mut renew_at) => {
+                renew_at = None;
+                renewing = opts.credentials.as_ref().map(|c| (c.0)());
+            }
+            token = opt(&mut renewing) => {
+                renewing = None;
+                match token {
+                    Ok(token) => {
+                        if sink.send(text(&ClientMsg::Renew { token })).await.is_err() {
+                            return Flow::Go;
+                        }
+                    }
+                    Err(e) => {
+                        auth_error(opts, CLIENT_ERROR, format!("the credentials failed: {e}"));
+                        renew_at = Some(Box::pin(tokio::time::sleep(RENEW_RETRY)));
+                    }
+                }
+            }
             frame = stream.next() => match frame {
-                Some(Ok(Message::Text(t))) => dispatch(subs, inserts, t.as_str()).await,
-                Some(Ok(Message::Close(_))) | None => return Flow::Go,
+                Some(Ok(Message::Text(t))) => match dispatch(subs, inserts, t.as_str()).await {
+                    Some(ServerMsg::Authenticated { expires_at, .. }) => {
+                        authenticated = true;
+                        if opts.credentials.is_some() {
+                            let wait = renewal(opts.refresh_before, expires_at);
+                            renew_at = Some(Box::pin(tokio::time::sleep(wait)));
+                        }
+                    }
+                    // the hello's or a renewal's credential refused (a refused hello's
+                    // connection then closes)
+                    Some(ServerMsg::Error { code, message, .. })
+                        if chlive_protocol::is_auth_error(&code)
+                            || code == chlive_protocol::PERMISSION_DENIED =>
+                    {
+                        auth_error(opts, &code, message);
+                    }
+                    Some(other) => tracing::warn!(message = ?other, "chlive: a message for no subscription"),
+                    None => {}
+                },
+                Some(Ok(Message::Close(frame))) => {
+                    let expired = frame.is_some_and(|f| {
+                        u16::from(f.code) == chlive_protocol::AUTH_CLOSE
+                            && f.reason.as_str() == chlive_protocol::AUTH_EXPIRED
+                    });
+                    // expired after it was verified: a new credential, at once (one refused
+                    // at the hello waits like any failed connect)
+                    return if expired && authenticated { Flow::Now } else { Flow::Go };
+                }
+                None => return Flow::Go,
                 Some(Err(e)) => {
                     tracing::warn!(error = %e, "chlive: connection lost");
                     return Flow::Go;
@@ -334,19 +467,28 @@ async fn connected(
 }
 
 /// Hand a message to its insert or subscription. One that doesn't parse fails only that
-/// subscription.
-async fn dispatch(subs: &mut BTreeMap<String, Sub>, inserts: &mut Inserts, text: &str) {
+/// subscription. The connection's own messages (no id) are returned.
+async fn dispatch(
+    subs: &mut BTreeMap<String, Sub>,
+    inserts: &mut Inserts,
+    text: &str,
+) -> Option<ServerMsg> {
     let bytes = text.len();
     let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "chlive: a message that isn't JSON");
-            return;
+            return None;
         }
     };
     let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
-        tracing::warn!(message = %value, "chlive: a message for no subscription");
-        return;
+        return match serde_json::from_value::<ServerMsg>(value.clone()) {
+            Ok(msg) => Some(msg),
+            Err(e) => {
+                tracing::warn!(message = %value, error = %e, "chlive: a message the client doesn't know");
+                None
+            }
+        };
     };
     if let Some(i) = inserts.sent.remove(id) {
         let answer = match serde_json::from_value::<ServerMsg>(value.clone()) {
@@ -358,10 +500,10 @@ async fn dispatch(subs: &mut BTreeMap<String, Sub>, inserts: &mut Inserts, text:
             }),
         };
         let _ = i.done.send(answer);
-        return;
+        return None;
     }
     // messages for subscriptions that are gone are ignored
-    let Some(sub) = subs.get_mut(id) else { return };
+    let sub = subs.get_mut(id)?;
     let event = match serde_json::from_value::<ServerMsg>(value.clone()) {
         Ok(msg) => {
             if let ServerMsg::Snapshot { at, .. }
@@ -378,6 +520,7 @@ async fn dispatch(subs: &mut BTreeMap<String, Sub>, inserts: &mut Inserts, text:
         },
     };
     let _ = sub.events.send(event).await;
+    None
 }
 
 /// No size limit on messages: a snapshot is the whole result in one message, so a big result

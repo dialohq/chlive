@@ -121,6 +121,12 @@ async fn main() -> Result<()> {
             &config.tables,
         )?);
     }
+    settings.auth = std::sync::Arc::new(chlive_server::auth::Auth::start(&config.auth).await?);
+    if config.auth.mode == chlive_server::auth::Mode::Declared {
+        warn!(
+            "auth.mode = \"declared\": clients say who they are, unverified (dev and tests only)"
+        );
+    }
     let mut server =
         chlive_server::start_with(&config.server.listen, settings, engine.clone()).await?;
     info!(addr = %server.addr, path = %config.server.path, "listening");

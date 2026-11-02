@@ -10,7 +10,7 @@ class FakeSocket {
   sent: any[] = [];
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((ev?: { code?: number; reason?: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   url: string;
   constructor(url: string) {
@@ -20,9 +20,9 @@ class FakeSocket {
   send(data: string) {
     this.sent.push(JSON.parse(data));
   }
-  close() {
+  close(code?: number, reason?: string) {
     this.readyState = 3;
-    this.onclose?.();
+    this.onclose?.({ code, reason });
   }
   open() {
     this.readyState = 1;
@@ -678,4 +678,143 @@ test("an insert unanswered when the connection drops is DISCONNECTED; closing fa
   await assert.rejects(queued, (e: InsertError) => e.code === "CLIENT_ERROR");
   await assert.rejects(unsent, (e: InsertError) => e.code === "CLIENT_ERROR");
   await assert.rejects(client.insert("messages", {}), (e: InsertError) => e.code === "CLIENT_ERROR");
+});
+
+/** A client whose `token` function gives t1, t2, …, telling `errors` what's refused. */
+function credentialed(opts: Partial<ConstructorParameters<typeof LiveClient>[0]> = {}) {
+  FakeSocket.all = [];
+  let n = 0;
+  const errors: { code: string; message: string }[] = [];
+  const client = new LiveClient({
+    url: "ws://x/live",
+    minBackoffMs: 30,
+    cache: false,
+    WebSocket: FakeSocket as any,
+    token: async () => `t${++n}`,
+    onAuthError: (e) => errors.push(e),
+    ...opts,
+  });
+  return { client, errors };
+}
+
+test("a credential comes first on every connection, from the token function each time", async () => {
+  const { client } = credentialed();
+  client.subscribe(SQL, () => {});
+  await tick(0);
+  const ws1 = FakeSocket.all[0];
+  ws1.open();
+  assert.deepEqual(ws1.sent, [
+    { type: "hello", token: "t1" },
+    { type: "subscribe", id: "s1", sql: SQL },
+  ]);
+  ws1.deliver({ type: "authenticated", subject: "user:alice", expires_at: Date.now() + 600_000 });
+  assert.equal(client.subject, "user:alice");
+  ws1.close();
+  await tick(60);
+  const ws2 = FakeSocket.all[1];
+  ws2.open();
+  assert.deepEqual(ws2.sent[0], { type: "hello", token: "t2" });
+  client.close();
+});
+
+test("a credential is renewed on the same connection before it expires", async () => {
+  const { client, errors } = credentialed({ refreshBeforeMs: 50 });
+  client.subscribe(SQL, () => {});
+  await tick(0);
+  const ws = FakeSocket.all[0];
+  ws.open();
+  ws.deliver({ type: "authenticated", subject: "agent:7", expires_at: Date.now() + 120 });
+  await tick(40);
+  assert.equal(ws.sent.length, 2, "not yet");
+  await tick(60);
+  assert.deepEqual(ws.sent.at(-1), { type: "renew", token: "t2" });
+  // refused (another subject): told; the connection carries on
+  ws.deliver({ type: "error", code: "PERMISSION_DENIED", message: "a renewed credential is for the connection's subject" });
+  assert.equal(errors.at(-1)!.code, "PERMISSION_DENIED");
+  assert.equal(FakeSocket.all.length, 1);
+  client.close();
+});
+
+test("an expired credential reconnects at once with a new one and resumes", async () => {
+  const { client, errors } = credentialed({ minBackoffMs: 10_000 });
+  const states: LiveState[] = [];
+  client.subscribe(SQL, (s) => states.push(s));
+  await tick(0);
+  const ws1 = FakeSocket.all[0];
+  ws1.open();
+  ws1.deliver({ type: "authenticated", subject: "agent:7", expires_at: Date.now() + 600_000 });
+  ws1.deliver({ type: "snapshot", id: "s1", columns: COLUMNS, rows: [{ user_id: "h1" }], at: "c0" });
+  ws1.deliver({ type: "error", code: "AUTH_EXPIRED", message: "the credential has expired" });
+  ws1.close(4401, "AUTH_EXPIRED");
+  assert.equal(errors.at(-1)!.code, "AUTH_EXPIRED");
+  await tick(5);
+  // not after the backoff (10 s): now
+  const ws2 = FakeSocket.all[1];
+  assert.ok(ws2, "reconnected at once");
+  ws2.open();
+  assert.deepEqual(ws2.sent, [
+    { type: "hello", token: "t2" },
+    { type: "subscribe", id: "s1", sql: SQL, since: "c0" },
+  ]);
+  assert.deepEqual(states.at(-1)!.rows, [{ user_id: "h1" }]);
+  client.close();
+});
+
+test("a refused credential is told, and tried again with backoff", async () => {
+  const { client, errors } = credentialed();
+  client.subscribe(SQL, () => {});
+  for (const code of ["AUTH_BAD_SIGNATURE", "AUTH_WRONG_AUDIENCE", "AUTH_EXPIRED", "AUTH_MISSING"]) {
+    await tick(0);
+    const ws = FakeSocket.all.at(-1)!;
+    ws.open();
+    ws.deliver({ type: "error", code, message: "no" });
+    ws.close(4401, code);
+    assert.equal(errors.at(-1)!.code, code);
+    const sockets = FakeSocket.all.length;
+    await tick(5);
+    // refused at the hello, even as expired: the backoff, not at once
+    assert.equal(FakeSocket.all.length, sockets, code);
+    await tick(250);
+    assert.equal(FakeSocket.all.length, sockets + 1, code);
+  }
+  client.close();
+});
+
+test("a failing token function is told and asked again", async () => {
+  FakeSocket.all = [];
+  let calls = 0;
+  const errors: string[] = [];
+  const client = new LiveClient({
+    url: "ws://x/live",
+    minBackoffMs: 5,
+    cache: false,
+    WebSocket: FakeSocket as any,
+    token: () => {
+      if (calls++ === 0) throw new Error("the issuer is down");
+      return "t2";
+    },
+    onAuthError: (e) => errors.push(`${e.code}: ${e.message}`),
+  });
+  client.subscribe(SQL, () => {});
+  await tick(30);
+  assert.deepEqual(errors, ["CLIENT_ERROR: the token function failed: the issuer is down"]);
+  const ws = FakeSocket.all[0];
+  ws.open();
+  assert.deepEqual(ws.sent[0], { type: "hello", token: "t2" });
+  client.close();
+});
+
+test("a credential for someone other than `user` closes the client", async () => {
+  const { client, errors } = credentialed({ user: "user:alice" });
+  client.subscribe(SQL, () => {});
+  await tick(0);
+  const ws = FakeSocket.all[0];
+  ws.open();
+  // with a token, `user` only names the cache: it isn't sent
+  assert.deepEqual(ws.sent[0], { type: "hello", token: "t1" });
+  ws.deliver({ type: "authenticated", subject: "user:bob", expires_at: Date.now() + 600_000 });
+  assert.equal(errors.at(-1)!.code, "CLIENT_ERROR");
+  await tick(60);
+  assert.equal(FakeSocket.all.length, 1, "no reconnecting");
+  assert.equal(client.subject, undefined);
 });

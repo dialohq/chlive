@@ -80,7 +80,9 @@ public = true
 ```
 
 The app says who each connection is (`new LiveClient({ url, user })`): the user's external_id in
-WorkOS. chlive finds their membership in the organization, and asks, per grant: the resources
+WorkOS, taken as said, since the demo's server trusts declared users (`[auth] mode = "declared"`).
+A real app presents a credential instead (`token`, verified by the server: see the main README's
+"Authentication"). chlive finds their membership in the organization, and asks, per grant: the resources
 under the organization they hold `feed:read` on (their external_ids are the values of
 `user_id` they may read), and whether they hold `messages:read` on the organization itself.
 Each answer is asked again every `poll` (so it's up to that old), a new user's at once. When it

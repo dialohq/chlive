@@ -12,12 +12,15 @@
 
 use chlive_engine::ast::{CmpOp, ColumnRef, Expr, Literal, Projection, Query, SelectExpr};
 use chlive_engine::error::{render_at, Span};
-use chlive_engine::parser::parse;
+use chlive_engine::parser::{parse_with, ParseOptions};
 
 /// A compiled grants query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
-    /// The permissions table (in Postgres' `public` schema).
+    /// The permissions table's schema, when the query names it (`FROM app.grants`); the
+    /// provider's otherwise.
+    pub schema: Option<String>,
+    /// The permissions table.
     pub table: String,
     /// Its column holding the subject.
     pub subject: String,
@@ -29,7 +32,10 @@ pub struct Grant {
 
 impl Grant {
     pub fn parse(sql: &str) -> Result<Self, String> {
-        let q = parse(sql).map_err(|e| e.render(sql))?;
+        let options = ParseOptions {
+            qualified_tables: true,
+        };
+        let q = parse_with(sql, options).map_err(|e| e.render(sql))?;
         compile(&q).map_err(|(message, span)| render_at(sql, span, &message))
     }
 
@@ -158,6 +164,7 @@ fn compile(q: &Query) -> Result<Grant, Error> {
         ));
     };
     Ok(Grant {
+        schema: q.from.schema.clone(),
         table: q.from.name.clone(),
         subject,
         value: name(value, q)?,
@@ -208,6 +215,7 @@ mod tests {
         assert_eq!(
             g,
             Grant {
+                schema: None,
                 table: "permissions".into(),
                 subject: "viewer_id".into(),
                 value: "author_id".into(),
@@ -228,6 +236,32 @@ mod tests {
         };
         assert_eq!(g.eval(row("admin")), Some(("alice".into(), "bob".into())));
         assert_eq!(g.eval(row("guest")), None);
+    }
+
+    #[test]
+    fn grants_name_their_schema_or_leave_it_to_the_provider() {
+        let g = Grant::parse(
+            "SELECT session_id FROM app.session_grants g WHERE g.user_id = {subject:String}",
+        )
+        .unwrap();
+        assert_eq!(
+            (g.schema.as_deref(), g.table.as_str(), g.subject.as_str()),
+            (Some("app"), "session_grants", "user_id")
+        );
+        // a column qualified by the table's name, the schema left out
+        let g = Grant::parse(
+            "SELECT session_id FROM app.session_grants WHERE session_grants.user_id = {subject:String}",
+        )
+        .unwrap();
+        assert_eq!(g.subject, "user_id");
+        assert_eq!(
+            Grant::parse("SELECT a FROM t WHERE s = {subject:String}")
+                .unwrap()
+                .schema,
+            None
+        );
+        let e = Grant::parse("SELECT a FROM db.app.t WHERE s = {subject:String}").unwrap_err();
+        assert!(e.contains("`schema.table` at 1:21"), "{e}");
     }
 
     #[test]

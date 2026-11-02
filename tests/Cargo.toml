@@ -19,3 +19,5 @@ rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dy
 rand = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tokio-tungstenite = "0.30"
+# the Postgres permissions provider's test: its schema, role and publication
+tokio-postgres = "0.7"
