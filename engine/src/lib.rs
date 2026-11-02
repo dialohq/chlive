@@ -40,7 +40,7 @@ pub mod write;
 // the pure part (the dialect, the plans, the stream's state), shared with the clients
 pub use chlive_core::{
     ast, bound, calendar, checkpoint, cursor, diff, error, event, keyed, lexer, order, parser,
-    plan, rules, security, state, table, table_engine, timeline, types, watermark,
+    plan, predict, result, rules, security, state, table, table_engine, timeline, types, watermark,
 };
 
 pub use binder::{BoundColumn, BoundExpr, BoundQuery, Params};

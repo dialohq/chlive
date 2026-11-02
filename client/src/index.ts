@@ -1,4 +1,5 @@
 import type { ValueParsers } from "./parsers.ts";
+import { covered, loadedWasm, loadWasm, type PendingRows, Prediction } from "./optimistic.ts";
 import type { ClientMessage, DiffMessage, Params, Row, ServerMessage } from "./protocol.ts";
 import { type CachedResult, ResultStore } from "./state.ts";
 
@@ -63,6 +64,9 @@ export interface LiveState<R extends Row = Row> {
   status: Status;
   /** Exactly the selected columns, in the query's order (and in its ORDER BY order, if any). */
   rows: R[];
+  /** With `optimistic`: the rows shown that are the client's own inserts, placed where the
+   * server will put them, until the server's rows have them. */
+  pending?: ReadonlySet<R>;
   error?: LiveError;
   /** When the cached rows were saved (while `status` is `cached`). */
   cachedAt?: number;
@@ -92,6 +96,23 @@ export interface SubscriptionStats {
   at?: string;
   /** With a cache: what it did for this subscription. */
   cache?: CacheStats;
+  /** With `optimistic`: its predictions. */
+  optimistic?: OptimisticStats;
+}
+
+/** An optimistic client's predictions for one result. */
+export interface OptimisticStats {
+  /** Whether its own inserts are shown before the server has them; if not, why. */
+  predicted: boolean;
+  reason?: string;
+  /** The plan they're placed by, as the server sent it. */
+  plan?: unknown;
+  /** Pending rows shown now. */
+  pending: number;
+  /** Pending rows no longer shown: the server's rows had them. */
+  settled: number;
+  /** Pending rows no longer shown: their insert failed. */
+  rolledBack: number;
 }
 
 export interface CacheStats {
@@ -207,6 +228,20 @@ export interface LiveClientOptions {
    * they arrived, so they don't depend on the parsers.
    */
   parsers?: ValueParsers | false;
+  /**
+   * Show the client's own inserts in its live results at once, where the server's diffs will
+   * put them (by the query's WHERE, with the user's row filters, ORDER BY, LIMIT, FINAL and
+   * `now()`), until the server's rows have them; marked in `pending`, and taken back if the
+   * insert fails. Placed by the server's own code (chlive-core as WebAssembly, loaded when the
+   * first plan arrives), by each subscription's plan. Queries it can't predict (aggregates,
+   * sub-queries, OFFSET, …) say why in `stats.optimistic.reason`. Default `false`.
+   */
+  optimistic?: boolean;
+}
+
+export interface InsertOptions {
+  /** With an `optimistic` client: show the rows before the server has them (default `true`). */
+  optimistic?: boolean;
 }
 
 /** A query's result, shared by everyone subscribed to the same query and params. */
@@ -237,10 +272,22 @@ interface Result {
   gcTimer: ReturnType<typeof setTimeout> | null;
   /** When the last subscriber left (for evicting the oldest first). */
   idleSince: number;
+  /** Optimistic: the server's plan for it (`undefined`: none, see `stats.optimistic.reason`). */
+  plan: { table: string } | undefined;
+  /** Its predictions, once chlive-core is loaded. */
+  prediction: Prediction | undefined;
+  /** The rows to show while it has pending rows (the server's with them placed). */
+  predicted: { rows: any[]; pending: Set<any> } | undefined;
+  /** When it last showed pending rows (its copy of the rows goes 30 s later). */
+  predictedAt: number;
+  /** The pending inserts it shows. */
+  shown: Set<PendingRows>;
 }
 
 const OPEN = 1;
 const DEFAULT_WARM_ROWS = 10_000;
+/** How long an acknowledged optimistic insert is shown at most (results that never get it). */
+const PENDING_MS = 30_000;
 
 /**
  * One WebSocket shared by any number of live queries. Reconnects with exponential backoff and
@@ -269,6 +316,10 @@ export class LiveClient {
   private byWire = new Map<string, Result>();
   /** Inserts waiting for their answer, by id. */
   private inserts = new Map<string, PendingInsert>();
+  /** Optimistic inserts whose rows some results may not have yet, in insert order. */
+  private pending: PendingRows[] = [];
+  /** While there are pending rows or predictors: forgets old ones, re-places `now()` rows. */
+  private pendingTimer: ReturnType<typeof setInterval> | null = null;
   private nextId = 1;
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -283,6 +334,7 @@ export class LiveClient {
       keepAliveMs: 5000,
       gcTimeMs: 300_000,
       memoryRows: 100_000,
+      optimistic: false,
       ...rest,
     };
     this.backoff = this.opts.minBackoffMs;
@@ -434,16 +486,135 @@ export class LiveClient {
    * table's columns. Sent once connected; one sent but unanswered when the connection drops
    * rejects with `DISCONNECTED` (it isn't sent again). An update or delete is an insert by the
    * table's own convention (e.g. a new version in a ReplacingMergeTree).
+   *
+   * With an `optimistic` client the rows show in its live results over the table at once, and
+   * go if the insert fails.
    */
-  insert(table: string, rows: Row | Row[]): Promise<Ack> {
+  insert(table: string, rows: Row | Row[], opts: InsertOptions = {}): Promise<Ack> {
     if (this.closed) return Promise.reject(new InsertError("CLIENT_ERROR", "LiveClient is closed"));
-    const msg = { type: "insert" as const, id: `w${this.nextId++}`, table, rows: Array.isArray(rows) ? rows : [rows] };
-    return new Promise<Ack>((resolve, reject) => {
+    const list = Array.isArray(rows) ? rows : [rows];
+    const msg = { type: "insert" as const, id: `w${this.nextId++}`, table, rows: list };
+    const answer = new Promise<Ack>((resolve, reject) => {
       const pending: PendingInsert = { msg, sent: false, resolve, reject };
       this.inserts.set(msg.id, pending);
       pending.sent = this.send(msg);
       if (!pending.sent) this.ensureConnected();
     });
+    if (!this.opts.optimistic || opts.optimistic === false) return answer;
+    const shown: PendingRows = { table, rows: list };
+    this.pending.push(shown);
+    this.repredict(table);
+    return answer.then(
+      (ack) => {
+        shown.offsets = ack.offsets;
+        shown.ackedAt = Date.now();
+        this.repredict(table);
+        return ack;
+      },
+      (e) => {
+        this.pending = this.pending.filter((p) => p !== shown);
+        this.repredict(table);
+        throw e;
+      },
+    );
+  }
+
+  // --- optimistic inserts --------------------------------------------------------------------
+
+  /** The results over `table` show its pending rows as they are now. */
+  private repredict(table: string): void {
+    this.prune();
+    for (const r of this.results.values()) {
+      if (r.plan?.table === table && this.predict(r)) this.emit(r, this.view(r));
+    }
+    this.watchPending();
+  }
+
+  /**
+   * Places the pending rows of the result's table that its rows don't have yet in them
+   * (`predicted`); whether what it shows changed.
+   */
+  private predict(r: Result): boolean {
+    const before = r.predicted;
+    const w = loadedWasm();
+    const plan = r.plan;
+    const mine = plan && w ? this.pending.filter((p) => p.table === plan.table && !covered(w, r.store.at, p)) : [];
+    const o = r.stats.optimistic ?? { predicted: false, pending: 0, settled: 0, rolledBack: 0 };
+    let { settled, rolledBack, reason } = o;
+    for (const p of r.shown) {
+      if (mine.includes(p)) continue;
+      if (p.offsets) settled += p.rows.length;
+      else rolledBack += p.rows.length;
+    }
+    r.shown = new Set(mine);
+    r.predicted = undefined;
+    if (mine.length > 0 && plan && w && r.store.at !== undefined) {
+      try {
+        r.prediction ??= new Prediction(w, plan, this.opts.user);
+        const ids = r.store.ids();
+        const changes = r.prediction.view(
+          () => ({ rows: r.store.wireRows(), ids: ids.every((id) => id !== undefined) ? (ids as string[]) : undefined }),
+          mine,
+        );
+        if (changes.length > 0) {
+          const { rows, added } = r.store.preview(changes);
+          r.predicted = { rows, pending: new Set(added) };
+        }
+      } catch (e) {
+        // not predicted after all (e.g. a timezone the WebAssembly build hasn't)
+        reason = `chlive-core can't predict it: ${e instanceof Error ? e.message : String(e)}`;
+        r.prediction?.free();
+        r.prediction = undefined;
+        r.plan = undefined;
+        r.shown = new Set();
+      }
+    }
+    r.stats = {
+      ...r.stats,
+      optimistic: { ...o, predicted: r.plan !== undefined, reason, pending: r.predicted?.pending.size ?? 0, settled, rolledBack },
+    };
+    return before !== undefined || r.predicted !== undefined;
+  }
+
+  /** Forget the pending inserts every optimistic result over their table has, or that were
+   * acknowledged long enough ago; the results that showed them show them no more. */
+  private prune(): void {
+    const w = loadedWasm();
+    const now = Date.now();
+    const gone = this.pending.filter((p) => {
+      if (p.ackedAt === undefined) return false;
+      if (now - p.ackedAt >= PENDING_MS || !w) return true;
+      return ![...this.results.values()].some((r) => r.wireId && r.plan?.table === p.table && !covered(w, r.store.at, p));
+    });
+    if (gone.length === 0) return;
+    this.pending = this.pending.filter((p) => !gone.includes(p));
+    for (const r of this.results.values()) {
+      if (gone.some((p) => r.shown.has(p)) && this.predict(r)) this.emit(r, this.view(r));
+    }
+  }
+
+  /** While there are pending rows: forget old ones, and place them again each second (rows of
+   * a `now()` window come and go with time). Copies of rows no longer predicted with go. */
+  private watchPending(): void {
+    if (this.pendingTimer || this.closed) return;
+    this.pendingTimer = setInterval(() => {
+      this.prune();
+      const now = Date.now();
+      let seeded = false;
+      for (const r of this.results.values()) {
+        if (r.shown.size > 0) {
+          r.predictedAt = now;
+          if (this.predict(r)) this.emit(r, this.view(r));
+        } else if (r.prediction?.seeded && now - r.predictedAt > PENDING_MS) {
+          r.prediction.free();
+        }
+        seeded ||= !!r.prediction?.seeded;
+      }
+      if (this.pending.length === 0 && !seeded && this.pendingTimer) {
+        clearInterval(this.pendingTimer);
+        this.pendingTimer = null;
+      }
+    }, 1000);
   }
 
   /** Close the socket and stop reconnecting; save pending results and close the cache. */
@@ -456,6 +627,8 @@ export class LiveClient {
     }
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.pendingTimer) clearInterval(this.pendingTimer);
+    for (const r of this.results.values()) r.prediction?.free();
     for (const r of this.results.values()) this.clearTimers(r);
     this.results.clear();
     this.byWire.clear();
@@ -486,6 +659,11 @@ export class LiveClient {
       keepAliveTimer: null,
       gcTimer: null,
       idleSince: 0,
+      plan: undefined,
+      prediction: undefined,
+      predicted: undefined,
+      shown: new Set(),
+      predictedAt: 0,
     };
     this.results.set(key, r);
     if (!r.ready) void this.read(r);
@@ -604,6 +782,7 @@ export class LiveClient {
     this.clearTimers(r);
     this.unsubscribeWire(r);
     this.flushSave(r);
+    r.prediction?.free();
     if (this.results.get(r.key) === r) this.results.delete(r.key);
   }
 
@@ -641,6 +820,7 @@ export class LiveClient {
     const msg: ClientMessage = { type: "subscribe", id: r.wireId, sql: r.sql };
     if (r.store.at !== undefined) msg.since = r.store.at;
     if (r.params) msg.params = r.params;
+    if (this.opts.optimistic) msg.optimistic = true;
     if (this.send(msg)) r.stats = { ...r.stats, subscribes: r.stats.subscribes + 1 };
   }
 
@@ -657,7 +837,7 @@ export class LiveClient {
     };
     ws.onmessage = (ev: MessageEvent) => {
       const text = String(ev.data);
-      this.onMessage(JSON.parse(text) as ServerMessage, text.length);
+      this.onMessage(JSON.parse(text) as ServerMessage, text);
     };
     ws.onclose = () => {
       if (this.ws !== ws) return;
@@ -689,7 +869,8 @@ export class LiveClient {
     }, delay);
   }
 
-  private onMessage(msg: ServerMessage, bytes: number): void {
+  private onMessage(msg: ServerMessage, text: string): void {
+    const bytes = text.length;
     const pending = msg.id ? this.inserts.get(msg.id) : undefined;
     if (pending) {
       this.inserts.delete(pending.msg.id);
@@ -712,11 +893,35 @@ export class LiveClient {
         case "ack":
           // inserts' answers are theirs, never a subscription's
           return;
-        case "plan":
-          // never asked for yet
+        case "plan": {
+          // before each snapshot: how its rows are placed, for its own inserts
+          const plan = msg.plan as { table: string } | undefined;
+          rec.plan = plan;
+          rec.prediction?.free();
+          rec.prediction = undefined;
+          const o = stats.optimistic ?? { predicted: false, pending: 0, settled: 0, rolledBack: 0 };
+          stats.optimistic = { ...o, predicted: plan !== undefined, reason: msg.reason, plan };
+          rec.stats = stats;
+          this.emit(rec, rec.state);
+          if (plan) {
+            loadWasm().then(
+              () => rec.plan === plan && this.repredict(plan.table),
+              (e) => {
+                console.warn("chlive: chlive-core (WebAssembly) couldn't be loaded; inserts aren't shown before the server has them", e);
+                if (rec.plan !== plan) return;
+                rec.plan = undefined;
+                const reason = `chlive-core couldn't be loaded: ${e instanceof Error ? e.message : String(e)}`;
+                rec.stats = { ...rec.stats, optimistic: { ...rec.stats.optimistic!, predicted: false, reason } };
+                this.emit(rec, rec.state);
+              },
+            );
+          }
           return;
+        }
         case "snapshot":
           rec.store.applySnapshot(msg);
+          // new rows: its predictions start again from them
+          rec.prediction?.free();
           stats.snapshots++;
           if (stats.cache) stats.cache = { ...stats.cache, resumed: stats.cache.hit ? false : undefined };
           this.scheduleSave(rec);
@@ -729,6 +934,7 @@ export class LiveClient {
           break;
         case "diff":
           rec.store.applyDiff(msg);
+          rec.prediction?.apply(text);
           stats.diffs++;
           for (const c of msg.changes) {
             if (c.op === "insert") stats.inserts++;
@@ -757,6 +963,11 @@ export class LiveClient {
     stats.lastApplyMs = performance.now() - started;
     stats.at = rec.store.at;
     rec.stats = stats;
+    // its pending rows, placed again in the new rows (or gone, now that it has them)
+    if (rec.shown.size > 0 || this.pending.some((p) => p.table === rec.plan?.table)) {
+      this.predict(rec);
+      this.prune();
+    }
     this.emit(rec, { ...this.view(rec), status: "live" });
   }
 
@@ -823,6 +1034,8 @@ export class LiveClient {
   // -------------------------------------------------------------------------------------------
 
   private view(rec: Result): LiveState<any> {
+    const p = rec.predicted;
+    if (p) return { status: rec.state.status, rows: p.rows, pending: p.pending, stats: rec.stats };
     return { status: rec.state.status, rows: rec.store.rows(), stats: rec.stats };
   }
 

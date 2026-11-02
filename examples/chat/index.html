@@ -35,6 +35,8 @@
       .msg { padding: 2px 0; }
       .msg .who { font-weight: 600; margin-right: 6px; }
       .msg .when { color: var(--muted); font-size: 11px; margin-right: 6px; }
+      /* sent, not yet back from the server */
+      .msg.pending { opacity: 0.55; }
       form.compose { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--line); }
       form.compose input { flex: 1; font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }
       form.compose button { font: inherit; padding: 6px 12px; border: 0; border-radius: 6px; background: var(--accent); color: white; cursor: pointer; }

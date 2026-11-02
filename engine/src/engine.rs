@@ -280,6 +280,14 @@ impl Engine {
 
     /// [`explain`](Self::explain) with the values of the query's parameters (`{name:Type}`) and
     /// the rows of each table the subscriber may see.
+    /// The plan a client predicts its own inserts with (see [`Plan::client`]), with the column
+    /// the table's inserts get the user's name in.
+    pub fn client_plan(&self, plan: &Plan) -> Result<crate::plan::ClientPlan, String> {
+        let mut client = plan.client()?;
+        client.user_column = self.rules.insert(&plan.table).and_then(|c| c.user);
+        Ok(client)
+    }
+
     pub async fn explain_with(
         &self,
         sql: &str,

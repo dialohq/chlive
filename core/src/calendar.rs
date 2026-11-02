@@ -59,9 +59,11 @@ pub struct Interval {
     pub unit: Unit,
 }
 
-/// Whether the intervals need the calendar (DAY or WEEK, in a zone with offset changes).
-fn by_calendar(intervals: &[Interval], tz: Tz) -> bool {
-    tz != Tz::UTC
+/// Whether the intervals need the calendar (DAY or WEEK, in a zone with offset changes). Never
+/// without the `timezones` feature, where every zone is UTC (and so no zone's data is linked).
+pub fn by_calendar(intervals: &[Interval], tz: Tz) -> bool {
+    cfg!(feature = "timezones")
+        && tz != Tz::UTC
         && intervals
             .iter()
             .any(|i| matches!(i.unit, Unit::Day | Unit::Week))

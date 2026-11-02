@@ -1,17 +1,13 @@
-//! chlive-core for the TS client: a result's rows ([`Store`], applying the server's snapshots and
-//! diffs), and a stream plan placing rows as the server would ([`Predictor`]). Messages cross
-//! the boundary as JSON text (what the WebSocket gives) or as JS values (`*_value`).
+//! chlive-core for the TS client: a result's predictions ([`Predictor`]: the client's own
+//! pending rows placed as the server will place them), and a result's rows ([`Store`], applying
+//! the server's snapshots and diffs; measured against the TS store in `bench/wasm.ts`).
+//! Messages cross the boundary as JSON text (what the WebSocket gives) or as JS values
+//! (`*_value`).
 
-use chlive_core::bound::{BoundColumn, BoundQuery, BoundTable, ColumnId, OrderKey, Projected};
-use chlive_core::event::Event;
-use chlive_core::plan::{plan, StreamPlan};
+use chlive_core::plan::ClientPlan;
+use chlive_core::predict;
 use chlive_core::result::{Applied, ResultRows};
-use chlive_core::rules::{ColumnSource, TopicId};
-use chlive_core::state::{history_iteration, ResultState};
-use chlive_core::table_engine::TableEngine;
-use chlive_core::types::Type;
-use chlive_core::watermark::Watermark;
-use chlive_protocol::{Change, Row, ServerMsg};
+use chlive_protocol::{Row, ServerMsg};
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
 
@@ -102,106 +98,63 @@ fn compact(a: Applied<Row>) -> Value {
     }
 }
 
-/// A stream plan running on the client: the result's state seeded from its rows, then each
-/// row placed exactly as the server would (the diffs it makes).
+/// A result's predictions (chlive-core's `Predictor`): the client's own pending rows, placed as
+/// the server will place them, over the result's rows as the client has them.
 #[wasm_bindgen]
 pub struct Predictor {
-    plan: StreamPlan,
-    state: ResultState,
-    at: Watermark,
-    next: i64,
+    inner: predict::Predictor,
 }
 
 #[wasm_bindgen]
 impl Predictor {
-    /// For measuring, until plans come from the server: `select ts, user_id, latency_ms from
-    /// events order by latency_ms desc [limit n]` (`limit` 0: none), with `events(ts
-    /// DateTime64(3), user_id String, latency_ms UInt32)`.
+    /// For a subscription's plan (the `plan` message's `plan`, as JSON text), inserting as
+    /// `user`.
     #[wasm_bindgen(constructor)]
-    pub fn new(limit: u32) -> Predictor {
-        let plan = plan(&ordered_query((limit > 0).then_some(limit as u64))).stream;
-        Predictor {
-            state: ResultState::for_plan(&plan),
-            plan,
-            at: Watermark::default(),
-            next: 0,
+    pub fn new(plan: &str, user: Option<String>) -> Result<Predictor, JsError> {
+        let plan: ClientPlan = serde_json::from_str(plan).map_err(js)?;
+        Ok(Predictor {
+            inner: predict::Predictor::new(plan, user.as_deref()).map_err(|e| JsError::new(&e))?,
+        })
+    }
+
+    /// The result's rows (JSON text of an array, as they came over the wire) and their ids (JSON
+    /// text of an array, when every row has one).
+    pub fn seed(&mut self, rows: &str, ids: Option<String>) -> Result<(), JsError> {
+        let rows: Vec<Row> = serde_json::from_str(rows).map_err(js)?;
+        let ids: Option<Vec<String>> = ids
+            .map(|i| serde_json::from_str(&i))
+            .transpose()
+            .map_err(js)?;
+        self.inner.seed(rows, ids).map_err(|e| JsError::new(&e))
+    }
+
+    /// The server's next `diff` for the result, as the WebSocket's text. On an error the rows
+    /// are out of step: seed again.
+    pub fn apply(&mut self, diff: &str) -> Result<(), JsError> {
+        match serde_json::from_str(diff).map_err(js)? {
+            ServerMsg::Diff { changes, .. } => {
+                self.inner.apply(changes).map_err(|e| JsError::new(&e))
+            }
+            _ => Err(JsError::new("not a diff")),
         }
     }
 
-    /// The result's rows (JSON text of an array), as the history.
-    pub fn seed(&mut self, rows: &str) -> Result<usize, JsError> {
-        let rows: Vec<Row> =
-            serde_json::from_str(rows).map_err(|e| JsError::new(&e.to_string()))?;
-        let it = history_iteration(&self.plan, &mut self.state, &self.at, rows)
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(it.diffs.len())
-    }
-
-    /// A new row (JSON text of an object), as an event: the changes it makes, as JSON (the
-    /// protocol's `changes`).
-    pub fn place(&mut self, row: &str) -> Result<String, JsError> {
-        let value: Row = serde_json::from_str(row).map_err(|e| JsError::new(&e.to_string()))?;
-        self.next += 1;
-        let event = Event {
-            topic: TopicId("events".into()),
-            partition: 0,
-            offset: self.next,
-            timestamp: None,
-            value,
-        };
-        let decoded = self
-            .plan
-            .decode(&event)
-            .map_err(|e| JsError::new(&format!("{e:?}")))?;
-        let diffs = self.state.event(&self.plan, &decoded, (0, self.next));
-        let changes: Vec<Change> = diffs.into_iter().map(|d| d.into_change()).collect();
+    /// The changes (JSON text, the protocol's) that make the rows what to show: the pending rows
+    /// (JSON text of `[{"row": {…}, "at": [partition, offset]?}, …]`) placed in order, at
+    /// `now_ms`.
+    pub fn view(&mut self, pending: &str, now_ms: f64) -> Result<String, JsError> {
+        let pending: Vec<predict::Pending> = serde_json::from_str(pending).map_err(js)?;
+        let changes = self.inner.view(&pending, now_ms as i64);
         Ok(serde_json::to_string(&changes).expect("JSON"))
     }
 }
 
-fn ordered_query(limit: Option<u64>) -> BoundQuery {
-    let col = |i: usize, n: &str, ty: &str| BoundColumn {
-        id: ColumnId(i),
-        name: n.into(),
-        clickhouse: n.into(),
-        source: ColumnSource::Json(n.into()),
-        ty: Type::parse(ty),
-    };
-    let table = BoundTable {
-        name: "events".into(),
-        alias: None,
-        clickhouse_table: "default.events".into(),
-        database: "default".into(),
-        clickhouse_name: "events".into(),
-        topic: TopicId("events".into()),
-        engine: TableEngine::MergeTree,
-        internal: Vec::new(),
-        final_key: None,
-        denied: Vec::new(),
-        columns: vec![
-            col(0, "ts", "DateTime64(3)"),
-            col(1, "user_id", "String"),
-            col(2, "latency_ms", "UInt32"),
-        ],
-    };
-    BoundQuery {
-        projection: (0..3)
-            .map(|i| Projected {
-                column: ColumnId(i),
-                name: table.columns[i].name.clone(),
-            })
-            .collect(),
-        table,
-        filter: None,
-        order: vec![OrderKey {
-            column: ColumnId(2),
-            desc: true,
-            nulls_first: false,
-        }],
-        limit,
-        offset: None,
-        aggregation: None,
-        semi_join: None,
-        windows: Vec::new(),
-    }
+/// Whether a result complete to cursor `at` has the event at (`partition`, `offset`).
+#[wasm_bindgen]
+pub fn covers(at: &str, partition: i32, offset: f64) -> bool {
+    predict::covers(at, partition, offset as i64)
+}
+
+fn js(e: serde_json::Error) -> JsError {
+    JsError::new(&e.to_string())
 }

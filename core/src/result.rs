@@ -126,8 +126,11 @@ pub struct ResultRows<R> {
     ids: Ids,
     /// Aggregated results: each row's JSON by id, to merge updates into.
     json: HashMap<String, Row>,
-    parse: fn(Row) -> Result<R, String>,
+    parse: Parse<R>,
 }
+
+/// Reads a row into `R`.
+type Parse<R> = Box<dyn Fn(Row) -> Result<R, String> + Send + Sync>;
 
 impl ResultRows<Row> {
     /// Rows kept as JSON, as they come.
@@ -138,12 +141,12 @@ impl ResultRows<Row> {
 
 impl<R> ResultRows<R> {
     /// Rows read into `R` by `parse` (an error fails the snapshot or diff).
-    pub fn new(parse: fn(Row) -> Result<R, String>) -> Self {
+    pub fn new(parse: impl Fn(Row) -> Result<R, String> + Send + Sync + 'static) -> Self {
         Self {
             rows: Arc::new(Vec::new()),
             ids: Ids::default(),
             json: HashMap::new(),
-            parse,
+            parse: Box::new(parse),
         }
     }
 
@@ -155,13 +158,18 @@ impl<R> ResultRows<R> {
         self.rows.len()
     }
 
+    /// Each row's id, in row order, when every row has one (aggregated and FINAL results).
+    pub fn ids(&self) -> Option<Vec<String>> {
+        self.ids.list.iter().cloned().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
     /// Replaces everything (also after a reconnect: a snapshot is the whole result).
     pub fn snapshot(&mut self, rows: Vec<Row>, ids: Option<Vec<String>>) -> Result<(), String> {
-        let parse = self.parse;
+        let parse = &self.parse;
         if let Some(ids) = &ids {
             if ids.len() != rows.len() {
                 return Err(format!("{} ids for {} rows", ids.len(), rows.len()));
@@ -189,7 +197,7 @@ impl<R> ResultRows<R> {
     /// it), and returns the changes as applied. On an error (an index outside the list, an
     /// unknown id, a row that doesn't fit `R`) nothing changes.
     pub fn diff(&mut self, changes: Vec<Change>) -> Result<Vec<Applied<R>>, String> {
-        let parse = self.parse;
+        let parse = &self.parse;
         // 1. check and prepare, against a model of the result
         let mut len = self.rows.len();
         let mut ids = self.ids.clone();

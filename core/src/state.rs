@@ -24,6 +24,7 @@ fn bad_history_row(e: impl fmt::Display) -> StateError {
 }
 
 /// What a subscription keeps about its result to place new rows.
+#[derive(Clone)]
 pub enum ResultState {
     /// Unordered, unlimited: every row is appended.
     Append,

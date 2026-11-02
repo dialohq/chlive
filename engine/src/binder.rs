@@ -3372,7 +3372,7 @@ mod tests {
             "coupon": if i % 4 == 0 { serde_json::Value::Null } else { format!("x{}", i % 2).into() },
             "paid": i % 5 == 0,
             "tags": ["t"],
-            "product_id": format!("p{}", i % 6),
+            "product_id": format!("p{}", ((i * 2_654_435_761) >> 7) % 6),
             "version": i,
             "deleted": u8::from(i % 9 == 8),
             "item_id": format!("i{}", i % 4),
@@ -3397,9 +3397,8 @@ mod tests {
             "select * from events where latency_ms > 100 and user_id in ('a', 'b') \
              and coupon is not null and not paid order by latency_ms desc, ts limit 10",
             "select user_id, latency_ms from events where coupon = 'x1' or latency_ms <= 30 \
-             order by latency_ms nulls first limit 5 offset 2",
+             order by latency_ms nulls first limit 5",
             "select user_id from events where coupon not in ('x0') limit 3",
-            "select user_id from events limit 3 offset 2",
             "select ts, user_id from events where ts > now('Europe/Warsaw') - interval 1 day \
              and ts <= now() + interval 90 minute order by ts",
             "select product_id, version from products final where version > 1",
@@ -3464,10 +3463,147 @@ mod tests {
                 "select version from products final",
                 "FINAL's key product_id isn't in the result",
             ),
+            ("select user_id from events limit 3 offset 2", "OFFSET isn't predicted"),
+            (
+                "select * from products final order by version limit 2 offset 5",
+                "OFFSET isn't predicted",
+            ),
         ];
         for (sql, reason) in not_predicted {
             let plan = plan(&bind_sql(sql).await.unwrap());
             assert_eq!(plan.client().unwrap_err(), reason, "{sql}");
+        }
+    }
+
+    /// A client's own rows placed as the server places them: before each event, a predictor
+    /// that has the result's rows as a client has them (seeded mid-way, then kept in step with
+    /// the server's diffs) shows the event's row as pending; the result after the server's diff
+    /// must be exactly that. FINAL windows keep rows past the limit that the client hasn't got:
+    /// when one of those slides in, or gets a new version, that step isn't compared.
+    #[tokio::test]
+    async fn predictions_are_what_the_server_does() {
+        use crate::diff::Diff;
+        use crate::plan::plan;
+        use crate::predict::{Pending, Predictor};
+        use chlive_core::result::ResultRows;
+        use crate::source::Event;
+        use crate::state::ResultState;
+
+        let rows_of = |r: &ResultRows<Row>| r.rows().iter().map(|r| (**r).clone()).collect::<Vec<_>>();
+        let cases: [(&str, Option<&str>); 11] = [
+            ("select ts, user_id, latency_ms from events", None),
+            (
+                "select * from events where latency_ms > 100 and user_id in ('a', 'b') \
+                 and coupon is not null and not paid order by latency_ms desc, ts limit 10",
+                None,
+            ),
+            (
+                "select user_id, latency_ms from events where coupon = 'x1' or latency_ms <= 30 \
+                 order by latency_ms nulls first limit 5",
+                None,
+            ),
+            ("select user_id from events where coupon not in ('x0') limit 3", None),
+            (
+                "select ts, user_id from events where ts > now('Europe/Warsaw') - interval 1 day \
+                 order by ts desc limit 7",
+                None,
+            ),
+            // stamped with the user, as the server stamps inserts
+            ("select ts, user_id from events where user_id = 'zed' order by ts", Some("user_id")),
+            ("select product_id, version from products final where version > 1", None),
+            ("select * from products final order by version desc", None),
+            ("select * from products final order by version desc limit 4", None),
+            ("select product_id, version from products final limit 4", None),
+            ("select item_id, name from items final", None),
+        ];
+        let now_ms = 1_793_534_400_000i64; // 2026-11-01 12:00 UTC
+        for (sql, stamp) in cases {
+            let plan = plan(&bind_sql(sql).await.unwrap());
+            let mut client_plan = plan.client().unwrap_or_else(|e| panic!("{sql}: {e}"));
+            client_plan.user_column = stamp.map(String::from);
+            let s = &plan.stream;
+            let mut server = ResultState::for_plan(s);
+            let mut client: ResultRows<Row> = ResultRows::json();
+            let mut predictor: Option<Predictor> = None;
+            let (mut compared, mut skipped) = (0, 0);
+            for i in 0..80 {
+                // the row as inserted, and as the server writes it (stamped)
+                let inserted = event_row(i);
+                let mut written = inserted.clone();
+                if stamp.is_some() {
+                    written.insert("user_id".into(), "zed".into());
+                }
+                let at = (0, i);
+                let predicted = predictor.as_mut().map(|p| {
+                    let view = p.view(&[Pending { row: inserted.clone(), at: Some(at) }], now_ms);
+                    let mut shown = ResultRows::json();
+                    shown.snapshot(rows_of(&client), client.ids()).unwrap();
+                    shown.diff(view).unwrap_or_else(|e| panic!("{sql}: {e}"));
+                    rows_of(&shown)
+                });
+
+                let event = Event {
+                    topic: TopicId("events".into()),
+                    partition: 0,
+                    offset: i,
+                    timestamp: None,
+                    value: written,
+                };
+                let decoded = s.decode(&event).unwrap();
+                // FINAL windows: a key the server keeps past the window, which the client
+                // hasn't got (its new version isn't a new row)
+                let unseen = match (&server, &s.keyed) {
+                    (ResultState::Keyed(k), Some(keyed)) => {
+                        let (id, ..) = keyed.event(&decoded);
+                        k.version(&id).is_some() && !client.ids().unwrap_or_default().contains(&id)
+                    }
+                    _ => false,
+                };
+                let matches = match s.timed() {
+                    true => s.schedule(&decoded, i128::from(now_ms) * 1_000_000).in_now,
+                    false => s.matches(&decoded),
+                };
+                let diffs = server.event_matching(s, &decoded, at, matches);
+                let own = s.project(&decoded);
+                let slid_in = diffs
+                    .iter()
+                    .any(|d| matches!(d, Diff::Insert { row, .. } if *row != own));
+                let changes: Vec<_> = diffs.into_iter().map(Diff::into_change).collect();
+                client.diff(changes.clone()).unwrap();
+                match predicted {
+                    Some(_) if slid_in || unseen => skipped += 1,
+                    Some(predicted) => {
+                        assert_eq!(predicted, rows_of(&client), "{sql}, event {i}");
+                        compared += 1;
+                    }
+                    None => {}
+                }
+                match &mut predictor {
+                    Some(p) => p.apply(changes).unwrap(),
+                    // a client that starts predicting mid-way, from the rows it has
+                    None if i == 20 => {
+                        let mut p = Predictor::new(client_plan.clone(), Some("zed")).unwrap();
+                        p.seed(rows_of(&client), client.ids()).unwrap();
+                        predictor = Some(p);
+                    }
+                    None => {}
+                }
+            }
+            let window = s.keyed.as_ref().is_some_and(|k| k.window.is_some());
+            assert!(window || skipped == 0, "{sql}: {skipped} steps skipped");
+            assert!(compared > if window { 15 } else { 40 }, "{sql}: compared {compared}");
+            // a row the server would refuse isn't predicted, when the plan has the column it
+            // can tell by (otherwise the server's error rolls it back)
+            let bad_columns = ["latency_ms", "version", "name"];
+            if !s.columns.iter().any(|c| bad_columns.contains(&c.name.as_str())) {
+                continue;
+            }
+            let mut bad = event_row(0);
+            bad.insert("latency_ms".into(), "fast".into());
+            bad.insert("version".into(), "new".into());
+            bad.insert("name".into(), serde_json::Value::Null);
+            let view = predictor.unwrap().view(&[Pending { row: bad, at: None }], now_ms);
+            assert_eq!(view, [], "{sql}");
         }
     }
 }

@@ -2561,3 +2561,25 @@ async fn optimistic_subscriptions_get_their_plan_before_each_snapshot() {
     n.subscribe("n", "select user_id from requests").await;
     assert_eq!(n.expect().await["type"], "snapshot");
 }
+
+#[tokio::test]
+async fn a_plan_names_its_table_and_the_column_inserts_stamp_with_the_user() {
+    let live = Live::new();
+    let server = insert_server(&live, json!({"user": "user_id"}), ServerSettings::default()).await;
+    let mut c = Client::connect(&server).await;
+    hello(&mut c, "alice").await;
+    let sql = "select user_id, latency_ms from requests order by latency_ms desc limit 3";
+    c.send(json!({"type": "subscribe", "id": "s", "sql": sql, "optimistic": true}))
+        .await;
+    let plan = plan_then_snapshot(&mut c, "s").await.unwrap();
+    assert_eq!(plan.table, "requests");
+    assert_eq!(plan.user_column.as_deref(), Some("user_id"));
+    // OFFSET: not predicted
+    let sql = "select user_id, latency_ms from requests order by latency_ms limit 3 offset 1";
+    c.send(json!({"type": "subscribe", "id": "o", "sql": sql, "optimistic": true}))
+        .await;
+    assert_eq!(
+        plan_then_snapshot(&mut c, "o").await.unwrap_err(),
+        "OFFSET isn't predicted"
+    );
+}

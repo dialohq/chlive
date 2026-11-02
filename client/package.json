@@ -17,10 +17,11 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "wasm"
   ],
   "scripts": {
-    "build": "bun --bun tsc -p tsconfig.json",
+    "build": "wasm && bun --bun tsc -p tsconfig.json",
     "typecheck": "bun --bun tsc -p tsconfig.json --noEmit",
     "test": "bun test"
   },

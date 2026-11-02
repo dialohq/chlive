@@ -1,6 +1,7 @@
 //! chlive's core: the dialect ([`parser`]), queries as bound ([`bound`]), their plans
 //! ([`plan`]), and the state a live result keeps as events come ([`order`], [`keyed`],
-//! [`timeline`], [`aggregate`]), with the diffs it makes ([`diff`]). No IO: the engine
+//! [`timeline`], [`aggregate`]), with the diffs it makes ([`diff`]); and a client's own rows placed
+//! the same way, before the server has them ([`predict`]). No IO: the engine
 //! (ClickHouse, Kafka, snapshots) and the clients build on it, natively or as WebAssembly.
 
 pub mod aggregate;
@@ -17,6 +18,7 @@ pub mod lexer;
 pub mod order;
 pub mod parser;
 pub mod plan;
+pub mod predict;
 pub mod result;
 pub mod rules;
 pub mod security;

@@ -760,8 +760,10 @@ pub struct WindowPlan {
     pub ty: Type,
     pub intervals: Vec<Interval>,
     /// The query's timezone (`now('…')`), and the one DAY and WEEK go by: the query's, or the
-    /// server's (set by the engine; UTC until then).
+    /// server's (set by the engine; UTC until then). By name in a plan.
+    #[serde(with = "tz_name::option")]
     pub tz: Option<chrono_tz::Tz>,
+    #[serde(with = "tz_name")]
     pub zone: chrono_tz::Tz,
     /// `now(…) ± INTERVAL …` in dialect syntax, for `explain`.
     pub text: String,
@@ -785,6 +787,54 @@ impl WindowPlan {
             CmpOp::LtEq => (at(false), true),
             CmpOp::Eq | CmpOp::NotEq => unreachable!("the binder refuses = and != with now()"),
         })
+    }
+}
+
+/// Timezones in plans, by name. Reading every name links in every zone's data (most of the
+/// WebAssembly build's size), so without the `timezones` feature only UTC is read: a client plan
+/// needs another zone only for DAY or WEEK intervals in it ([`Plan::client`]).
+mod tz_name {
+    use chrono_tz::Tz;
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(tz: &Tz, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(tz.name())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Tz, D::Error> {
+        parse(&String::deserialize(d)?).map_err(D::Error::custom)
+    }
+
+    #[cfg(feature = "timezones")]
+    fn parse(name: &str) -> Result<Tz, String> {
+        name.parse()
+            .map_err(|_| format!("unknown timezone {name}"))
+    }
+
+    #[cfg(not(feature = "timezones"))]
+    fn parse(name: &str) -> Result<Tz, String> {
+        match name {
+            "UTC" => Ok(Tz::UTC),
+            _ => Err(format!("the timezone {name} isn't in this build")),
+        }
+    }
+
+    pub mod option {
+        use chrono_tz::Tz;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(tz: &Option<Tz>, s: S) -> Result<S::Ok, S::Error> {
+            match tz {
+                Some(tz) => super::serialize(tz, s),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Tz>, D::Error> {
+            Option::<String>::deserialize(d)?
+                .map(|name| super::parse(&name).map_err(serde::de::Error::custom))
+                .transpose()
+        }
     }
 }
 
@@ -1079,6 +1129,51 @@ impl StreamPlan {
     }
 
     /// The result row, rendered the way ClickHouse renders it.
+    /// A row of the result as output (as a client holds it), decoded: its output columns, the
+    /// others NULL.
+    pub fn decode_output(&self, row: &Row) -> Result<DecodedRow, RowDecodeError> {
+        let mut decoded = vec![Value::Null; self.width];
+        for (name, id) in &self.output {
+            let Some(c) = self.columns.iter().find(|c| c.id == *id) else {
+                continue;
+            };
+            decoded[id.0] = decode(row.get(name), &c.ty).map_err(|error| RowDecodeError {
+                column: name.clone(),
+                error,
+            })?;
+        }
+        Ok(decoded)
+    }
+
+    /// A row of an insert (by column name), decoded as its event will be: each column strictly,
+    /// as the server checks inserts (a missing one is its type's default), and the Kafka fields
+    /// as given (`kafka`: partition, offset, timestamp in milliseconds).
+    pub fn decode_insert(
+        &self,
+        row: &Row,
+        kafka: (i32, i64, Option<i64>),
+    ) -> Result<DecodedRow, String> {
+        let mut decoded = vec![Value::Null; self.width];
+        for c in &self.columns {
+            decoded[c.id.0] = match &c.source {
+                ColumnSource::Json(_) => match row.get(&c.name) {
+                    None => c.ty.default_value(),
+                    Some(json) => crate::types::decode_strict(json, &c.ty)
+                        .map_err(|e| format!("{}: {e}", c.name))?,
+                },
+                ColumnSource::Kafka(field) => {
+                    let value = match field {
+                        KafkaField::Partition => Some(i64::from(kafka.0)),
+                        KafkaField::Offset => Some(kafka.1),
+                        KafkaField::Timestamp => kafka.2,
+                    };
+                    decode_kafka(*field, value, &c.ty).map_err(|e| format!("{}: {e}", c.name))?
+                }
+            };
+        }
+        Ok(decoded)
+    }
+
     pub fn project(&self, row: &DecodedRow) -> Row {
         self.output
             .iter()
@@ -1384,6 +1479,12 @@ fn engine_note(engine: &TableEngine, keyed: Option<&KeyedPlan>) -> Option<String
 pub struct ClientPlan {
     /// The format's version, [`ClientPlan::VERSION`]; a client refuses others.
     pub v: u32,
+    /// The table (its dialect name): the inserts into it are the rows to predict.
+    pub table: String,
+    /// The column inserts into the table get the user's name in (set by the server, from the
+    /// table's insert grant): a client stamps its own rows likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_column: Option<String>,
     pub stream: StreamPlan,
 }
 
@@ -1394,8 +1495,9 @@ impl ClientPlan {
 impl Plan {
     /// The plan a client predicts with, or why there's none: a client has only the result's
     /// rows, so the columns it ranks or identifies them by must be in them (ORDER BY's, FINAL's
-    /// key; not FINAL's version: a client's own row is the newest); and aggregates and
-    /// semi-joins aren't predicted.
+    /// key; not FINAL's version: a client's own row is the newest); and aggregates, semi-joins
+    /// and OFFSET (a row landing above the result slides in one the client doesn't have)
+    /// aren't predicted.
     pub fn client(&self) -> Result<ClientPlan, String> {
         if self.aggregate.is_some() {
             return Err("GROUP BY and aggregates aren't predicted yet".into());
@@ -1404,6 +1506,9 @@ impl Plan {
             return Err("IN (SELECT …) and EXISTS aren't predicted".into());
         }
         let s = &self.stream;
+        if s.offset.is_some() || s.keyed.iter().any(|k| k.window.is_some_and(|w| w.offset > 0)) {
+            return Err("OFFSET isn't predicted".into());
+        }
         let shown = |id: ColumnId| s.output.iter().any(|(_, c)| *c == id);
         let name = |id: ColumnId| {
             s.columns
@@ -1422,8 +1527,23 @@ impl Plan {
         }
         Ok(ClientPlan {
             v: ClientPlan::VERSION,
+            table: self.table.clone(),
+            user_column: None,
             stream: StreamPlan {
                 topics: Vec::new(),
+                // a zone only where DAY or WEEK go by its calendar (the rest is UTC either way)
+                windows: s
+                    .windows
+                    .iter()
+                    .map(|w| WindowPlan {
+                        tz: None,
+                        zone: match crate::calendar::by_calendar(&w.intervals, w.zone) {
+                            true => w.zone,
+                            false => chrono_tz::Tz::UTC,
+                        },
+                        ..w.clone()
+                    })
+                    .collect(),
                 ..s.clone()
             },
         })

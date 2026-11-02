@@ -123,6 +123,8 @@ in
         [ -d node_modules/react ] || bun install
         port=$(dnvr-state pick-port)
         dnvr-state set url "http://localhost:$port"
+        # chlive-core as WebAssembly, for the optimistic inserts
+        wasm || echo "chlive-wasm didn't build: messages aren't shown before the server has them"
         exec bun --bun run --cwd examples/chat dev --port "$port" --strictPort
       '';
     };

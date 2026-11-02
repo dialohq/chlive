@@ -41,6 +41,9 @@ export interface LiveQuery<R extends Row = Row> {
   rows: R[];
   /** Why the query failed; it gets no more updates. */
   error?: LiveError;
+  /** With an `optimistic` client: the rows that are its own inserts, shown before the server
+   * has them. */
+  pending?: ReadonlySet<R>;
 }
 
 const EMPTY: LiveQuery<never> = { status: "loading", rows: [] };
@@ -56,12 +59,14 @@ export function subscriptionKey(sql: string, params: Params | undefined, enabled
   return enabled ? `${sql}\u0000${stableJson(params ?? {})}` : "";
 }
 
-/** The hook's view of a state: the same object while its status, rows and error are, so
- * changes to stats alone don't re-render. */
-export function project<R extends Row>(prev: LiveQuery<R>, s: { status: Status; rows: R[]; error?: LiveError }): LiveQuery<R> {
-  return prev.status === s.status && prev.rows === s.rows && prev.error === s.error
-    ? prev
-    : { status: s.status, rows: s.rows, error: s.error };
+/** The hook's view of a state: the same object while its status, rows, error and pending rows
+ * are, so changes to stats alone don't re-render. */
+export function project<R extends Row>(
+  prev: LiveQuery<R>,
+  s: { status: Status; rows: R[]; error?: LiveError; pending?: ReadonlySet<R> },
+): LiveQuery<R> {
+  if (prev.status === s.status && prev.rows === s.rows && prev.error === s.error && prev.pending === s.pending) return prev;
+  return s.pending ? { status: s.status, rows: s.rows, error: s.error, pending: s.pending } : { status: s.status, rows: s.rows, error: s.error };
 }
 
 /**

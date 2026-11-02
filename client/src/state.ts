@@ -1,5 +1,5 @@
 import { type ColumnParser, columnParsers, parseRow, resolveParsers, type ValueParsers } from "./parsers.ts";
-import { applyArrayEdit, type Column, type DiffMessage, type Row, type SnapshotMessage } from "./protocol.ts";
+import { applyArrayEdit, type Change, type Column, type DiffMessage, type Row, type SnapshotMessage } from "./protocol.ts";
 
 /** A result as kept in a cache: the rows (as they came over the wire) and the cursor they're
  * complete to. */
@@ -99,6 +99,29 @@ export class ResultStore<R extends Row = Row> {
    * understand (a newer server) or an index outside the list, leaving the rows untouched.
    */
   applyDiff(msg: DiffMessage): void {
+    const next = this.compute(msg.changes);
+    this.raw = next.raw;
+    this.data = next.data;
+    this.rowIds = next.ids;
+    if (next.moved || next.byId !== this.byId) {
+      this.byId = next.byId;
+      if (next.moved) this.reindex();
+    }
+    this.at = msg.at;
+  }
+
+  /**
+   * The rows these changes would make, without making them the result (the server's rows with
+   * the client's own pending rows placed in them): `rows`, and `added`, the rows the changes put
+   * in (inserted, or updated). Throws as `applyDiff` does.
+   */
+  preview(changes: Change[]): { rows: R[]; added: R[] } {
+    const next = this.compute(changes);
+    return { rows: next.data, added: next.added };
+  }
+
+  /** Changes applied to copies of the rows, their ids and the index of ids. */
+  private compute(changes: Change[]) {
     const cols = this.parsed;
     const raw = this.raw.slice();
     // the parsed rows, kept in step with `raw`; the same array when nothing is parsed
@@ -116,7 +139,8 @@ export class ResultStore<R extends Row = Row> {
       return byId.get(id);
     };
     const parse = (row: Row) => parseRow<R>(row, cols);
-    for (const change of msg.changes) {
+    const added: R[] = [];
+    for (const change of changes) {
       switch (change.op) {
         case "insert":
           if (change.index === undefined) {
@@ -135,6 +159,7 @@ export class ResultStore<R extends Row = Row> {
           } else {
             throw new Error(`insert at index ${change.index} of a result with ${raw.length} rows`);
           }
+          added.push(next[change.index ?? next.length - 1]);
           break;
         case "delete": {
           let i = change.index;
@@ -184,20 +209,14 @@ export class ResultStore<R extends Row = Row> {
           } else {
             throw new Error(`move to index ${change.index} of a result with ${raw.length} rows`);
           }
+          added.push(row);
           break;
         }
         default:
           throw new Error(`unsupported change ${JSON.stringify((change as { op: unknown }).op)}`);
       }
     }
-    this.raw = raw;
-    this.data = next;
-    this.rowIds = ids;
-    if (moved || byId !== this.byId) {
-      this.byId = byId;
-      if (moved) this.reindex();
-    }
-    this.at = msg.at;
+    return { raw, data: next, ids, byId, moved, added };
   }
 
   /** History first, then each change applied, parsed. A new array after each diff. */

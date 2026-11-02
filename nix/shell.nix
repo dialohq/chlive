@@ -117,7 +117,8 @@ in
       '';
     };
 
-    # Proxies /live to the server and /kafka to Redpanda's HTTP proxy (vite.config.js).
+    # Proxies /live to the server and /kafka to Redpanda's HTTP proxy (vite.config.js: writes go
+    # through the server, or straight to Kafka).
     playground = {
       env = {
         CHLIVE_URL = "dnvr://server/url";
@@ -128,6 +129,8 @@ in
         [ -d node_modules ] || bun install
         port=$(dnvr-state pick-port)
         dnvr-state set url "http://localhost:$port"
+        # chlive-core as WebAssembly, for the optimistic inserts
+        wasm || echo "chlive-wasm didn't build: inserts aren't shown before the server has them"
         exec bun --bun run --cwd examples/playground dev --port "$port" --strictPort
       '';
     };

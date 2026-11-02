@@ -18,6 +18,11 @@
       .status.idle { background: #e4e4f4; }
       .error { color: #b00; white-space: pre-wrap; }
       .ok { color: #070; }
+      /* the client's own inserts, shown before the server has them */
+      tr.pending td { color: #557; background: #eef3ff; font-style: italic; }
+      tr.pending td:first-child::after { content: "pending"; margin-left: 6px; padding: 0 4px; border-radius: 3px; background: #c9d8ff; font: 10px system-ui, sans-serif; vertical-align: middle; }
+      .writer .mode label { margin-right: 10px; }
+      .debug details.plan pre { max-height: 240px; overflow: auto; }
       /* narrow: the writer above the (long) result; wide: the writer beside it, sticky */
       .panes { display: grid; gap: 8px 32px; grid-template-areas: "writer" "query"; }
       .panes .query { grid-area: query; min-width: 0; }

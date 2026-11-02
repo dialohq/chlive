@@ -25,6 +25,9 @@ kafka_ts = { kafka = "timestamp" }
 [tables.events.insert]
 public = true
 
-[tables.orders]
-[tables.customers]
+# the playground writes all three through the server too
+[tables.orders.insert]
+public = true
+[tables.customers.insert]
+public = true
 [tables.products]

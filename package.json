@@ -4,6 +4,6 @@
   "workspaces": ["client", "examples/*"],
   "scripts": {
     "build": "bun --bun run --filter '*' build",
-    "test": "cd client && bun test"
+    "test": "wasm && cd client && bun test"
   }
 }

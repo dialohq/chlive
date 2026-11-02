@@ -85,6 +85,24 @@ pub fn decode(plan: &Plan, token: &str) -> Option<Watermark> {
     decode_cursor(plan, token).map(|c| c.at)
 }
 
+/// The position in a token without checking its plan (a client, which has the result's cursors
+/// but not its plan's fingerprint), or `None` if it isn't one of ours.
+pub fn position(token: &str) -> Option<Watermark> {
+    let v: Value = serde_json::from_str(token).ok()?;
+    if v["v"].as_u64()? != VERSION {
+        return None;
+    }
+    offsets(&v)
+}
+
+fn offsets(v: &Value) -> Option<Watermark> {
+    let mut offsets = BTreeMap::new();
+    for (p, o) in v["o"].as_object()? {
+        offsets.insert(p.parse().ok()?, o.as_i64()?);
+    }
+    Some(Watermark(offsets))
+}
+
 /// The position and lineage in a token, or `None` if it isn't one of ours for this plan (another
 /// plan, another version, or garbage).
 pub fn decode_cursor(plan: &Plan, token: &str) -> Option<Cursor> {
@@ -92,12 +110,8 @@ pub fn decode_cursor(plan: &Plan, token: &str) -> Option<Cursor> {
     if v["v"].as_u64()? != VERSION || v["fp"].as_str()? != fingerprint(plan) {
         return None;
     }
-    let mut offsets = BTreeMap::new();
-    for (p, o) in v["o"].as_object()? {
-        offsets.insert(p.parse().ok()?, o.as_i64()?);
-    }
     Some(Cursor {
-        at: Watermark(offsets),
+        at: offsets(&v)?,
         lineage: v["l"].as_str().map(String::from),
     })
 }

@@ -2264,3 +2264,160 @@ async fn a_restarted_server_restores_results_from_disk() -> Result<()> {
     })
     .await
 }
+
+/// Optimistic inserts: for each predictable case, the server's plan and chlive-core's
+/// `Predictor` (as a client runs them, over the rows it has) place an inserted row exactly
+/// where the server's diff then puts it. `kafka_ts` is the producer's clock, which a prediction
+/// can only guess, so it isn't compared.
+#[tokio::test]
+async fn predictions_match_the_server() -> Result<()> {
+    use std::collections::HashMap;
+
+    use chlive_engine::plan::ClientPlan;
+    use chlive_engine::predict::{covers, Pending, Predictor};
+    use chlive_engine::result::ResultRows;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    if !enabled() {
+        return Ok(());
+    }
+    let _guard = exclusive().await;
+    init_tracing();
+    with_server(config(), |server| {
+        async move {
+            let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                .max_message_size(None)
+                .max_frame_size(None);
+            let url = format!("ws://{}/live", server.addr);
+            let (ws, _) =
+                tokio_tungstenite::connect_async_with_config(&url, Some(config), false).await?;
+            let (mut sink, mut stream) = ws.split();
+            let cases: Vec<(&str, &str)> = CASES
+                .iter()
+                .filter(|(id, ..)| !id.ends_with("offset"))
+                .map(|(id, sql, _)| (*id, *sql))
+                .collect();
+            // complete snapshots: nothing of Kafka comes after them but what's new
+            for (id, sql) in &cases {
+                let m = json!({"type": "subscribe", "id": id, "sql": sql, "optimistic": true, "complete": true});
+                sink.send(Message::Text(m.to_string().into())).await?;
+            }
+            let mut next = async || -> Result<serde_json::Value> {
+                loop {
+                    let msg = tokio::time::timeout(Duration::from_secs(60), stream.next())
+                        .await?
+                        .expect("open")?;
+                    if let Message::Text(t) = msg {
+                        return Ok(serde_json::from_str(&t)?);
+                    }
+                }
+            };
+            struct Seen {
+                predictor: Predictor,
+                rows: ResultRows<Row>,
+                at: String,
+            }
+            let mut seen: HashMap<String, Seen> = HashMap::new();
+            let mut plans: HashMap<String, ClientPlan> = HashMap::new();
+            let mut held = Vec::new();
+            while seen.len() < cases.len() {
+                let m = next().await?;
+                let id = m["id"].as_str().unwrap_or_default().to_string();
+                match m["type"].as_str() {
+                    Some("plan") => {
+                        let plan = serde_json::from_value(m["plan"].clone())
+                            .unwrap_or_else(|_| panic!("{id}: {m}"));
+                        plans.insert(id, plan);
+                    }
+                    Some("snapshot") => {
+                        let rows: Vec<Row> = serde_json::from_value(m["rows"].clone())?;
+                        let mut predictor = Predictor::new(plans[&id].clone(), None)
+                            .map_err(anyhow::Error::msg)?;
+                        predictor.seed(rows.clone(), None).map_err(anyhow::Error::msg)?;
+                        let mut kept = ResultRows::json();
+                        kept.snapshot(rows, None).map_err(anyhow::Error::msg)?;
+                        let at = m["at"].as_str().unwrap().to_string();
+                        seen.insert(id, Seen { predictor, rows: kept, at });
+                    }
+                    Some("error") => panic!("{m}"),
+                    _ => held.push(m),
+                }
+            }
+            assert!(held.iter().all(|m| m["type"] == "progress"), "{held:?}");
+
+            let run = chrono::Utc::now().timestamp_millis();
+            let row = json!({
+                "ts": chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+                "user_id": format!("predicted-{run}"), "country": "PL", "path": "/checkout",
+                "latency_ms": 777, "amount": 50.5, "session_id": "6F1D3A20-1B2C-4D5E-8F90-A1B2C3D4E5F6",
+            });
+            let insert = json!({"type": "insert", "id": "w1", "table": "events", "rows": [row]});
+            sink.send(Message::Text(insert.to_string().into())).await?;
+            // what arrives before the ack is held: predictions are made on the rows before it
+            let mut after = Vec::new();
+            let (partition, offset) = loop {
+                let m = next().await?;
+                if m["id"] == "w1" {
+                    assert_eq!(m["type"], "ack", "{m}");
+                    break (m["offsets"][0][0].as_i64().unwrap() as i32, m["offsets"][0][1].as_i64().unwrap());
+                }
+                after.push(m);
+            };
+            let pending = [Pending {
+                row: row.as_object().unwrap().clone(),
+                at: Some((partition, offset)),
+            }];
+            let mut predicted: HashMap<String, Vec<Row>> = HashMap::new();
+            for (id, s) in &mut seen {
+                let view = s.predictor.view(&pending, chrono::Utc::now().timestamp_millis());
+                let mut shown = ResultRows::json();
+                shown.snapshot(s.rows.rows().iter().map(|r| (**r).clone()).collect(), None).unwrap();
+                shown.diff(view).map_err(anyhow::Error::msg)?;
+                predicted.insert(id.clone(), shown.rows().iter().map(|r| (**r).clone()).collect());
+            }
+            // the server's diffs, until every result has the insert
+            let mut i = 0;
+            while seen.values().any(|s| !covers(&s.at, partition, offset)) {
+                let m = match after.get(i) {
+                    Some(m) => m.clone(),
+                    None => next().await?,
+                };
+                i += 1;
+                let Some(s) = seen.get_mut(m["id"].as_str().unwrap_or_default()) else {
+                    continue;
+                };
+                if m["type"] == "diff" {
+                    let changes = serde_json::from_value(m["changes"].clone())?;
+                    s.rows.diff(changes).map_err(anyhow::Error::msg)?;
+                }
+                if let Some(at) = m["at"].as_str() {
+                    s.at = at.to_string();
+                }
+            }
+            let strip = |rows: &[Row]| -> Vec<Row> {
+                rows.iter()
+                    .map(|r| {
+                        let mut r = r.clone();
+                        r.shift_remove("kafka_ts");
+                        r
+                    })
+                    .collect()
+            };
+            let mut shown_in = 0;
+            for (id, s) in &seen {
+                let server: Vec<Row> = s.rows.rows().iter().map(|r| (**r).clone()).collect();
+                let ours = &predicted[id];
+                assert_eq!(strip(ours), strip(&server), "{id}");
+                if server.iter().any(|r| r.get("user_id") == Some(&row["user_id"])) {
+                    shown_in += 1;
+                }
+            }
+            // it matched most of them (the rest: not matching, or past a LIMIT)
+            assert!(shown_in >= cases.len() / 2, "shown in {shown_in} of {}", cases.len());
+            Ok(())
+        }
+        .boxed()
+    })
+    .await
+}

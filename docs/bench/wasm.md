@@ -12,8 +12,12 @@ listeners need: a new rows array after every snapshot or diff.
 | `opt-level = "s"` (kept) | 531 KB | 205 KB | 162 KB |
 | `opt-level = "z"` | 477 KB | 191 KB | 154 KB |
 
-Built-in timezones (chrono-tz) account for only about 5 KB. The rest is code: the plans, the
-stream state, the aggregates and serde_json.
+Built-in timezones (chrono-tz) cost almost nothing as long as no zone is read by name: reading
+plans' zones by name links every zone's data in (1.4 MB raw, 355 KB gzip). So the WebAssembly
+build reads only UTC (`chlive-core` without its `timezones` feature): plans send a zone only
+for DAY or WEEK intervals in it, which the browser then doesn't predict. The rest is code: the
+plans and their JSON, the stream state, the aggregates and serde_json. With the complete
+`Predictor` (FINAL, windows, `now()`), it's 550 KB raw, 205 KB gzip.
 
 Load: compiling takes 3 ms and instantiating 0.4 ms.
 
@@ -43,10 +47,15 @@ Both stores end with the same rows.
 
 ## Predicting (`order by latency_ms desc`, 57k rows)
 
-| | seed from the rows (ms) | place one row, median (ms) | p99 (ms) |
-|---|---|---|---|
-| no LIMIT | 105 | 0.007 | 0.04 |
-| LIMIT 200 | 0.4 | 0.004 | 0.009 |
+Measured with the final `Predictor`: the plan as the server sends it, the rows copied in once, then views of the pending rows placed in them.
+
+| | copy the rows in (once) | view with 1 pending, median | p99 | view with 10 pending, median | a server diff, then a view, median |
+|---|---|---|---|---|---|
+| no LIMIT | 119 ms | 0.069 ms | 0.12 ms | 0.12 ms | 1.87 ms |
+| LIMIT 200 | 0.45 ms | 0.004 ms | 0.017 ms | 0.031 ms | 0.017 ms |
+
+A view reuses the state seeded from the rows; a server diff changes the rows, so the next view
+seeds it again from the predictor's copy (no JSON): about 2 ms at 57k rows.
 
 ## What it means
 

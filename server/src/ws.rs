@@ -408,7 +408,7 @@ async fn connection(socket: WebSocket, s: AppState, conn: u64, origin: Option<St
                     }
                 };
                 if optimistic {
-                    send(plan_msg(&id, &plan)).await;
+                    send(plan_msg(&s, &id, &plan)).await;
                 }
                 let joined = s.hub.join(
                     &plan,
@@ -568,8 +568,8 @@ async fn insert(
 }
 
 /// An optimistic subscription's `plan` message: the plan a client predicts with, or why not.
-fn plan_msg(id: &str, plan: &Plan) -> ServerMsg {
-    let (plan, reason) = match plan.client() {
+fn plan_msg(s: &AppState, id: &str, plan: &Plan) -> ServerMsg {
+    let (plan, reason) = match s.hub.engine().client_plan(plan) {
         Ok(p) => (Some(serde_json::to_value(p).expect("a plan is JSON")), None),
         Err(reason) => (None, Some(reason)),
     };
@@ -672,7 +672,7 @@ async fn refilter(
     };
     debug!(conn, id, "permissions changed: new snapshot");
     if live.optimistic {
-        let _ = tx.send(Outgoing::Msg(plan_msg(id, &plan))).await;
+        let _ = tx.send(Outgoing::Msg(plan_msg(s, id, &plan))).await;
     }
     live.joined = s.hub.join(
         &plan,

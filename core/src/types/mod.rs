@@ -312,6 +312,25 @@ pub fn decode(json: Option<&Json>, ty: &Type) -> Result<Value, DecodeError> {
     }
 }
 
+/// A value as its column takes it in an insert, strictly: NULL only for a Nullable column, and
+/// an integer only within its type's range.
+pub fn decode_strict(json: &Json, ty: &Type) -> Result<Value, String> {
+    let value = match (json, &ty.kind) {
+        (Json::Null, _) if ty.nullable => Some(Value::Null),
+        (Json::Null, _) => return Err(format!("{ty} isn't Nullable")),
+        (json, Kind::Int(t)) => t.decode_exact(json),
+        (json, kind) => kind.column_type().decode(json),
+    };
+    value.ok_or_else(|| {
+        let mut found = json.to_string();
+        if found.len() > 40 {
+            found.truncate(40);
+            found.push('…');
+        }
+        format!("cannot read {found} as {ty}")
+    })
+}
+
 /// Whether Kafka Connect's `InsertField` stores a Kafka field into a column of this type exactly:
 /// offsets and partitions in integer columns, timestamps (milliseconds) in `DateTime64(3)` or a
 /// 64-bit integer. A `DateTime` or another precision reads the milliseconds as its own unit.

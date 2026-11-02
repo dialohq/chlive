@@ -160,19 +160,59 @@ line("## Updates by id at 5k groups (an aggregate), moving (ms per diff)\n");
 }
 
 // --- predicting --------------------------------------------------------------------------------
-line("## Placing a pending row as the server would (`order by latency_ms desc`), 57k rows\n");
-line("| | seed (ms) | place, median (ms) | place, p99 (ms) |");
-line("|---|---|---|---|");
-for (const limit of [0, 200]) {
+// the plan of `select ts, user_id, latency_ms from events order by latency_ms desc [limit n]`,
+// as an optimistic subscription gets it
+const plan = (limit: number | null) => {
+  const col = (id: number, name: string, ty: string) => ({ id, name, source: { json: name }, ty });
+  return JSON.stringify({
+    v: 1,
+    table: "events",
+    stream: {
+      topics: [],
+      columns: [col(0, "ts", "DateTime64(3)"), col(1, "user_id", "String"), col(2, "latency_ms", "UInt32")],
+      width: 3,
+      output: [["ts", 0], ["user_id", 1], ["latency_ms", 2]],
+      filter: "all",
+      order: {
+        keys: [{ column: 2, desc: true, nulls_first: false }],
+        columns: [{ id: 2, name: "latency_ms", history_field: "latency_ms", ty: "UInt32" }],
+        hidden: [],
+        text: "latency_ms DESC NULLS LAST",
+      },
+      limit,
+      offset: null,
+      keyed: null,
+      windows: [],
+      history_fields: [],
+    },
+  });
+};
+line("## Showing a pending row as the server would place it (`order by latency_ms desc`), 57k rows\n");
+line("| | seed (ms) | view with 1 pending, median (ms) | p99 (ms) | view with 10 pending, median (ms) | server diff, then view, median (ms) |");
+line("|---|---|---|---|---|---|");
+for (const limit of [null, 200]) {
   const rows = Array.from({ length: 57_000 }, (_, i) => row(i)).sort(
     (a, b) => (b.latency_ms as number) - (a.latency_ms as number),
   );
   const shown = limit ? rows.slice(0, limit) : rows;
-  const p = new Predictor(limit);
-  const [, seedMs] = time(() => p.seed(JSON.stringify(shown)));
-  const places = Array.from({ length: 1000 }, (_, i) => JSON.stringify(row(100_000 + i)));
-  const t = places.map((r) => time(() => JSON.parse(p.place(r)))[1]);
-  line(`| ${limit ? `limit ${limit}` : "no limit"} | ${ms(seedMs)} | ${ms(median(t))} | ${ms(p99(t))} |`);
+  const p = new Predictor(plan(limit), undefined);
+  const [, seedMs] = time(() => p.seed(JSON.stringify(shown), undefined));
+  const one = Array.from({ length: 200 }, (_, i) => JSON.stringify([{ row: row(100_000 + i) }]));
+  const t = one.map((pending) => time(() => JSON.parse(p.view(pending, Date.now())))[1]);
+  const ten = JSON.stringify(Array.from({ length: 10 }, (_, i) => ({ row: row(200_000 + i) })));
+  const t10 = Array.from({ length: 50 }, () => time(() => JSON.parse(p.view(ten, Date.now())))[1]);
+  // a server diff in between: applied to the predictor's rows, whose state is seeded again
+  const diff = (i: number) =>
+    JSON.stringify({ type: "diff", id: "s1", at: `c${i}`, changes: [{ op: "insert", row: { ts: "2026-11-01 12:00:00.000", user_id: "x", latency_ms: 0 }, index: shown.length + i }] });
+  const td = Array.from({ length: 50 }, (_, i) =>
+    time(() => {
+      p.apply(diff(i));
+      return JSON.parse(p.view(one[0], Date.now()));
+    })[1],
+  );
+  line(
+    `| ${limit ? `limit ${limit}` : "no limit"} | ${ms(seedMs)} | ${ms(median(t))} | ${ms(p99(t))} | ${ms(median(t10))} | ${ms(median(td))} |`,
+  );
 }
 
 if (process.argv.includes("--write")) {

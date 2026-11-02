@@ -25,7 +25,7 @@ use crate::history::HistoryError;
 use crate::rules::{ColumnSource, TopicId};
 use crate::security::{InsertConfig, InsertFilter, RowFilter};
 use crate::source::Outgoing;
-use crate::types::{Kind, Type, Value};
+use crate::types::{decode_strict as decode, Type, Value};
 
 /// How long a table's description is used for inserts before it's read again.
 const DESCRIBED_FOR: Duration = Duration::from_secs(30);
@@ -247,25 +247,6 @@ fn message(
     Ok(Outgoing {
         key,
         value: Json::Object(out).to_string(),
-    })
-}
-
-/// A value as its column takes it, strictly: NULL only for a Nullable column, and an integer
-/// only within its type's range.
-fn decode(json: &Json, ty: &Type) -> Result<Value, String> {
-    let value = match (json, &ty.kind) {
-        (Json::Null, _) if ty.nullable => Some(Value::Null),
-        (Json::Null, _) => return Err(format!("{ty} isn't Nullable")),
-        (json, Kind::Int(t)) => t.decode_exact(json),
-        (json, kind) => kind.column_type().decode(json),
-    };
-    value.ok_or_else(|| {
-        let mut found = json.to_string();
-        if found.len() > 40 {
-            found.truncate(40);
-            found.push('…');
-        }
-        format!("cannot read {found} as {ty}")
     })
 }
 

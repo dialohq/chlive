@@ -4,7 +4,9 @@ import { defaultUrl, LiveClient } from "@chlive/client";
 import { LiveClientProvider, useLiveQueryDebug } from "@chlive/client/react";
 
 // Results are cached (SQLite on OPFS): a reload shows them at once, then resumes from their cursor.
-const client = new LiveClient({ url: defaultUrl() });
+// Optimistic: rows inserted through chlive show at once where the server will put them, marked
+// pending until the server's diff has them.
+const client = new LiveClient({ url: defaultUrl(), optimistic: true });
 
 // Queries in the chlive dialect:
 // SELECT * | column [AS name], … FROM table [WHERE condition] [ORDER BY ALL | column [ASC|DESC] [NULLS FIRST|LAST], …] [LIMIT n]
@@ -107,10 +109,11 @@ const WRITE_PRESETS = {
     ["Mid latency (lands mid-list)", () => ({ ts: now(), user_id: "u-mid", country: "PL", path: "/search", latency_ms: 250, amount: 0 })],
     ["Old timestamp (bottom of ts desc)", () => ({ ts: "2020-01-01 00:00:00.000", user_id: "u-old", country: "DE", path: "/", latency_ms: 10, amount: 0 })],
     ["Paid order in DE", () => ({ ts: now(), user_id: "u-buyer", country: "DE", path: "/checkout", latency_ms: 140, amount: 59.9 })],
-    ["Numbers as strings", () => ({ ts: now(), user_id: "u-text", country: "FR", path: "/", latency_ms: "750", amount: "19.99" })],
+    ["Numbers as strings (read as numbers)", () => ({ ts: now(), user_id: "u-text", country: "FR", path: "/", latency_ms: "750", amount: "19.99" })],
     ["Missing keys (zero values)", () => ({ user_id: "u-partial" })],
     ["Session in uppercase (stored lowercase)", () => ({ ts: now(), user_id: "u-upper", country: "PL", path: "/", latency_ms: 80, amount: 0, session_id: SESSIONS[0].toUpperCase() })],
-    ["Unreadable latency (skipped)", () => ({ ts: now(), user_id: "u-broken", country: "PL", path: "/", latency_ms: "fast", amount: 0 })],
+    // through chlive: refused (INVALID_INSERT), and the pending row taken back; to Kafka: skipped
+    ["Unreadable latency (refused / skipped)", () => ({ ts: now(), user_id: "u-broken", country: "PL", path: "/", latency_ms: "fast", amount: 0 })],
     [
       "Batch of 3",
       () => [
@@ -159,8 +162,18 @@ function parseMessages(text) {
   return values;
 }
 
-// Produce messages to a Kafka topic through Redpanda's HTTP proxy; returns where they landed.
-async function write(topic, values) {
+/**
+ * Write rows to a table: through chlive (`client.insert`: the server checks them, and with
+ * `optimistic` they show at once in the results over the table), or straight to its Kafka topic
+ * through Redpanda's HTTP proxy, as any producer would. Returns where they landed.
+ */
+async function write(table, values, { kafka = false, optimistic = true } = {}) {
+  if (kafka) return produce(table, values);
+  const { offsets } = await client.insert(table, values, { optimistic });
+  return offsets.map(([p, o]) => `${p}:${o}`);
+}
+
+async function produce(topic, values) {
   const res = await fetch(`/kafka/topics/${topic}`, {
     method: "POST",
     headers: { "Content-Type": "application/vnd.kafka.json.v2+json" },
@@ -171,17 +184,47 @@ async function write(topic, values) {
   return offsets.map((o) => `${o.partition}:${o.offset}`);
 }
 
-function Writer() {
+/** How the writer and the generator write: through chlive (optimistic or not), or to Kafka. */
+function WriteMode({ how, setHow }) {
+  return (
+    <section className="writer">
+      <h2>Write</h2>
+      <p className="mode">
+        <label>
+          <input type="radio" checked={!how.kafka} onChange={() => setHow({ ...how, kafka: false })} /> through chlive (
+          <code>client.insert</code>)
+        </label>
+        <label>
+          <input type="radio" checked={how.kafka} onChange={() => setHow({ ...how, kafka: true })} /> straight to Kafka
+        </label>
+      </p>
+      <p className="mode">
+        <label>
+          <input
+            type="checkbox"
+            disabled={how.kafka}
+            checked={how.optimistic && !how.kafka}
+            onChange={(e) => setHow({ ...how, optimistic: e.target.checked })}
+          />{" "}
+          optimistic: show the rows at once, where the server will put them (marked pending)
+        </label>
+      </p>
+    </section>
+  );
+}
+
+function Writer({ how }) {
   const [topic, setTopic] = useState("events");
   const [text, setText] = useState(() => pretty(WRITE_PRESETS.events[0][1]()));
   const [result, setResult] = useState(null); // { ok, message }
 
   const run = async (values, label) => {
     try {
-      const at = await write(topic, values);
-      setResult({ ok: true, message: `wrote ${label} to ${topic} (partition:offset ${at.join(", ")})` });
+      const at = await write(topic, values, how);
+      const via = how.kafka ? "to Kafka" : how.optimistic ? "through chlive, optimistically" : "through chlive";
+      setResult({ ok: true, message: `wrote ${label} to ${topic} ${via} (partition:offset ${at.join(", ")})` });
     } catch (e) {
-      setResult({ ok: false, message: e.message });
+      setResult({ ok: false, message: e.code ? `${e.code}: ${e.message}` : e.message });
     }
   };
   const writeText = () => {
@@ -202,7 +245,6 @@ function Writer() {
 
   return (
     <section className="writer">
-      <h2>Write to Kafka</h2>
       <p>
         {TOPICS.map((t) => (
           <label key={t}>
@@ -235,7 +277,7 @@ function Writer() {
 }
 
 /** A loop: write a batch of generated rows, sleep, repeat — until stopped. */
-function Generator() {
+function Generator({ how }) {
   const [topic, setTopic] = useState("events");
   const [kind, setKind] = useState("Uniform");
   const [batch, setBatch] = useState(1);
@@ -243,19 +285,19 @@ function Generator() {
   const [running, setRunning] = useState(false);
   const [stats, setStats] = useState({ written: 0, ticks: 0, errors: 0, lastError: null });
   // the loop reads the latest settings through a ref, so they can change while it runs
-  const settings = useRef({ topic, kind, batch, intervalMs });
-  settings.current = { topic, kind, batch, intervalMs };
+  const settings = useRef({ topic, kind, batch, intervalMs, how });
+  settings.current = { topic, kind, batch, intervalMs, how };
 
   useEffect(() => {
     if (!running) return;
     let stopped = false;
     let timer;
     const tick = async () => {
-      const { topic, kind, batch, intervalMs } = settings.current;
+      const { topic, kind, batch, intervalMs, how } = settings.current;
       const make = GENERATORS[topic][kind] ?? GENERATORS[topic].Uniform;
       const n = Math.max(1, Number(batch) || 1);
       try {
-        await write(topic, Array.from({ length: n }, make));
+        await write(topic, Array.from({ length: n }, make), how);
         setStats((s) => ({ ...s, written: s.written + n, ticks: s.ticks + 1 }));
       } catch (e) {
         setStats((s) => ({ ...s, ticks: s.ticks + 1, errors: s.errors + 1, lastError: e.message }));
@@ -334,6 +376,7 @@ function summarize(msg) {
   if (msg.type === "error") return `error ${msg.code}`;
   if (msg.type === "resume") return "resume: cached rows are valid, catching up";
   if (msg.type === "progress") return "progress: cursor moved (no matching events)";
+  if (msg.type === "plan") return msg.plan ? `plan: inserts into ${msg.plan.table} are predicted` : `plan: not predicted (${msg.reason})`;
   if (msg.type !== "diff") return msg.type;
   const ops = msg.changes.map((c) =>
     c.op === "insert"
@@ -436,6 +479,7 @@ function Debug({ state, sql, shown }) {
             <th>live rate</th>
             <td>{rate.toFixed(1)} inserts/s (last 5 s)</td>
           </tr>
+          <OptimisticRows stats={stats} />
           <CacheRows stats={stats} />
           <tr>
             <th>last message</th>
@@ -466,6 +510,31 @@ function Debug({ state, sql, shown }) {
         </small>
       </p>
     </details>
+  );
+}
+
+/** What the client predicts for this result: its own inserts, before the server has them. */
+function OptimisticRows({ stats }) {
+  const o = stats.optimistic;
+  return (
+    <tr>
+      <th>optimistic</th>
+      <td>
+        {!o ? (
+          "waiting for the plan…"
+        ) : o.predicted ? (
+          <>
+            {o.pending} pending shown · {o.settled} settled (the server's rows had them) · {o.rolledBack} taken back
+            <details className="plan">
+              <summary>the plan they're placed by</summary>
+              <pre className="json">{JSON.stringify(o.plan, null, 2)}</pre>
+            </details>
+          </>
+        ) : (
+          <>not predicted: {o.reason}</>
+        )}
+      </td>
+    </tr>
   );
 }
 
@@ -580,7 +649,7 @@ function Result({ sql, params, enabled }) {
         </thead>
         <tbody>
           {shown.map((r, i) => (
-            <tr key={i}>
+            <tr key={i} className={state.pending?.has(r) ? "pending" : undefined}>
               {columns.map((c) => (
                 <td key={c}>{cell(r[c])}</td>
               ))}
@@ -655,15 +724,23 @@ function Query() {
   );
 }
 
+function Side() {
+  const [how, setHow] = useState({ kafka: false, optimistic: true });
+  return (
+    <div className="side">
+      <WriteMode how={how} setHow={setHow} />
+      <Writer how={how} />
+      <Generator how={how} />
+    </div>
+  );
+}
+
 createRoot(document.getElementById("root")).render(
   <LiveClientProvider client={client}>
     <h1>chlive playground</h1>
     <div className="panes">
       <Query />
-      <div className="side">
-        <Writer />
-        <Generator />
-      </div>
+      <Side />
     </div>
   </LiveClientProvider>,
 );

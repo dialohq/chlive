@@ -50,7 +50,9 @@ Every process is prefixed `chat-` (`dnvr logs chat-server`, …); `ch` is a Clic
 Messages are inserted through chlive (`client.insert("messages", …)`), as the pane's user: the
 server sets `user_id` to who's inserting (`[tables.messages.insert] user = "user_id"`), so a pane
 can't post as someone else, and the app holds no Kafka credentials. The sink puts them into
-ClickHouse and chlive into the panes permitted to see them.
+ClickHouse and chlive into the panes permitted to see them. The clients are `optimistic`: a sent
+message shows at once in its own pane, faded and stamped with its author, where the server will
+put it, until the server's diff brings it (see the main README's "Optimistic inserts").
 
 ## Permissions from WorkOS (`nix/chlive.chat.toml`, `scripts/chat/workos.ts`)
 

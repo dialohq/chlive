@@ -81,9 +81,9 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `nix/chlive.dev.toml` | the dev server's config (the stack's addresses come as flags) |
 | `nix/packages/` | custom derivations: `chlive.nix` (the server and `clc`), `clickhouse.nix` (26.7.2), `libchdb.nix` (chDB, same version), `redpanda.nix` (the Docker-run Redpanda process) |
 | `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
-| `core/` | `chlive-core` (Rust, no IO; also WebAssembly): the dialect (parser), bound queries, plans, a live result's state as events come (ordering, windows, FINAL, time windows, native aggregates), the diffs it makes, and a client's result rows |
+| `core/` | `chlive-core` (Rust, no IO; also WebAssembly): the dialect (parser), bound queries, plans, a live result's state as events come (ordering, windows, FINAL, time windows, native aggregates), the diffs it makes, a client's result rows, and its own inserts placed the same way (`predict`) |
 | `engine/` | `chlive-engine` (Rust): binding against the catalog, and the event loop over ClickHouse and Kafka, on `chlive-core` |
-| `wasm/` | `chlive-wasm`: `chlive-core` for the TS client (`wasm` builds it into `client/wasm/`); see `docs/bench/wasm.md` |
+| `wasm/` | `chlive-wasm`: `chlive-core` for the TS client's optimistic inserts (`wasm` builds it into `client/wasm/`); see `docs/bench/wasm.md` |
 | `protocol/` | `chlive-protocol` (Rust): the WebSocket protocol's messages, shared by the server and the Rust client |
 | `server/` | `chlive-server` (Rust; binary `chlive`): the WebSocket protocol over the engine, and its config (`chlive.example.toml`: every key and default) |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |
@@ -170,6 +170,24 @@ columns = { provider = "pg", grants = "SELECT column_name FROM writable WHERE us
 - **Grants** are the read grants' kinds, with their own queries or permissions: `table` (inserts allowed while it grants anything), `rows` (the row's `column` must be one of the values granted), and `columns` (the columns it may set). They're asked on each insert.
 - **Not atomic.** The rows of one insert are produced together, each acknowledged by the brokers (idempotently). If Kafka fails partway, `WRITE_FAILED` says which rows went in.
 - **Updates and deletes are inserts**, by the table's own convention: a new version of a key in a ReplacingMergeTree (with `ReplacingMergeTree(kafka_offset)`, Kafka orders the versions; see [Kafka columns](#kafka-columns)), with its is-deleted column set to delete. FINAL queries then show the latest.
+
+### Optimistic inserts
+
+With `new LiveClient({ url, optimistic: true })`, the client's own inserts show in its live results at once, before the server has them:
+- **Placed where the server's diff will put them.** That covers the WHERE with the user's row filters, ORDER BY with ties, LIMIT pushing a row out, FINAL replacing or deleting a key's row, and `now()` windows. The rows are stamped with the user as the server stamps them.
+- **One implementation.** The placing is done by the server's own code: `chlive-core`, as WebAssembly in the browser (208 KB gzipped). It runs on each subscription's plan, which the server sends on `optimistic` subscriptions (see [Protocol](#protocol)).
+- **Marked** in `state.pending`, the set of shown rows that are predictions. When the server's diff brings the row and the result's cursor passes the insert's offset, the server's row takes its place. A failed insert is taken back.
+
+How it works:
+- **The WebAssembly is loaded** when the first plan arrives.
+- **A result's copy of its rows** is made on its first optimistic insert: 119 ms for 57k unlimited rows, under 1 ms with LIMIT 200 (`docs/bench/wasm.md`). The copy then follows the server's diffs, and goes 30 s after the last pending row.
+- **Placing pending rows** takes microseconds, and is redone on every server diff while they're pending.
+- **Refused rows aren't shown.** A row the server would refuse (by the columns the query reads) never shows. One it refuses for another column shows until the error, then goes.
+- **Not predicted:** aggregates, IN/EXISTS sub-queries, OFFSET (a row landing above the result slides in one the client doesn't have), results ordered by a column they don't have, FINAL results without their key, and DAY/WEEK `now()` intervals in a timezone other than UTC (the WebAssembly build has no timezone data). These say why in `stats.optimistic.reason`, and show the server's rows only.
+- **Approximations:**
+  - In a FINAL window (`LIMIT` without ORDER BY), a new version of a row past the window shows as a new row, and a deleted row's place isn't refilled until the server's diff.
+  - The Kafka timestamp of a pending row is the client's clock, and its partition and offset come with the ack.
+- `insert(table, rows, { optimistic: false })` skips it for one insert.
 
 ### Kafka columns
 
@@ -368,6 +386,10 @@ sub.unsubscribe();
 
 // writing (see Inserts): each row's [partition, offset], or an InsertError with a code
 const { offsets } = await live.insert("messages", { chat_id: "c7", body: "hi" });
+
+// optimistic (see Optimistic inserts): inserts show at once, marked until the server has them
+const app = new LiveClient({ url, optimistic: true });
+const { rows, pending } = useLiveQuery<Message>(sql); // pending: Set of the rows not back yet
 ```
 
 `status` is `loading` (nothing yet), `cached` (rows from the offline cache, being caught up), `live`, `error`, or, from the hooks, `idle`.
@@ -486,7 +508,7 @@ JSON text frames on `/live` (`protocol/src/lib.rs`, the `chlive-protocol` crate 
 - A `diff` is atomic: its changes apply in sequence, each index into the list as the previous change left it, and only the state after all of them is meaningful (in between, an insert and its delete can briefly make one row more than the LIMIT). The client applies a whole diff to one copy of the rows before its listeners see it.
 - **Resuming.** `snapshot`, `diff` and `{"type": "progress", "id", "at"}` carry `at`, an opaque cursor: how far the result is complete, per Kafka partition, counting events that didn't match. A client that kept a result subscribes with `"since": <at>`; the server answers `{"type": "resume", "id", "columns", "order"?, "limit"?}` instead of a snapshot (the client's rows are still valid), then diffs with only what was missed. If it can't resume (another query or schema, a cursor from an earlier server result for the query, one older than the result's change log, …), it sends a normal `snapshot`.
 - **Complete snapshots.** A `subscribe` with `"complete": true` gets a snapshot holding every event in the query's topics up to their latest offsets when the server got the `subscribe`. Otherwise a snapshot is whatever the result has: a new result's ClickHouse snapshot (which trails Kafka by the sink's lag and the snapshot's age), or a shared result's current state (behind on a burst). The newer events then come as diffs. The server waits for the result to get there; if it can't within `server.complete_wait` (30 s), the subscription ends with `CATCH_UP_TIMEOUT`. A `resume` is unaffected. `@chlive/client` doesn't ask for it; the Rust client's `history()` does.
-- **Plans.** A `subscribe` with `"optimistic": true` gets `{"type": "plan", "id", "plan"}` right before each `snapshot` or `resume`: the result's stream plan (`chlive-core`'s `ClientPlan`, versioned by `"v"`). It holds the WHERE with the user's row filters, ORDER BY, LIMIT, OFFSET, FINAL's key and the `now()` windows, so a client can place its own inserts where the server's diffs will put them before they arrive (optimistic updates). The plan is per subscription: its row filters are part of it, and a permission change brings a new plan with the new snapshot. Some queries can't be predicted from a result's rows: aggregates, IN/EXISTS sub-queries, and results ordered by a column they don't have or missing FINAL's key. Those get `{"type": "plan", "id", "reason"}` instead. Neither client asks for it yet.
+- **Plans.** A `subscribe` with `"optimistic": true` gets `{"type": "plan", "id", "plan"}` right before each `snapshot` or `resume`: the result's stream plan (`chlive-core`'s `ClientPlan`, versioned by `"v"`). It holds the WHERE with the user's row filters, ORDER BY, LIMIT, OFFSET, FINAL's key and the `now()` windows, so a client can place its own inserts where the server's diffs will put them before they arrive (optimistic updates). The plan is per subscription: its row filters are part of it, and a permission change brings a new plan with the new snapshot. The plan also names its `table`, and the `user_column` the table's inserts are stamped with. Some queries can't be predicted from a result's rows: aggregates, IN/EXISTS sub-queries, OFFSET, and results ordered by a column they don't have or missing FINAL's key. Those get `{"type": "plan", "id", "reason"}` instead. `@chlive/client` asks for plans with `optimistic: true` (see [Optimistic inserts](#optimistic-inserts)); the Rust client doesn't yet.
 - **Inserts.** `insert` writes rows into a table (see [Inserts](#inserts)); its id is the client's, apart from subscriptions'. The answer is an `ack` with each row's `[partition, offset]`, in order, or an `error` with that id: `PERMISSION_DENIED`, `INVALID_INSERT` (nothing went in) or `WRITE_FAILED` (Kafka; the message says which rows went in).
 - Error codes: `SYNTAX_ERROR` and `INVALID_QUERY` (the query; positioned), `HISTORY_FAILED` (ClickHouse), `STREAM_FAILED` (Kafka), `AGGREGATE_FAILED` (chDB), `SNAPSHOT_FAILED` (the pause server, or cloning), `BAD_MESSAGE` (unparseable, no id), `DUPLICATE_ID`, `TOO_MANY_SUBSCRIPTIONS` (over `server.max_subscriptions_per_connection`), `CATCH_UP_TIMEOUT` (a complete snapshot not had within `server.complete_wait`), and for inserts `INVALID_INSERT` and `WRITE_FAILED`. After an error, that subscription is over.
 - Rows are exactly the selected columns, rendered like ClickHouse's JSON output.
@@ -561,7 +583,7 @@ The playground uses it: the "Client state" panel shows a hit or miss, whether th
 ```sh
 cargo test --workspace     # engine (lexer, parser, binder, planner, types, watermark), server protocol over a real WebSocket,
                            # the protocol's messages, the Rust client's result store and connection (against a fake server)
-bun run test               # client state, reconnect/resume, the cache store on bun:sqlite (bun test)
+bun run test               # builds chlive-wasm, then: client state, reconnect/resume, optimistic inserts, the cache store on bun:sqlite (bun test)
 e2e                        # = CHLIVE_E2E=1 cargo test -p chlive-engine -p chlive-e2e, against `dnvr up`; output kept in .dnvr/e2e.log
 ```
 

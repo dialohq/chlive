@@ -2,7 +2,8 @@
 // pane is its own connection, as its user: chlive shows it what that user may read, per WorkOS
 // (polled) or Postgres (followed live): whether they may read the messages, whose, and (Postgres
 // only) which columns of the users. Messages are inserted through chlive too, as the pane's user
-// (the server sets `user_id`): the app holds no Kafka credentials.
+// (the server sets `user_id`): the app holds no Kafka credentials. Optimistically: a sent message
+// shows at once (pending, as its author, where the server will put it) until the server has it.
 import { StrictMode, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { LiveClient, defaultUrl } from "@chlive/client";
@@ -13,7 +14,7 @@ import { LiveClientProvider, useLiveQuery } from "@chlive/client/react";
 function useUserClient(user) {
   const [c, setC] = useState(null);
   useEffect(() => {
-    const c = new LiveClient({ url: defaultUrl(), user, cache: false });
+    const c = new LiveClient({ url: defaultUrl(), user, cache: false, optimistic: true });
     setC(c);
     return () => c.close();
   }, [user]);
@@ -97,7 +98,7 @@ function Chat({ client, userId, setUserId, retry }) {
       ) : (
         <div className="messages" ref={list}>
           {[...messages.rows].reverse().map((m) => (
-            <div key={m.message_id} className="msg">
+            <div key={m.message_id} className={messages.pending?.has(m) ? "msg pending" : "msg"}>
               <span className="when">{time(m.ts)}</span>
               <span className="who" style={{ color: names[m.user_id]?.color }}>
                 {names[m.user_id]?.name ?? m.user_id}
