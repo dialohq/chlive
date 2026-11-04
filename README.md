@@ -232,10 +232,24 @@ columns = { provider = "pg", grants = "SELECT column_name FROM writable WHERE us
 # public = true                                 # anyone, anonymous too (no user, no grants)
 ```
 
+`rows` can also be a list, each grant on its own column, and a row must pass every one. A session's events, where a user inserts only into the sessions they own or play, and only the kinds they're given:
+
+```toml
+[tables.session_events.insert]
+user = "author"
+key = "session_id"
+rows = [
+  { column = "session_id", provider = "pg", grants = "SELECT session_id FROM app.session_access WHERE subject = {subject:String} AND role IN ('owner', 'player')" },
+  { column = "kind", provider = "pg", grants = "SELECT kind FROM app.insert_kinds WHERE subject = {subject:String}" },
+]
+```
+
+Each grant gives a subject one set of values, whatever the row's other columns are: here the kinds are the subject's, not per session. A grant is one table keyed by the subject (see [Permissions from Postgres](#permissions-from-postgres)), so a per-role rule (owners insert `user_message` and `user_interrupt`, players anything) is kept as rows of `insert_kinds` by the application, e.g. by a trigger on `session_access`.
+
 - **Opt-in per table**, whatever the read security: a table without `[tables.<t>.insert]` refuses inserts (`PERMISSION_DENIED`). With the section, either `public = true` or every insert needs a subject (see [Authentication](#authentication)).
 - **Rows are checked before anything is produced.** Each key is a column of the table, by the name queries use; not a hidden one, and not one filled from Kafka. Each value must read as its column's type, strictly: NULL only in a Nullable column, an integer only within its type's range. One bad row refuses the whole insert (`INVALID_INSERT`, naming the row).
 - **The message** holds each value as ClickHouse renders it (`"2026-11-01 12:00:00.250"`, a dashed UUID), under the column's JSON key, so what ClickHouse stores and what the stream decodes are the same. Columns a row leaves out stay out: ClickHouse stores their DEFAULT, and the stream reads NULL or the type's zero, as for any message.
-- **Grants** are the read grants' kinds, with their own queries or permissions: `table` (inserts allowed while it grants anything), `rows` (the row's `column` must be one of the values granted), and `columns` (the columns it may set). They're asked on each insert.
+- **Grants** are the read grants' kinds, with their own queries or permissions: `table` (inserts allowed while it grants anything), `rows` (the row's `column` must be one of the values granted; with several, each on its own, and all must hold), and `columns` (the columns it may set). They're asked on each insert. A row that leaves a granted column out is checked with the column's default.
 - **Not atomic.** The rows of one insert are produced together, each acknowledged by the brokers (idempotently). If Kafka fails partway, `WRITE_FAILED` says which rows went in.
 - **Updates and deletes are inserts**, by the table's own convention: a new version of a key in a ReplacingMergeTree (with `ReplacingMergeTree(kafka_offset)`, Kafka orders the versions; see [Kafka columns](#kafka-columns)), with its is-deleted column set to delete. FINAL queries then show the latest.
 

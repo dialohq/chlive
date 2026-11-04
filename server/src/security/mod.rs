@@ -213,14 +213,14 @@ impl TableAccess {
     }
 }
 
-/// Who may insert what into a table: while `table` grants them anything, rows whose `rows`
-/// column is one of what it grants them, and the columns `columns` grants them (each: none,
-/// no limit).
+/// Who may insert what into a table: while `table` grants them anything, rows whose column of
+/// each `rows` grant is one of what that grant gives them, and the columns `columns` grants
+/// them (each: none, no limit).
 #[derive(Clone, Default)]
 pub struct InsertRule {
     pub table: Option<Source>,
-    /// The column (dialect name), and its granted values.
-    pub rows: Option<(String, Source)>,
+    /// Each a column (dialect name) and its granted values; a row must pass all of them.
+    pub rows: Vec<(String, Source)>,
     pub columns: Option<Source>,
 }
 
@@ -229,7 +229,7 @@ pub struct InsertAccess {
     table: String,
     user: Option<String>,
     allowed: Option<watch::Receiver<Granted>>,
-    rows: Option<(String, watch::Receiver<Granted>)>,
+    rows: Vec<(String, watch::Receiver<Granted>)>,
     columns: Option<watch::Receiver<Granted>>,
 }
 
@@ -258,11 +258,11 @@ impl InsertAccess {
         if self.allowed.is_some() && values.next().expect("one per receiver").is_empty() {
             return Err(format!("you may not insert into {}", self.table));
         }
-        if let Some((column, _)) = &self.rows {
-            filter.rows = RowFilter::In {
+        for (column, _) in &self.rows {
+            filter.rows.push(RowFilter::In {
                 column: column.clone(),
                 values: values.next().expect("one per receiver").as_ref().clone(),
-            };
+            });
         }
         if self.columns.is_some() {
             let granted = values.next().expect("one per receiver");
@@ -419,7 +419,11 @@ impl Security {
         for (table, i) in planned.inserts {
             let rule = InsertRule {
                 table: i.table.map(source),
-                rows: i.rows.map(|(column, s)| (column, source(s))),
+                rows: i
+                    .rows
+                    .into_iter()
+                    .map(|(column, s)| (column, source(s)))
+                    .collect(),
                 columns: i.columns.map(source),
             };
             out.inserts.insert(table, rule);
@@ -435,7 +439,7 @@ impl Security {
             table: table.to_string(),
             user: user.map(str::to_string),
             allowed: None,
-            rows: None,
+            rows: Vec::new(),
             columns: None,
         };
         let Some(rule) = self.inserts.get(table) else {
@@ -448,8 +452,8 @@ impl Security {
             Ok(s.provider.watch(s.grant, user))
         };
         access.allowed = rule.table.as_ref().map(watch).transpose()?;
-        if let Some((column, s)) = &rule.rows {
-            access.rows = Some((column.clone(), watch(s)?));
+        for (column, s) in &rule.rows {
+            access.rows.push((column.clone(), watch(s)?));
         }
         access.columns = rule.columns.as_ref().map(watch).transpose()?;
         Ok(access)
@@ -504,7 +508,7 @@ struct Planned {
 
 struct PlannedInsert {
     table: Option<(String, usize)>,
-    rows: Option<(String, (String, usize))>,
+    rows: Vec<(String, (String, usize))>,
     columns: Option<(String, usize)>,
 }
 
@@ -648,20 +652,19 @@ fn plan(security: &SecurityConfig, tables: &TablesConfig) -> Result<Planned> {
             )?),
             None => None,
         };
+        let mut rows = Vec::new();
+        for (n, r) in i.rows.iter().enumerate() {
+            // the single form's place, or the list's
+            let at = match i.rows.len() {
+                1 => format!("{at}.rows"),
+                _ => format!("{at}.rows.{n}"),
+            };
+            let grant = register(&at, &r.provider, &r.grants, GrantKind::Values)?;
+            rows.push((r.column.clone(), grant));
+        }
         let planned = PlannedInsert {
             table: table_grant,
-            rows: match &i.rows {
-                Some(r) => Some((
-                    r.column.clone(),
-                    register(
-                        &format!("{at}.rows"),
-                        &r.provider,
-                        &r.grants,
-                        GrantKind::Values,
-                    )?,
-                )),
-                None => None,
-            },
+            rows,
             columns: match &i.columns {
                 Some(g) => Some(register(
                     &format!("{at}.columns"),
@@ -980,13 +983,40 @@ mod tests {
         let p = plan(&security, &tables).unwrap();
         let pg = |i| ("pg".to_string(), i);
         assert_eq!(p.inserts["messages"].table, Some(pg(1)));
-        assert_eq!(p.inserts["messages"].rows, Some(("chat_id".into(), pg(2))));
+        assert_eq!(p.inserts["messages"].rows, [("chat_id".into(), pg(2))]);
         assert_eq!(p.inserts["messages"].columns, None);
         assert!(!p.inserts.contains_key("notes"), "nothing to ask for");
         assert!(
             !p.rules.contains_key("messages"),
             "reads are another matter"
         );
+        // several row grants, each its own
+        let (security, tables) = config(&format!(
+            r#"{PROVIDER}
+            [tables.session_events.insert]
+            user = "author"
+            rows = [
+              {{ column = "session_id", provider = "pg", grants = "SELECT session_id FROM session_access WHERE subject = {{subject:String}} AND role IN ('owner', 'player')" }},
+              {{ column = "kind", provider = "pg", grants = "SELECT kind FROM insert_kinds WHERE subject = {{subject:String}}" }},
+            ]
+            "#
+        ));
+        let p = plan(&security, &tables).unwrap();
+        assert_eq!(
+            p.inserts["session_events"].rows,
+            [("session_id".into(), pg(1)), ("kind".into(), pg(2))]
+        );
+        let (security, tables) = config(&format!(
+            r#"{PROVIDER}
+            [tables.m.insert]
+            rows = [
+              {{ column = "a", provider = "pg", grants = "SELECT a FROM g WHERE s = {{subject:String}}" }},
+              {{ column = "b", provider = "pg", grants = "SELECT b FROM" }},
+            ]
+            "#
+        ));
+        let e = format!("{:#}", plan(&security, &tables).err().unwrap());
+        assert!(e.contains("tables.m.insert.rows.1.grants: "), "{e}");
         let (security, tables) = config(&format!(
             "{PROVIDER}\n[tables.m.insert]\ncolumns = {{ provider = \"nope\", grants = \"x\" }}\n"
         ));
@@ -1008,7 +1038,7 @@ mod tests {
             "messages",
             InsertRule {
                 table: Some(source(0)),
-                rows: Some(("chat_id".into(), source(1))),
+                rows: vec![("chat_id".into(), source(1)), ("kind".into(), source(3))],
                 columns: Some(source(2)),
             },
         );
@@ -1025,14 +1055,21 @@ mod tests {
         p.set(0, "alice", &["yes"]);
         p.set(1, "alice", &["c1", "c2"]);
         p.set(2, "alice", &["body", "chat_id"]);
+        p.set(3, "alice", &["user_message"]);
         let mut a = security.insert_access(Some("alice"), "messages").unwrap();
         assert_eq!(
             a.decide().await,
             Ok(InsertFilter {
-                rows: RowFilter::In {
-                    column: "chat_id".into(),
-                    values: vec!["c1".into(), "c2".into()],
-                },
+                rows: vec![
+                    RowFilter::In {
+                        column: "chat_id".into(),
+                        values: vec!["c1".into(), "c2".into()],
+                    },
+                    RowFilter::In {
+                        column: "kind".into(),
+                        values: vec!["user_message".into()],
+                    },
+                ],
                 columns: Some(["body".to_string(), "chat_id".to_string()].into()),
                 user: Some("alice".into()),
             })

@@ -320,17 +320,17 @@ impl ConfiguredRules {
                     ));
                 }
                 let names = [("user", &i.user), ("key", &i.key)];
-                let row_column = i.rows.as_ref().map(|r| ("rows.column", &r.column));
+                let row_columns = i.rows.iter().map(|r| ("rows.column", &r.column));
                 for (what, col) in names
                     .iter()
                     .filter_map(|(w, c)| c.as_ref().map(|c| (*w, c)))
-                    .chain(row_column)
+                    .chain(row_columns)
                 {
                     if !is_ident(col) {
                         return Err(err(format!("insert.{what}: {col:?} is not a column name")));
                     }
                 }
-                if i.user.is_some() && i.user == i.rows.as_ref().map(|r| r.column.clone()) {
+                if i.rows.iter().any(|r| i.user.as_ref() == Some(&r.column)) {
                     return Err(err(
                         "insert: the user column is the server's, so rows can't grant it".into(),
                     ));
@@ -511,6 +511,52 @@ mod tests {
         );
         let r = ConfiguredRules::new(d).unwrap();
         assert!(!r.exposes("events"), "listed: nothing without a list");
+    }
+
+    #[test]
+    fn insert_row_grants_one_or_a_list() {
+        use crate::security::RowGrant;
+        let grant =
+            |column: &str| serde_json::json!({ "column": column, "provider": "pg", "grants": "q" });
+        let rows = |r: &ConfiguredRules| r.insert("t").unwrap().rows;
+        let one = rules(serde_json::json!({ "t": { "insert": { "rows": grant("a") } } }));
+        let a = RowGrant {
+            column: "a".into(),
+            provider: "pg".into(),
+            grants: "q".into(),
+        };
+        assert_eq!(rows(&one), std::slice::from_ref(&a));
+        let list =
+            rules(serde_json::json!({ "t": { "insert": { "rows": [grant("a"), grant("b")] } } }));
+        let b = RowGrant {
+            column: "b".into(),
+            ..a.clone()
+        };
+        assert_eq!(rows(&list), [a, b]);
+        assert!(
+            rules(serde_json::json!({ "t": { "insert": { "rows": [] } } }))
+                .insert("t")
+                .is_some_and(|i| !i.has_grants())
+        );
+        let e = error(serde_json::json!({ "t": { "insert": { "rows": "a" } } }));
+        assert!(
+            e.contains("a row grant `{ column, provider, grants }`, or a list"),
+            "{e}"
+        );
+        let e = error(
+            serde_json::json!({ "t": { "insert": { "rows": [grant("a"), { "column": "b" }] } } }),
+        );
+        assert!(e.contains("missing field `provider`"), "{e}");
+        let e = error(
+            serde_json::json!({ "t": { "insert": { "user": "u", "rows": [grant("a"), grant("u")] } } }),
+        );
+        assert!(e.contains("rows can't grant it"), "{e}");
+        let e =
+            error(serde_json::json!({ "t": { "insert": { "rows": [grant("a"), grant("b c")] } } }));
+        assert!(
+            e.contains("insert.rows.column: \"b c\" is not a column name"),
+            "{e}"
+        );
     }
 
     #[test]

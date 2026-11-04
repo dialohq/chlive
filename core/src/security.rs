@@ -103,9 +103,13 @@ pub struct InsertConfig {
     /// Whether a subject may insert at all: while this grant answers anything.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table: Option<GrantSource>,
-    /// Which values of a column a subject's rows may have.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rows: Option<RowGrant>,
+    /// Which values of columns a subject's rows may have: each grant on its own, and a row
+    /// must pass all of them. One grant (`rows = { … }`) or a list (`rows = [{ … }, …]`).
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many"
+    )]
+    pub rows: Vec<RowGrant>,
     /// Which columns a subject may set; without it, every one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub columns: Option<GrantSource>,
@@ -114,8 +118,28 @@ pub struct InsertConfig {
 impl InsertConfig {
     /// Whether any grant decides who may insert what.
     pub fn has_grants(&self) -> bool {
-        self.table.is_some() || self.rows.is_some() || self.columns.is_some()
+        self.table.is_some() || !self.rows.is_empty() || self.columns.is_some()
     }
+}
+
+/// `rows`: one grant, or a list of them.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<RowGrant>, D::Error> {
+    use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+    use serde::Deserialize;
+    struct OneOrMany;
+    impl<'de> serde::de::Visitor<'de> for OneOrMany {
+        type Value = Vec<RowGrant>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a row grant `{ column, provider, grants }`, or a list of them")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, m: A) -> Result<Self::Value, A::Error> {
+            RowGrant::deserialize(MapAccessDeserializer::new(m)).map(|g| vec![g])
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, s: A) -> Result<Self::Value, A::Error> {
+            Vec::deserialize(SeqAccessDeserializer::new(s))
+        }
+    }
+    d.deserialize_any(OneOrMany)
 }
 
 /// A grant of a column's values: a row's `column` must be one of them.
@@ -134,8 +158,9 @@ pub struct RowGrant {
 /// every row against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InsertFilter {
-    /// The rows it may insert; for [`RowFilter::In`], `column` is a dialect name.
-    pub rows: RowFilter,
+    /// The rows it may insert: each filter must allow a row (none: any row); for
+    /// [`RowFilter::In`], `column` is a dialect name.
+    pub rows: Vec<RowFilter>,
     /// The columns (dialect names) it may set; none: every one.
     pub columns: Option<BTreeSet<String>>,
     /// Who inserts (`hello`), for the table's `user` column.
@@ -146,7 +171,7 @@ impl InsertFilter {
     /// Any row, any column, as `user`.
     pub fn open(user: Option<&str>) -> Self {
         Self {
-            rows: RowFilter::All,
+            rows: Vec::new(),
             columns: None,
             user: user.map(str::to_string),
         }

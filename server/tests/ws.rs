@@ -2447,7 +2447,7 @@ async fn insert_grants_decide_who_inserts_which_rows_and_columns() {
         "requests",
         chlive_server::security::InsertRule {
             table: None,
-            rows: Some(("user_id".into(), source(0))),
+            rows: vec![("user_id".into(), source(0))],
             columns: Some(source(1)),
         },
     );
@@ -2487,6 +2487,117 @@ async fn insert_grants_decide_who_inserts_which_rows_and_columns() {
     p.set(0, "alice", &[]);
     insert(&mut c, "w4", json!([{"user_id": "team-a"}])).await;
     assert_eq!(error_code(&mut c, "w4").await, "INVALID_INSERT");
+}
+
+/// Several row grants, each on its own column, all of which a row must pass: here `user_id` is
+/// the session and `latency_ms` the kind, as in a session's events, where its owner inserts
+/// only some kinds and its player any.
+#[tokio::test]
+async fn every_row_grant_must_pass() {
+    let live = Live::new();
+    let p = MemoryProvider::loaded();
+    let source = |grant| Source {
+        provider: p.clone(),
+        grant,
+    };
+    let security = Security::open().inserts(
+        "requests",
+        chlive_server::security::InsertRule {
+            table: None,
+            rows: vec![
+                ("user_id".into(), source(0)),
+                ("latency_ms".into(), source(1)),
+            ],
+            columns: None,
+        },
+    );
+    let settings = ServerSettings {
+        auth: std::sync::Arc::new(Auth::Declared),
+        security: std::sync::Arc::new(security),
+        ..Default::default()
+    };
+    let server = insert_server(&live, json!({}), settings).await;
+    p.set(0, "owner", &["s1", "s2"]);
+    p.set(1, "owner", &["1", "2"]);
+    p.set(0, "player", &["s2"]);
+    p.set(1, "player", &["1", "2", "3", "4"]);
+    let mut owner = Client::connect(&server).await;
+    hello(&mut owner, "owner").await;
+    let mut player = Client::connect(&server).await;
+    hello(&mut player, "player").await;
+    async fn refused(c: &mut Client, id: &str, row: Value, why: &str) {
+        insert(c, id, json!([row])).await;
+        let m = c.expect().await;
+        assert_eq!(
+            (&m["code"], &m["id"]),
+            (&json!("INVALID_INSERT"), &json!(id)),
+            "{m}"
+        );
+        let message = m["message"].as_str().unwrap();
+        assert!(message.contains(why), "{message}");
+    }
+    // the owner: its sessions, its kinds
+    insert(
+        &mut owner,
+        "w1",
+        json!([{"user_id": "s1", "latency_ms": 2}]),
+    )
+    .await;
+    assert_eq!(owner.expect().await["type"], "ack");
+    refused(
+        &mut owner,
+        "w2",
+        json!({"user_id": "s1", "latency_ms": 3}),
+        "latency_ms = 3",
+    )
+    .await;
+    refused(
+        &mut owner,
+        "w3",
+        json!({"user_id": "s9", "latency_ms": 1}),
+        "user_id = \"s9\"",
+    )
+    .await;
+    // one bad row: none go
+    insert(
+        &mut owner,
+        "w4",
+        json!([{"user_id": "s2", "latency_ms": 1}, {"user_id": "s2", "latency_ms": 4}]),
+    )
+    .await;
+    assert_eq!(error_code(&mut owner, "w4").await, "INVALID_INSERT");
+    // the player: its one session, any kind
+    insert(
+        &mut player,
+        "w1",
+        json!([{"user_id": "s2", "latency_ms": 4}]),
+    )
+    .await;
+    assert_eq!(player.expect().await["type"], "ack");
+    refused(
+        &mut player,
+        "w2",
+        json!({"user_id": "s1", "latency_ms": 1}),
+        "user_id = \"s1\"",
+    )
+    .await;
+    // each grant follows its own changes
+    p.set(1, "owner", &["1", "2", "3"]);
+    insert(
+        &mut owner,
+        "w5",
+        json!([{"user_id": "s1", "latency_ms": 3}]),
+    )
+    .await;
+    assert_eq!(owner.expect().await["type"], "ack");
+    p.set(1, "player", &[]);
+    refused(
+        &mut player,
+        "w3",
+        json!({"user_id": "s2", "latency_ms": 4}),
+        "latency_ms = 4",
+    )
+    .await;
 }
 
 #[tokio::test]

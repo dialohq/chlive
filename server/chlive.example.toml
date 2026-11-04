@@ -164,3 +164,15 @@
 ##                                          # kafka: the column holds the message's "offset",
 ##                                          # "partition" or "timestamp" (Kafka Connect's
 ##                                          # InsertField), not a JSON key; shown even if hidden
+##   [tables.session_events.insert]         # the table takes inserts (without it, none)
+##   user = "author"                        # set by the server to the subject, never by a row
+##   key = "session_id"                     # the Kafka key
+##   table = { provider = "pg", grants = "SELECT role FROM app.writers WHERE subject = {subject:String}" }
+##                                          # inserts at all, while this grants anything
+##   rows = [                               # each must hold: the row's column is among its values
+##     { column = "session_id", provider = "pg", grants = "SELECT session_id FROM app.session_access WHERE subject = {subject:String} AND role IN ('owner', 'player')" },
+##     { column = "kind", provider = "pg", grants = "SELECT kind FROM app.insert_kinds WHERE subject = {subject:String}" },
+##   ]                                      # or one: rows = { column, provider, grants }
+##   columns = { provider = "pg", grants = "SELECT column_name FROM app.writable WHERE subject = {subject:String}" }
+##                                          # the columns it may set; without it, any
+##   # public = true                        # anyone's rows, anonymous too (no user, no grants)

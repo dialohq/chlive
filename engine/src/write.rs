@@ -195,32 +195,33 @@ fn message(
             .map_err(|e| format!("{user_column} (the user): {e}"))?;
         values.push((user_column, c, v));
     }
-    match &filter.rows {
-        RowFilter::All => {}
-        RowFilter::None => return Err(format!("you may not insert into {table}")),
-        RowFilter::In {
-            column: name,
-            values: granted,
-        } => {
-            let c = column(name, "rows' column")?;
-            let v = values
-                .iter()
-                .find(|(n, ..)| n == name)
-                .map(|(.., v)| v.clone())
-                .unwrap_or_else(|| c.ty.default_value());
-            let allowed = granted.iter().any(|g| {
-                c.ty.kind
-                    .column_type()
-                    .decode(&Json::String(g.clone()))
-                    .as_ref()
-                    == Some(&v)
-            });
-            if !allowed {
-                return Err(format!(
-                    "you may not insert rows of {table} with {name} = {}",
-                    v.to_json()
-                ));
-            }
+    for rows in &filter.rows {
+        let (name, granted) = match rows {
+            RowFilter::All => continue,
+            RowFilter::None => return Err(format!("you may not insert into {table}")),
+            RowFilter::In {
+                column: name,
+                values: granted,
+            } => (name, granted),
+        };
+        let c = column(name, "rows' column")?;
+        let v = values
+            .iter()
+            .find(|(n, ..)| n == name)
+            .map(|(.., v)| v.clone())
+            .unwrap_or_else(|| c.ty.default_value());
+        let allowed = granted.iter().any(|g| {
+            c.ty.kind
+                .column_type()
+                .decode(&Json::String(g.clone()))
+                .as_ref()
+                == Some(&v)
+        });
+        if !allowed {
+            return Err(format!(
+                "you may not insert rows of {table} with {name} = {}",
+                v.to_json()
+            ));
         }
     }
     let key = match &config.key {
@@ -409,18 +410,37 @@ mod tests {
         assert!(e.contains("needs a user"), "{e}");
         // the rows it may insert
         let chats = InsertFilter {
-            rows: RowFilter::In {
+            rows: vec![RowFilter::In {
                 column: "chat_id".into(),
                 values: vec!["c1".into()],
-            },
+            }],
             ..as_user("u1")
         };
         let e = refused(&engine, &[json!({"chat_id": "c2"})], &chats).await;
         assert!(e.contains("with chat_id = \"c2\""), "{e}");
         let e = refused(&engine, &[json!({"body": "no chat"})], &chats).await;
         assert!(e.contains("with chat_id = \"\""), "{e}");
+        // several: each must allow the row, on its own column
+        let likes = |values: &[&str]| RowFilter::In {
+            column: "likes".into(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+        };
+        let both = InsertFilter {
+            rows: vec![chats.rows[0].clone(), likes(&["1", "2"])],
+            ..as_user("u1")
+        };
+        let e = refused(&engine, &[json!({"chat_id": "c2", "likes": 1})], &both).await;
+        assert!(e.contains("with chat_id = \"c2\""), "{e}");
+        let e = refused(&engine, &[json!({"chat_id": "c1", "likes": 3})], &both).await;
+        assert!(e.contains("with likes = 3"), "{e}");
+        let neither = InsertFilter {
+            rows: vec![chats.rows[0].clone(), likes(&[])],
+            ..as_user("u1")
+        };
+        let e = refused(&engine, &[json!({"chat_id": "c1", "likes": 1})], &neither).await;
+        assert!(e.contains("with likes = 1"), "{e}");
         let none = InsertFilter {
-            rows: RowFilter::None,
+            rows: vec![RowFilter::None],
             ..as_user("u1")
         };
         assert!(refused(&engine, &[json!({})], &none)
@@ -436,7 +456,9 @@ mod tests {
         assert!(sink.produced("messages").is_empty());
         let rows = [row(json!({"chat_id": "c1", "body": "hi"}))];
         engine.insert("messages", &rows, &some).await.unwrap();
-        assert_eq!(sink.produced("messages").len(), 1);
+        let rows = [row(json!({"chat_id": "c1", "likes": 2}))];
+        engine.insert("messages", &rows, &both).await.unwrap();
+        assert_eq!(sink.produced("messages").len(), 2);
     }
 
     #[tokio::test]
