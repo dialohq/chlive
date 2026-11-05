@@ -43,6 +43,10 @@
           libchdb = pkgs.callPackage ./nix/packages/libchdb.nix { };
           # the server (`chlive`) and the terminal client (`clc`)
           chlive = pkgs.callPackage ./nix/packages/chlive.nix { inherit libchdb; };
+          # chlive-core for the TS client, as WebAssembly: @chlive/client's wasm/ directory
+          chlive-wasm = pkgs.callPackage ./nix/packages/chlive-wasm.nix {
+            rust = import ./nix/rust.nix { inherit pkgs; };
+          };
         in
         {
           # nixpkgs with rust-overlay's `rust-bin` (nothing else changes: same packages)
@@ -56,6 +60,7 @@
               clickhouse
               libchdb
               chlive
+              chlive-wasm
               ;
             default = chlive;
           };

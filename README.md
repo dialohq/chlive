@@ -83,7 +83,7 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
 | `core/` | `chlive-core` (Rust, no IO; also WebAssembly): the dialect (parser), bound queries, plans, a live result's state as events come (ordering, windows, FINAL, time windows, native aggregates), the diffs it makes, a client's result rows, and its own inserts placed the same way (`predict`) |
 | `engine/` | `chlive-engine` (Rust): binding against the catalog, and the event loop over ClickHouse and Kafka, on `chlive-core` |
-| `wasm/` | `chlive-wasm`: `chlive-core` for the TS client's optimistic inserts (`wasm` builds it into `client/wasm/`); see `docs/bench/wasm.md` |
+| `wasm/` | `chlive-wasm`: `chlive-core` for the TS client's optimistic inserts (`wasm` builds it into `client/wasm/`; the flake's `packages.chlive-wasm` is that directory, for other flakes building the client); see `docs/bench/wasm.md` |
 | `protocol/` | `chlive-protocol` (Rust): the WebSocket protocol's messages, shared by the server and the Rust client |
 | `server/` | `chlive-server` (Rust; binary `chlive`): the WebSocket protocol over the engine, and its config (`chlive.example.toml`: every key and default) |
 | `client/` | `@chlive/client` (zero dependencies) plus the `@chlive/client/react` hook `useLiveQuery` |

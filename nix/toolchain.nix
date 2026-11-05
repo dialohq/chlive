@@ -5,14 +5,7 @@
   libchdb,
 }:
 let
-  # rustc as nixpkgs has it, plus the wasm32 target (chlive-wasm, the TS client's core)
-  rust = pkgs.rust-bin.stable."1.98.1".default.override {
-    targets = [ "wasm32-unknown-unknown" ];
-    extensions = [
-      "rust-src"
-      "rust-analyzer"
-    ];
-  };
+  rust = import ./rust.nix { inherit pkgs; };
 in
 {
   packages = with pkgs; [
