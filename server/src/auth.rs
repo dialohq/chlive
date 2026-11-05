@@ -1,17 +1,24 @@
 //! Who a connection is (the `[auth]` section): nobody (`none`, the default: connections are
 //! anonymous), whoever its `hello` says (`declared`, for dev and tests), or the subject of a
-//! credential it presents (`jwt`): a JWT signed by the issuer, verified with the issuer's public
-//! keys only, so that chlive can check credentials but never make them.
+//! credential it presents (`jwt`): a JWT signed by one of the issuers (`[[auth.issuers]]`),
+//! verified with that issuer's public keys only, so that chlive can check credentials but never
+//! make them.
 //!
-//! The keys are a JWKS, from a file, a URL, or both (their union): read at start (which fails
-//! without them), again every `jwks_refresh`, and when a credential names a key id that isn't
-//! among them (at most every `jwks_cooldown`), so a rotation needs no restart. A source that
-//! fails to load keeps its previous keys.
+//! A credential's `iss` picks its issuer, and only that issuer's keys may verify it: a key of
+//! one issuer never validates another's credential. Each issuer has its audiences (any one of
+//! them in `aud` is enough), its algorithms, the claim its subject is in (with a prefix, so that
+//! issuers' subjects can't collide), and claims that must have exact values.
+//!
+//! Each issuer's keys are a JWKS, from a file, a URL, or both (their union): read at start
+//! (which fails without them), again every `jwks_refresh`, and when a credential names a key id
+//! that isn't among them (at most every `jwks_cooldown`), so a rotation needs no restart. A
+//! source that fails to load keeps its previous keys.
 //!
 //! What a client hears of a failure is one of four codes with a fixed message
-//! ([`AuthError`]): the signature is checked before any claim, and nothing of the credential
-//! or of what the server expected is said.
+//! ([`AuthError`]): past the choice of issuer, the signature is checked before any claim, and
+//! nothing of the credential or of what the server expected is said.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -20,7 +27,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -28,37 +36,153 @@ use crate::protocol::{AUTH_BAD_SIGNATURE, AUTH_EXPIRED, AUTH_WRONG_AUDIENCE};
 
 /// `[auth]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(try_from = "RawAuthConfig")]
 pub struct AuthConfig {
     pub mode: Mode,
-    /// jwt: the credentials' `iss`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub issuer: Option<String>,
-    /// jwt: what their `aud` must hold.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub audience: Option<String>,
-    /// jwt: the issuer's public keys (a JWKS), over HTTP(S) ...
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub jwks_url: Option<String>,
-    /// ... and/or in a file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub jwks_file: Option<PathBuf>,
+    /// jwt: who signs credentials, each with its own keys and claims.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub issuers: Vec<IssuerConfig>,
     /// How often the keys are read again.
     #[serde(with = "humantime_serde")]
     pub jwks_refresh: Duration,
-    /// A credential with a key id the server doesn't have reads them again, at most this often.
+    /// A credential with a key id its issuer's keys don't have reads them again, at most this
+    /// often.
     #[serde(with = "humantime_serde")]
     pub jwks_cooldown: Duration,
-    /// The signing algorithms taken; only public-key ones (HS* would need the issuer's secret).
-    pub algorithms: Vec<String>,
-    /// The claim holding the subject (`{subject:String}` in grants), taken as an opaque string.
-    pub subject_claim: String,
     /// Clock skew allowed on `exp` and `nbf`.
     #[serde(with = "humantime_serde")]
     pub leeway: Duration,
     /// jwt: a connection without a `hello` this long after connecting is closed.
     #[serde(with = "humantime_serde")]
     pub hello_timeout: Duration,
+}
+
+/// `[[auth.issuers]]`: one issuer of credentials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerConfig {
+    /// The credentials' `iss`, exactly: it picks the issuer, so each is listed once.
+    pub issuer: String,
+    /// What their `aud` must hold one of.
+    pub audiences: Vec<String>,
+    /// The issuer's public keys (a JWKS), over HTTP(S) ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_url: Option<String>,
+    /// ... and/or in a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_file: Option<PathBuf>,
+    /// The signing algorithms taken; only public-key ones (HS* would need the issuer's secret).
+    #[serde(default = "default_algorithms")]
+    pub algorithms: Vec<String>,
+    /// The claim holding the subject (`{subject:String}` in grants), a string taken as is ...
+    #[serde(default = "default_subject_claim")]
+    pub subject_claim: String,
+    /// ... after this prefix (e.g. `user:`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subject_prefix: String,
+    /// Claims that must have exactly these values (e.g. `email_verified = true`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub required_claims: BTreeMap<String, serde_json::Value>,
+}
+
+fn default_algorithms() -> Vec<String> {
+    [
+        "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+fn default_subject_claim() -> String {
+    "sub".into()
+}
+
+impl Default for IssuerConfig {
+    /// No issuer yet: the defaults of the rest.
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            audiences: Vec::new(),
+            jwks_url: None,
+            jwks_file: None,
+            algorithms: default_algorithms(),
+            subject_claim: default_subject_claim(),
+            subject_prefix: String::new(),
+            required_claims: BTreeMap::new(),
+        }
+    }
+}
+
+/// `[auth]` as written, with the single issuer's keys of before `[[auth.issuers]]` (refused,
+/// saying where they went).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawAuthConfig {
+    mode: Mode,
+    issuers: Vec<IssuerConfig>,
+    #[serde(with = "humantime_serde")]
+    jwks_refresh: Duration,
+    #[serde(with = "humantime_serde")]
+    jwks_cooldown: Duration,
+    #[serde(with = "humantime_serde")]
+    leeway: Duration,
+    #[serde(with = "humantime_serde")]
+    hello_timeout: Duration,
+    issuer: Option<IgnoredAny>,
+    audience: Option<IgnoredAny>,
+    jwks_url: Option<IgnoredAny>,
+    jwks_file: Option<IgnoredAny>,
+    algorithms: Option<IgnoredAny>,
+    subject_claim: Option<IgnoredAny>,
+}
+
+impl Default for RawAuthConfig {
+    fn default() -> Self {
+        let d = AuthConfig::default();
+        Self {
+            mode: d.mode,
+            issuers: d.issuers,
+            jwks_refresh: d.jwks_refresh,
+            jwks_cooldown: d.jwks_cooldown,
+            leeway: d.leeway,
+            hello_timeout: d.hello_timeout,
+            issuer: None,
+            audience: None,
+            jwks_url: None,
+            jwks_file: None,
+            algorithms: None,
+            subject_claim: None,
+        }
+    }
+}
+
+impl TryFrom<RawAuthConfig> for AuthConfig {
+    type Error = String;
+
+    fn try_from(r: RawAuthConfig) -> Result<Self, String> {
+        let moved = [
+            ("issuer", r.issuer.is_some()),
+            ("audience", r.audience.is_some()),
+            ("jwks_url", r.jwks_url.is_some()),
+            ("jwks_file", r.jwks_file.is_some()),
+            ("algorithms", r.algorithms.is_some()),
+            ("subject_claim", r.subject_claim.is_some()),
+        ];
+        if let Some((key, _)) = moved.iter().find(|(_, set)| *set) {
+            return Err(format!(
+                "auth.{key} moved: each issuer is its own [[auth.issuers]], with issuer, \
+                 audiences (a list), jwks_url and/or jwks_file, algorithms and subject_claim"
+            ));
+        }
+        Ok(Self {
+            mode: r.mode,
+            issuers: r.issuers,
+            jwks_refresh: r.jwks_refresh,
+            jwks_cooldown: r.jwks_cooldown,
+            leeway: r.leeway,
+            hello_timeout: r.hello_timeout,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -77,18 +201,9 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             mode: Mode::None,
-            issuer: None,
-            audience: None,
-            jwks_url: None,
-            jwks_file: None,
+            issuers: Vec::new(),
             jwks_refresh: Duration::from_secs(300),
             jwks_cooldown: Duration::from_secs(30),
-            algorithms: [
-                "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA",
-            ]
-            .map(String::from)
-            .to_vec(),
-            subject_claim: "sub".into(),
             leeway: Duration::from_secs(5),
             hello_timeout: Duration::from_secs(10),
         }
@@ -98,42 +213,65 @@ impl Default for AuthConfig {
 impl AuthConfig {
     /// What can be checked without the keys.
     pub fn check(&self) -> Result<()> {
-        self.algorithms()?;
-        if self.subject_claim.is_empty() {
-            bail!("auth.subject_claim: empty");
+        let mut seen = BTreeSet::new();
+        for (i, issuer) in self.issuers.iter().enumerate() {
+            let at = format!("auth.issuers.{i}");
+            issuer.check(&at)?;
+            if !seen.insert(&issuer.issuer) {
+                bail!(
+                    "{at}.issuer: {:?} is listed twice (a credential's iss picks its issuer)",
+                    issuer.issuer
+                );
+            }
         }
-        if self.mode != Mode::Jwt {
-            return Ok(());
+        if self.mode == Mode::Jwt && self.issuers.is_empty() {
+            bail!(
+                "auth.issuers: mode = \"jwt\" needs at least one [[auth.issuers]]: who signs \
+                 the credentials, and with which keys"
+            );
         }
-        if self.issuer.as_deref().unwrap_or_default().is_empty() {
-            bail!("auth.issuer: mode = \"jwt\" needs the credentials' issuer");
+        Ok(())
+    }
+}
+
+impl IssuerConfig {
+    fn check(&self, at: &str) -> Result<()> {
+        if self.issuer.is_empty() {
+            bail!("{at}.issuer: empty (the credentials' iss)");
         }
-        if self.audience.as_deref().unwrap_or_default().is_empty() {
-            bail!("auth.audience: mode = \"jwt\" needs the audience credentials are for");
+        if self.audiences.is_empty() || self.audiences.iter().any(String::is_empty) {
+            bail!("{at}.audiences: the audiences credentials are for, at least one (none empty)");
         }
         if self.jwks_url.is_none() && self.jwks_file.is_none() {
-            bail!("auth: mode = \"jwt\" needs the issuer's keys: jwks_url, jwks_file or both");
+            bail!("{at}: the issuer's keys are needed: jwks_url, jwks_file or both");
         }
         if let Some(url) = &self.jwks_url {
             if !(url.starts_with("https://") || url.starts_with("http://")) {
-                bail!("auth.jwks_url: {url:?} isn't an http(s) URL");
+                bail!("{at}.jwks_url: {url:?} isn't an http(s) URL");
             }
+        }
+        self.algorithms(at)?;
+        if self.subject_claim.is_empty() {
+            bail!("{at}.subject_claim: empty");
+        }
+        if self.required_claims.keys().any(String::is_empty) {
+            bail!("{at}.required_claims: a claim without a name");
         }
         Ok(())
     }
 
-    fn algorithms(&self) -> Result<Vec<Algorithm>> {
+    fn algorithms(&self, at: &str) -> Result<Vec<Algorithm>> {
         if self.algorithms.is_empty() {
-            bail!("auth.algorithms: empty");
+            bail!("{at}.algorithms: empty");
         }
         self.algorithms
             .iter()
             .map(|a| {
                 let alg = Algorithm::from_str(a)
-                    .map_err(|_| anyhow::anyhow!("auth.algorithms: unknown algorithm {a:?}"))?;
+                    .map_err(|_| anyhow::anyhow!("{at}.algorithms: unknown algorithm {a:?}"))?;
                 if matches!(alg, Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512) {
                     bail!(
-                        "auth.algorithms: {a} is a shared secret, which would let chlive make \
+                        "{at}.algorithms: {a} is a shared secret, which would let chlive make \
                          credentials too; it only verifies them (public-key algorithms only)"
                     );
                 }
@@ -194,10 +332,11 @@ pub struct Verified {
 /// Why a credential isn't taken: one of the protocol's codes, each with a fixed message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthError {
-    /// Malformed, signed by no key the server has, or with an algorithm it doesn't take.
+    /// Malformed, signed by no key of its issuer, or with an algorithm it doesn't take.
     BadSignature,
-    /// Not for this server: its issuer or audience differs, or a claim the server needs (the
-    /// subject, the expiry) is missing.
+    /// Not for this server: its issuer is none of the server's, its audience differs, a claim
+    /// the server needs (the subject, the expiry) is missing, or a required claim's value
+    /// differs.
     WrongAudience,
     /// Past its `exp` (or before its `nbf`).
     Expired,
@@ -261,68 +400,52 @@ impl Keys {
     }
 }
 
-/// Verifies credentials with the issuer's public keys.
+/// Verifies credentials, each with its issuer's public keys.
 pub struct Verifier {
-    validation: Validation,
-    subject_claim: String,
-    /// Kept apart from `validation.leeway` (seconds) for the deadline.
+    /// By `iss`.
+    issuers: BTreeMap<String, Issuer>,
+    /// Kept apart from the validations' leeway (seconds) for the deadline.
     leeway: Duration,
     pub hello_timeout: Duration,
-    jwks_url: Option<String>,
-    jwks_file: Option<PathBuf>,
     cooldown: Duration,
     http: reqwest::Client,
+}
+
+/// One issuer: how its credentials are validated and whose they are, and its keys.
+struct Issuer {
+    iss: String,
+    validation: Validation,
+    subject_claim: String,
+    subject_prefix: String,
+    required_claims: BTreeMap<String, serde_json::Value>,
+    jwks_url: Option<String>,
+    jwks_file: Option<PathBuf>,
     keys: RwLock<Keys>,
-    /// When the keys were last read (one reload at a time).
+    /// When its keys were last read; held while they're read again.
     loaded_at: tokio::sync::Mutex<Instant>,
 }
 
 impl Verifier {
-    /// Load the keys (failing without any), then reload them every `jwks_refresh`.
+    /// Load every issuer's keys (failing without any), then reload them every `jwks_refresh`.
     pub async fn start(config: &AuthConfig) -> Result<Arc<Self>> {
         config.check()?;
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.algorithms = config.algorithms()?;
-        validation.set_issuer(&[config.issuer.as_deref().unwrap_or_default()]);
-        validation.set_audience(&[config.audience.as_deref().unwrap_or_default()]);
-        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
-        validation.validate_nbf = true;
-        validation.leeway = config.leeway.as_secs();
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let mut issuers = BTreeMap::new();
+        for (i, c) in config.issuers.iter().enumerate() {
+            let at = format!("auth.issuers.{i}");
+            let issuer = Issuer::new(c, config.leeway, &at)?;
+            issuer.load(&http, &at).await?;
+            issuers.insert(c.issuer.clone(), issuer);
+        }
         let verifier = Arc::new(Self {
-            validation,
-            subject_claim: config.subject_claim.clone(),
+            issuers,
             leeway: config.leeway,
             hello_timeout: config.hello_timeout,
-            jwks_url: config.jwks_url.clone(),
-            jwks_file: config.jwks_file.clone(),
             cooldown: config.jwks_cooldown,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()?,
-            keys: RwLock::default(),
-            loaded_at: tokio::sync::Mutex::new(Instant::now()),
+            http,
         });
-        let mut keys = Keys::default();
-        if let Some(file) = &verifier.jwks_file {
-            keys.file = verifier
-                .read_file(file)
-                .with_context(|| format!("auth.jwks_file: {}", file.display()))?;
-        }
-        if let Some(url) = &verifier.jwks_url {
-            keys.url = verifier
-                .fetch(url)
-                .await
-                .with_context(|| format!("auth.jwks_url: {url}"))?;
-        }
-        if keys.all().next().is_none() {
-            bail!("auth: the issuer's JWKS has no keys");
-        }
-        info!(
-            file = keys.file.len(),
-            url = keys.url.len(),
-            "auth: keys loaded"
-        );
-        *verifier.keys.write().unwrap() = keys;
 
         let weak = Arc::downgrade(&verifier);
         let refresh = config.jwks_refresh;
@@ -330,9 +453,11 @@ impl Verifier {
             loop {
                 tokio::time::sleep(refresh).await;
                 let Some(v) = weak.upgrade() else { return };
-                let mut loaded_at = v.loaded_at.lock().await;
-                v.reload().await;
-                *loaded_at = Instant::now();
+                for issuer in v.issuers.values() {
+                    let mut loaded_at = issuer.loaded_at.lock().await;
+                    issuer.reload(&v.http).await;
+                    *loaded_at = Instant::now();
+                }
             }
         });
         Ok(verifier)
@@ -341,13 +466,86 @@ impl Verifier {
     /// The credential's subject and expiry, or why it isn't taken.
     pub async fn verify(&self, token: &str) -> Result<Verified, AuthError> {
         let header = jsonwebtoken::decode_header(token).map_err(|_| AuthError::BadSignature)?;
+        // the issuer it claims, unverified: only to choose whose keys may verify it
+        let claimed: serde_json::Map<String, serde_json::Value> =
+            jsonwebtoken::dangerous::insecure_decode_claims(token)
+                .map_err(|_| AuthError::BadSignature)?;
+        let issuer = claimed
+            .get("iss")
+            .and_then(|iss| iss.as_str())
+            .and_then(|iss| self.issuers.get(iss))
+            .ok_or(AuthError::WrongAudience)?;
+        issuer.verify(token, &header, self).await
+    }
+
+    /// When a connection with this credential must have renewed it.
+    pub fn deadline(&self, v: &Verified) -> Instant {
+        let left = v.expires_at - now_ms();
+        Instant::now() + Duration::from_millis(left.max(0) as u64) + self.leeway
+    }
+}
+
+impl Issuer {
+    fn new(c: &IssuerConfig, leeway: Duration, at: &str) -> Result<Self> {
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.algorithms = c.algorithms(at)?;
+        validation.set_issuer(&[&c.issuer]);
+        validation.set_audience(&c.audiences);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.validate_nbf = true;
+        validation.leeway = leeway.as_secs();
+        Ok(Self {
+            iss: c.issuer.clone(),
+            validation,
+            subject_claim: c.subject_claim.clone(),
+            subject_prefix: c.subject_prefix.clone(),
+            required_claims: c.required_claims.clone(),
+            jwks_url: c.jwks_url.clone(),
+            jwks_file: c.jwks_file.clone(),
+            keys: RwLock::default(),
+            loaded_at: tokio::sync::Mutex::new(Instant::now()),
+        })
+    }
+
+    /// Its keys, the first time: each source must load, and together have a key.
+    async fn load(&self, http: &reqwest::Client, at: &str) -> Result<()> {
+        let mut keys = Keys::default();
+        if let Some(file) = &self.jwks_file {
+            keys.file =
+                read_file(file).with_context(|| format!("{at}.jwks_file: {}", file.display()))?;
+        }
+        if let Some(url) = &self.jwks_url {
+            keys.url = fetch(http, url)
+                .await
+                .with_context(|| format!("{at}.jwks_url: {url}"))?;
+        }
+        if keys.all().next().is_none() {
+            bail!("{at}: the issuer's JWKS has no keys");
+        }
+        info!(
+            issuer = self.iss,
+            file = keys.file.len(),
+            url = keys.url.len(),
+            "auth: keys loaded"
+        );
+        *self.keys.write().unwrap() = keys;
+        Ok(())
+    }
+
+    /// `token`, which claims to be this issuer's, verified with this issuer's keys only.
+    async fn verify(
+        &self,
+        token: &str,
+        header: &Header,
+        verifier: &Verifier,
+    ) -> Result<Verified, AuthError> {
         if !self.validation.algorithms.contains(&header.alg) {
             return Err(AuthError::BadSignature);
         }
         // a key id the server doesn't have: the issuer may have rotated
         if let Some(kid) = &header.kid {
             if !self.has(kid) {
-                self.reload_soon().await;
+                self.reload_soon(&verifier.http, verifier.cooldown).await;
             }
         }
         let keys = self.keys.read().unwrap().clone();
@@ -383,12 +581,7 @@ impl Verifier {
         verdict
     }
 
-    /// When a connection with this credential must have renewed it.
-    pub fn deadline(&self, v: &Verified) -> Instant {
-        let left = v.expires_at - now_ms();
-        Instant::now() + Duration::from_millis(left.max(0) as u64) + self.leeway
-    }
-
+    /// Whose a credential with these (verified) claims is, if it has what this issuer requires.
     fn verified(
         &self,
         claims: &serde_json::Map<String, serde_json::Value>,
@@ -398,12 +591,19 @@ impl Verifier {
             .and_then(|s| s.as_str())
             .filter(|s| !s.is_empty())
             .ok_or(AuthError::WrongAudience)?;
+        if self
+            .required_claims
+            .iter()
+            .any(|(claim, value)| claims.get(claim) != Some(value))
+        {
+            return Err(AuthError::WrongAudience);
+        }
         let exp = claims
             .get("exp")
             .and_then(|e| e.as_f64())
             .ok_or(AuthError::WrongAudience)?;
         Ok(Verified {
-            subject: subject.to_string(),
+            subject: format!("{}{subject}", self.subject_prefix),
             expires_at: (exp * 1000.0) as i64,
         })
     }
@@ -417,24 +617,24 @@ impl Verifier {
     }
 
     /// Read the keys again, unless they were within the cooldown (or another reload is on).
-    async fn reload_soon(&self) {
+    async fn reload_soon(&self, http: &reqwest::Client, cooldown: Duration) {
         let Ok(mut loaded_at) = self.loaded_at.try_lock() else {
             // one is on: wait for it
             let _ = self.loaded_at.lock().await;
             return;
         };
-        if loaded_at.elapsed() < self.cooldown {
+        if loaded_at.elapsed() < cooldown {
             return;
         }
-        self.reload().await;
+        self.reload(http).await;
         *loaded_at = Instant::now();
     }
 
     /// Each source again; one that fails keeps its keys.
-    async fn reload(&self) {
+    async fn reload(&self, http: &reqwest::Client) {
         let mut keys = self.keys.read().unwrap().clone();
         if let Some(file) = &self.jwks_file {
-            match self.read_file(file) {
+            match read_file(file) {
                 Ok(k) => keys.file = k,
                 Err(e) => {
                     warn!(file = %file.display(), error = %format!("{e:#}"), "auth: reading the keys failed; keeping the ones loaded")
@@ -442,7 +642,7 @@ impl Verifier {
             }
         }
         if let Some(url) = &self.jwks_url {
-            match self.fetch(url).await {
+            match fetch(http, url).await {
                 Ok(k) => keys.url = k,
                 Err(e) => {
                     warn!(url, error = %format!("{e:#}"), "auth: fetching the keys failed; keeping the ones loaded")
@@ -451,23 +651,22 @@ impl Verifier {
         }
         *self.keys.write().unwrap() = keys;
     }
+}
 
-    fn read_file(&self, file: &PathBuf) -> Result<Arc<[Key]>> {
-        let text = std::fs::read_to_string(file)?;
-        parse_jwks(&text)
-    }
+fn read_file(file: &PathBuf) -> Result<Arc<[Key]>> {
+    let text = std::fs::read_to_string(file)?;
+    parse_jwks(&text)
+}
 
-    async fn fetch(&self, url: &str) -> Result<Arc<[Key]>> {
-        let text = self
-            .http
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        parse_jwks(&text)
-    }
+async fn fetch(http: &reqwest::Client, url: &str) -> Result<Arc<[Key]>> {
+    let text = http
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    parse_jwks(&text)
 }
 
 /// A JWKS's keys: public keys only (a shared secret, `"kty": "oct"`, is refused); keys of a
@@ -525,37 +724,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn jwt_needs_an_issuer_an_audience_and_keys() {
+    fn jwt_needs_issuers_each_with_audiences_and_keys() {
+        let issuer = |iss: &str| IssuerConfig {
+            issuer: iss.into(),
+            audiences: vec!["chlive".into()],
+            jwks_file: Some("jwks.json".into()),
+            ..Default::default()
+        };
         let jwt = |f: fn(&mut AuthConfig)| {
             let mut c = AuthConfig {
                 mode: Mode::Jwt,
-                issuer: Some("https://auth.example".into()),
-                audience: Some("chlive".into()),
-                jwks_file: Some("jwks.json".into()),
+                issuers: vec![issuer("https://a.example"), issuer("https://b.example")],
                 ..Default::default()
             };
             f(&mut c);
             c.check().map_err(|e| e.to_string())
         };
         assert!(jwt(|_| {}).is_ok());
-        assert!(jwt(|c| c.issuer = None)
-            .unwrap_err()
-            .contains("auth.issuer"));
-        assert!(jwt(|c| c.audience = None)
-            .unwrap_err()
-            .contains("auth.audience"));
-        assert!(jwt(|c| c.jwks_file = None)
-            .unwrap_err()
-            .contains("jwks_url, jwks_file or both"));
-        assert!(jwt(|c| c.jwks_url = Some("ftp://x".into()))
-            .unwrap_err()
-            .contains("http(s)"));
-        assert!(jwt(|c| c.algorithms = vec!["ES256".into(), "HS256".into()])
-            .unwrap_err()
-            .contains("shared secret"));
-        assert!(jwt(|c| c.algorithms = vec!["XX1".into()])
-            .unwrap_err()
-            .contains("unknown algorithm"));
+        let refused = |f: fn(&mut AuthConfig), expected: &str| {
+            let e = jwt(f).unwrap_err();
+            assert!(e.contains(expected), "{e}");
+        };
+        refused(|c| c.issuers.clear(), "at least one [[auth.issuers]]");
+        refused(
+            |c| c.issuers[1].issuer.clear(),
+            "auth.issuers.1.issuer: empty",
+        );
+        refused(
+            |c| c.issuers[1].issuer = "https://a.example".into(),
+            "auth.issuers.1.issuer: \"https://a.example\" is listed twice",
+        );
+        refused(
+            |c| c.issuers[0].audiences.clear(),
+            "auth.issuers.0.audiences",
+        );
+        refused(
+            |c| c.issuers[0].audiences.push(String::new()),
+            "auth.issuers.0.audiences",
+        );
+        refused(
+            |c| c.issuers[0].jwks_file = None,
+            "auth.issuers.0: the issuer's keys are needed: jwks_url, jwks_file or both",
+        );
+        refused(
+            |c| c.issuers[0].jwks_url = Some("ftp://x".into()),
+            "auth.issuers.0.jwks_url: \"ftp://x\" isn't an http(s) URL",
+        );
+        refused(
+            |c| c.issuers[1].algorithms = vec!["ES256".into(), "HS256".into()],
+            "auth.issuers.1.algorithms: HS256 is a shared secret",
+        );
+        refused(
+            |c| c.issuers[0].algorithms = vec!["XX1".into()],
+            "unknown algorithm",
+        );
+        refused(
+            |c| c.issuers[0].subject_claim.clear(),
+            "auth.issuers.0.subject_claim: empty",
+        );
         // the other modes need none of it
         assert!(AuthConfig::default().check().is_ok());
     }

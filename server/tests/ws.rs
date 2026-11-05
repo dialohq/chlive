@@ -2768,18 +2768,42 @@ fn token(subject: &str, secs: i64) -> String {
     sign("k1", Some("k1"), &claims(subject, secs))
 }
 
-/// Verifying credentials with keys k1 and k2 (from a file), the way `f` changes it.
+/// The issuer `iss`, for AUDIENCE, with `keys` (from a file of its own).
+fn issuer(iss: &str, keys: &[&str]) -> chlive_server::auth::IssuerConfig {
+    chlive_server::auth::IssuerConfig {
+        issuer: iss.into(),
+        audiences: vec![AUDIENCE.into()],
+        jwks_file: Some(jwks_file(keys)),
+        ..Default::default()
+    }
+}
+
+/// Verifying credentials of ISSUER, with keys k1 and k2, the way `f` changes it.
 async fn jwt(f: impl FnOnce(&mut chlive_server::auth::AuthConfig)) -> std::sync::Arc<Auth> {
     let mut c = chlive_server::auth::AuthConfig {
         mode: chlive_server::auth::Mode::Jwt,
-        issuer: Some(ISSUER.into()),
-        audience: Some(AUDIENCE.into()),
-        jwks_file: Some(jwks_file(&["k1", "k2"])),
+        issuers: vec![issuer(ISSUER, &["k1", "k2"])],
         leeway: Duration::ZERO,
         ..Default::default()
     };
     f(&mut c);
     std::sync::Arc::new(Auth::start(&c).await.unwrap())
+}
+
+/// A server verifying credentials as `jwt(f)` does.
+async fn jwt_server(f: impl FnOnce(&mut chlive_server::auth::AuthConfig)) -> chlive_server::Server {
+    server_with(ServerSettings {
+        auth: jwt(f).await,
+        ..Default::default()
+    })
+    .await
+}
+
+/// The server's answer to `hello {token}` on a new connection.
+async fn hello_with(server: &chlive_server::Server, token: String) -> Value {
+    let mut c = Client::connect(server).await;
+    c.send(json!({"type": "hello", "token": token})).await;
+    c.expect().await
 }
 
 impl Client {
@@ -3035,7 +3059,7 @@ async fn keys_rotate() {
     let file = jwks_file(&["k1", "k2"]);
     let server = server_with(ServerSettings {
         auth: jwt(|c| {
-            c.jwks_file = Some(file.clone());
+            c.issuers[0].jwks_file = Some(file.clone());
             c.jwks_refresh = Duration::from_millis(100);
         })
         .await,
@@ -3084,8 +3108,8 @@ async fn keys_rotate() {
     tokio::spawn(async move { axum::serve(listener, issuer).await });
     let server = server_with(ServerSettings {
         auth: jwt(|c| {
-            c.jwks_file = None;
-            c.jwks_url = Some(url);
+            c.issuers[0].jwks_file = None;
+            c.issuers[0].jwks_url = Some(url);
             c.jwks_cooldown = Duration::from_millis(200);
         })
         .await,
@@ -3116,6 +3140,181 @@ async fn keys_rotate() {
     assert_eq!(hello("k3").await["code"], "AUTH_BAD_SIGNATURE");
     assert_eq!(hello("k3").await["code"], "AUTH_BAD_SIGNATURE");
     assert_eq!(fetched(), 2);
+}
+
+const AGENTS: &str = "https://agents.test";
+
+/// `claims`, from `iss`.
+fn claims_from(iss: &str, subject: &str, secs: i64) -> Value {
+    let mut c = claims(subject, secs);
+    c["iss"] = json!(iss);
+    c
+}
+
+#[tokio::test]
+async fn each_issuer_verifies_with_its_own_keys() {
+    // ISSUER signs with k1, AGENTS with k2
+    let server = jwt_server(|c| {
+        c.issuers = vec![issuer(ISSUER, &["k1"]), issuer(AGENTS, &["k2"])];
+    })
+    .await;
+    let m = hello_with(&server, sign("k1", Some("k1"), &claims("user:alice", 60))).await;
+    assert_eq!(
+        (&m["type"], &m["subject"]),
+        (&json!("authenticated"), &json!("user:alice"))
+    );
+    let t = sign("k2", Some("k2"), &claims_from(AGENTS, "agent:7", 60));
+    assert_eq!(hello_with(&server, t).await["subject"], "agent:7");
+
+    // a key of one issuer never verifies a credential claiming the other: by its kid or not
+    for (key, iss) in [("k1", AGENTS), ("k2", ISSUER)] {
+        let c = claims_from(iss, "user:mallory", 60);
+        let m = hello_with(&server, sign(key, Some(key), &c)).await;
+        assert_eq!(m["code"], "AUTH_BAD_SIGNATURE", "{key} as {iss}: {m}");
+        let m = hello_with(&server, sign(key, None, &c)).await;
+        assert_eq!(
+            m["code"], "AUTH_BAD_SIGNATURE",
+            "{key} as {iss}, no kid: {m}"
+        );
+    }
+
+    // an issuer that isn't one, or none: not for this server
+    let t = sign(
+        "k1",
+        Some("k1"),
+        &claims_from("https://someone.else", "user:alice", 60),
+    );
+    assert_eq!(hello_with(&server, t).await["code"], "AUTH_WRONG_AUDIENCE");
+    let mut c = claims("user:alice", 60);
+    c.as_object_mut().unwrap().remove("iss");
+    let t = sign("k1", Some("k1"), &c);
+    assert_eq!(hello_with(&server, t).await["code"], "AUTH_WRONG_AUDIENCE");
+}
+
+#[tokio::test]
+async fn the_subject_is_the_prefix_and_the_claim() {
+    let p = MemoryProvider::loaded();
+    p.set(0, "user:me@adamchol.com", &["slow"]);
+    let auth = jwt(|c| {
+        c.issuers[0].subject_claim = "email".into();
+        c.issuers[0].subject_prefix = "user:".into();
+    })
+    .await;
+    let server = server_with(ServerSettings { auth, ..secured(p) }).await;
+    let mut c = claims("ignored-sub", 60);
+    c["email"] = json!("me@adamchol.com");
+    let mut a = Client::connect(&server).await;
+    a.send(json!({"type": "hello", "token": sign("k1", Some("k1"), &c)}))
+        .await;
+    let m = a.expect().await;
+    assert_eq!(m["subject"], "user:me@adamchol.com", "{m}");
+    // grants match the prefixed subject
+    a.subscribe("s", "select user_id from requests").await;
+    assert_eq!(a.expect().await["type"], "snapshot");
+    assert_eq!(a.inserts("s", 1).await, [json!({"user_id": "slow"})]);
+    // without the claim, or with it not a string: not for this server
+    let t = sign("k1", Some("k1"), &claims("user:alice", 60));
+    assert_eq!(hello_with(&server, t).await["code"], "AUTH_WRONG_AUDIENCE");
+    c["email"] = json!(42);
+    let t = sign("k1", Some("k1"), &c);
+    assert_eq!(hello_with(&server, t).await["code"], "AUTH_WRONG_AUDIENCE");
+}
+
+#[tokio::test]
+async fn required_claims_must_match_exactly() {
+    let server = jwt_server(|c| {
+        c.issuers[0].required_claims = [
+            ("email_verified".to_string(), json!(true)),
+            ("hd".to_string(), json!("adamchol.com")),
+        ]
+        .into();
+    })
+    .await;
+    let with = |f: fn(&mut Value)| {
+        let mut c = claims("user:alice", 60);
+        c["email_verified"] = json!(true);
+        c["hd"] = json!("adamchol.com");
+        f(&mut c);
+        sign("k1", Some("k1"), &c)
+    };
+    assert_eq!(
+        hello_with(&server, with(|_| {})).await["type"],
+        "authenticated"
+    );
+    let refused: [fn(&mut Value); 5] = [
+        |c| c["email_verified"] = json!(false),
+        |c| {
+            c.as_object_mut().unwrap().remove("email_verified");
+        },
+        |c| c["email_verified"] = json!("true"),
+        |c| c["hd"] = json!("example.com"),
+        |c| {
+            c.as_object_mut().unwrap().remove("hd");
+        },
+    ];
+    for (i, f) in refused.into_iter().enumerate() {
+        let m = hello_with(&server, with(f)).await;
+        assert_eq!(m["code"], "AUTH_WRONG_AUDIENCE", "case {i}: {m}");
+        assert_eq!(m["message"], "the credential isn't for this server");
+    }
+}
+
+#[tokio::test]
+async fn any_one_audience_is_enough() {
+    let server = jwt_server(|c| {
+        c.issuers[0].audiences = vec!["chlive".into(), "chlive-staging".into()];
+    })
+    .await;
+    let with_aud = |aud: Value| {
+        let mut c = claims("user:alice", 60);
+        c["aud"] = aud;
+        sign("k1", Some("k1"), &c)
+    };
+    for aud in [
+        json!("chlive"),
+        json!("chlive-staging"),
+        json!(["another-service", "chlive-staging"]),
+    ] {
+        let m = hello_with(&server, with_aud(aud.clone())).await;
+        assert_eq!(m["type"], "authenticated", "{aud}: {m}");
+    }
+    for aud in [json!("another-service"), json!(["a", "b"]), json!([])] {
+        let m = hello_with(&server, with_aud(aud.clone())).await;
+        assert_eq!(m["code"], "AUTH_WRONG_AUDIENCE", "{aud}: {m}");
+    }
+}
+
+#[tokio::test]
+async fn a_renewal_keeps_the_subject_whichever_issuer_signs_it() {
+    let live = Live::new();
+    let settings = ServerSettings {
+        auth: jwt(|c| {
+            c.issuers = vec![issuer(ISSUER, &["k1"]), issuer(AGENTS, &["k2"])];
+        })
+        .await,
+        ..Default::default()
+    };
+    let server = live_server(&live, settings).await;
+    let mut c = Client::connect(&server).await;
+    c.send(json!({"type": "hello", "token": token("agent:7", 60)}))
+        .await;
+    assert_eq!(c.expect().await["subject"], "agent:7");
+    c.subscribe("s", "select user_id from requests").await;
+    assert_eq!(c.expect().await["type"], "snapshot");
+    // the same subject, from the other issuer: taken
+    let t = sign("k2", Some("k2"), &claims_from(AGENTS, "agent:7", 120));
+    c.send(json!({"type": "renew", "token": t})).await;
+    let m = c.expect().await;
+    assert_eq!(
+        (&m["type"], &m["subject"]),
+        (&json!("authenticated"), &json!("agent:7"))
+    );
+    // another subject, from either: refused, and the connection carries on
+    let t = sign("k2", Some("k2"), &claims_from(AGENTS, "agent:8", 120));
+    c.send(json!({"type": "renew", "token": t})).await;
+    assert_eq!(c.expect().await["code"], "PERMISSION_DENIED");
+    live.push("still", 1);
+    assert_eq!(users(&mut c, "s", 1).await.0, ["still"]);
 }
 
 #[tokio::test]

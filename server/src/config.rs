@@ -852,16 +852,23 @@ mod tests {
 
                 [auth]
                 mode = "jwt"
-                issuer = "https://auth.example"
-                audience = "chlive-prod"
-                jwks_url = "https://auth.example/jwks.json"
-                jwks_file = "/etc/chlive/jwks.json"
                 jwks_refresh = "1m"
                 jwks_cooldown = "5s"
-                algorithms = ["ES256"]
-                subject_claim = "uid"
                 leeway = "1s"
                 hello_timeout = "3s"
+                [[auth.issuers]]
+                issuer = "https://auth.example"
+                audiences = ["chlive-prod", "chlive-staging"]
+                jwks_url = "https://auth.example/jwks.json"
+                jwks_file = "/etc/chlive/jwks.json"
+                algorithms = ["ES256"]
+                subject_claim = "email"
+                subject_prefix = "user:"
+                required_claims = { email_verified = true, hd = "adamchol.com", tier = 2 }
+                [[auth.issuers]]
+                issuer = "https://agents.example"
+                audiences = ["chlive-prod"]
+                jwks_file = "/etc/chlive/agents.json"
 
                 [tables]
                 expose = "all"
@@ -915,14 +922,31 @@ mod tests {
                 c.auth,
                 crate::auth::AuthConfig {
                     mode: crate::auth::Mode::Jwt,
-                    issuer: Some("https://auth.example".into()),
-                    audience: Some("chlive-prod".into()),
-                    jwks_url: Some("https://auth.example/jwks.json".into()),
-                    jwks_file: Some("/etc/chlive/jwks.json".into()),
+                    issuers: vec![
+                        crate::auth::IssuerConfig {
+                            issuer: "https://auth.example".into(),
+                            audiences: vec!["chlive-prod".into(), "chlive-staging".into()],
+                            jwks_url: Some("https://auth.example/jwks.json".into()),
+                            jwks_file: Some("/etc/chlive/jwks.json".into()),
+                            algorithms: vec!["ES256".into()],
+                            subject_claim: "email".into(),
+                            subject_prefix: "user:".into(),
+                            required_claims: [
+                                ("email_verified".to_string(), serde_json::json!(true)),
+                                ("hd".to_string(), serde_json::json!("adamchol.com")),
+                                ("tier".to_string(), serde_json::json!(2)),
+                            ]
+                            .into(),
+                        },
+                        crate::auth::IssuerConfig {
+                            issuer: "https://agents.example".into(),
+                            audiences: vec!["chlive-prod".into()],
+                            jwks_file: Some("/etc/chlive/agents.json".into()),
+                            ..Default::default()
+                        },
+                    ],
                     jwks_refresh: Duration::from_secs(60),
                     jwks_cooldown: Duration::from_secs(5),
-                    algorithms: vec!["ES256".into()],
-                    subject_claim: "uid".into(),
                     leeway: Duration::from_secs(1),
                     hello_timeout: Duration::from_secs(3),
                 }
@@ -1164,6 +1188,31 @@ mod tests {
             .is_ok());
             let e = err(jail, "[kafka]\nmetadata_refresh = \"0s\"");
             assert!(e.contains("metadata_refresh"), "{e}");
+            // the single issuer of before [[auth.issuers]]: refused, saying where it went
+            for key in [
+                "issuer = \"https://a\"",
+                "audience = \"x\"",
+                "subject_claim = \"uid\"",
+            ] {
+                let e = err(jail, &format!("[auth]\nmode = \"jwt\"\n{key}"));
+                assert!(
+                    e.contains("moved: each issuer is its own [[auth.issuers]]"),
+                    "{e}"
+                );
+            }
+            let e = err(
+                jail,
+                "[auth]\nmode = \"jwt\"\n[[auth.issuers]]\nissuer = \"https://a\"\naudience = \"x\"",
+            );
+            assert!(e.contains("audience"), "{e}");
+            let e = err(
+                jail,
+                "[auth]\nmode = \"jwt\"\n[[auth.issuers]]\nissuer = \"https://a\"\naudiences = [\"x\"]",
+            );
+            assert!(
+                e.contains("auth.issuers.0: the issuer's keys are needed"),
+                "{e}"
+            );
             // a missing file is an error, not the defaults
             let e = Config::load(&Overrides {
                 file: Some("absent.toml".into()),

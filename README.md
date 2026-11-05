@@ -153,23 +153,37 @@ customer = { clickhouse = "customer_id", json = "customerId" }
 
 ### Authentication
 
-Who a connection is decides what it may read and insert: the subject is `{subject:String}` in every grant, and what an insert's user column is set to. The subject comes from a credential the client presents, issued by a service of your own (for end users and headless agents alike) and verified by chlive without calling it:
+Who a connection is decides what it may read and insert: the subject is `{subject:String}` in every grant, and what an insert's user column is set to. The subject comes from a credential the client presents, issued by services of your own or an identity provider (for end users and headless agents alike) and verified by chlive without calling them. Each issuer is listed, as Kubernetes' structured authentication lists its JWT authenticators:
 
 ```toml
 [auth]
 mode = "jwt"
-issuer = "https://auth.example.com"            # the credentials' iss
-audience = "chlive"                            # what their aud must hold
-jwks_url = "https://auth.example.com/.well-known/jwks.json"   # the issuer's public keys
-# jwks_file = "/etc/chlive/jwks.json"          # or a file, or both (their union)
-# subject_claim = "sub"                        # an opaque string: "user:alice", "agent:<uuid>", …
+
+[[auth.issuers]]
+issuer = "https://accounts.google.com"         # the credentials' iss, exactly
+audiences = ["chlive", "chlive-staging"]       # their aud must hold one of these
+jwks_url = "https://www.googleapis.com/oauth2/v3/certs"   # the issuer's public keys
+# jwks_file = "/etc/chlive/google.json"        # or a file, or both (their union)
+# algorithms = ["RS256"]                       # default: RS*, PS*, ES256, ES384, EdDSA
+subject_claim = "email"                        # default "sub"
+subject_prefix = "user:"                       # the subject: user:me@adamchol.com
+required_claims = { email_verified = true, hd = "adamchol.com" }   # exact values
+
+[[auth.issuers]]
+issuer = "https://agents.example.com"
+audiences = ["chlive"]
+jwks_file = "/etc/chlive/agents.json"
+subject_prefix = "agent:"
 ```
 
-- **Credentials are JWTs** signed by the issuer with a private key (RS256/384/512, PS256/384/512, ES256/384 or EdDSA; `algorithms` narrows them). chlive holds only the public keys, so it can verify credentials but never make them: shared secrets (HS256, a JWKS `"kty": "oct"`) are refused at start.
-- **Keys rotate without a restart.** The JWKS is read at start (the server doesn't start without it), again every `jwks_refresh` (5 min), and when a credential names a key id it doesn't have (at most every `jwks_cooldown`, 30 s). A source that fails to load keeps its previous keys.
+- **A credential's `iss` picks its issuer, and only that issuer's keys can verify it**, so a key of one issuer never validates a credential claiming another. An `iss` that isn't listed is `AUTH_WRONG_AUDIENCE`.
+- **Credentials are JWTs** signed with a private key (RS256/384/512, PS256/384/512, ES256/384 or EdDSA; an issuer's `algorithms` narrows them). chlive holds only the public keys, so it can verify credentials but never make them: shared secrets (HS256, a JWKS `"kty": "oct"`) are refused at start.
+- **The subject** is the issuer's `subject_claim` (a non-empty string, taken as is) after its `subject_prefix`. The prefix keeps issuers' subjects apart: without one, two issuers that both say `alice` give the same subject, with the same grants. `required_claims` must be in the credential with exactly the values given (`true` is not `"true"`); one missing or different is `AUTH_WRONG_AUDIENCE`.
+- **Keys rotate without a restart.** Each issuer's JWKS is read at start (the server doesn't start without it), again every `jwks_refresh` (5 min), and when a credential names a key id that issuer doesn't have (at most every `jwks_cooldown`, 30 s). A source that fails to load keeps its previous keys. These, `leeway` and `hello_timeout` are for all issuers.
+- **Before `[[auth.issuers]]`**, `[auth]` had a single `issuer`, `audience`, `jwks_url`, `jwks_file`, `algorithms` and `subject_claim`. They're refused now, with a message saying where they went: an `[[auth.issuers]]` with `audiences = [the audience]`.
 - **The credential comes in the first message**, `{"type": "hello", "token": "eyJ…"}`, since browsers can't set headers on a WebSocket. The server answers `{"type": "authenticated", "subject", "expires_at"}`. Subscriptions and inserts may follow the hello at once; nothing may come before it, and a connection without one within `hello_timeout` (10 s) is closed.
-- **Credentials are short-lived, connections needn't be.** Before `expires_at`, the client sends `{"type": "renew", "token": …}` with a fresh credential for the same subject: the connection, its subscriptions and their cursors carry on, with no new snapshot. Not renewed, the connection is closed once the credential expires (plus `leeway`, 5 s); the client reconnects with a new one and resumes every result from its cursor. Both clients do all of this from a function you give them (below).
-- **Failures say which, and nothing more:** an `error` with no id and one of `AUTH_MISSING` (no credential, or a declared `user`), `AUTH_BAD_SIGNATURE` (malformed, or no trusted key verifies it), `AUTH_WRONG_AUDIENCE` (another issuer or audience, or no subject) and `AUTH_EXPIRED`, then a Close frame with code 4401 and the code as its reason. The signature is checked before any claim, and the messages are fixed. A refused `renew` is the same error without the close: the connection lasts until the current credential expires. A renewal for another subject is `PERMISSION_DENIED`.
+- **Credentials are short-lived, connections needn't be.** Before `expires_at`, the client sends `{"type": "renew", "token": …}` with a fresh credential for the same subject (from any issuer, as long as the subject is the same): the connection, its subscriptions and their cursors carry on, with no new snapshot. Not renewed, the connection is closed once the credential expires (plus `leeway`, 5 s); the client reconnects with a new one and resumes every result from its cursor. Both clients do all of this from a function you give them (below).
+- **Failures say which, and nothing more:** an `error` with no id and one of `AUTH_MISSING` (no credential, or a declared `user`), `AUTH_BAD_SIGNATURE` (malformed, or no key of its issuer verifies it), `AUTH_WRONG_AUDIENCE` (an issuer that isn't listed, another audience, no subject, or a required claim that doesn't match) and `AUTH_EXPIRED`, then a Close frame with code 4401 and the code as its reason. Past choosing the issuer, the signature is checked before any claim, and the messages are fixed. A refused `renew` is the same error without the close: the connection lasts until the current credential expires. A renewal for another subject is `PERMISSION_DENIED`.
 - **Modes.** Without `[auth]` (`mode = "none"`), connections are anonymous and a `hello` is refused. `mode = "declared"` trusts `{"type": "hello", "user": "alice"}` as it is, for dev and tests only (the dev and chat stacks use it).
 
 ```ts
