@@ -79,7 +79,8 @@ Kafka ──▶ Kafka Connect: ClickHouse sink ──▶ ClickHouse ◀── cl
 | `flake.nix` | the flake: packages (`nix build` builds `chlive`: the server `chlive` and the terminal client `clc`) and the dnvr dev shell |
 | `nix/shell.nix` | the dnvr dev shell: toolchain, env, the local stack's processes (Redpanda in Docker, ClickHouse 26.7.2, Kafka Connect with the ClickHouse sink, the pause server, schema, seed, server, examples) and scripts |
 | `nix/chlive.dev.toml` | the dev server's config (the stack's addresses come as flags) |
-| `nix/packages/` | custom derivations: `chlive.nix` (the server and `clc`), `clickhouse.nix` (26.7.2), `libchdb.nix` (chDB, same version), `redpanda.nix` (the Docker-run Redpanda process) |
+| `nix/packages/` | custom derivations: `chlive.nix` (the server and `clc`), `chlive-image.nix` (the server's image, `packages.chlive-image`), `chlive-wasm.nix`, `clickhouse.nix` (26.7.2), `libchdb.nix` (chDB, same version), `redpanda.nix` (the Docker-run Redpanda process) |
+| `.github/workflows/` | `image.yml`: builds the server's image (nix2container) on every pull request and push, and pushes it to `ghcr.io/dialohq/chlive` as `sha-<commit>`, plus `master` from master and the tag from `v*` tags |
 | `scripts/` | `schema.sql` (tables, the sink's state tables, users) and `seed.sql` (historical events, as JSON to produce); |
 | `core/` | `chlive-core` (Rust, no IO; also WebAssembly): the dialect (parser), bound queries, plans, a live result's state as events come (ordering, windows, FINAL, time windows, native aggregates), the diffs it makes, a client's result rows, and its own inserts placed the same way (`predict`) |
 | `engine/` | `chlive-engine` (Rust): binding against the catalog, and the event loop over ClickHouse and Kafka, on `chlive-core` |

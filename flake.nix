@@ -9,6 +9,9 @@
     # its `feat/rex-runner` branch (the Rex runner, `dnvr down`/`restart`) until that's merged
     dnvr.url = "github:dialohq/dnvr/feat/rex-runner";
     dnvr.inputs.nixpkgs.follows = "nixpkgs";
+    # the server's OCI image (packages.chlive-image)
+    nix2container.url = "github:nlewo/nix2container";
+    nix2container.inputs.nixpkgs.follows = "nixpkgs";
     # The production ingestion (Kafka Connect's ClickHouse sink, exactly once) and its pause
     # server, which chlive's snapshots go through. Its `pause-server` branch (the pause server's
     # Keeper storage and leader election) until that's merged into main.
@@ -47,6 +50,11 @@
           chlive-wasm = pkgs.callPackage ./nix/packages/chlive-wasm.nix {
             rust = import ./nix/rust.nix { inherit pkgs; };
           };
+          # the server as an OCI image
+          chlive-image = pkgs.callPackage ./nix/packages/chlive-image.nix {
+            inherit chlive libchdb;
+            inherit (inputs.nix2container.packages.${system}) nix2container;
+          };
         in
         {
           # nixpkgs with rust-overlay's `rust-bin` (nothing else changes: same packages)
@@ -63,7 +71,8 @@
               chlive-wasm
               ;
             default = chlive;
-          };
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux { inherit chlive-image; };
 
           dnvr.shells.default = import ./nix/shell.nix {
             inherit

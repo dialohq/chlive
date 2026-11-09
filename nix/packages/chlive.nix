@@ -7,6 +7,7 @@
   pkg-config,
   rdkafka,
   zlib,
+  openssl,
   libchdb,
 }:
 let
@@ -25,6 +26,7 @@ rustPlatform.buildRustPackage {
       ../../server
       ../../core
       ../../engine
+      ../../wasm
       ../../protocol
       ../../client-rs
       ../../tests
@@ -56,6 +58,8 @@ rustPlatform.buildRustPackage {
   buildInputs = [
     rdkafka
     zlib
+    # chdb-rust's build script (reqwest with native-tls; it downloads nothing, CHDB_LIB_DIR is set)
+    openssl
     libchdb
   ];
 
