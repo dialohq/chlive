@@ -12,9 +12,9 @@ in
     nixfmt
 
     # Rust toolchain (cargo, rustc, clippy, rustfmt, rust-analyzer), and for the WebAssembly
-    # build: wasm-bindgen's CLI (the `wasm-bindgen` crate is pinned to its version) and wasm-opt
+    # build: wasm-bindgen's CLI (at the `wasm-bindgen` crate's version: ./packages/wasm-bindgen-cli.nix) and wasm-opt
     rust
-    wasm-bindgen-cli
+    (callPackage ./packages/wasm-bindgen-cli.nix { })
     binaryen
 
     # chdb-rust links libchdb; its bindgen needs libclang

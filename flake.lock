@@ -17,6 +17,21 @@
         "type": "github"
       }
     },
+    "crane": {
+      "locked": {
+        "lastModified": 1794870543,
+        "narHash": "sha256-RQc417nQURjHvaUkVFLyvaQ6Px18G7ZHjRF9bYUkScg=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "dbd1288af7a7ec997cb912c034b1a1962938173e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
     "dnvr": {
       "inputs": {
         "nixpkgs": [
@@ -97,6 +112,7 @@
     "root": {
       "inputs": {
         "continuous-backup": "continuous-backup",
+        "crane": "crane",
         "dnvr": "dnvr",
         "flake-parts": "flake-parts",
         "nix2container": "nix2container",

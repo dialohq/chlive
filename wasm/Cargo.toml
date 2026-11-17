@@ -15,6 +15,6 @@ chlive-core = { path = "../core", default-features = false }
 chlive-protocol = { path = "../protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-# must be the version of the dev shell's wasm-bindgen CLI (nix/toolchain.nix)
+# must be the version of the wasm-bindgen CLI (nix/packages/wasm-bindgen-cli.nix; checks.wasm-bindgen-version)
 wasm-bindgen = "=0.2.127"
 serde-wasm-bindgen = "0.6"
